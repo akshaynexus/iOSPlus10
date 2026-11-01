@@ -1,0 +1,664 @@
+laurel 0004 (boot 2026-11-01 20:02, owner: widgets blank, wallpapers wrong): every OSType gets a picture. -attachImage: does not refuse a
+format any more (CoreAnimation does not look at the answer: a refusal was a blank layer; '_RB4' = every opaque RenderBox layer, every home
+widget): surface_formats.c converts it; BGR10_XR and kin that the kernel calls BGRA (value LaurelMetalFormat, flame/0020) are turned into 8-bit
+pixels by the GPU, without a copy; OpenGL ES refusing a form falls back to 8-bit pixels; "redwood-gl: contents:" says what a surface holds at
+the first draw with it and when a blank one fills. Applied by scripts/laurel/gpu-userland.sh after 0003.
+
+--- a/userland/gpu/eagl.c
++++ b/userland/gpu/eagl.c
+@@ -73,6 +73,8 @@
+ #include <errno.h>
+ 
+ #include "redwood_gl.h"
++#include "surface_formats.h"
++#include <libkern/OSCacheControl.h>
+ 
+ /* ---- OpenGL ES: the types, the few names used here, the library's functions --------------------- */
+ 
+@@ -238,6 +240,14 @@
+ 	GLenum to, internal, format, type;
+ 	uint32_t plane, seed;
+ 	GLsizei width, height;
++	/* laurel 0004: a surface OpenGL ES cannot take as it is ('_RB4', a poster's BGR10_XR words, ...) */
++	const struct lsf_format *decoded;
++	GLuint xr_source;               /* ... its memory as a texture of bytes, turned into the 8-bit picture by the GPU (xr_pass) */
++	unsigned xr_frame;              /* ... the frame that was last done in */
++	bool xr_checked;
++	unsigned fills;                 /* ... times it was converted by the CPU (decoded_fill) */
++	struct lsf_contents contents;   /* what the surface held, last looked at */
++	uint8_t told;                   /* 0: the contents line is still to come; 1: said, and it was blank; 2: said, with something in it */
+ };
+ 
+ struct eagl {
+@@ -245,7 +255,7 @@
+ 	id object;                      /* the EAGLContext */
+ 	struct redwood_gl *gl;
+ 	unsigned long api;
+-	struct image images[256];
++	struct image images[512];
+ 	unsigned image_count;
+ 	GLuint framebuffer;             /* the one bound */
+ 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
+@@ -291,6 +301,10 @@
+ 		GLint size;
+ 		GLenum type;
+ 	} arrays[8];                    /* the vertex arrays, as given */
++	GLuint xr_program, xr_framebuffer;      /* laurel 0004: xr_pass */
++	GLint xr_kind, xr_flip;
++	bool xr_failed;
++	unsigned contents_wanted;       /* images whose contents line has not come yet */
+ 	bool in_frame;
+ 	struct {                        /* what the line a frame gets with glframes=1 says (frame_end()) */
+ 		bool taken, boxed;      /* the first draw or clear into the display's picture seen; scissored */
+@@ -376,6 +390,11 @@
+ static const char *eagl_slot_name(unsigned offset);
+ static void census_report(void);
+ static void clear_now(struct eagl *e);
++static void decoded_fill(struct eagl *e, struct image *image);
++static unsigned surface_planes(IOSurfaceRef surface, struct lsf_plane plane[2]);
++static void xr_pass(struct eagl *e, struct image *image);
++static bool format_first(uint32_t pixels, unsigned way);
++static bool xr_setup(struct eagl *e, struct image *image);
+ 
+ static void
+ eagl_enter(struct eagl *e, unsigned offset)
+@@ -562,11 +581,18 @@
+ 		if (image->mirror != 0) {
+ 			glDeleteTextures(1, &image->mirror);
+ 		}
++		if (image->xr_source != 0) {
++			glDeleteTextures(1, &image->xr_source);
++		}
++		if (image->told == 0 && e->contents_wanted != 0) {
++			e->contents_wanted--;
++		}
+ 		CFRelease(image->surface);
+ 	}
+ 	memset(image, 0, sizeof(*image));
+ 	image->texture = texture;
+ 	image->sub_ok = true;
++	image->told = 2;                /* (no contents line unless contents_watch() asks for one) */
+ 	image->surface = (IOSurfaceRef)CFRetain(surface);
+ 	return image;
+ }
+@@ -580,6 +606,12 @@
+ 		if (image->mirror != 0) {
+ 			glDeleteTextures(1, &image->mirror);
+ 		}
++		if (image->xr_source != 0) {
++			glDeleteTextures(1, &image->xr_source);
++		}
++		if (image->told == 0 && e->contents_wanted != 0) {
++			e->contents_wanted--;
++		}
+ 		CFRelease(image->surface);
+ 		*image = e->images[--e->image_count];
+ 	}
+@@ -613,6 +645,221 @@
+ }
+ 
+ /*
++ * laurel 0004: IOSurface formats OpenGL ES cannot take as they are. QuartzCore 20H392 CA::OGL::GLESContext::attach_surface_texture
++ * has its own GL form for BGRA, RGBA, A008, L008, L565, L555, RGhA, RGfA and the 420/422/444 pairs (-texImageIOSurface:, its shaders
++ * convert). Every other OSType goes to -attachImage: and CoreAnimation does not look at the answer: a refusal is an empty texture, a
++ * blank layer. '_RB4' is what RenderBox picks for an opaque layer once the device is of family Apple3 or better
++ * (RB::ColorMode::pixel_format 0x1e68c95e0, RB_COLOR_MODE=fixed does not change that path): every widget on the home screen.
++ * A surface here gets 8-bit pixels in the texture CoreAnimation has bound: by the GPU where the kernel lets it read the surface
++ * as bytes (one plane, 4 bytes a pixel: xr_pass), else by the CPU (surface_formats.c).
++ */
++static unsigned
++surface_planes(IOSurfaceRef surface, struct lsf_plane plane[2])
++{
++	size_t count = IOSurfaceGetPlaneCount(surface);
++
++	if (count == 0) {
++		plane[0] = (struct lsf_plane){ IOSurfaceGetBaseAddress(surface), IOSurfaceGetBytesPerRow(surface),
++			(uint32_t)IOSurfaceGetWidth(surface), (uint32_t)IOSurfaceGetHeight(surface),
++			(uint32_t)IOSurfaceGetBytesPerElement(surface) };
++		return 0;
++	}
++	for (size_t i = 0; i < 2; i++) {
++		bool there = i < count;
++
++		plane[i] = (struct lsf_plane){ there ? IOSurfaceGetBaseAddressOfPlane(surface, i) : NULL,
++			there ? IOSurfaceGetBytesPerRowOfPlane(surface, i) : 0, there ? (uint32_t)IOSurfaceGetWidthOfPlane(surface, i) : 0,
++			there ? (uint32_t)IOSurfaceGetHeightOfPlane(surface, i) : 0,
++			there ? (uint32_t)IOSurfaceGetBytesPerElementOfPlane(surface, i) : 0 };
++	}
++	return (unsigned)count;
++}
++
++/*
++ * The kernel keeps 'w30r', 'l10r' and 'w30R' as BGRA (SweetSurface: clients that draw with the CPU read that back), so the OSType does
++ * not say what a Metal client draws there: NegroniMetal (flame/0020) writes the texture's pixel format into the surface's value.
++ * The Astronomy poster's BGR10_XR_sRGB words read as BGRA are the false colours of 2026-11-01 (docs/laurel_sprout/gpu.md).
++ */
++static const struct lsf_format *
++surface_drawn_as(IOSurfaceRef surface)
++{
++	CFTypeRef value;
++	int32_t format = 0;
++
++	if (IOSurfaceGetPixelFormat(surface) != 'BGRA' || IOSurfaceGetPlaneCount(surface) != 0 ||
++	    (value = IOSurfaceCopyValue(surface, CFSTR("LaurelMetalFormat"))) == NULL) {
++		return NULL;
++	}
++	if (CFGetTypeID(value) == CFNumberGetTypeID()) {
++		CFNumberGetValue((CFNumberRef)value, kCFNumberSInt32Type, &format);
++	}
++	CFRelease(value);
++	return lsf_of_metal((uint32_t)format);
++}
++
++static bool
++surface_value_says(IOSurfaceRef surface, CFStringRef key, CFStringRef word)
++{
++	CFTypeRef value = IOSurfaceCopyValue(surface, key);
++	bool says = false;
++
++	if (value != NULL) {
++		says = CFGetTypeID(value) == CFStringGetTypeID() && CFStringFind((CFStringRef)value, word, 0).location != kCFNotFound;
++		CFRelease(value);
++	}
++	return says;
++}
++
++/* One line per kind of surface converted (and every guess, with its OSType: to be added to surface_formats.c) */
++static void
++surface_converted_line(IOSurfaceRef surface, struct image *image, const char *how)
++{
++	char name[5];
++	uint32_t pixels = (uint32_t)IOSurfaceGetPixelFormat(surface);
++
++	if (!format_first(image->decoded->ostype != 0 ? image->decoded->ostype : pixels, 1)) {
++		return;
++	}
++	lsf_name(pixels, name);
++	say("redwood-gl: %s surface %u, OSType '%s', %zu planes, %zu bytes a pixel, %zu x %zu: %s%s: no blank layer; one line per format\n", how,
++	    IOSurfaceGetID(surface), name, IOSurfaceGetPlaneCount(surface), IOSurfaceGetBytesPerElement(surface), IOSurfaceGetWidth(surface),
++	    IOSurfaceGetHeight(surface), image->decoded->guess ? "THIS OSTYPE IS NOT KNOWN, best effort: " : "converted from ", image->decoded->what);
++}
++
++/* A line for the owner's log: what a surface holds at the first draw with it, and when a blank one fills: */
++static void
++contents_say(struct image *image, const char *when)
++{
++	static unsigned lines;
++	char name[5];
++	bool blank = image->contents.lit == 0;
++
++	image->told = blank ? 1 : 2;
++	if (lines++ >= 256) {
++		return;
++	}
++	lsf_name((uint32_t)IOSurfaceGetPixelFormat(image->surface), name);
++	say("redwood-gl: contents: surface %u ('%s' %d x %d), texture %u, %s: %u of %u samples not black, %u unlike the first%s; %s%s\n",
++	    IOSurfaceGetID(image->surface), name, image->width, image->height, image->texture, when, image->contents.lit,
++	    image->contents.samples, image->contents.unlike, blank ? " = BLANK, nothing drawn in it yet" : "",
++	    image->xr_source != 0 ? "converted by the GPU from " : image->decoded != NULL ? "converted by the CPU from " : "as it is",
++	    image->decoded != NULL ? image->decoded->what : "");
++}
++
++/* Every surface with a conversion gets the line, and of the plain ones what is big enough to be a wallpaper or a window. */
++static void
++contents_watch(struct eagl *e, struct image *image)
++{
++	if (image->decoded != NULL || (image->width >= 256 && image->height >= 256)) {
++		image->told = 0;
++		e->contents_wanted++;
++	}
++}
++
++static void
++contents_of_memory(struct image *image)
++{
++	const uint8_t *base = IOSurfaceGetBaseAddress(image->surface);
++	size_t row = IOSurfaceGetBytesPerRow(image->surface);
++
++	if (base != NULL && IOSurfaceGetPlaneCount(image->surface) == 0 && IOSurfaceGetBytesPerElement(image->surface) == 4) {
++		sys_dcache_flush((void *)(uintptr_t)base, row * (size_t)image->height);
++		lsf_contents_of_words(image->decoded != NULL ? (enum lsf_kind)image->decoded->kind : LSF_BGRA, base, row, (uint32_t)image->width,
++		    (uint32_t)image->height, &image->contents);
++	}
++}
++
++/* Before a draw: the textures bound for it. (Bound is what is known here; a program may not read them all.) */
++static void
++contents_at_draw(struct eagl *e)
++{
++	bool again = e->frames % 128 == 0;
++
++	for (unsigned unit = 0; unit < 8; unit++) {
++		struct image *image = e->bound[unit] != 0 ? image_of(e, e->bound[unit]) : NULL;
++		char when[48];
++
++		if (image == NULL || image->target) {
++			continue;
++		}
++		if (image->told == 0) {
++			if (image->decoded == NULL || image->xr_source != 0) {
++				contents_of_memory(image);
++			}
++			e->contents_wanted--;
++			snprintf(when, sizeof(when), "frame %u, first draw with it", e->frames + 1);
++			contents_say(image, when);
++		} else if (image->told == 1 && again && (image->decoded == NULL || image->xr_source != 0)) {
++			contents_of_memory(image);
++			if (image->contents.lit != 0) {
++				snprintf(when, sizeof(when), "frame %u, now drawn", e->frames + 1);
++				contents_say(image, when);
++			}
++		}
++	}
++}
++
++/* The surface as 8-bit pixels by the CPU, into the texture that is bound. */
++static void
++decoded_fill(struct eagl *e, struct image *image)
++{
++	IOSurfaceRef surface = image->surface;
++	struct lsf_plane plane[2];
++	unsigned planes;
++	size_t row = (size_t)image->width * 4;
++	enum lsf_matrix matrix = LSF_MATRIX_601;
++	bool linear = false, was_blank = image->told == 1;
++	GLint row_length = 0, alignment = 4;
++	uint8_t *pixels = malloc(row * (size_t)image->height);
++
++	if (pixels == NULL || IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
++		say("redwood-gl: surface %u: no memory for its pixels, or it cannot be locked\n", IOSurfaceGetID(surface));
++		free(pixels);
++		return;
++	}
++	planes = surface_planes(surface, plane);
++	if (plane[0].base == NULL) {
++		say("redwood-gl: surface %u has no memory in this process\n", IOSurfaceGetID(surface));
++		IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
++		free(pixels);
++		return;
++	}
++	if (image->decoded->kind >= LSF_YUV_2P8 && image->decoded->kind <= LSF_UYVY) {
++		matrix = surface_value_says(surface, CFSTR("IOSurfaceYCbCrMatrix"), CFSTR("709")) ? LSF_MATRIX_709 :
++		    surface_value_says(surface, CFSTR("IOSurfaceYCbCrMatrix"), CFSTR("2020")) ? LSF_MATRIX_2020 : LSF_MATRIX_601;
++	}
++	if (image->decoded->kind == LSF_HALF || image->decoded->kind == LSF_FLOAT) {
++		linear = surface_value_says(surface, CFSTR("IOSurfaceColorSpace"), CFSTR("Linear"));
++	}
++	sys_dcache_flush(IOSurfaceGetBaseAddress(surface), IOSurfaceGetAllocSize(surface));
++	lsf_convert(image->decoded, matrix, linear, plane, planes, (uint32_t)image->width, (uint32_t)image->height, pixels, row, image->invert);
++	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
++	lsf_contents_of_pixels(image->decoded, pixels, row, (uint32_t)image->width, (uint32_t)image->height, &image->contents);
++	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
++	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
++	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++	if (image->fills != 0) {
++		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, image->width, image->height, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
++	} else {
++		glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA, image->width, image->height, 0, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
++	}
++	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
++	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
++	free(pixels);
++	image->fills++;
++	image->seed = IOSurfaceGetSeed(surface);
++	e->uploads++;
++	e->upload_bytes += row * (size_t)image->height;
++	if (was_blank && image->contents.lit != 0) {
++		char when[48];
++
++		snprintf(when, sizeof(when), "frame %u, fill %u, now drawn", e->frames + 1, image->fills);
++		contents_say(image, when);
++	}
++}
++
++/*
+  * For a surface drawn into (blit_targets): a second texture that is the surface's memory, for the
+  * frame to be copied into by the GPU; the texture CoreAnimation draws into stays the library's own.
+  * The texture that is bound is bound again after.
+@@ -675,12 +922,13 @@
+ surface_changed(struct eagl *e, struct image *image)
+ {
+ 	IOSurfaceRef surface = image->surface;
+-	size_t size = IOSurfaceGetBytesPerRow(surface) * (size_t)(image->height - 1) +
++	/* laurel 0004: a converted surface: every byte of every plane (a Metal client's GPU writes them: often no seed moves) */
++	size_t size = image->decoded != NULL ? IOSurfaceGetAllocSize(surface) : IOSurfaceGetBytesPerRow(surface) * (size_t)(image->height - 1) +
+ 	    (size_t)image->width * bytes_a_pixel(image->format, image->type);
+ 	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+ 	uint64_t sum = size, word;
+ 
+-	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
++	if (image->looked == e->frames + 1 || base == NULL || (IOSurfaceGetPlaneCount(surface) > 0 && image->decoded == NULL)) {
+ 		return false;
+ 	}
+ 	/*
+@@ -701,6 +949,9 @@
+ 		return false;
+ 	}
+ 	image->looked = e->frames + 1;
++	if (image->decoded != NULL) {
++		sys_dcache_flush((void *)(uintptr_t)base, size);        /* (the writer is another process's GPU: not the lines of an earlier look) */
++	}
+ 	for (size_t at = 0; at + 8 <= size; at += 8) {
+ 		memcpy(&word, base + at, 8);
+ 		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
+@@ -726,8 +977,13 @@
+ 	GLint row_length = 0, alignment = 4;
+ 	uint8_t *base, *flipped = NULL;
+ 	bool alpha_first = image->alpha_first && !planar && pixel == 4;
++	GLenum refused = 0;
+ 
+-	if (image->shared) {
++	if (image->shared || image->xr_source != 0) {
++		return;
++	}
++	if (image->decoded != NULL) {
++		decoded_fill(e, image);
+ 		return;
+ 	}
+ 	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
+@@ -789,8 +1045,12 @@
+ 			    image->height, 0, image->format, image->type, base);
+ 		}
+ 	} else {
++		while (glGetError() != 0) {
++		}
+ 		glTexImage2D(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height,
+ 		    0, image->format, image->type, base);
++		/* laurel 0004: never a blank layer: what OpenGL ES refuses in this form goes in as 8-bit pixels */
++		refused = glGetError();
+ 	}
+ 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
+ 	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+@@ -824,6 +1084,20 @@
+ 	image->seed = IOSurfaceGetSeed(surface);
+ 	e->uploads++;
+ 	e->upload_bytes += row * (size_t)image->height;
++	if (refused != 0) {
++		struct lsf_plane plane[2];
++		unsigned planes = surface_planes(surface, plane);
++		char name[5];
++
++		lsf_name((uint32_t)IOSurfaceGetPixelFormat(surface), name);
++		image->decoded = lsf_find((uint32_t)IOSurfaceGetPixelFormat(surface), planes, plane);
++		say("redwood-gl: surface %u ('%s' %d x %d): OpenGL ES refused internal format %#x, format %#x, type %#x (error %#x): 8-bit "
++		    "pixels from %s instead\n", IOSurfaceGetID(surface), name, image->width, image->height, image->internal, image->format,
++		    image->type, refused, image->decoded->what);
++		image->internal = image->format = GL_BGRA;
++		image->type = GL_UNSIGNED_BYTE;
++		decoded_fill(e, image);
++	}
+ }
+ 
+ /*
+@@ -1004,7 +1278,7 @@
+ 	for (unsigned i = 0; i < e->image_count; i++) {
+ 		struct image *image = &e->images[i];
+ 
+-		if (image->target || image->shared || IOSurfaceGetSeed(image->surface) == image->seed) {
++		if (image->target || image->shared || image->xr_source != 0 || IOSurfaceGetSeed(image->surface) == image->seed) {
+ 			continue;
+ 		}
+ 		if (!rebound) {
+@@ -1217,6 +1491,9 @@
+ 	struct image *image;
+ 
+ 	frame_begin(e);
++	if (e->contents_wanted != 0 || e->frames % 128 == 0) {
++		contents_at_draw(e);
++	}
+ 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
+ 		image->drawn = image->painted = true;
+ 		if (frame_lines && image->width >= 1000 && image->height >= 2000) {
+@@ -1238,7 +1515,7 @@
+ my_glBindTexture(void *context, GLenum target, GLuint texture)
+ {
+ 	struct eagl *e = context;
+-	struct image *image;
++	struct image *image = NULL;
+ 
+ 	EAGL_ENTER(e, 0x30);
+ 	if (eagl_tracing) {
+@@ -1248,7 +1525,9 @@
+ 	if (target == GL_TEXTURE_2D && e->unit < 8) {
+ 		e->bound[e->unit] = texture;
+ 	}
+-	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && !image->shared &&
++	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && image->xr_source != 0) {
++		xr_pass(e, image);
++	} else if (texture != 0 && e->image_count != 0 && image != NULL && !image->shared &&
+ 	    (!image->target ? IOSurfaceGetSeed(image->surface) != image->seed || surface_changed(e, image) :
+ 	    image->wrapped && !image->painted && surface_changed(e, image))) {
+ 		surface_to_texture(e, image);
+@@ -1861,10 +2140,132 @@
+ 	glBindAttribLocation(program, 3, "vertex_texcoord1");
+ 	glLinkProgram(program);
+ 	glGetProgramiv(program, GL_LINK_STATUS, &good);
+-	say("redwood-gl: a program of ours for the blur whose radius varies (%s): %s %s\n", what, good ? "made" : "NOT MADE", said);
++	say("redwood-gl: a program of ours (%s): %s %s\n", what, good ? "made" : "NOT MADE", said);
+ 	return good ? program : 0;
+ }
+ 
++/*
++ * laurel 0004: a surface of 32-bit words other than blue-first bytes (BGR10_XR, BGR10A2, RGB10A2), turned into the 8-bit picture by the
++ * GPU: the surface's memory is a texture of bytes as for any surface (no copy), the program puts each word together again and writes
++ * the texture CoreAnimation reads. Once in a frame in which it is bound: a Metal client's GPU writes move no seed.
++ */
++#define GL_COLOR_WRITEMASK      0x0c23
++
++static const char xr_fragment[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D source;\n"
++    "uniform int kind;\n"
++    "uniform int flip;\n"
++    "layout(location = 0) out vec4 colour;\n"
++    "void main() {\n"
++    "  ivec2 at = ivec2(gl_FragCoord.xy);\n"
++    "  if (flip != 0) at.y = textureSize(source, 0).y - 1 - at.y;\n"
++    "  uvec4 t = uvec4(texelFetch(source, at, 0) * 255.0 + 0.5);\n"       /* (t.r is the word's third byte: the texture is blue-first) */
++    "  uint w = t.b | (t.g << 8) | (t.r << 16) | (t.a << 24);\n"
++    "  vec3 c = vec3(float((w >> 20) & 1023u), float((w >> 10) & 1023u), float(w & 1023u));\n"
++    "  if (kind == 0) colour = vec4(clamp((c - 384.0) / 510.0, 0.0, 1.0), 1.0);\n"
++    "  else if (kind == 1) colour = vec4(c / 1023.0, float(w >> 30) / 3.0);\n"
++    "  else colour = vec4(c.bgr / 1023.0, float(w >> 30) / 3.0);\n"
++    "}\n";
++
++/* with the texture of the image bound: true: it will be converted by the GPU. false: this is for the CPU */
++static bool
++xr_setup(struct eagl *e, struct image *image)
++{
++	uint8_t kind = image->decoded->kind;
++	bool made;
++
++	if (!share_surfaces || e->xr_failed || (kind != LSF_XR_BGR10 && kind != LSF_BGR10A2 && kind != LSF_RGB10A2) ||
++	    IOSurfaceGetPlaneCount(image->surface) != 0 || IOSurfaceGetBytesPerElement(image->surface) != 4 ||
++	    (size_t)image->width != IOSurfaceGetWidth(image->surface) || (size_t)image->height != IOSurfaceGetHeight(image->surface)) {
++		return false;
++	}
++	if (e->xr_program == 0) {
++		e->xr_program = vblur_program(vblur_vertex, xr_fragment, "10-bit words to 8-bit pixels");
++		if (e->xr_program == 0) {
++			e->xr_failed = true;
++			return false;
++		}
++		glUseProgram(e->xr_program);
++		glUniform1i(glGetUniformLocation(e->xr_program, "source"), 0);
++		e->xr_kind = glGetUniformLocation(e->xr_program, "kind");
++		e->xr_flip = glGetUniformLocation(e->xr_program, "flip");
++		glUseProgram(e->program);
++		glGenFramebuffers(1, &e->xr_framebuffer);
++	}
++	glGenTextures(1, &image->xr_source);
++	glBindTexture(GL_TEXTURE_2D, image->xr_source);
++	made = redwood_gl_surface_texture(e->gl, IOSurfaceGetID(image->surface));
++	if (made) {
++		glTexParameteri(GL_TEXTURE_2D, 0x2801, GL_NEAREST);     /* min filter */
++		glTexParameteri(GL_TEXTURE_2D, 0x2800, GL_NEAREST);     /* mag filter */
++	}
++	glBindTexture(GL_TEXTURE_2D, image->texture);
++	if (!made) {
++		glDeleteTextures(1, &image->xr_source);
++		image->xr_source = 0;
++		return false;
++	}
++	glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA, image->width, image->height, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
++	return true;
++}
++
++static void
++xr_pass(struct eagl *e, struct image *image)
++{
++	GLint view[4], box[4];
++	GLboolean scissored, blended, mask[4];
++
++	if (image->xr_frame == e->frames + 1) {
++		return;
++	}
++	image->xr_frame = e->frames + 1;
++	glGetIntegerv(GL_VIEWPORT, view);
++	glGetIntegerv(GL_SCISSOR_BOX, box);
++	glGetBooleanv(GL_COLOR_WRITEMASK, mask);
++	scissored = glIsEnabled(GL_SCISSOR_TEST);
++	blended = glIsEnabled(GL_BLEND);
++	clear_now(e);
++	glBindFramebuffer(GL_FRAMEBUFFER, e->xr_framebuffer);
++	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
++	if (!image->xr_checked) {
++		GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++
++		image->xr_checked = true;
++		if (status != GL_FRAMEBUFFER_COMPLETE) {
++			/* (off for this surface, with one line; the CPU converts it from here on) */
++			say("redwood-gl: surface %u: the GPU cannot write its 8-bit picture (framebuffer status %#x): the CPU converts it\n",
++			    IOSurfaceGetID(image->surface), status);
++			glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
++			glDeleteTextures(1, &image->xr_source);
++			image->xr_source = 0;
++			decoded_fill(e, image);
++			return;
++		}
++	}
++	glViewport(0, 0, image->width, image->height);
++	glDisable(GL_SCISSOR_TEST);
++	glDisable(GL_BLEND);
++	glColorMask(1, 1, 1, 1);
++	glUseProgram(e->xr_program);
++	glUniform1i(e->xr_kind, image->decoded->kind == LSF_XR_BGR10 ? 0 : image->decoded->kind == LSF_BGR10A2 ? 1 : 2);
++	glUniform1i(e->xr_flip, image->invert);
++	glActiveTexture(GL_TEXTURE0);
++	glBindTexture(GL_TEXTURE_2D, image->xr_source);
++	glDrawArrays(GL_TRIANGLES, 0, 3);
++	glBindTexture(GL_TEXTURE_2D, e->bound[0]);
++	glActiveTexture(GL_TEXTURE0 + e->unit);
++	glUseProgram(e->program);
++	glColorMask(mask[0], mask[1], mask[2], mask[3]);
++	(blended ? glEnable : glDisable)(GL_BLEND);
++	(scissored ? glEnable : glDisable)(GL_SCISSOR_TEST);
++	glScissor(box[0], box[1], box[2], box[3]);
++	glViewport(view[0], view[1], view[2], view[3]);
++	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
++}
++
+ static struct vblur_chain *
+ vblur_chain_of(struct eagl *e, GLuint picture, bool make)
+ {
+@@ -3638,10 +4039,56 @@
+ 	}
+ 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
+ 	began = now_us();
+-	if (!surface_shared(e, image)) {
++	/* laurel 0004: what its OSType does not say: a Metal client draws 10-bit words here (surface_drawn_as()) */
++	if (plane == 0 && (image->decoded = surface_drawn_as(surface)) != NULL) {
++		surface_converted_line(surface, image, "-texImageIOSurface:");
++		image->internal = image->format = GL_BGRA;
++		image->type = GL_UNSIGNED_BYTE;
++		image->width = (GLsizei)IOSurfaceGetWidth(surface);
++		image->height = (GLsizei)IOSurfaceGetHeight(surface);
++		if (xr_setup(e, image)) {
++			xr_pass(e, image);              /* (CoreAnimation may draw with it without binding it again) */
++		} else {
++			surface_changed(e, image);
++			surface_to_texture(e, image);
++		}
++	} else if (!surface_shared(e, image)) {
++		surface_changed(e, image);              /* (what it adds up to now) */
++		surface_to_texture(e, image);
++	}
++	contents_watch(e, image);
++	e->attaching += now_us() - began;
++	eagl_leave(e, 0x970);
++	return YES;
++}
++
++/*
++ * laurel 0004: what CoreAnimation attaches without a GL form of its own. It does not look at the answer: never "no", as long as there
++ * is a texture to fill; a new OSType gets one line, a guess says so.
++ */
++static BOOL
++attach_converted(struct eagl *e, struct image *image, const struct lsf_format *format, BOOL inverted)
++{
++	IOSurfaceRef surface = image->surface;
++	uint64_t began = now_us();
++
++	image->decoded = format;
++	image->target = false;
++	image->to = GL_TEXTURE_2D;
++	image->invert = inverted;
++	image->width = (GLsizei)IOSurfaceGetWidth(surface);
++	image->height = (GLsizei)IOSurfaceGetHeight(surface);
++	image->internal = image->format = GL_BGRA;
++	image->type = GL_UNSIGNED_BYTE;
++	surface_converted_line(surface, image, "-attachImage:");
++	note_format("IOSurface converted", GL_BGRA, GL_BGRA, GL_UNSIGNED_BYTE, image->width, image->height);
++	if (xr_setup(e, image)) {
++		xr_pass(e, image);                      /* (CoreAnimation may draw with it without binding it again) */
++	} else {
+ 		surface_changed(e, image);              /* (what it adds up to now) */
+ 		surface_to_texture(e, image);
+ 	}
++	contents_watch(e, image);
+ 	e->attaching += now_us() - began;
+ 	eagl_leave(e, 0x970);
+ 	return YES;
+@@ -3657,6 +4104,7 @@
+ 	GLint texture = 0;
+ 	uint32_t pixels;
+ 	uint64_t began;
++	const struct lsf_format *drawn_as;
+ 
+ 	(void)selector;
+ 	if (e == NULL || surface == NULL) {
+@@ -3666,17 +4114,22 @@
+ 	clear_now(e);
+ 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+ 	pixels = IOSurfaceGetPixelFormat(surface);
+-	if (target != GL_TEXTURE_2D || texture == 0 || (pixels != 'BGRA' && pixels != 0) ||
+-	    IOSurfaceGetBytesPerElement(surface) != 4 || IOSurfaceGetPlaneCount(surface) != 0 ||
+-	    (image = image_new(e, (GLuint)texture, surface)) == NULL) {
+-		/* laurel: one line per format: chronod's '_RB4' gave 36 of these in 5 minutes */
+-		if (format_first(pixels, 1)) {
+-			say("redwood-gl: -attachImage: target %#lx, texture %d, an IOSurface of '%.4s' (%zu planes, %zu bytes a pixel): not done; one line per format\n",
+-			    target, texture, (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, IOSurfaceGetPlaneCount(surface),
+-			    IOSurfaceGetBytesPerElement(surface));
+-		}
++	/* laurel 0004: only what has no texture to fill is refused: the line says it every time, a blank layer is never silent */
++	if (target != GL_TEXTURE_2D || texture == 0 || (image = image_new(e, (GLuint)texture, surface)) == NULL) {
++		say("redwood-gl: -attachImage: REFUSED, A LAYER STAYS BLANK: target %#lx, texture %d, surface %u of '%.4s' (%zu planes, %zu bytes a pixel), %u images\n",
++		    target, texture, IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(pixels) },
++		    IOSurfaceGetPlaneCount(surface), IOSurfaceGetBytesPerElement(surface), e->image_count);
++		eagl_leave(e, 0x970);
+ 		return NO;
+ 	}
++	drawn_as = surface_drawn_as(surface);
++	if (drawn_as != NULL || (pixels != 'BGRA' && pixels != 0) || IOSurfaceGetBytesPerElement(surface) != 4 ||
++	    IOSurfaceGetPlaneCount(surface) != 0) {
++		struct lsf_plane plane[2];
++		unsigned planes = surface_planes(surface, plane);
++
++		return attach_converted(e, image, drawn_as != NULL ? drawn_as : lsf_find(pixels, planes, plane), inverted);
++	}
+ 	image->target = true;
+ 	image->to = GL_TEXTURE_2D;
+ 	image->invert = inverted;

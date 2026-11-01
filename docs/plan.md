@@ -1,6 +1,8 @@
 # Plan and status
 
 ## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
+Render round (2026-11-01 21:30, branch t3/laurel-render-fixes, built, NOT BOOTED): boot 20:02, owner: widgets blank, Astronomy false colours, wallpaper black.
+[V] Widgets: every opaque RenderBox layer is `_RB4` (RGB8_444_2P); `-attachImage:` refused it and CA does not read the answer: empty texture. RB_COLOR_MODE=fixed does not touch that path. Now converted (surface_formats.c, eagl 0004), every OSType has a picture. [I, numbers fit] Astronomy: kernel keeps `w30r` as BGRA, GL read BGR10_XR words as bytes: flame/0020 + GPU pass. [V] backboardd sig 11 = Mesa NULL after the kernel could not make a page table from an empty pool: 2895, Mesa 0001. [U] wallpaper: only one screen-sized surface reaches GL; `contents` line decides. Needs kernel + root (libtopaz-gl, libOSMesa, NegroniMetal). Next: boot, metal.md 12.4.
 Real-GPU round (2026-11-01 19:30, branch t3/laurel-metal-realgpu, built, NOT BOOTED): boot 18:40 = first Metal on the GPU; owner: home wallpaper black.
 Most likely cause [I]: default wallpaper 7400 is HEIC layers, no HEVC decoder here (ios-flame found the same black layer) -> root-wallpaper.sh writes PNGs. Also: launchd's 5 s extension
 kill loop (AegirPoster) -> boot-arg launchd_disable_all_timeouts=1, poster strike rule; device open 3-10 s [I flat lookups of 3312 weak imports] -> macho-weak-self.py;

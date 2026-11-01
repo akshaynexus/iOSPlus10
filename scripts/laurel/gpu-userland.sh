@@ -23,7 +23,8 @@ O=$G/obj
 R=$G/root
 rm -rf "$O" "$R"
 mkdir -p "$O" "$R$PREFIX/lib" "$R/usr/libexec"
-# topaz eagl.c + our patches (userland/laurel/gpu/patches: still surfaces summed every 8th frame, HakiOS 759b620)
+# topaz eagl.c + our patches (userland/laurel/gpu/patches: still surfaces summed every 8th frame, HakiOS 759b620; 0004: every IOSurface format)
+"$(dirname "$0")/gpu-surface-test.sh" > "$G/surface-formats-test.log" 2>&1 || { tail -5 "$G/surface-formats-test.log"; gpu_die "surface_formats host test failed"; }
 mkdir -p "$O/src/userland/gpu"
 cp "$U/eagl.c" "$O/src/userland/gpu/eagl.c"
 for p in "$REPO"/userland/laurel/gpu/patches/*.patch; do
@@ -37,9 +38,9 @@ python3 -I "$SCION/userland/mkeagl.py" "$SCION/userland/src/eagl_slots.txt" "$M/
 echo "gpu-userland: eagl_gen.h: $(grep -c '^static' "$O/eagl_gen.h" || true) generated functions"
 
 # 2. libtopaz-gl.dylib: OpenGL ES behind EAGLContext (eagl.c) on Mesa's OSMesa (gl_osmesa.c)
-gpu_cc "$R$PREFIX/lib/libtopaz-gl.dylib" -dynamiclib -install_name $PREFIX/lib/libtopaz-gl.dylib -I"$O" -I"$U" \
+gpu_cc "$R$PREFIX/lib/libtopaz-gl.dylib" -dynamiclib -install_name $PREFIX/lib/libtopaz-gl.dylib -I"$O" -I"$U" -I"$REPO/userland/laurel/gpu" \
   -framework CoreFoundation -framework IOKit -framework IOSurface -lobjc "$M/libOSMesa.8.dylib" \
-  "$EAGL" "$U/gl_osmesa.c" 2> "$O/libtopaz-gl.log" || { cat "$O/libtopaz-gl.log"; gpu_die "libtopaz-gl did not build"; }
+  "$EAGL" "$U/gl_osmesa.c" "$REPO/userland/laurel/gpu/surface_formats.c" 2> "$O/libtopaz-gl.log" || { cat "$O/libtopaz-gl.log"; gpu_die "libtopaz-gl did not build"; }
 # 3. libtopaz-inject.dylib: inserted into backboardd; loads libtopaz-gl once the kernel publishes RedwoodGPU
 gpu_cc "$R$PREFIX/lib/libtopaz-inject.dylib" -dynamiclib -install_name $PREFIX/lib/libtopaz-inject.dylib \
   -framework CoreFoundation -framework IOKit -lobjc "$U/topaz_inject.c" 2> "$O/inject.log" ||

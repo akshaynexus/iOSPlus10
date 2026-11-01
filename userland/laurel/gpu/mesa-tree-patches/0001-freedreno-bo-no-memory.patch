@@ -1,0 +1,82 @@
+laurel: the crash of boot 2026-11-01 20:16:15 (backboardd sig 11 at address 0x18, fd_bo_mark_for_dump(NULL) <- fd_bo_heap_alloc): no NULL block in the heap, cached buffers go back and the process waits for GPU memory, commands buffers never NULL. Applied by scripts/laurel/mesa-linux.sh after topaz's patches.
+
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "util/os_mman.h"
++#include "util/os_time.h"
+ 
+ #include "freedreno_drmif.h"
+ #include "freedreno_drm_perfetto.h"
+@@ -157,10 +158,30 @@
+    return bo;
+ }
+ 
++/*
++ * laurel: no GPU memory now (another client holds it): what this process keeps goes back, and it waits. A buffer for commands has no
++ * way to fail further up: after 2 s the process ends with one line (launchd restarts it, the kernel takes all its buffers back).
++ */
++static struct fd_bo *
++bo_new_waiting(struct fd_device *dev, uint32_t size, uint32_t flags, struct fd_bo_cache *cache, unsigned tries)
++{
++   struct fd_bo *bo = bo_new(dev, size, flags, cache);
++
++   for (unsigned i = 0; !bo && i < tries; i++) {
++      fd_bo_cache_cleanup(&dev->bo_cache, 0);
++      fd_bo_cache_cleanup(&dev->ring_cache, 0);
++      os_time_sleep(20000);
++      bo = bo_new(dev, size, flags, cache);
++      if (bo)
++         fprintf(stderr, "redwood-gl: a GPU buffer of %u bytes after %u tries (no GPU memory for a moment)\n", size, i + 2);
++   }
++   return bo;
++}
++
+ struct fd_bo *
+ _fd_bo_new(struct fd_device *dev, uint32_t size, uint32_t flags)
+ {
+-   struct fd_bo *bo = bo_new(dev, size, flags, &dev->bo_cache);
++   struct fd_bo *bo = bo_new_waiting(dev, size, flags, &dev->bo_cache, 10);
+    if (bo)
+       bo->bo_reuse = BO_CACHE;
+    return bo;
+@@ -180,12 +201,14 @@
+ struct fd_bo *
+ fd_bo_new_ring(struct fd_device *dev, uint32_t size)
+ {
+-   struct fd_bo *bo = bo_new(dev, size, RING_FLAGS, &dev->ring_cache);
+-   if (bo) {
+-      bo->bo_reuse = RING_CACHE;
+-      bo->reloc_flags |= FD_RELOC_DUMP;
+-      fd_bo_set_name(bo, "cmdstream");
++   struct fd_bo *bo = bo_new_waiting(dev, size, RING_FLAGS, &dev->ring_cache, 100);
++   if (!bo) {
++      fprintf(stderr, "redwood-gl: no GPU memory for %u bytes of commands in 2 s: this process ends, launchd starts it again\n", size);
++      abort();
+    }
++   bo->bo_reuse = RING_CACHE;
++   bo->reloc_flags |= FD_RELOC_DUMP;
++   fd_bo_set_name(bo, "cmdstream");
+    return bo;
+ }
+ 
+--- a/src/freedreno/drm/freedreno_bo_heap.c
++++ b/src/freedreno/drm/freedreno_bo_heap.c
+@@ -233,6 +233,15 @@
+       heap->blocks[idx] = fd_bo_new(
+             heap->dev, FD_BO_HEAP_BLOCK_SIZE, heap->flags | _FD_BO_HINT_HEAP,
+             "heap-%x-block-%u", heap->flags, idx);
++      /* laurel (boot 2026-11-01 20:16:15): the kernel refused the 4 MiB block: fd_bo_mark_for_dump(NULL) killed backboardd.
++       * bo_new() tries a buffer of its own next.
++       */
++      if (!heap->blocks[idx]) {
++         util_vma_heap_free(&heap->heap, s->offset, size);
++         simple_mtx_unlock(&heap->lock);
++         free(s);
++         return NULL;
++      }
+       if (heap->flags == RING_FLAGS)
+          fd_bo_mark_for_dump(heap->blocks[idx]);
+    }

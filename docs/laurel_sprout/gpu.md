@@ -824,6 +824,32 @@ LAUREL GPU CLOCK: on: last minute 300 MHz 41 s, 600 MHz 19 s, 37 raises, 0 hot r
 3. No hang, no panic, no `GPU hang` line. A long game-like load: `gpu N C` in the minute line, a refusal above 90 C.
 4. Reboot, a crash or a frozen panel right after the first scroll: `gpudcvs=0` and report it. That is the one failure the self-check cannot turn off: a clock that passes the check and later breaks a block.
 
+## IOSurface formats and blank layers (boot 2026-11-01 20:02; built, NOT BOOTED; widget trace: metal.md section 12)
+
+**Rule: GL in backboardd does not leave a surface blank.** CoreAnimation (QuartzCore 20H392 `CA::OGL::GLESContext::attach_surface_texture`, 0x1884088e4 [V]) has a GL form of its own for BGRA, RGBA, A008, L008, L565, L555, RGhA, RGfA and the 420/422/444 pairs: these go to `-texImageIOSurface:`, its shaders convert YCbCr. Every other OSType goes to `-attachImage:toCoreSurface:invertedRender:`, and the answer is not read (0x188409048-0x18840904c [V]): a refused attach is an empty texture.
+
+`userland/laurel/gpu/surface_formats.c` (host test: `scripts/laurel/gpu-surface-test.sh`, gpu-userland.sh runs it) turns every layout into 8-bit blue-first pixels. Sources of the layouts:
+
+| OSType | Metal format | Layout | Source |
+|---|---|---|---|
+| `_RB4` | 542 RGB8_444_2P | plane 0 green bytes (w x h), plane 1 (blue, red) byte pairs (w x h), no alpha. Codes as they are, no conversion | [V] RenderBox table 0x1e6945af0, plane sizes `RB::create_iosurface` 0x1e68b47d4 (1 + 2 bytes); [V m2v ycbcr_write.rs, measured on Apple GPUs] channels. **Not** 4 + 1 bytes (flame/0016's comment reads 550's case). The kernel's top-level bpe 4, bpr 1152 are its default: RenderBox gives no top-level value |
+| `w30r`, `w30R` | 554, 555 BGR10_XR(_sRGB) | bits 31-30 unused (Metal writes ones), red 29-20, green 19-10, blue 9-0; value = (code - 384) / 510 | [V] m2v extended_range.rs; RenderBox table 0x1e69456f0 |
+| `w40a`, `w40p` | 552, 553 BGRA10_XR | 16-bit fields B G R A, code in the top 10 bits | same |
+| `b3a8` | 550, 551 RGB10A8_2P_XR10 | plane 0 as 554 (top bits zero), plane 1 alpha bytes | m2v surface_two_planes.rs. The kernel still keeps it as one-plane BGRA, m2v refuses 550 there: [U] does anybody ask for it. The `kind:` line tells |
+| `l10r` / `R10k` | 94 / 90 | alpha 31-30, then 10-bit fields: blue low / red low | RenderBox table + m2v |
+| `RGhA`, `RGfA`, `L00h`, `2C0h`, `L00f`, `2C0f` | | half or float channels, clipped; sRGB-encoded when the surface's colour space says Linear | |
+| `L565 L555 4444 L008 A008 LA08 2C08 L016` | | as named | |
+| `420f/v 422f/v 444f/v`, `xf20 x420 xf22 x422 xf44 x444`, `pf20 p420 pf22 p422 pf44 p444`, `xf4p`, `yuvs yuvf 2vuy 2vuf` | | BT.601/709/2020 by `IOSurfaceYCbCrMatrix`, range by OSType, chroma nearest | m2v ycbcr.rs. In the normal path CA samples the planes itself; this is for `-attachImage:` and refused forms |
+| any other | | by layout: one plane 4/8/16/2/1 bytes, or planes 1+2, 2+4, 4+1; one line `THIS OSTYPE IS NOT KNOWN, best effort` | |
+
+**GPU or CPU.** The kernel imports only one plane of 4-byte pixels with rows of 64 (`surfaceBuffer`). So: 32-bit word formats go as bytes through the existing zero-copy import, `xr_pass()` rebuilds the word in a shader and writes the texture CoreAnimation reads, once per frame in which the texture is bound (a Metal client's GPU writes move no seed). Self-check: import or framebuffer fails = one line, CPU from then on. All else (`_RB4` included): CPU, on seed change or a changed sum of all planes; `sys_dcache_flush` first, because another process's GPU wrote the memory. Widgets change rarely; the sum follows the still-surface rule (every 8th frame after 120 equal looks).
+
+**What the kernel hides.** SweetSurface keeps `w30r`, `l10r`, `w30R`, `b3a8` as BGRA, for CPU clients (HackiOS): they read that back. So the OSType cannot say what a Metal client draws. flame/0020 writes the texture's pixel format into the surface value `LaurelMetalFormat`; `surface_drawn_as()` reads it. No heuristic: BGR10_XR's top bits are ones, a word reads as an opaque BGRA pixel.
+
+**Crash of 20:16:15 (backboardd sig 11).** Not a write to a read-only mapping: the signal address is 0x18, the `far` in the CRASH line is stale. [V dSYM] pc = `fd_bo_mark_for_dump(NULL)` <- `fd_bo_heap_alloc` <- `fd_bo_new_ring` <- `fd_submit_sp_new_ringbuffer` <- `build_prog_fb_rast` <- `fd6_draw_vbos` <- `tc_flush` <- `my_glFlush`. One line before it: `RedwoodGPU: a buffer of 4194304 bytes cannot be entered into the GPU's address space`. Chain [V source + log]: posters filled the 512 MiB pool (20:15:31: 14 MB free, 20:15:36: 0) -> `gemNew` falls to scattered pages -> a new L3 table is needed -> `table_alloc` -> `kbuf_alloc_low` takes 64 KiB from the same empty pool -> `mmu_map` false. Also the 17 lines of 8-9.7 MiB at 20:15:33-34 and Pride's `texture: OutOfMemory(Device)`.
+
+Fixes: kernel 2895: all page tables at once (8256 KiB at first use, 2048 L3 + 4 L2 + L1); the last 64 MiB of the pool only for backboardd. Mesa `mesa-tree-patches/0001`: no NULL block in the heap; on no memory cached buffers go back and the call waits (20 ms x 10, commands x 100); a command buffer that stays impossible ends the process with one line. Recovery as before: launchd restarts backboardd in the same second ([V] 20:16:15), the kernel takes its buffers back ([V] pool 12 -> 381 MB), 2 fast exits = software renderer (bbd_wrap).
+
 ## Recovery (no UI after the GPU root)
 
 1. Boot with `gl=0` (backboardd without the loader, software renderer) or `gpu=0` (no GPU at all, no loader), or

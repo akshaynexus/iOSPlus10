@@ -1,0 +1,19 @@
+laurel (boot 2026-11-01 20:02, Astronomy poster in false colours): a texture of another pixel format over a surface the kernel calls BGRA writes that format
+into the surface's value LaurelMetalFormat; backboardd's eagl.c (patch 0004) converts by it. One line in the process's log at the first one.
+
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -2055,6 +2055,13 @@
+  static std::atomic<bool> told{false};
+  if(planes && !told.exchange(true))NBLOG(@"native-metal: first texture over a surface with planes: fmt %lu, plane %lu of %zu, OSType 0x%08x (flame/0016)",
+    (unsigned long)d.pixelFormat,(unsigned long)plane,planes,(unsigned)IOSurfaceGetPixelFormat(surface));
++ // laurel (flame/0020): the kernel keeps 'w30r', 'l10r', 'w30R' as BGRA for its CPU clients, so backboardd's GL cannot tell from the OSType what is
++ // drawn here: BGR10_XR words read as BGRA were the Astronomy poster's false colours (boot 2026-11-01 20:15). The pixel format goes into the surface's values.
++ if(!planes && IOSurfaceGetPixelFormat(surface)=='BGRA' && d.pixelFormat!=MTLPixelFormatBGRA8Unorm && d.pixelFormat!=MTLPixelFormatBGRA8Unorm_sRGB){
++  IOSurfaceSetValue(surface,CFSTR("LaurelMetalFormat"),(__bridge CFTypeRef)@((int)d.pixelFormat));
++  static std::atomic<bool> marked{false};
++  if(!marked.exchange(true))NBLOG(@"native-metal: first texture of another format over a BGRA surface: fmt %lu, surface %u: LaurelMetalFormat set (flame/0020)",(unsigned long)d.pixelFormat,(unsigned)IOSurfaceGetID(surface));
++ }
+  texture.surface=(IOSurfaceRef)CFRetain(surface);texture.surfacePlane=plane;return (id<MTLTexture>)texture;
+ }
+ - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {

@@ -1,0 +1,159 @@
+laurel 2895: (1) all GPU page tables at once (8 MiB + 64 KiB, first use), so a full pool cannot stop scattered buffers: boot 2026-11-01 20:15:33 "a buffer of N bytes cannot be entered into the GPU's address space" x17, Metal textures OutOfMemory(Device), at 20:16:15 backboardd's 4 MiB block and Mesa's NULL: window server dead. (2) The last 64 MiB of the GPU pool are the window server's: Metal clients go on in scattered pages. (3) "SWEET SURF: kind:" one line per process and OSType for the whole boot, with planes and what the client asked for.
+
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -313,6 +313,24 @@
+ 	return true;
+ }
+ 
++/*
++ * laurel 2895: is there room for `size` with `keep` bytes left over? RedwoodGPU leaves the rest of the pool to the window server: Metal
++ * clients (the posters: 300 MiB in 2 s, boot 2026-11-01 20:15:31) go on in scattered pages. No pool, or none made yet: yes.
++ */
++extern "C" bool topaz_gpu_pool_room(uint64_t size, uint64_t keep);
++bool
++topaz_gpu_pool_room(uint64_t size, uint64_t keep)
++{
++	bool room = true;
++
++	if (gpu_pool_size != 0) {
++		lck_mtx_lock(&laurel_gpu_pool_lock);
++		room = !gpu_pool_ready || gpu_pool.free_bytes >= size + keep;
++		lck_mtx_unlock(&laurel_gpu_pool_lock);
++	}
++	return room;
++}
++
+ /* laurel 2156: for RedwoodGPU's buffers line: free memory, ranges, frees refused/lost, ranges passed over */
+ extern "C" void topaz_gpu_pool_note(char *s, size_t n);
+ void
+@@ -757,19 +775,38 @@
+ static struct table *l3[2048];          /* one per 2 MB of GPU VA */
+ static struct kbuf table_chunk;         /* tables are carved from 64 KiB chunks (laurel 2157: one pool unit) */
+ #define TABLE_CHUNK     0x10000u
+-static uint32_t table_chunk_used = TABLE_CHUNK / 4096;
++/*
++ * laurel 2895: every table the 4 GiB can ever need (2048 L3, 4 L2, the L1) is taken at once, when the first one is made. They came from the
++ * pool as they were needed: with the pool empty (boot 2026-11-01 20:15:33, "GPU pool 0 of 512 MB free") no new L3 could be made, so the
++ * fallback to scattered pages failed for any buffer that needed one ("a buffer of 8388608 bytes cannot be entered into the GPU's address
++ * space" x16, and at 20:16:15 backboardd's 4 MiB block: Mesa's NULL killed the window server).
++ */
++#define TABLE_ALL       (((2048u + 4u + 1u) * 4096u + TABLE_CHUNK - 1) & ~(TABLE_CHUNK - 1))
++static uint32_t table_chunk_used, table_chunk_pages;
+ static bool tables_dirty;
+ 
+ static bool
+ table_alloc(struct table *t)
+ {
+-	if (table_chunk.va == NULL || table_chunk_used >= TABLE_CHUNK / 4096) {
++	if (table_chunk.va == NULL || table_chunk_used >= table_chunk_pages) {
+ 		struct kbuf b = {};
+-		if (!kbuf_alloc(&b, TABLE_CHUNK)) {
+-			return false;
++		uint32_t bytes = table_chunk.va == NULL ? TABLE_ALL : TABLE_CHUNK;
++
++		if (!kbuf_alloc(&b, bytes)) {
++			bytes = TABLE_CHUNK;
++			if (!kbuf_alloc(&b, bytes)) {
++				IOLog("LAUREL GPU TABLES: no memory for a page table\n");
++				return false;
++			}
++		}
++		if (table_chunk.va == NULL) {
++			IOLog("LAUREL GPU TABLES: on: %u KiB held for the GPU's page tables%s\n", bytes >> 10,
++			    bytes == TABLE_ALL ? ", all it can need: a full pool cannot stop a buffer from being entered" :
++			    " only: the whole set did not fit, tables come as they are needed");
+ 		}
+ 		table_chunk = b;                        /* (never freed: tables live as long as the GPU) */
+ 		table_chunk_used = 0;
++		table_chunk_pages = bytes / 4096;
+ 	}
+ 	t->va = (uint64_t *)(table_chunk.va + 4096 * table_chunk_used);
+ 	t->pa = table_chunk.pa + 4096 * table_chunk_used;
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -60,6 +60,7 @@
+ void topaz_gpu_gl_opened(void);                 /* laurel 2150 (TopazAdreno.cpp): backboardd's GL has the GPU */
+ bool topaz_gpu_pool_clear(uint64_t pa, uint64_t size);  /* laurel 2156: zeroed through the chunk map that covers it all */
+ void topaz_gpu_pool_note(char * s, size_t n);   /* laurel 2156: the pool part of the buffers line */
++bool topaz_gpu_pool_room(uint64_t size, uint64_t keep);  /* laurel 2895 */
+ bool redwood_gpu_parameter(uint32_t which, uint64_t * value);
+ uint64_t redwood_gpu_address(uint64_t size);
+ void redwood_gpu_address_free(uint64_t address, uint64_t size);
+@@ -476,6 +477,7 @@
+ 	struct gpu_kept         fKept[GPU_KEPT];
+ 	uint64_t                fKeptBytes;
+ 	uint64_t                fHostBytes;             /* laurel 2160: wired by host imports */
++	bool                    fWindowServer;          /* laurel 2895: this client is backboardd */
+ 
+ 	struct gpu_buffer * buffer(uint32_t handle);
+ 	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle,
+@@ -544,6 +546,7 @@
+ 		}
+ 	}
+ 	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
++	fWindowServer = strcmp(name, "backboardd") == 0;
+ 	if (fBuffers != NULL && strcmp(name, "backboardd") == 0) {
+ 		topaz_gpu_gl_opened();                  /* only backboardd's Mesa opens the GPU: GL is loaded */
+ 	}
+@@ -930,7 +933,21 @@
+ 		}
+ 		/* else: from the GPU's pool below 4 GiB (contiguous, write-combined) */
+ 		void * va = NULL;
+-		uint64_t pa = topaz_gpu_pool_alloc(size, &va);
++		/* laurel 2895: the last 64 MiB of the pool are the window server's: the desktop must draw when posters fill the rest */
++		uint64_t pa = 0;
++
++		if (ident || fWindowServer || topaz_gpu_pool_room(size, 64ull << 20)) {
++			pa = topaz_gpu_pool_alloc(size, &va);
++		} else {
++			static uint32_t told;
++			if (told++ < 8) {
++				char who[32];
++
++				proc_selfname(who, sizeof(who));
++				IOLog("LAUREL GPU POOL: under 64 MiB free for %s: its buffer of %llu bytes goes to scattered pages (the rest is the window server's)\n",
++				    who, size);
++			}
++		}
+ 
+ 		if (pa == 0 && ident) {
+ 			IOLog("RedwoodGPU: the GPU pool has no %llu bytes left\n", size);
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1336,6 +1336,35 @@
+ 			}
+ 		}
+ 	}
++	/*
++	 * laurel 2895: the 64 lines below end after minutes (2026-11-01: at 20:14:53, before the posters): one line per process and OSType for
++	 * the whole boot, with the planes and what the client asked for (the kernel keeps 'w30r', 'l10r', 'w30R' and 'b3a8' as BGRA).
++	 */
++	if (ret == kIOReturnSuccess) {
++		static uint32_t kinds[96];
++		uint32_t asked = sweet_dict_u32(props, "IOSurfacePixelFormat", 0), kind = asked * 31u;
++		char who[32] = "";
++		unsigned at;
++
++		proc_selfname(who, sizeof(who));
++		for (const char *c = who; *c != 0; c++) {
++			kind = (kind ^ (uint8_t)*c) * 16777619u;
++		}
++		kind |= 1;
++		for (at = 0; at < 96 && kinds[at] != 0 && kinds[at] != kind; at++) {
++		}
++		if (at < 96 && kinds[at] == 0) {
++			kinds[at] = kind;
++			IOLog("SWEET SURF: kind: %s '%c%c%c%c'%s id %u %ux%u bpe %u bpr %u planes %u size %u", who, (char)(asked >> 24), (char)(asked >> 16),
++			    (char)(asked >> 8), (char)asked, asked != s->pixelFormat ? " kept as BGRA" : "", s->id, s->width, s->height,
++			    s->bytesPerElement, s->bytesPerRow, s->planeCount, s->allocSize);
++			for (unsigned i = 0; i < s->planeCount; i++) {
++				IOLog("; plane %u %ux%u bpe %u bpr %u at %u", i, s->planes[i].width, s->planes[i].height,
++				    s->planes[i].bytesPerElement, s->planes[i].bytesPerRow, s->planes[i].offset);
++			}
++			IOLog("\n");
++		}
++	}
+ 	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
