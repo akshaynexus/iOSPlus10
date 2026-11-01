@@ -31,11 +31,14 @@ echo "mesa-linux: SDK $(basename "$(readlink -f "$SDK")") (theos/sdks ${SDKS_COM
 
 # 2. source tree = archive + topaz patches (a tree patched with other patches is unpacked again)
 S=$M/mesa-$MESA_VERSION
-PATCHES=$(cat "$TOPAZ"/userland/mesa/*.patch | gpu_sha256)
+PATCHES=$(cat "$TOPAZ"/userland/mesa/*.patch "$LAUREL_MESA_TREE_PATCHES"/*.patch | gpu_sha256)
 if [ "${CLEAN:-0}" = 1 ] || [ ! -d "$S" ] || [ "$(cat "$S/.laurel-patches" 2>/dev/null)" != "$PATCHES" ]; then
   rm -rf "$S" "$M"/build-*
   tar -xJf "$DL/mesa-$MESA_VERSION.tar.xz" -C "$M"
   for p in "$TOPAZ"/userland/mesa/*.patch; do
+    patch -s --no-backup-if-mismatch -d "$S" -p1 < "$p" || gpu_die "patch $(basename "$p") does not apply"
+  done
+  for p in "$LAUREL_MESA_TREE_PATCHES"/*.patch; do
     patch -s --no-backup-if-mismatch -d "$S" -p1 < "$p" || gpu_die "patch $(basename "$p") does not apply"
   done
   echo "$PATCHES" > "$S/.laurel-patches"

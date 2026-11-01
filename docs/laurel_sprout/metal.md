@@ -360,7 +360,7 @@ Owner: "Widgets aren't black, home screen wallpaper is black. GPU acceleration l
 
 | # | What the owner sees | Evidence | Cause | Fix |
 |---|---|---|---|---|
-| 1 | Black home wallpaper, most likely cause | [V root 20H392] `DefaultWallpapers~iphone.plist`: default = id 7400 "WWDC 2022" (no iPhone10,3 entry), a layered CA package for CollectionsPoster; its layers (`Body`, `Head`, `Head Mask`, `Leg`, `Arm`) are HEIC (HEVC Main), 48 files. [V ios-flame HANDOFF 289-295, on a Pixel 4, not here] "HEIC decodes to nothing on this phone (no HEVC hardware; ImageIO returns an image with no data)", "CA's Metal path uploads the zeros and draws the opaque Head layer black"; PNGs over the files fixed its wallpaper. Same sizes: flame 1271x1823, 1105x1160; this root's Body 1271x1823, Head 1105x1160 [V]. This log: CollectionsPoster created 1 surface, 1x1 BGRA, no Metal device [V] | [I] the same: this phone has no HEVC decoder. [U] that the phone's poster is 7400: the log does not name it | `scripts/laurel/root-wallpaper.sh`: PNG bytes in the same file names at root build |
+| 1 | Black home wallpaper, most likely cause | [V root 20H392] `DefaultWallpapers~iphone.plist`: default = id 7400 "WWDC 2022" (no iPhone10,3 entry), a layered CA package for CollectionsPoster; its layers (`Body`, `Head`, `Head Mask`, `Leg`, `Arm`) are HEIC (HEVC Main), 48 files. [V ios-flame HANDOFF 289-295, on a Pixel 4, not here] "HEIC decodes to nothing on this phone (no HEVC hardware; ImageIO returns an image with no data)", "CA's Metal path uploads the zeros and draws the opaque Head layer black"; PNGs over the files fixed its wallpaper. Same sizes: flame 1271x1823, 1105x1160; this root's Body 1271x1823, Head 1105x1160 [V]. This log: CollectionsPoster created 1 surface, 1x1 BGRA, no Metal device [V] | [I] the same: this phone has no HEVC decoder. [U] that the phone's poster is 7400: the log does not name it | Was `root-wallpaper.sh` (PNG bytes). REMOVED by the owner's order: `docs/laurel_sprout/hevc.md`. Correction [V cache]: this system has a software HEVC decoder; "no decoder" was wrong |
 | 2 | Astronomy poster never draws; chooser; CPU load | [V] AegirPoster: 10 starts in 47 s (18:45:50-18:46:37): 6 x `sig 9 reason ns 7 code 0x3: extension check-in timeout`, each 5 s after its exec; after 4 strikes the plug-in refused the device and the poster aborted (sig 6). Stacks: `NUNIAegirResourceManager _generatePipeline...` and `CLKUIMetalQuadView snapshotInRect:` on its main thread, NegroniMetal below [V crash-symbolize.sh]. [V launchd] `ExtensionWatchdogTimeout` default 5 s | Main thread busy with device open (3-4 s) + pipelines; the kill is launchd's, no GPU fault. Each kill added a strike: 4 strikes = no device = abort | (a) boot-arg `launchd_disable_all_timeouts=1` (b) device open shorter, 11.2 (c) a poster's strike only for a crash, not a kill |
 | 3 | Widgets: empty or old content [U which; the owner's sentence has 2 readings] | [V] every chronod surface `_RB4` 2 planes (282x282, 584x282, 584x962), each followed by `surface import refused` (45), and 36 backboardd lines `-attachImage ... '_RB4': not done`. 11 refusals in SpringBoard: BGRA 692x160 row 2784 | (a) `RB_COLOR_MODE=fixed` set by the plug-in comes too late: RenderBox reads it once in a static of its first `RB::ColorMode` [V 0x1e68c91e8] (b) kernel import by ID (`surfaceBuffer`): one plane, 4 bytes, rows of 64 only, a rule for GL [V source] | (a) `scripts/laurel/metal-job-env.py`: in the launchd job of chronod + SpringBoard (b) stand-in falls back to 0x49 |
 | 4 | Metal clients get nil for surfaces | [V] 173 `surface import refused: no-copy buffer: Unsupported(HostMemory)`: mediaserverd 113 ('420f'), chronod 45, SpringBoard 11, AegirPoster 4. `LAUREL GPU HOST PAGES: on` and m2vtest `import bad 0/4096` passed: plain pages work | Noted surface: only 0x7e was tried; its refusal gave no log, Turnip `INVALID_EXTERNAL_HANDLE`, m2v `not_importable` [V source] | `redwood_drm_host_import`: 0x7e, then the caller's pages (0x49). One line per cause |
@@ -387,17 +387,71 @@ Poster dead-man (`deadman_mark`): `dead-man: on: a crash before the first comple
 
 ### 11.4 Still unproven
 
-- [U] Which poster is the owner's, and that PNG layers end the black wallpaper. Test below.
+- [U] Which poster is the owner's, and that real HEIC decode ends the black wallpaper: `hevc.md` section 8.
 - [U] XR10: can GL backboardd show a poster's `BGR10_XR` CAMetalLayer surface? Aegir never reached it. Look for `a new kind of surface shown` with an XR OSType: `surface_shared` would hand the words to the GPU as they are. eagl has no XR conversion yet: wrong colours or nothing is possible [I].
-- [U] HEVC: Photos and other HEIC images stay blank; a software decoder is the real fix (flame says the same). AvatarKit 1510, WeatherUI 99, NanoTimeKit 34 HEIC files not converted.
+- HEVC: `hevc.md`. The decoder is in the root; every HEIC stays as shipped.
 - [U] 0x49 over a mapped IOSurface: only anonymous pages ran (m2vtest). `prepare()` over a surface map, and cache cost: every writable host buffer named by a submission is cleaned (30 camera surfaces, 80 MB). Watch the `RedwoodGPU:` line "KB out of the cache".
 - [U] Padded rows: m2v must shadow a BGRA surface with a 2784-byte row; refusal text comes through `noteRefused`.
 - [U] What holds mediaserverd's memory; why the snapshot file does not page in.
 
 ### 11.5 Next boot: expected lines
 
-Root build: `laurel-root: wallpaper: on: 48 HEIC layers as PNG (0 were already, 0 failed), 46 MiB in all`, `metal-job-env: RB_COLOR_MODE=fixed in com.apple.chronod, com.apple.SpringBoard`. Turnip build: `macho-weak-self: 3312 of 3508 imports: flat lookup -> this image (3 other weak imports stay)`.
+Root build: `laurel-root: hevc: on: HEVCH8.videodecoder, ...`, `metal-job-env: RB_COLOR_MODE=fixed in com.apple.chronod, com.apple.SpringBoard`. Turnip build: `macho-weak-self: 3312 of 3508 imports: flat lookup -> this image (3 other weak imports stay)`.
 
 Phone: `NMTL[.. SpringBoard]: device Turnip Adreno (TM) 610 in N ms, of which M ms loading Turnip` (N well under 10138), `native-metal: gpuCoreCount = 1 (NegroniMetal answer for Turnip Adreno (TM) 610)`, `negronigl: IOSurface: no import by ID, its pages go through USERPTR: surface N, ... (one line per cause)`, `SWEET SURF: chronod create ... fmt 0x42475241 ... planes 0`, no `'_RB4'`, no `extension check-in timeout`, `LAUREL METAL CLIENTS: QuartzCore refused N x (first ...): <reason>`, `NMTL[.. AegirPoster]: dead-man: on: ...` + `pipelines N compiled`. If it still fails: `CRASH PosterBoard file <path> size N, offset 0x4`, `memory: footprint ...`, `native-metal: first heap texture refused: fmt ...`.
 
 Owner checks: home wallpaper and lock wallpaper (photo), widgets show content, wallpaper chooser, boot-to-UI time.
+
+## 12. Blank widgets, false colours, black wallpaper (boot 2026-11-01 20:02, `logs/laurel-boot-2002.txt`; built, NOT BOOTED)
+
+Owner: "Widgets are blank", "Astronomy wallpapers have wrong colours", "Wallpaper is still black". Labels: [V] log, source, binary; [I] inference; [U] unknown.
+
+### 12.1 One widget, end to end
+
+| Step | Evidence | Verdict |
+|---|---|---|
+| Extension runs | [V] `exec` AppStoreWidgetsExtension, PhotosReliveWidget, ScreenTimeWidgetExtension 20:05:15, SleepWidgetExtension 20:05:18, PeopleWidget 20:05:19, Batteries 20:05:14. **0 sig 9** of a widget in this boot (only driverkitd 20:03:07, memory limit); no check-in timeout; no `low swap` line. `launchd_disable_all_timeouts=1` ended the kills of boot 18:40 | no break seen. [U] the log has nothing about the timeline each one delivers |
+| chronod renders with RenderBox on Metal | [V] device 158 ms, `first texture over a surface with planes: fmt 542`, first command buffer completed, `pipelines 1 compiled ... 0 failed`, no refusal line, no crash | no break seen. [U] that the planes hold pixels: nothing could read them. New line in 12.3 |
+| Surface format | [V] chronod makes `_RB4` 282x282, 584x282, 584x622 = small, medium, large at 2x. `RB_COLOR_MODE=fixed` printed and in effect, still `_RB4`. [V 0x1e68c944c] `RB::ColorMode::pixel_format`: flags say opaque, no alpha, `RB::Device+0x111` >= 3 (family Apple3+) -> 542. "fixed" changes depth and gamut, not this path | the earlier fix could not work. Not a break by itself |
+| Surface in backboardd | [V] `-attachImage: target 0xde1, texture 70, an IOSurface of '_RB4'` in the same second as the create (20:14:40) | arrives |
+| GL sampling | [V] answer `not done`. [V QuartzCore 0x188409048] CA does not read the answer. Texture empty | **THE BREAK: every opaque RenderBox layer = every home widget is blank** |
+
+Cross-check from the owner's photo [V]: lock-screen complications (battery, bed icons) have alpha, so RenderBox picks BGRA, and they draw. Opaque widgets do not. This fits only this break.
+
+Also on the path, not the cause in calm periods: **(2) pool empty** 20:15:33-20:16:15: any buffer that needs a new page table fails, Metal textures nil, then the window server died (gpu.md). Fixed by 2895. **(3) GPU-written planes and CPU caches**: a line cached before the GPU's write hides it. Fixed in eagl for converted surfaces. **(4) `images[256]`**: a full table refused silently. Now 512, and a line.
+
+What can still blank a widget, and which line tells:
+
+| Cause | Line |
+|---|---|
+| chronod draws nothing into the planes (m2v's store of 542 over host pages has not run on the A610 with a reader) | `contents: ... = BLANK` and no `now drawn` |
+| CA draws the texture in a way eagl does not serve | `contents` with lit samples, the owner still sees blank: next step `gltrace_place` |
+| CA never draws it | no `contents` line for `_RB4` |
+| Extension delivers no timeline: a placeholder, not a blank [I] | [U] no line |
+| Metal refusal or no memory | `native-metal: refused`, `cannot be entered`, `LAUREL GPU POOL` |
+
+### 12.2 Astronomy false colours
+
+[V] AegirPoster: `supportsExtendedXR10Formats = 1`, ClockKitUI sets an XR format (BGR10_XR_sRGB, 555, notes 2026-10-25). [V SweetSurface] the kernel keeps `w30r` as BGRA. [V log] backboardd saw no XR OSType, only `BGRA` at 720x1560; `surface_shared` gives the words to the GPU as BGRA8. [V arithmetic, test] black = code 384 = word 0xD8060180 = R 6, G 1, B 128, A 0xD8: deep blue; white = code 894 = R 237, G 251, B 126: yellow-green; mid codes: the green byte wraps every 64 codes, the red byte every 16: contour bands. The photo shows deep blue-purple darks, yellow-green brights, bands. UI text is other surfaces, right. [I] the cause; the numbers fit, the surface's OSType could not be logged (create lines stop at 64 per boot, at 20:14:53; the poster came 20:15:29: now `SWEET SURF: kind:`).
+
+Fix: flame/0020 + `xr_pass`. Transfer: `_sRGB` and plain both hold non-linear codes for display: (code - 384) / 510, clipped to 0...1. Colours beyond sRGB are clipped. [U] a poster that draws Display P3: no gamut conversion here.
+
+### 12.3 Black home wallpaper
+
+Proven [V]: AegirPoster is not the home wallpaper (first exec 20:15:29, the owner's gallery). CollectionsPoster runs from 20:05:21; 20:05:26 its only surface is 1x1, no Metal device, no crash. Until the 64 create lines stop (20:14:53) no poster made a big surface, backboardd wrapped no picture above 180x180. Textures at 20:14:42, home on screen: filled at most 512x512; shown `BGRA` up to 720x1560 = one surface (38, 20:14:40). So the HEIC/PNG layers (1271x1823) never reach GL as such [V at this size]. PosterBoard sig 10 20:08:04: `_ERROR_ImageIO_DataBufferIsNotReadable` <- `-[PBUIImageEncoder createUIImageWithError:]` <- `-[PBFPosterSnapshotter _lock_storeImage:definition:error:]` <- `_lock_populateSnapshotsFromAssetCatalogIfPossible`, file `.../PhotosPosterProvider/staticdescriptors/.../versions/0` size 0: a gallery snapshot, restarts, not the home poster. PosterBoard 3 x `create 0x0 -> 0xe00002bd` 20:15:29-37 (a 0x0 surface refused).
+
+[I] Surface 38 is the home wallpaper's snapshot; if so it arrives and GL shows it as it is, so it was black when written: the break is before GL. [U] who writes it, what it holds. The next boot's `contents` line for 720x1560 answers this: BLANK = the writer; lit = GL. No GL change was made for this; the HEIC decoder is another agent's work.
+
+### 12.4 Next boot: lines
+
+Kernel: `LAUREL GPU TABLES: on: 8256 KiB held for the GPU's page tables, all it can need: ...`; `SWEET SURF: kind: chronod '_RB4' id N 282x282 bpe 4 bpr 1152 planes 2 size 327680; plane 0 282x282 bpe 1 bpr R at 0; plane 1 282x282 bpe 2 bpr R at O` (proves the layout); `SWEET SURF: kind: AegirPoster 'w30r' kept as BGRA id N ...` (proves 12.2); `LAUREL GPU POOL: under 64 MiB free for AegirPoster: ...`; no `cannot be entered`.
+
+Metal: `NMTL[N AegirPoster]: native-metal: first texture of another format over a BGRA surface: fmt 555, surface N: LaurelMetalFormat set (flame/0020)`.
+
+GL, **the widget proof**: `redwood-gl: -attachImage: surface N, OSType '_RB4', 2 planes, 4 bytes a pixel, 282 x 282: converted from RenderBox RGB8_444_2P: green plane + blue-red plane: no blank layer; one line per format`, then per surface `redwood-gl: contents: surface N ('_RB4' 282 x 282), texture T, frame F, first draw with it: L of M samples not black, U unlike the first; converted by the CPU from RenderBox RGB8_444_2P: ...`. L > 0 and U > 0 = really drawn and sampled. `= BLANK, nothing drawn in it yet`, later `frame F, fill K, now drawn: ...`. Never again `'_RB4' ... not done`; `REFUSED, A LAYER STAYS BLANK` must be absent.
+
+Poster: `-texImageIOSurface: surface N, OSType 'BGRA', 0 planes, ...: converted from BGR10_XR words`, `a program of ours (10-bit words to 8-bit pixels): made`, `contents: surface N ('BGRA' 720 x 1560) ... converted by the GPU from BGR10_XR words`. Wallpaper: `contents: surface N ('BGRA' 720 x 1560), ... as it is`.
+
+Crash path: `redwood-gl: a GPU buffer of N bytes after K tries` at most; no `CRASH backboardd`.
+
+Owner checks: home widgets show content; Astronomy Earth in true colours; wallpaper colour; frame rate while the Earth moves.

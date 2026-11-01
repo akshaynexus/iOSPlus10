@@ -28,7 +28,7 @@ DRAM=${DRAM:-auto}
 CPUS=${CPUS:-8}
 SIZE_MIB=${SIZE_MIB:-48}
 # boot-args: the shim set (scripts/laurel/shim.sh) without the ones the shim path needed; DarwinBoot copies them unchanged
-CMDLINE=${1:-"debug=0xc serial=3 cpus=$CPUS keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 launchd_disable_all_timeouts=1 wdt=-1 sweetfb_hz=30 ipa=0"}
+CMDLINE=${1:-"debug=0xc serial=3 cpus=$CPUS keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 launchd_disable_all_timeouts=1 wdt=-1 sweetfb_hz=60 ipa=0"}
 # ipa=0: phone test 2026-11-01 17:01: the IPA handshake crashed the modem (GSI channel 1 assert), which stops Wi-Fi too. 2782 adds the
 # missing channel allocation, but no self-check can see a modem firmware assert: ipa=0 stays until a phone boot shows the evidence in
 # docs/laurel_sprout/cellular.md section 8. That test: IPA_TEST=1 scripts/laurel/uefi-image.sh, then fastboot boot (RAM, one boot).
