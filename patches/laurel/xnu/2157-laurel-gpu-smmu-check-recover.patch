@@ -1,0 +1,527 @@
+laurel 2157: the stage-1 SMMU check (2154) no longer turns the GPU off; its own GPU VA seed (no pool free, 2156).
+Boot 07:19 (2154 + 2156): "LAUREL GPU POOL: free of 0x1000000+0xef000000 refused" (hw_start seeded the GPU VA allocator
+through redwood_gpu_address_free = the pool's checked free in pass-through), then the stage-1 switch, the CP ring fetch at
+VA 0xc0020040 faulted (terminated), the CP hung (rptr 17 wptr 21), the pass-through fallback found it stuck and the GPU
+went off. Boot 07:21 with gpu_smmu=0: GPU on in pass-through (2154 + 2156 are fine there).
+Changes:
+- va_seed(): the allocator's one range 0x01000000-0x7fffffff, set directly when the tables come up; pass-through uses no
+  allocator (no seed in hw_start, no refused free).
+- the check: one line per step (LAUREL GPU SMMU: check 1..4): 1 the CP buffers walk to VA = PA in the tables (CPU-side
+  walk of every page, each table link checked), 2 context bank 0 registers as held (with CBA2R0: FSR FORMAT 2 hints at
+  a non-AArch64 walk), 3 a CP fence at VA = PA, 4 a CP fence to a kernel page at VA != PA. Linux's context bank values and
+  order (CBA2R, CBAR type 1 + BPSHCFG NSH + MemAttr WB + VMID 1, TCR2 PASize 36 + AS + SEP upstream, TCR, TTBR0, MAIR0,
+  SCTLR last).
+- during the check a fault STALLS the access (SCTLR.CFCFG) instead of terminating it; the fault is logged decoded (FSR
+  bits, FORMAT, FAR, FSYNR0 level/read-write/table walk, CPU-side walk of FAR) before anything clears it. On failure the
+  context bank goes back to pass-through and a stalled access to our own memory at VA = PA (CP buffers, GPU pool) is
+  retried there (CB_RESUME TnR 0): the CP goes on. Any other stalled access is terminated. In use (check passed): fault =
+  terminate, as before.
+- cp_recover(): CP idle: one fence. CP hung: GPU power collapse (power_up), zap resume (SCM set_remote_state 0, as Linux),
+  SMMU pass-through again, CP start + fence test (A610: no RBBM_SW_RESET, Linux a6xx_gpu_sw_reset). The GPU stays ON in
+  pass-through with 2150's backboardd-only rule. cp_start keeps the CP buffers on a second start (test va, not md).
+- tables: 16 per 64 KiB pool unit (was one unit per PAGE_SIZE chunk).
+Lines: LAUREL GPU SMMU: check 1: ... | check 2: ... | check 3: ... | check 4: ... | on: ... | check failed: <why>; context
+bank 0 back to pass-through[, the stalled access retried there] | pass-through: the CP goes on ... | off: <why>: pass-through.
+Kill switch: gpu_smmu=0 (as 2154). Docs: docs/laurel_sprout/gpu.md "SMMU stage 1".
+
+diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -451,7 +451,7 @@
+ #define SCTLR_PASS          0xE0u                                   /* topaz: M = 0 (CFRE CFIE CFCFG) */
+ #define SCTLR_STAGE1        ((1u << 0) | (1u << 1) | (1u << 2) | (1u << 5) | (1u << 8))  /* M TRE AFE CFRE HUPCF */
+ static uint32_t gpu_smmu = 1;
+-static char smmu_note[200];             /* the LAUREL GPU SMMU line */
++static char smmu_note[320];             /* the LAUREL GPU SMMU line */
+ 
+ static bool
+ kbuf_alloc_low(struct kbuf *b, uint64_t size)
+@@ -802,16 +802,17 @@
+ struct table { uint64_t *va; uint64_t pa; };
+ static struct table l1, l2[4];
+ static struct table *l3[2048];          /* one per 2 MB of GPU VA */
+-static struct kbuf table_chunk;         /* tables are carved from 16 KB pages */
+-static uint32_t table_chunk_used = 4;
++static struct kbuf table_chunk;         /* tables are carved from 64 KiB chunks (laurel 2157: one pool unit) */
++#define TABLE_CHUNK     0x10000u
++static uint32_t table_chunk_used = TABLE_CHUNK / 4096;
+ static bool tables_dirty;
+ 
+ static bool
+ table_alloc(struct table *t)
+ {
+-	if (table_chunk_used == PAGE_SIZE / 4096) {
++	if (table_chunk.va == NULL || table_chunk_used >= TABLE_CHUNK / 4096) {
+ 		struct kbuf b = {};
+-		if (!kbuf_alloc(&b, PAGE_SIZE)) {
++		if (!kbuf_alloc(&b, TABLE_CHUNK)) {
+ 			return false;
+ 		}
+ 		table_chunk = b;                        /* (never freed: tables live as long as the GPU) */
+@@ -960,6 +961,19 @@
+ 	return 0;
+ }
+ 
++/*
++ * laurel 2157: the allocator's one range, 0x01000000 to the VA = PA window. Not through redwood_gpu_address_free:
++ * in pass-through that is the pool's free, and 2156 refuses (and logs) a free of memory the pool never gave out
++ * (07:19:32 boot: "free of 0x1000000+0xef000000 refused ... caller topaz_adreno_thread + 0x178").
++ */
++static void
++va_seed(void)
++{
++	va_free[0].start = VA_USER_START;
++	va_free[0].size = IDENT_BASE - VA_USER_START;
++	va_free_count = 1;
++}
++
+ void
+ redwood_gpu_address_free(uint64_t address, uint64_t size)
+ {
+@@ -1124,10 +1138,15 @@
+ 	}
+ 	IOLog("TopazGPU: cp: SQE %zu bytes (%s, version %08x), allocating ring\n", fw_size, sqe_from, ((const uint32_t *)fw)[1]);
+ 	size_t n = strlen(fw_note);
+-	snprintf(fw_note + n, sizeof(fw_note) - n, ", SQE %s %08x", sqe_from, ((const uint32_t *)fw)[1]);
+-	if ((sqe.md == NULL && (!kbuf_alloc(&sqe, fw_size - 4) || !kbuf_map(&sqe))) ||
+-	    (ring.md == NULL && (!kbuf_alloc(&ring, RB_BYTES) || !kbuf_map(&ring))) ||
+-	    (mem.md == NULL && (!kbuf_alloc(&mem, PAGE_SIZE) || !kbuf_map(&mem)))) {
++	static bool sqe_noted;                  /* laurel 2157: once (cp_recover may start the CP again) */
++	if (!sqe_noted) {
++		snprintf(fw_note + n, sizeof(fw_note) - n, ", SQE %s %08x", sqe_from, ((const uint32_t *)fw)[1]);
++		sqe_noted = true;
++	}
++	/* laurel 2157: a second start (cp_recover) keeps the CP buffers (pool buffers have no md: va is the test) */
++	if ((sqe.va == NULL && (!kbuf_alloc(&sqe, fw_size - 4) || !kbuf_map(&sqe))) ||
++	    (ring.va == NULL && (!kbuf_alloc(&ring, RB_BYTES) || !kbuf_map(&ring))) ||
++	    (mem.va == NULL && (!kbuf_alloc(&mem, PAGE_SIZE) || !kbuf_map(&mem)))) {
+ 		IOLog("TopazGPU: CP buffers failed\n");
+ 		return false;
+ 	}
+@@ -1228,18 +1247,168 @@
+ smmu_stage1_fail(const char *why)
+ {
+ 	snprintf(smmu_note, sizeof(smmu_note), "%s", why);
++	IOLog("LAUREL GPU SMMU: check 0: %s\n", why);
+ 	return false;
+ }
+ 
+-/* laurel 2154: from pass-through to stage-1 tables, with the CP up and idle; false: smmu_note says why */
++/* laurel 2157: context bank 0 registers (SMMUv2 offsets), fault bits */
++#define CB_SCTLR            (SMMU_CB0 + 0x000)
++#define CB_RESUME           (SMMU_CB0 + 0x008)
++#define CB_TCR2             (SMMU_CB0 + 0x010)
++#define CB_TTBR0            (SMMU_CB0 + 0x020)
++#define CB_TCR              (SMMU_CB0 + 0x030)
++#define CB_MAIR0            (SMMU_CB0 + 0x038)
++#define CB_FSR              (SMMU_CB0 + 0x058)
++#define CB_FAR              (SMMU_CB0 + 0x060)
++#define CB_FSYNR0           (SMMU_CB0 + 0x068)
++#define GR1_CBAR0           0x1000
++#define GR1_CBA2R0          0x1800
++#define FSR_SS              (1u << 30)
++#define FSR_FAULTS          0x800001FEu                         /* MULTI, UUT ASF TLBLKF TLBMCF EF PF AFF TF */
++#define SCTLR_CFCFG         (1u << 7)                           /* a context fault stalls the access (not terminate) */
++/* Linux arm_smmu_write_context_bank, AArch64 stage 1: CBAR type 1, BPSHCFG NSH, MemAttr WB, VMID 1 */
++#define CBAR0_S1            ((1u << 16) | (0xFu << 12) | (3u << 8) | 1u)
++#define TCR_S1              (32u | (1u << 23))                  /* T0SZ 32 (4 GiB), TG0 4 KiB, NC NSH walks, EPD1 */
++#define TCR2_S1             (1u | (1u << 4) | (7u << 15))       /* PASize 36 bits, AS (16-bit ASID), SEP upstream */
++
++/*
++ * laurel 2157: the leaf entry of `va` as the SMMU walks it (TTBR0 -> level 1 -> 2 -> 3), read from the CPU side;
++ * every table link must hold the next table's physical address. 0: no leaf, *level = where the walk stopped.
++ */
++static uint64_t
++sw_walk(uint64_t va, int *level)
++{
++	unsigned i1 = (unsigned)((va >> 30) & 3), i2 = (unsigned)((va >> 21) & 511), i3 = (unsigned)((va >> 12) & 511);
++	struct table *t;
++
++	*level = 0;
++	if (va >= IDENT_END || l1.va == NULL) {
++		return 0;
++	}
++	*level = 1;
++	if (l2[i1].va == NULL || l1.va[i1] != (l2[i1].pa | PTE_VALID | PTE_TABLE)) {
++		return 0;
++	}
++	*level = 2;
++	t = l3[va >> 21];
++	if (t == NULL || l2[i1].va[i2] != (t->pa | PTE_VALID | PTE_TABLE)) {
++		return 0;
++	}
++	*level = 3;
++	return t->va[i3];
++}
++
++/* laurel 2157: every page of a CP buffer walks to its own PA (VA = PA) with the page attributes; false: why */
++static bool
++tables_check(const struct kbuf *b, const char *name, char *why, size_t n)
++{
++	for (uint64_t off = 0; off < b->size; off += 4096) {
++		int level;
++		uint64_t e = sw_walk(b->iova + off, &level);
++
++		if (e != ((b->pa + off) | PTE_PAGE)) {
++			snprintf(why, n, "the %s page VA %#llx walks to entry %#llx (level %d), not PA %#llx", name, b->iova + off,
++			    e, level, b->pa + off);
++			return false;
++		}
++	}
++	return true;
++}
++
++/* laurel 2157: the context bank as the SMMU holds it (for the check lines) */
++static void
++smmu_regs_note(char *s, size_t n)
++{
++	snprintf(s, n, "SCTLR %08x TCR %08x TCR2 %08x TTBR0 %08x%08x MAIR0 %08x CBAR0 %08x CBA2R0 %08x S2CR0 %08x SMR0 %08x",
++	    rd(smmu, CB_SCTLR), rd(smmu, CB_TCR), rd(smmu, CB_TCR2), rd(smmu, CB_TTBR0 + 4), rd(smmu, CB_TTBR0),
++	    rd(smmu, CB_MAIR0), rd(smmu, GR1_CBAR0), rd(smmu, GR1_CBA2R0), rd(smmu, 0xC00), rd(smmu, 0x800));
++}
++
++/*
++ * laurel 2157: the fault as recorded, before anything clears it (the 07:19:35 line came after the clear: FSR
++ * 00000400 = only FORMAT left), decoded, with the CPU-side walk of the faulting address.
++ */
++static uint32_t
++fault_note(char *s, size_t n)
++{
++	uint32_t fsr = rd(smmu, CB_FSR), syn = rd(smmu, CB_FSYNR0);
++	uint64_t far = rd(smmu, CB_FAR) | ((uint64_t)rd(smmu, CB_FAR + 4) << 32);
++	static const char *const bit[9] = { "", "TF", "AFF", "PF", "EF", "TLBMCF", "TLBLKF", "ASF", "UUT" };
++	char kinds[48] = "";
++	int level;
++	uint64_t leaf = sw_walk(far, &level);
++
++	for (unsigned i = 1; i < 9; i++) {
++		if (fsr & (1u << i)) {
++			strlcat(kinds, bit[i], sizeof(kinds));
++			strlcat(kinds, " ", sizeof(kinds));
++		}
++	}
++	snprintf(s, n, "FSR %08x (%s%sformat %u) FAR %#llx FSYNR0 %08x (level %u, %s%s) walk: entry %#llx at level %d", fsr,
++	    kinds, (fsr & FSR_SS) ? "stalled " : "", (fsr >> 9) & 3, far, syn, syn & 3, (syn & (1u << 4)) ? "write" : "read",
++	    (syn & (1u << 10)) ? ", table walk" : "", leaf, level);
++	return fsr;
++}
++
++/* laurel 2157: the address a stalled access wanted is our own memory at VA = PA (a retry in pass-through is safe) */
++static bool
++retry_safe(uint64_t far)
++{
++	const struct kbuf *own[3] = { &ring, &sqe, &mem };
++
++	for (unsigned i = 0; i < 3; i++) {
++		if (far >= own[i]->pa && far < own[i]->pa + own[i]->size) {
++			return true;
++		}
++	}
++	return gpu_pool_size != 0 && far >= gpu_pool_base && far < gpu_pool_base + gpu_pool_size;
++}
++
++/*
++ * laurel 2157: context bank 0 back to pass-through. A stalled access (SCTLR.CFCFG during the check) is retried
++ * when it wanted our own memory at VA = PA: with M = 0 it then completes as a physical access and the CP goes
++ * on; any other stalled access is terminated. true: an access was retried.
++ */
++static bool
++smmu_back(void)
++{
++	uint32_t fsr = rd(smmu, CB_FSR);
++	uint64_t far = rd(smmu, CB_FAR) | ((uint64_t)rd(smmu, CB_FAR + 4) << 32);
++	bool retry = (fsr & FSR_SS) != 0 && retry_safe(far);
++
++	wr(smmu, CB_SCTLR, SCTLR_PASS);
++	tlb_flush();
++	wr(smmu, CB_FSR, 0xFFFFFFFF);
++	if (fsr & FSR_SS) {
++		wr(smmu, CB_RESUME, retry ? 0 : 1);     /* TnR: 0 retry, 1 terminate */
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	return retry;
++}
++
++/* laurel 2157: the check failed: state back to pass-through, the reason kept for the LAUREL GPU SMMU line */
++static void
++smmu_note_back(const char *why, bool retried)
++{
++	va_free_count = 0;
++	gpu_identity = 1;
++	snprintf(smmu_note, sizeof(smmu_note), "%s", why);
++	IOLog("LAUREL GPU SMMU: check failed: %s; context bank 0 back to pass-through%s\n", why,
++	    retried ? ", the stalled access retried there" : "");
++}
++/*
++ * laurel 2154/2157: from pass-through to stage-1 tables, with the CP up and idle; false: smmu_note says why, the
++ * context bank is in pass-through again and the CP state is for cp_recover to check. One line per check step.
++ */
+ static bool
+ smmu_stage1(void)
+ {
+-	char why[160];
++	char why[320], regs[200];
+ 	uint64_t us_low = 0, us_high = 0;
+ 
+ 	if (!gpu_smmu) {
+-		return smmu_stage1_fail("boot-arg gpu_smmu=0");
++		snprintf(smmu_note, sizeof(smmu_note), "boot-arg gpu_smmu=0");
++		return false;
+ 	}
+ 	if (l1.va == NULL || !ring_idle(100)) {
+ 		return smmu_stage1_fail("no table root or the CP is not idle");
+@@ -1257,39 +1426,53 @@
+ 		    sqe.pa, mem.pa);
+ 		return smmu_stage1_fail(why);
+ 	}
+-	va_free_count = 0;
+-	gpu_identity = 0;                                       /* (redwood_gpu_address_free: the allocator, not the pool) */
+-	redwood_gpu_address_free(VA_USER_START, IDENT_BASE - VA_USER_START);
+-	gpu_identity = 1;
+-	/* 2. context bank 0 translates (same values as topaz's gpu_identity=0, plus HUPCF, no fault interrupt) */
+-	wr(smmu, SMMU_CB0 + 0x000, SCTLR_PASS & ~(1u << 6));
+-	wr(smmu, SMMU_CB0 + 0x058, 0xFFFFFFFF);
+-	wr(smmu, 0x1000 + 0x800, 1);                            /* CBA2R0: AArch64 descriptors */
+-	wr(smmu, 0x1000, 0x0001f000);                           /* CBAR0: S1 translate, S2 bypass */
+-	wr(smmu, SMMU_CB0 + 0x020, (uint32_t)l1.pa);
+-	wr(smmu, SMMU_CB0 + 0x024, (uint32_t)(l1.pa >> 32));
+-	wr(smmu, SMMU_CB0 + 0x030, 32 | (1u << 23));            /* TCR: T0SZ 32 (4 GiB), 4 KiB, NC walks, EPD1 */
+-	wr(smmu, SMMU_CB0 + 0x010, 1);                          /* TCR2: PASize 36 bits */
+-	wr(smmu, SMMU_CB0 + 0x038, 0x44);                       /* MAIR0: attr0 = Normal non-cacheable */
+-	wr(smmu, SMMU_CB0 + 0x03C, 0);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (!tables_check(&ring, "ring", why, sizeof(why)) || !tables_check(&sqe, "SQE", why, sizeof(why)) ||
++	    !tables_check(&mem, "fence", why, sizeof(why))) {
++		return smmu_stage1_fail(why);
++	}
++	IOLog("LAUREL GPU SMMU: check 1: tables at %#llx: ring %#llx+%#llx, SQE %#llx+%#llx, fence %#llx+%#llx walk to VA = PA\n",
++	    l1.pa, ring.pa, ring.size, sqe.pa, sqe.size, mem.pa, mem.size);
++	va_seed();
++	/*
++	 * 2. context bank 0 translates: Linux's values and order (CBA2R, CBAR, TCR2, TCR, TTBR0, MAIR0, then SCTLR), no
++	 * fault interrupt, HUPCF; during the checks a fault STALLS the access (CFCFG) instead of terminating it: a
++	 * terminated CP fetch hangs the CP for good (07:19:35: rptr 17, wptr 21), a stalled one is retried in
++	 * pass-through by smmu_back and the CP goes on.
++	 */
++	wr(smmu, CB_SCTLR, SCTLR_PASS & ~(1u << 6));
++	wr(smmu, CB_FSR, 0xFFFFFFFF);
++	wr(smmu, GR1_CBA2R0, 1);                                /* VA64: AArch64 descriptors */
++	wr(smmu, GR1_CBAR0, CBAR0_S1);
++	wr(smmu, CB_TCR2, TCR2_S1);
++	wr(smmu, CB_TCR, TCR_S1);
++	wr(smmu, CB_TTBR0, (uint32_t)l1.pa);
++	wr(smmu, CB_TTBR0 + 4, (uint32_t)(l1.pa >> 32));        /* ASID 0 */
++	wr(smmu, CB_MAIR0, 0x44);                               /* attr0 = Normal non-cacheable */
++	wr(smmu, CB_MAIR0 + 4, 0);
+ 	tlb_flush();
+-	wr(smmu, SMMU_CB0 + 0x000, SCTLR_STAGE1);
++	wr(smmu, CB_SCTLR, SCTLR_STAGE1 | SCTLR_CFCFG);
+ 	tlb_flush();
+ 	/* 3. read back: a register the hypervisor or TrustZone refuses shows here */
+-	uint32_t sctlr = rd(smmu, SMMU_CB0), cbar = rd(smmu, 0x1000), s2cr = rd(smmu, 0xC00), smr = rd(smmu, 0x800);
+-	uint64_t ttbr = rd(smmu, SMMU_CB0 + 0x20) | ((uint64_t)rd(smmu, SMMU_CB0 + 0x24) << 32);
+-	if ((sctlr & 1) == 0 || (ttbr & 0xFFFFFFFFF000ull) != l1.pa || ((cbar >> 16) & 3) != 1 || (s2cr & 0x300FF) != 0 ||
+-	    (smr & (1u << 31)) == 0) {
+-		snprintf(why, sizeof(why), "registers do not hold: SCTLR %08x TTBR0 %llx (want %llx) CBAR0 %08x S2CR0 %08x SMR0 %08x",
+-		    sctlr, ttbr, l1.pa, cbar, s2cr, smr);
++	uint32_t sctlr = rd(smmu, CB_SCTLR), cbar = rd(smmu, GR1_CBAR0), cba2r = rd(smmu, GR1_CBA2R0);
++	uint32_t s2cr = rd(smmu, 0xC00), smr = rd(smmu, 0x800);
++	uint64_t ttbr = rd(smmu, CB_TTBR0) | ((uint64_t)rd(smmu, CB_TTBR0 + 4) << 32);
++	smmu_regs_note(regs, sizeof(regs));
++	IOLog("LAUREL GPU SMMU: check 2: %s; stall on fault %s\n", regs, (sctlr & SCTLR_CFCFG) ? "yes" : "no");
++	if ((sctlr & 1) == 0 || (ttbr & 0xFFFFFFFFF000ull) != l1.pa || ((cbar >> 16) & 3) != 1 || (cba2r & 1) == 0 ||
++	    (s2cr & 0x300FF) != 0 || (smr & (1u << 31)) == 0) {
++		snprintf(why, sizeof(why), "registers do not hold (want M, TTBR0 %llx, CBAR0 type 1, CBA2R0 VA64, S2CR0 -> CB0, "
++		    "SMR0 valid)", l1.pa);
+ 		goto back;
+ 	}
+-	/* 4. a fence through the tables at VA = PA (pool / low kernel memory) */
++	/* 4. a fence through the tables at VA = PA (pool / low kernel memory): the CP fetches the ring through them too */
+ 	if (!cp_fence((volatile uint32_t *)mem.va, mem.iova, 0x51a6e001, &us_low)) {
+-		snprintf(why, sizeof(why), "no fence write through the tables at VA = PA %#llx (FSR %08x)", mem.iova,
+-		    rd(smmu, SMMU_CB0 + 0x58));
++		char f[200];
++		(void)fault_note(f, sizeof(f));
++		snprintf(why, sizeof(why), "no fence write through the tables at VA = PA %#llx: %s", mem.iova, f);
+ 		goto back;
+ 	}
++	IOLog("LAUREL GPU SMMU: check 3: CP fence through the tables at VA = PA %#llx in %llu us\n", mem.iova, us_low);
+ 	/*
+ 	 * 5. an ordinary kernel page (above 4 GiB here) at a VA that is not its PA: translation, 36-bit output. The VA is
+ 	 * a pool unit reserved for the test (the allocator's when there is no pool): a write that bypassed the tables
+@@ -1301,7 +1484,8 @@
+ 		void *pool_va = NULL;
+ 		uint64_t pool_pa = pa != 0 ? topaz_gpu_pool_alloc(GPU_POOL_UNIT, &pool_va) : 0;
+ 		uint64_t va = pool_pa != 0 ? pool_pa : (pa != 0 ? redwood_gpu_address(4096) : 0);
+-		bool ok = va != 0 && mmu_map(va, pa, false);
++		bool ok = va != 0 && mmu_map(va, pa, false), backed = false, retried = false;
++		char f[200] = "no fault recorded";
+ 
+ 		if (pool_va != NULL) {
+ 			*(volatile uint32_t *)pool_va = 0;
+@@ -1311,6 +1495,12 @@
+ 		tables_dirty = false;
+ 		ok = ok && cp_fence((volatile uint32_t *)t->getBytesNoCopy(), va, 0x51a6e002, &us_high);
+ 		bool bypassed = pool_va != NULL && *(volatile uint32_t *)pool_va == 0x51a6e002;
++		if (!ok && !bypassed) {
++			/* the stalled write (if any) is settled before the test page and the pool unit go back */
++			(void)fault_note(f, sizeof(f));
++			retried = smmu_back();
++			backed = true;
++		}
+ 		if (va != 0) {
+ 			uint64_t *l3 = l3_for(va, false);
+ 			if (l3 != NULL) {
+@@ -1319,8 +1509,9 @@
+ 			}
+ 			tlb_flush();
+ 			if (pool_pa != 0) {
++				IODelay(100);                   /* (a retried write lands in the unit, before it goes back) */
+ 				pool_give_back(pool_pa, GPU_POOL_UNIT);
+-			} else {
++			} else if (!backed) {
+ 				gpu_identity = 0;
+ 				redwood_gpu_address_free(va, 4096);
+ 				gpu_identity = 1;
+@@ -1332,17 +1523,24 @@
+ 			goto back;
+ 		}
+ 		if (!ok) {
+-			snprintf(why, sizeof(why), "no fence write to kernel page PA %#llx at VA %#llx (FSR %08x FAR %08x%08x)", pa, va,
+-			    rd(smmu, SMMU_CB0 + 0x58), rd(smmu, SMMU_CB0 + 0x64), rd(smmu, SMMU_CB0 + 0x60));
++			snprintf(why, sizeof(why), "no fence write to kernel page PA %#llx at VA %#llx: %s", pa, va, f);
++			if (backed) {
++				smmu_note_back(why, retried);
++				return false;
++			}
+ 			goto back;
+ 		}
++		IOLog("LAUREL GPU SMMU: check 4: CP fence to kernel page PA %#llx at VA %#llx in %llu us\n", pa, va, us_high);
+ 		/* 6. no fault on the way */
+-		uint32_t fsr = rd(smmu, SMMU_CB0 + 0x58);
+-		if (fsr != 0) {
+-			snprintf(why, sizeof(why), "fault FSR %08x FAR %08x%08x during the checks", fsr, rd(smmu, SMMU_CB0 + 0x64),
+-			    rd(smmu, SMMU_CB0 + 0x60));
++		uint32_t fsr = rd(smmu, CB_FSR);
++		if (fsr & FSR_FAULTS) {
++			(void)fault_note(f, sizeof(f));
++			snprintf(why, sizeof(why), "fault during the checks: %s", f);
+ 			goto back;
+ 		}
++		/* in use: a fault terminates the access (a stall would block the GPU); the 5 s statistics report it */
++		wr(smmu, CB_SCTLR, SCTLR_STAGE1);
++		wr(smmu, CB_FSR, 0xFFFFFFFF);
+ 		*(volatile uint32_t *)mem.va = seqno;
+ 		sweet_dcache_flush((vm_offset_t)mem.va, 64);
+ 		gpu_identity = 0;
+@@ -1352,16 +1550,71 @@
+ 		return true;
+ 	}
+ back:
+-	/* back to pass-through: the CP's addresses are physical again (they are the same numbers) */
+-	wr(smmu, SMMU_CB0 + 0x000, SCTLR_PASS);
+-	tlb_flush();
+-	wr(smmu, SMMU_CB0 + 0x058, 0xFFFFFFFF);
+-	va_free_count = 0;
+-	gpu_identity = 1;
+-	snprintf(smmu_note, sizeof(smmu_note), "%s", why);
++	smmu_note_back(why, smmu_back());
+ 	return false;
+ }
+ 
++/*
++ * laurel 2157: the zap shader after a GPU power collapse: TrustZone keeps PAS 13 loaded; Linux a6xx_zap_shader_init
++ * then only asks for a resume (qcom_scm_set_remote_state(SCM_GPU_ZAP_SHADER_RESUME = 0, 0): SVC_BOOT 0x01, cmd 0x0a).
++ */
++static bool
++zap_resume(void)
++{
++	uint64_t res = 0, st = scm(SCM_FN(0x01, 0x0a), 2, 0, 0, 0, &res);
++
++	IOLog("TopazGPU: zap resume: %llx/%llx\n", st, res);
++	return st == 0;
++}
++
++/*
++ * laurel 2157: after a failed stage-1 check the GPU stays on in pass-through. 1) the CP is idle (its stalled access
++ * was retried in pass-through): one fence checks it. 2) it hangs (a terminated access): the A610 has no usable
++ * RBBM_SW_RESET (Linux a6xx_gpu_sw_reset: "11nm chips (e.g. ones with A610) have hw issues with the reset line"),
++ * so the recovery is Linux's for a GMU-less A610: GPU power collapse (power_up cycles the GX and CX GDSCs), zap
++ * resume, SMMU pass-through again (it is in the CX domain), CP start with its fence test.
++ */
++static bool
++cp_recover(void)
++{
++	uint64_t us = 0;
++	bool idle = false;
++
++	/* the retried access needs a moment to finish (no "ring stuck" line here: the next line says what is next) */
++	for (unsigned i = 0; i < 10000 && !idle; i++) {
++		idle = gpu_rd(0x806) == wptr % RB_DWORDS;
++		if (!idle) {
++			IODelay(10);
++		}
++	}
++	if (idle && cp_fence((volatile uint32_t *)mem.va, mem.iova, 0x51a6e0ff, &us)) {
++		*(volatile uint32_t *)mem.va = seqno;
++		sweet_dcache_flush((vm_offset_t)mem.va, 64);
++		IOLog("LAUREL GPU SMMU: pass-through: the CP goes on, fence at %#llx in %llu us\n", mem.iova, us);
++		return true;
++	}
++	IOLog("LAUREL GPU SMMU: pass-through: the CP hangs (rptr %u wptr %u RBBM_STATUS %08x): GPU power cycle, zap resume, "
++	    "CP start\n", gpu_rd(0x806), wptr % RB_DWORDS, gpu_rd(0x210));
++	stage = "power cycle after the stage-1 check";
++	if (!power_up()) {
++		return false;
++	}
++	stage = "zap resume after the stage-1 check";
++	if (!zap_resume()) {
++		return false;
++	}
++	stage = "SMMU after the stage-1 check";
++	if (!smmu_setup()) {
++		return false;
++	}
++	stage = "CP start after the stage-1 check";
++	if (!cp_start()) {
++		return false;
++	}
++	IOLog("LAUREL GPU SMMU: pass-through: the CP runs again after the power cycle\n");
++	return true;
++}
++
+ static bool
+ hw_start(void)
+ {
+@@ -1374,8 +1627,7 @@
+ 		stage = "MMIO map";
+ 		return false;
+ 	}
+-	va_free_count = 0;
+-	redwood_gpu_address_free(VA_USER_START, VA_KERNEL - VA_USER_START);
++	va_free_count = 0;                      /* laurel 2157: pass-through uses no GPU VA allocator (smmu_stage1 seeds it) */
+ 	stage = "power (GDSC/clocks)";
+ 	if (!power_up()) {
+ 		return false;
+@@ -1393,15 +1645,13 @@
+ 	if (!cp_start()) {
+ 		return false;
+ 	}
+-	/* laurel 2154: stage-1 tables; failed: pass-through as before, checked again with one fence */
+-	if (!smmu_stage1()) {
+-		uint64_t us = 0;
++	/*
++	 * laurel 2154/2157: stage-1 tables; a failed check leaves the GPU ON in pass-through (cp_recover: one fence, or
++	 * a power cycle and a CP restart when the CP hangs) with 2150's backboardd-only rule
++	 */
++	if (!smmu_stage1() && gpu_smmu) {
+ 		stage = "pass-through after the stage-1 check";
+-		if (!ring_idle(100) || !cp_fence((volatile uint32_t *)mem.va, mem.iova, 0x51a6e0ff, &us)) {
+-			return false;
+-		}
+-		*(volatile uint32_t *)mem.va = seqno;
+-		sweet_dcache_flush((vm_offset_t)mem.va, 64);
++		return cp_recover();
+ 	}
+ 	return true;
+ }

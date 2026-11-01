@@ -16,6 +16,14 @@ other surfaces from wired pages), 2103 (native 720x1560 canvas at scale 2 by def
 `LAUREL FB CANVAS:`, `LAUREL FB CANVAS: first frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
 + 0102 (DarwinBoot shrinks the window instead of "NO WINDOW"); mkadt `--dram auto`. Next: boot, read `LAUREL RAM:`, `LAUREL SPOOL:`,
 `LAUREL FB CANVAS:`, `LAUREL FB: first iOS frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
+Console flash fix (2026-11-01 07:50, branch t3/laurel-fb-console-flash, built, NOT BOOTED): with GL, the idle UI showed
+kernel log text. Cause [V log + source]: backboardd presents surface 1 (= boot framebuffer 0x5c000000, GL draws into it)
+between GPU-pool frames; the copy path skipped it and flipped to a back buffer that still held a boot console frame. Kernel
+2104: surface-1 frames scanned directly, boot text cleared from 0x5c000000, stale flip buffers cleared, `LAUREL FB HANDOFF:`
+self-check (console only in its shadow, panic still draws); kill switch fbhandoff=0. Also 2760's bsd/conf/files hunk rebased
+on 2720 (laurel-int-1 1c04a5e did not apply: 247 of 249). 249/249 patches, 0 LSE, kernel sha256 793f6122.... Next: GL boot,
+read `LAUREL FB HANDOFF: on:` + `swap N shows surface 1`, leave the UI idle 1 min: no kernel text. Details:
+`docs/laurel_sprout/gpu.md` "Console flash".
 Clock + status bar (2026-11-01 07:30, branch t3/laurel-rtc-statusbar, built, NOT BOOTED): lock screen showed 1969-12-31 4 PM
 (no time source; usblog `settime: error: unknown command`) and the red rdar:45025538 bar. Kernel 2720: calendar from the PM6125
 RTC (SID 0 0x6000, via the one SPMI core, reads only) + own offset in /private/var/db/laurel_rtc, build-date floor, USB ctl
@@ -28,6 +36,15 @@ Bluetooth (2026-11-01 05:30, area G, built, NOT BOOTED): kernel 2600 (WCN3990 on
 EDL version, 3000000 baud, crbtfw21.tlv + crnv21.bin from bluetooth_b at run time, HCI reset, BD_ADDR; iOS transport as negroni),
 mkadt /arm-io/bluetooth, userland/laurel/bt + root-bt.sh. Next: boot, read `LAUREL BT: on|off:`, then bluetoothd log + a scan.
 Details: `docs/laurel_sprout/bluetooth.md`.
+Camera step 1 (2026-11-01 08:30, branch t3/laurel-camera, built, NOT BOOTED): Camera.app does not work (no frame path, no iOS
+side). Path decision: RDI raw frames (CSIPHY -> CSID -> ISPIF -> VFE0 RDI, no ISP/CPP, no firmware on this CAMSS generation) + the
+negroni/HakiOS mediaserverd plug-in with CPU ISP and the `NCFRAME1` device ABI. Sensors [V stock vendor libraries, DT,
+camera_config.xml]: rear IMX586 (or IMX582) 0x1a, depth GC2375H 0x17 / OV02A10 0x3d, front S5KGD1 0x2d, ultrawide S5K4H7 0x10.
+Kernel 2770: camss_top GDSC + CCI clocks (37.5 MHz) + CCI controller (polled), power-up order of each library (GPIO LDOs + L12A via
+the RPM), chip ID per slot, everything back as the boot left it; one `LAUREL CAMERA: on|off:` line, sysctl kern.laurel_camera, kill
+switch camera=0. Host test scripts/laurel/cam-test.sh 69/69. 249/249 patches (2760 context refreshed after 2720), 0 LSE, kernel
+sha256 e0707f0d.... Next: boot, read the `LAUREL CAMERA:` lines; then step 2 (IMX586 1280x720 RDI frames, tables from a root copy of
+the vendor libraries). Details: `docs/laurel_sprout/camera.md`.
 Flashing (2026-10-31 23:58): `fastboot boot` is refused by this ABL; the shim image goes to `boot_b` with
 `scripts/bg.sh laurel-flash scripts/laurel/flash-boot.sh`. The script runs `fastboot reboot bootloader` first:
 a session entered with Power+VolDown has a broken ABL USB state (garbled commands, uploads stall at 16 MiB); after the
@@ -754,8 +771,32 @@ Observed [V, usblog 07:20:52 boot, laurel-int-1 at e2c29b4 + EXTRA_ARGS=gpu_smmu
 Open: 2154 SMMU stage-1 faults on the CP ring and turns the GPU off (fix agent t3/laurel-smmu-pool-bt), so tests use
 gpu_smmu=0 until then; BT rampatch check rejects apbtfw10.tlv (same agent); RTC/status bar (2720 + root-statusbar.py, merged,
 needs a root rebuild); cellular step 1 (2760) merged, step 2 IPA in progress.
+## Mi A3: GPU stays on after a failed stage-1 check; Bluetooth picks cmbtfw12 (2026-11-01 07:45, branch t3/laurel-smmu-pool-bt, 2157 + 2600)
 
-## Mi A3: brightness slider fix (2201) + flashlight (2770 + LaurelFlashlight.driver) built (2026-11-01 08:10, branch t3/laurel-brightness-torch; build only, NOT BOOTED)
+Observed [V boot 07:19, usblog-20261101-001446]: `LAUREL GPU POOL: free of 0x1000000+0xef000000 refused` (2154's VA seed through
+2156's checked pool free), the stage-1 check's first ring fetch faulted at 0xc0020040 (terminated: CP hung), the fallback did not
+recover the CP, `LAUREL GPU: off`. Same kernel with gpu_smmu=0 (07:21): GPU on. BT: chip product 0x000f rom 0x0102, `off: the
+rampatch is for another product` (apbtfw10.tlv = product 0x000a).
+Done [V build, 248/248 patches, 0 LSE, no warnings in the changed files; sha256 64df80382164...]: 2157 `va_seed()` (no pool free),
+check steps logged with the decoded fault, stall-on-fault during the check + retry in pass-through, `cp_recover()` (fence, or power
+cycle + zap resume + CP start), Linux's context-bank values. 2600/2601: names from the EDL ROM version (Linux), the rampatch header
+picks the file (cmbtfw12.tlv + cmnv12.bin for this chip), NVM speed byte from the file. [V host test] scripts/laurel/bt-fw-test.sh.
+Not booted. Next: boot; expect `LAUREL GPU SMMU: check 1..2`, then `on: stage 1` or `check failed: ... FSR .. (..) ..` +
+`pass-through: the CP goes on` + `LAUREL GPU: on ... SMMU pass-through`; BT `fw: cmbtfw12.tlv ...` and `on: WCN39xx product 0x000f`.
+The failure line's FSR/FSYNR0/walk text decides the next table fix. Details: docs/laurel_sprout/gpu.md "Stage-1 check failure",
+docs/laurel_sprout/bluetooth.md "The chip is WCN3950 family".
+
+## Mi A3: SMMU stage 1, Bluetooth, RTC, SIM status on the phone (2026-11-01 07:45, coordinator)
+
+Observed [V, usblog boot 07:44:5x, laurel-int-1 8660387, root of 07:16]:
+- `LAUREL GPU SMMU: on: stage 1, context bank 0 ... any process may open the GPU` (checks 1-4 passed, fences 56/61 us);
+  `LAUREL GPU: on: ... SMMU stage 1`; `LAUREL METAL: on`.
+- `LAUREL BT: on: WCN39xx product 0x000f rom 0x0102, cmbtfw12.tlv + cmnv12.bin, 3000000 baud` (SE DMA, WCN3950 family).
+- `LAUREL RTC: saved offset ...` after the host settime.
+- `LAUREL CELL: on: SIM1 present (USIM detected), SIM2 absent; ... radio off: no AP IPA driver yet`; NAS1 BIND_SUBSCRIPTION error
+  0x3, DMS GET_OPERATING_MODE error 0x4a (to check in step 2).
+
+## Mi A3: brightness slider fix (2201) + flashlight (2780 + LaurelFlashlight.driver) built (2026-11-01 08:10, branch t3/laurel-brightness-torch; build only, NOT BOOTED)
 
 Brightness [V log 07:27, V DT, V Linux source; cause I]: the slider values were sent (the missing `panel level` lines are
 the 8-line log cap) but in LP mode with no DMA line; the Samsung s6e8fco DT sends brightness/on/off in HS and Linux
@@ -763,13 +804,13 @@ schedules each command DMA at the front-porch line (DSI_DMA_SCHEDULE_CTRL 0x100)
 start self-check fallback (unscheduled, then LP). Also: one blWork at a time (THREAD_CALL_OPTIONS_ONCE), no stale fade
 step, wake at the user's level, one line per settled value. No ambient light sensor for iOS (stk3x3x on the ADSP hub):
 `root-brightness.py` sets BKEnableALS false. Details: docs/laurel_sprout/brightness.md.
-Flashlight: 2770 PMI632 flash LED torch (SID 3 0xD300, LED1, 12.5..150 mA, auto-off 600 s, off at OTST/fault, quiesce at
+Flashlight: 2780 PMI632 flash LED torch (SID 3 0xD300, LED1, 12.5..150 mA, auto-off 600 s, off at OTST/fault, quiesce at
 halt/panic, `torch=0`), `/dev/laureltorch`, `/product/camera flash` (Control Center button) only with the plug-in;
 `userland/laurel/flashlight` (mediaserverd: FigFlashlight vendor hook + FigFlashlight server). Details:
 docs/laurel_sprout/torch.md.
 Also: 2760's bsd/conf/files hunk refreshed (it did not apply after 2720 on laurel-int-1).
-Build [V]: kernel-linux.sh 249/249 patches, 0 LSE, no warnings in the changed files, kernel.development.sweet.4k sha256
-f5e631b49c0833ff62bfc51582a698a51841c370f7819895a29e80f4aeed29aa. LaurelFlashlight.driver built (userland/laurel/flashlight/build.sh).
+Build [V]: kernel-linux.sh 252/252 patches (merged laurel-int-1 16b1a73), 0 LSE, no warnings in the changed files, kernel.development.sweet.4k sha256
+468b1abc685ceb351d8a87e13f9cb40d6edb2d3392ca602f7992079ea25195e9. LaurelFlashlight.driver built (userland/laurel/flashlight/build.sh).
 Next: boot image with this kernel + root rebuild (root.sh: root-flashlight.sh + root-brightness.py; owner approves the
 userdata flash). Check `LAUREL BACKLIGHT: on: ... DCS HS, DMA at line 1567`, move the slider (panel must follow, one
 `brightness N of 255 ... -> DBV` line per stop), `LAUREL TORCH: on:`, `LAUREL TORCH UI: on:`, `LAUREL FLASHLIGHT: on:`,

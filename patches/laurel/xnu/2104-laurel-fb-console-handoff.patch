@@ -1,0 +1,197 @@
+laurel 2104: console handoff. Owner bug 2026-11-01 07:20:52 (GPU on, 'direct scanout off'): when the UI is idle the panel shows kernel log text until the next frame. Cause [V, code + log]: backboardd's GL draws every other frame into surface 1 = AppleCLCD's fSurface = the boot framebuffer 0x5c000000 (RedwoodGPU 'surface 1 ... shared at 0x5c000000'; 'SWEET FB: swap 6/8/10/.../70 layer 0 surface 1'). Such a swap is not GPU-pool, so it took the copy path, which skips fSurface ('already on the panel', true only before the flip buffers) and flips to the back buffer: with GL the GPU-pool frames are scanned directly and never touch the flip buffers, so both still hold console frames from boot (sweet_console_copy_dirty while fConsShown). Every surface-1 frame showed the boot kernel log; the next GPU-pool frame covered it. The video console itself draws only into its shadow after sweet_console_retarget. Fix: (1) a single-layer swap of surface 1 is presented directly (presenter thread), the MDP scans 0x5c000000 itself; (2) at AppleCLCD start, after the MDP has latched the first console flip, the boot text in 0x5c000000 is cleared (the console text is in the shadow); (3) the copy path copies surface 1 into the back buffer like any surface, and clears a flip buffer that still holds a boot console frame before its first iOS frame; (4) at the first iOS frame one line LAUREL FB HANDOFF: self-check that the console draws into its shadow (nothing scans it; a panic shows it, sweet_cons_show); if not, console text stops being drawn (sweet_console_muted, the USB log keeps it, a panic draws). Kill switch fbhandoff=0 (no direct scan of surface 1, no clear, no self-check; the copy-path fix stays).
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -226,6 +226,15 @@
+ 	void          flipBack(void);
+ 	IOBufferMemoryDescriptor *fCons;    /* console shadow frame (cached, contiguous) */
+ 	uint64_t      fConsPhys;
++	/*
++	 * laurel 2104 (console handoff): after the first iOS frame the kernel console never reaches the
++	 * panel again (a panic does). fFlipStale: that flip buffer still holds a console frame from boot.
++	 */
++	int           fHandoff;       /* 0 off (kill switch fbhandoff=0), 1 on */
++	bool          fHandedOff;     /* the first iOS frame came */
++	bool          fFlipStale[2];
++	bool          fSurfaceTold;
++	void          consoleHandoff(void);
+ 	const uint8_t *fLastVA;       /* last directly scanned frame (panel window) */
+ 	uint32_t      fLastStride;
+ 	SweetSurface *fLastSurf;      /* keeps fLastVA alive */
+@@ -525,6 +534,8 @@
+ 		return false;
+ 	}
+ 	int native = laurel_fb_native(provider, fWidth, fHeight);       /* laurel 2103: native canvas by default */
++	uint32_t handoff = 1;                                           /* laurel 2104: console handoff */
++	fHandoff = !(PE_parse_boot_argn("fbhandoff", &handoff, sizeof(handoff)) && handoff == 0);
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+@@ -642,6 +653,21 @@
+ 			fConsShown = true;
+ 			flipFrom(c, fRowBytes);
+ 			IOLog("SWEET FB: console double buffered (shadow %#llx)\n", fConsPhys);
++			/*
++			 * laurel 2104: the boot framebuffer is surface 1 now, a buffer backboardd draws into (GL
++			 * renders frames there). Clear the boot text in it once the MDP has left it, so a frame
++			 * that names surface 1 never shows that text. The console text lives in the shadow.
++			 */
++			for (int t = 0; fHandoff > 0 && t < 500 && (fCtl0[0x18 / 4] & fFlush) != 0; t++) {
++				IODelay(100);
++			}
++			if (fHandoff > 0 && (fCtl0[0x18 / 4] & fFlush) == 0 && fScanPhys != fPhys) {
++				for (vm_size_t o = 0; o < fsz; o += 8) {
++					*(volatile uint64_t *)(fPixels + o) = 0xff000000ff000000ull;
++				}
++				__asm__ volatile("dsb sy" ::: "memory");
++			}
++			fFlipStale[0] = fFlipStale[1] = true;
+ 		} else {
+ 			OSSafeReleaseNULL(fCons);
+ 		}
+@@ -1051,7 +1077,9 @@
+ 			layer = layer < 0 ? (int)i : -2;
+ 		}
+ 	}
+-	return layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown;
++	/* laurel 2104: surface 1 (the boot framebuffer, GL draws frames into it) is scanned directly too */
++	return layer >= 0 && held[layer] != NULL && (held[layer]->gpuPool || (held[layer] == fSurface && fHandoff > 0)) &&
++	       !fPowerOff && !fConsShown;
+ }
+ 
+ void
+@@ -1458,6 +1486,36 @@
+ 	}
+ 	bool ok = false;
+ 	(void)topaz_surface_drawn(s, 100);
++	if (s == fSurface) {
++		/*
++		 * laurel 2104: surface 1 is the boot framebuffer (backboardd's GL draws frames into it). The
++		 * MDP scans it as it is. Before: the copy path skipped it ("already on the panel") and
++		 * flipped to a back buffer that still held a console frame from boot, so every frame drawn
++		 * into surface 1 showed the kernel log until the next frame.
++		 */
++		if (fHandoff > 0 && (fPhys & 0xf) == 0 && fPhys + (uint64_t)fHeight * fRowBytes < (1ull << 32)) {
++			scanFrom(fPhys, fRowBytes);
++			ok = true;
++			IOLockLock(fLock);
++			if (fLastSurf != s) {
++				s->retain();
++				if (fLastSurf != NULL) {
++					fLastSurf->release();
++				}
++				fLastSurf = s;
++			}
++			fLastVA = (const uint8_t *)fPixels;
++			fLastStride = fRowBytes;
++			IOLockUnlock(fLock);
++			if (!fSurfaceTold) {
++				fSurfaceTold = true;
++				IOLog("LAUREL FB HANDOFF: swap %u shows surface 1 (boot framebuffer %#llx) by scanning it directly\n",
++				    get32(rec, 0x50), fPhys);
++			}
++		}
++		s->release();
++		return ok;
++	}
+ 	if (s->scanoutPhys != 0 && s->bytesPerElement == 4 &&
+ 	    s->width >= fWidth && s->height >= fHeight) {
+ 		/* full-screen surface: panel window at the logical offset */
+@@ -1504,6 +1562,34 @@
+ 	return ok;
+ }
+ 
++/*
++ * laurel 2104: console handoff at the first iOS frame. From now on the kernel console never draws
++ * onto the panel; a panic still does (sweet_cons_show / _cnputs with panic_active). Self-check: the
++ * console must draw into its shadow frame (sweet_console_retarget, which nothing scans after this
++ * frame). It does not (no shadow: the console still draws into the boot framebuffer, which is
++ * surface 1 and may be on the panel): console text stops being drawn (sweet_console_muted; it
++ * still reaches the USB log, and a panic draws). Kill switch fbhandoff=0: topaz behaviour.
++ */
++extern "C" int sweet_console_on_shadow(void);       /* osfmk/console/video_console.c */
++
++void
++AppleCLCD::consoleHandoff(void)
++{
++	if (fHandoff == 0) {
++		IOLog("LAUREL FB HANDOFF: off: fbhandoff=0 (kernel console frames may show on the panel)\n");
++		return;
++	}
++	if (sweet_console_on_shadow()) {
++		IOLog("LAUREL FB HANDOFF: on: first iOS frame owns the panel; kernel console only in its shadow %#llx "
++		    "(not scanned, shown again only by a panic); surface 1 = boot framebuffer %#llx, scanned directly\n",
++		    fConsPhys, fPhys);
++	} else {
++		sweet_console_muted = 1;
++		IOLog("LAUREL FB HANDOFF: on: first iOS frame owns the panel; no console shadow (console drew into the "
++		    "boot framebuffer): console text off the panel (USB log keeps it, a panic draws)\n");
++	}
++}
++
+ /* laurel 2103: self-report of the canvas (see laurel_fb_native) */
+ static void
+ laurel_fb_first_frame(const uint8_t *rec, const char *path, uint32_t cw, uint32_t chh)
+@@ -1550,6 +1636,10 @@
+ 		return;
+ 	}
+ 	fConsShown = false;
++	if (!fHandedOff) {
++		fHandedOff = true;
++		consoleHandoff();               /* laurel 2104: the first iOS frame owns the panel */
++	}
+ 	if (directPresent(rec)) {
+ 		laurel_fb_first_frame(rec, "direct", fLogicalW, fLogicalH);     /* laurel 2103 */
+ 		if (!fConsolePaused) {
+@@ -1573,6 +1663,11 @@
+ 	if (fFlip[0] == NULL && fVig0 != NULL && fScanPhys != fBootSrc) {
+ 		scanFrom(fBootSrc, fBootStride);
+ 	}
++	/* laurel 2104: a back buffer with a boot console frame in it is cleared before its first iOS frame */
++	if (fFlip[0] != NULL && !fConsShown && fFlipStale[fFlipIdx ^ 1]) {
++		fFlipStale[fFlipIdx ^ 1] = false;
++		bzero(dst, (size_t)fRowBytes * fHeight);
++	}
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -1604,7 +1699,9 @@
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+-		if (s == NULL || s == fSurface) {
++		/* laurel 2104: surface 1 is already in place only when we compose into it itself; into a back
++		 * buffer it is copied like any other surface (skipped, the back buffer's old frame showed) */
++		if (s == NULL || (s == fSurface && dst == (uint8_t *)fPixels)) {
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -153,6 +153,7 @@
+ static vm_offset_t sweet_shadow_va;
+ static unsigned int sweet_dirty_top = ~0u, sweet_dirty_bottom;
+ int sweet_console_copy_dirty(void *dst);
++int sweet_console_on_shadow(void);      /* laurel 2104 */
+ static void (*sweet_orig_paint)(unsigned int, unsigned int, unsigned char, int, unsigned char, int);
+ static void (*sweet_orig_clear)(unsigned int, unsigned int, unsigned int, unsigned int, int);
+ static void (*sweet_orig_sdown)(int, unsigned int, unsigned int);
+@@ -3409,6 +3410,16 @@
+ 	sweet_flush_rows(yy, yy + 1);
+ }
+ 
++/*
++ * laurel 2104: does the console draw into the shadow frame (and not into the boot framebuffer)?
++ * AppleCLCD asks at the first iOS frame; initialize_screen() on the boot framebuffer undoes it.
++ */
++int
++sweet_console_on_shadow(void)
++{
++	return sweet_shadow_va != 0 && vinfo.v_baseaddr == sweet_shadow_va && gc_ops.paint_char == sweet_paint;
++}
++
+ /* Point the console at the shadow frame (same geometry as the boot one). */
+ void
+ sweet_console_retarget(vm_offset_t va)

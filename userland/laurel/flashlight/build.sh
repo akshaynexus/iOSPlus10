@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build LaurelFlashlight.driver (the mediaserverd side of the Mi A3 torch: userland/laurel/flashlight/README.md;
-# kernel side patches/laurel/xnu/2770, /dev/laureltorch).
+# kernel side patches/laurel/xnu/2780, /dev/laureltorch).
 #   userland/laurel/flashlight/build.sh          (a few seconds; no tmux needed)
 # Linux: the theos iPhone toolchain (clang, ld64, ldid) and MacOSX13.3.sdk headers that scripts/laurel/kernel-linux.sh
 #        downloads into out/laurel-kernel/{theos,deps}; the link uses text stubs (.tbd) of libSystem, libobjc and

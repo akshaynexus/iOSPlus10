@@ -1,6 +1,6 @@
 # LaurelFlashlight.driver: the mediaserverd side of the Mi A3 torch
 
-Kernel side: patch 2770 (`docs/laurel_sprout/torch.md`), `/dev/laureltorch`, write `0`..`100` (percent).
+Kernel side: patch 2780 (`docs/laurel_sprout/torch.md`), `/dev/laureltorch`, write `0`..`100` (percent).
 Status (2026-11-01): built on Linux (arm64 bundle, minos 16.0, ad hoc signed). NOT RUN on the phone.
 
 - `laurel_flashlight.c`: a HAL plug-in (factory `LaurelFlashlight_Create` returns NULL) that mediaserverd loads from

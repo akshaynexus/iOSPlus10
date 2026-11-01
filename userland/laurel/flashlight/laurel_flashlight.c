@@ -1,5 +1,5 @@
 /*
- * LaurelFlashlight.driver (iOSPlus10, Mi A3 laurel_sprout): the iOS side of the torch. Kernel: patch 2770
+ * LaurelFlashlight.driver (iOSPlus10, Mi A3 laurel_sprout): the iOS side of the torch. Kernel: patch 2780
  * (bsd/dev/laurel_torch.c, /dev/laureltorch root:mobile 0660, write "0".."100" percent).
  *
  * How iOS 16.7.x (20H392) drives the flashlight [V: negroni's disassembly of the same cache, userland/flashlight/

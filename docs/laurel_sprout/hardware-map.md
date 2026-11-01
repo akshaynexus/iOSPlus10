@@ -30,12 +30,13 @@ DDR banks: not in the DT (ABL fills `memory`). Read them from the live FDT (root
 | Modem | MPSS PAS 4 at 0x6080000, region 0x4b000000 (0x7e00000); GLINK modem SPI 68 mbox 12; APCS 0x0F111000 | Q trinket.dtsi:1137, 1543 | similar | **regions, IRQs, mbox bits** |
 | Bluetooth | WCN3990 over QUP1 SE9 HS-UART 0x4c90000, SPI 312, GPIO 10-13; supplies L9/L17/L23/L16 (PM6125); fw in `bluetooth_b` partition | Q trinket.dtsi:2048, trinket-qupv3.dtsi:252 | none | patch 2600 (build only): docs/laurel_sprout/bluetooth.md |
 | Audio | ADSP PAS 1 @0xab00000, region 0x55300000 (0x2200000); Bolero rx 0x0a440000, tx 0x0a460000, wsa 0x0a480000, va 0x0a4a0000; WCD937x (reset GPIO 120); speaker MAX98927 @0x3a on QUP0 SE1 I2C 0x04a84000 (reset GPIO 95), SEC_MI2S GPIO 125-128 | Q trinket-audio-overlay.dtsi, X audio.dtsi | ADSP + own codec | **codec + amp differ** |
-| Flash LED | PMI632 flash LED `qcom,qpnp-flash-led-v2`, SID 3, base 0xD300; laurel torch_0 = LED1 only, 12.5 mA steps, DT max 950 mA; power from the charger flash boost SID 2 0xA600 (VREG_OK 0xA607 bit 4) | Q pmi632.dtsi:519, X trinket-camera.dtsi | none | patch 2770 (build only): `torch.md` |
+| Flash LED | PMI632 flash LED `qcom,qpnp-flash-led-v2`, SID 3, base 0xD300; laurel torch_0 = LED1 only, 12.5 mA steps, DT max 950 mA; power from the charger flash boost SID 2 0xA600 (VREG_OK 0xA607 bit 4) | Q pmi632.dtsi:519, X trinket-camera.dtsi | none | patch 2780 (build only): `torch.md` |
 | Vibration | PMI632 LDO vibrator (ERM) `qcom,qpnp-vibrator-ldo`, SID 3, base 0x5700, 3.0 V | Q pmi632.dtsi:412 | none | **new driver**: SPMI write + iOS haptics glue |
 | PMICs | SPMI arb core 0x1c40000, chnls 0x1e00000, obsrvr 0x3e00000, intr 0x3f00000, cnfg 0x1c0a000; PM6125 SID 0/1, PMI632 SID 2/3 | Q trinket.dtsi:1948 | check | verify SIDs; every SPMI user goes through `sweet_spmi.c` (one lock, 2710) |
 | Charger/gauge | PMI632 smb5 0x1000-0x1600, QG 0x4800; SMB1355 parallel | Q pmi632.dtsi:187-378 | check | verify 0091/0148 |
 | USB | DWC3 0x4e00000, SPI 255, QUSB2 PHY 0x1613000; high-speed only | Q trinket-usb.dtsi | check | verify |
 | UFS | 0x4804000, SPI 356, PHY 0x4807000 | Q trinket.dtsi:937 | same | none |
+| Camera | CAMSS gen1 (sdm660 type): CCI 0x5c0c000 SPI 207, CSIPHY0-2 0x1628000+0x1000 n, CSID0-3 0x5c30000+0x400 n, ISPIF 0x5c31000, VFE0/1 0x5c10000/0x5c14000 (vfe48), camss_top GDSC 0x145607c; rear IMX586 (or IMX582) 0x1a, depth GC2375H 0x17 / OV02A10 0x3d, front S5KGD1 0x2d, ultrawide S5K4H7 0x10; rails = GPIO LDOs + PM6125 L12A | Q trinket-camera.dtsi, X laurel_sprout-trinket-camera.dtsi, vendor libmmcamera_laurus_* | none | patch 2780 step 1 (chip IDs): `camera.md` |
 
 ## Reserved memory (laurel values)
 

@@ -1,4 +1,4 @@
-# Mi A3 flashlight (torch): kernel 2770 + LaurelFlashlight.driver
+# Mi A3 flashlight (torch): kernel 2780 + LaurelFlashlight.driver
 
 Status (2026-11-01, branch t3/laurel-brightness-torch): built (kernel and plug-in). NOT BOOTED. Marks: [V] seen in a
 source or tool output, [I] inference, [U] unknown.
@@ -7,10 +7,10 @@ source or tool output, [I] inference, [U] unknown.
 
 | Part | File | What |
 |---|---|---|
-| kernel driver | `bsd/dev/laurel_torch.c` (patch 2770) | PMI632 flash LED in torch mode, `/dev/laureltorch`, watch thread, auto-off, quiesce |
-| IOKit service | `iokit/Kernel/arm/LaurelTorch.cpp` (2770) | `LaurelTorch` (IOResources match) starts the driver; publishes `IODeviceTree:/product/camera` `flash` |
-| SPMI user | `sweet_spmi.c/.h` (2770) | user `SWEET_SPMI_TORCH` ("torch") of the one core (2710 rule) |
-| halt/panic | `SweetPlatformExpert.cpp` (2770) | `laurel_torch_quiesce()` at halt, restart, panic begin / hold |
+| kernel driver | `bsd/dev/laurel_torch.c` (patch 2780) | PMI632 flash LED in torch mode, `/dev/laureltorch`, watch thread, auto-off, quiesce |
+| IOKit service | `iokit/Kernel/arm/LaurelTorch.cpp` (2780) | `LaurelTorch` (IOResources match) starts the driver; publishes `IODeviceTree:/product/camera` `flash` |
+| SPMI user | `sweet_spmi.c/.h` (2780) | user `SWEET_SPMI_TORCH` ("torch") of the one core (2710 rule) |
+| halt/panic | `SweetPlatformExpert.cpp` (2780) | `laurel_torch_quiesce()` at halt, restart, panic begin / hold |
 | mediaserverd | `userland/laurel/flashlight/` | `LaurelFlashlight.driver`: FigFlashlight vendor hook + FigFlashlight server start |
 | root | `scripts/laurel/root-flashlight.sh` | installs the plug-in (root.sh calls it; `TORCH=0` skips) |
 
@@ -81,7 +81,7 @@ Off lines name the reason: `LAUREL TORCH: off: torch=0`, `... no SPMI APID ...`,
 `... TGR_CURRENT write did not read back ...`, `LAUREL TORCH UI: off: no ... LaurelFlashlight ... in the root`,
 `LAUREL FLASHLIGHT: off: <why>`.
 
-## Test (after a boot image with 2770 + a root with the plug-in)
+## Test (after a boot image with 2780 + a root with the plug-in)
 
 1. Boot log: `LAUREL TORCH: on:` and `LAUREL TORCH UI: on:`.
 2. `scripts/net/ssh-phone.sh 'cat /dev/laureltorch'` -> `level=0 ... state=on reason=never lit`.

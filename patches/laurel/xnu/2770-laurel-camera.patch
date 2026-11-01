@@ -1,0 +1,1200 @@
+laurel 2770: camera step 1 on the Mi A3 (SM6125 CAMSS: CCI + VFE48/ISPIF/CSID v5.0, the sdm660 type): find the four cameras. Slots from the DT (laurel_sprout-trinket-camera.dtsi over trinket-camera-sensor-qrd.dtsi) and vendor camera_config.xml: 0 rear IMX586 (qtech/sunny) or IMX582, CCI M0, CSIPHY1; 1 depth GC2375H (qtech) or OV02A10 (sunny), M1, CSIPHY0; 2 front S5KGD1 (ofilm/sunny), M1, CSIPHY2; 3 ultrawide S5K4H7 (qtech/sunny), M1, CSIPHY2 (MIPI switch GPIO 114/115). Sensor facts (7-bit address, chip ID register/value, power-up/down order + delays) from the stock /vendor/lib/libmmcamera_laurus_*.so sensor_lib_t, read by scripts/laurel/camera-sensors.py (scripts/laurel/camera-inventory.sh -> out/laurel/camera/sensors.txt; no blob in git). Rails are GPIO-switched LDOs on the camera flex (rear VIO 49 VANA 15 VDIG 14 VAF 123; shared VANA 20; front VDIG 82; ultrawide VDIG 21) + PM6125 L12A 1.8 V (VREG VIO) through topaz_rpm_write. New bsd/dev/laurel_cam{,_hw,_cci}.c + laurel_cam{,_core}.h: camss_top GDSC (0x145607c), GCC camera AHB / camss top AHB / CCI AHB + core branches, CCI RCG 37.5 MHz (GPLL0 early / 16; 19.2 MHz TCXO fallback with the cci_v1 timing), every branch checked (CLK_OFF) before the CCI is touched; MCLK0-3 19.2 MHz from the TCXO (no PLL) on GPIO 34/35/36/44 (gpio 44: function 7); CCI pins 37-40 cci_i2c pull-up; CCI controller 0x5c0c000 polled (Linux i2c-qcom-cci.c register map and command words; trinket DT timings = cci_v2), NACK = ENXIO, errors halt + reset the master. Per slot: power-up list, chip ID of each candidate (16-bit big-endian, at most 400 kHz; OV02A10 100 kHz), power-down list, pins released (input, pull-down); then clocks, GDSC and the CCI RCG back as the boot left them, L12A off. Host test scripts/laurel/cam-test.sh (core header from this patch; cross-check with sensors.txt). One line 'LAUREL CAMERA: on: rear IMX586 (0x1a id 0x0586), depth GC2375H (0x17 id 0x2375), front S5KGD1 (0x2d id 0x0841), ultrawide S5K4H7 (0x10 id 0x487b); CCI 37500000 Hz, MCLK 19.2 MHz; capture path: step 2' (a slot without an answer: 'front: no answer (NACK at 0x2d)') or 'LAUREL CAMERA: off: <why>'; sysctl kern.laurel_camera = the same text. Kill switch camera=0. A failure turns off only the camera. No SPMI, TrustZone, SMMU or pool use in step 1. Step 2 (CSIPHY/CSID/ISPIF/VFE RDI raw frames into a pool buffer, sensor mode tables from the vendor libraries at run time) and the iOS side: docs/laurel_sprout/camera.md.
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-01 07:50:18.927051808 +0530
++++ b/bsd/conf/files	2026-11-01 07:55:34.289400397 +0530
+@@ -137,6 +137,9 @@
+ bsd/dev/laurel_bt_ios.c			standard
+ bsd/dev/laurel_bt_ctl.c			standard
+ bsd/dev/laurel_bt_dev.c			standard
++bsd/dev/laurel_cam.c			standard
++bsd/dev/laurel_cam_hw.c			standard
++bsd/dev/laurel_cam_cci.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff -ruN a/bsd/dev/laurel_cam.c b/bsd/dev/laurel_cam.c
+--- a/bsd/dev/laurel_cam.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_cam.c	2026-11-01 07:58:36.820189613 +0530
+@@ -0,0 +1,251 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) camera (laurel 2770), step 1: find the cameras. On by default; kill switch camera=0.
++ * A thread (STARTUP EARLY_BOOT) waits for the RPM path (topaz_soc_map), then:
++ *   camss_top GDSC + CCI clocks + CCI pins (laurel_cam_hw.c), CCI reset (laurel_cam_cci.c);
++ *   per slot (rear, depth, front, ultrawide): the power-up order of the stock sensor library, the chip ID over CCI
++ *   (every candidate module of the slot), the power-down order;
++ *   everything back as the boot left it.
++ * Result, one line (also in sysctl kern.laurel_camera):
++ *   "LAUREL CAMERA: on: rear IMX586 (0x1a id 0x0586), depth GC2375H (0x17 id 0x2375), front S5KGD1 (0x2d id 0x0841),
++ *    ultrawide S5K4H7 (0x10 id 0x487b); CCI 37500000 Hz, MCLK 19.2 MHz; capture path: step 2"
++ *   "LAUREL CAMERA: off: <reason>"   (no sensor answers, a clock or the GDSC does not come up, camera=0)
++ * A slot whose sensor does not answer is named in the "on" line ("front: no answer (NACK at 0x2d)").
++ * A failure turns off only the camera: no other block shares the camss GDSC, the CCI or these pins; L12A is a
++ * camera-only rail in the DT (it is switched off again after the scan).
++ * Step 2 (docs/laurel_sprout/camera.md): CSIPHY/CSID/ISPIF/VFE RDI raw frames of one sensor into a pool buffer,
++ * then the iOS side (NegroniCamera.driver path).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <stdarg.h>
++#include <kern/startup.h>
++#include <kern/thread.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "laurel_cam.h"
++#include "laurel_cam_core.h"
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern kern_return_t thread_terminate(thread_t);
++extern bool topaz_soc_map(void);
++
++static LCK_GRP_DECLARE(lcam_grp, "laurel_camera");
++static LCK_MTX_DECLARE(lcam_lock, &lcam_grp);
++static char lcam_result[320] = "scan not done";
++static bool rail_warned;
++
++/* append to a bounded text: never past len, always terminated */
++static void __printflike(4, 5)
++append(char *buf, size_t len, size_t *used, const char *fmt, ...)
++{
++	va_list ap;
++	int n;
++
++	if (*used >= len - 1) {
++		return;
++	}
++	va_start(ap, fmt);
++	n = vsnprintf(buf + *used, len - *used, fmt, ap);
++	va_end(ap);
++	if (n > 0) {
++		*used = *used + (size_t)n < len - 1 ? *used + (size_t)n : len - 1;
++	}
++}
++
++static void
++set_result(const char *s)
++{
++	lck_mtx_lock(&lcam_lock);
++	strlcpy(lcam_result, s, sizeof(lcam_result));
++	lck_mtx_unlock(&lcam_lock);
++}
++
++static int
++lcam_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	char buf[sizeof(lcam_result)];
++
++	lck_mtx_lock(&lcam_lock);
++	strlcpy(buf, lcam_result, sizeof(buf));
++	lck_mtx_unlock(&lcam_lock);
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, laurel_camera, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, lcam_sysctl, "A", "LAUREL camera: sensors found (step 1), or why the camera is off");
++
++static void
++off(const char *why)
++{
++	char line[sizeof(lcam_result)];
++
++	snprintf(line, sizeof(line), "off: %s", why);
++	set_result(line);
++	LCAM_SAY("%s\n", line);
++}
++
++/* one power list; the first failure stops it (rail or clock) and is returned */
++static int
++power(const struct lcam_slot *s, const struct lcam_step *list, const char **why)
++{
++	int e, first = 0;
++
++	for (unsigned n = 0; n < 16 && list[n].kind != LCAM_END; n++) {
++		const struct lcam_step *t = &list[n];
++		e = 0;
++		switch (t->kind) {
++		case LCAM_GPIO:
++			lcam_gpio((unsigned)s->pin[t->pin], t->on != 0);
++			break;
++		case LCAM_RAIL:
++			/* a refusal is logged once; the rail can be on from the boot, the chip-ID read is the check */
++			if (lcam_rail(t->on != 0, why) != 0 && !rail_warned) {
++				rail_warned = true;
++				LCAM_SAY("rail: %s: going on with the boot state\n", *why);
++			}
++			break;
++		case LCAM_MCLK:
++			e = lcam_mclk(s->mclk, t->on != 0);
++			if (e) {
++				*why = "MCLK does not run";
++			}
++			break;
++		}
++		if (e && t->on) {
++			return e;               /* power-up: stop; the caller runs the power-down list */
++		}
++		first = first ? first : e;      /* power-down: go on, report the first failure */
++		lcam_sleep_ms(t->ms);
++	}
++	return first;
++}
++
++/* chip ID of every candidate: the matching sensor, or NULL with the answer in note */
++static const struct lcam_sensor *
++identify(const struct lcam_slot *s, char *note, size_t len)
++{
++	const struct lcam_sensor *got = NULL;
++	size_t used = 0;
++
++	note[0] = 0;
++	for (unsigned i = 0; i < LCAM_MAX_CAND && s->cand[i] && !got; i++) {
++		const struct lcam_sensor *c = s->cand[i];
++		uint8_t a[2], b[2] = { 0, 0 };
++		unsigned an = lcam_reg_addr_bytes(c, c->id_reg, a);
++		int e;
++
++		lcam_cci_speed(s->master, c->speed);
++		e = lcam_cci_write_read(s->master, c->addr, a, an, b, 2);
++		if (e == 0 && (got = lcam_match(s, c->addr, b)) != NULL) {
++			break;
++		}
++		/* a second candidate at the same address (IMX586 / IMX582) is matched by the read above */
++		if (i + 1 < LCAM_MAX_CAND && s->cand[i + 1] && s->cand[i + 1]->addr == c->addr) {
++			i++;
++		}
++		if (e == 0) {
++			append(note, len, &used, "%s%#04x id %#06x", used ? ", " : "", c->addr, (unsigned)(b[0] << 8 | b[1]));
++		} else {
++			append(note, len, &used, "%s%s at %#04x", used ? ", " : "",
++			    e == ENXIO ? "NACK" : e == ETIMEDOUT ? "timeout" : "bus error", c->addr);
++		}
++	}
++	return got;
++}
++
++static void
++scan(void)
++{
++	char line[sizeof(lcam_result)], part[96], note[64];
++	const char *why = "";
++	size_t used = 0;
++	unsigned found = 0;
++	int e;
++
++	for (unsigned i = 0; i < LCAM_NSLOTS; i++) {
++		if (!lcam_slot_ok(&lcam_slots[i])) {
++			off("slot table not usable (build error)");
++			return;
++		}
++	}
++	/* the RPM doorbell (APCS) first: it can wait for UFS; no camera clock is on while it waits */
++	(void)topaz_soc_map();
++	if ((e = lcam_hw_on(&why)) != 0 || (e = lcam_cci_init(&why)) != 0) {
++		lcam_cci_stop();
++		lcam_hw_off();
++		off(why);
++		return;
++	}
++	LCAM_SAY("cci: version %#x, %u Hz\n", lcam_cci_version(), lcam_cci_hz());
++	line[0] = 0;
++	for (unsigned i = 0; i < LCAM_NSLOTS; i++) {
++		const struct lcam_slot *s = &lcam_slots[i];
++		const struct lcam_sensor *got = NULL;
++		const char *pwhy = "";
++
++		e = power(s, s->up, &pwhy);
++		if (e == 0) {
++			got = identify(s, note, sizeof(note));
++		} else {
++			strlcpy(note, pwhy, sizeof(note));
++		}
++		(void)power(s, s->down, &pwhy);
++		for (unsigned p = 0; p < LCAM_NPINS; p++) {
++			if (s->pin[p] >= 0 && p != LCAM_CUSTOM1 && p != LCAM_CUSTOM2) {
++				lcam_gpio_release((unsigned)s->pin[p]);  /* rails and reset: no drive into an unpowered sensor */
++			}
++		}
++		if (got) {
++			found++;
++			snprintf(part, sizeof(part), "%s %s (%#04x id %#06x)", s->role, got->name, got->addr, got->id);
++			LCAM_SAY("%s: %s chip ID %#06x at %#04x (CCI M%u), MCLK%u\n", s->role, got->name, got->id, got->addr,
++			    s->master, s->mclk);
++		} else {
++			snprintf(part, sizeof(part), "%s: no answer (%s)", s->role, note);
++			LCAM_SAY("%s: no sensor: %s\n", s->role, note);
++		}
++		append(line, sizeof(line), &used, "%s%s", used ? ", " : "", part);
++	}
++	lcam_cci_stop();
++	lcam_hw_off();
++	if (found == 0) {
++		char why2[sizeof(lcam_result) - 8];
++		snprintf(why2, sizeof(why2), "no sensor answered (%s)", line);
++		off(why2);
++		return;
++	}
++	char result[sizeof(lcam_result)];
++	snprintf(result, sizeof(result), "on: %s; CCI %u Hz, MCLK 19.2 MHz; capture path: step 2", line,
++	    lcam_cci_hz());
++	set_result(result);
++	LCAM_SAY("%s\n", result);
++}
++
++static void
++scan_thread(void *arg __unused, wait_result_t w __unused)
++{
++	scan();
++	(void)thread_terminate(current_thread());
++}
++
++static void
++laurel_cam_start(void)
++{
++	uint32_t on = 1;
++	thread_t th;
++
++	(void)PE_parse_boot_argn("camera", &on, sizeof(on));
++	if (on == 0) {
++		off("camera=0");
++	} else if (kernel_thread_start(scan_thread, NULL, &th) != KERN_SUCCESS) {
++		off("no scan thread");
++	} else {
++		thread_deallocate(th);
++	}
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, laurel_cam_start);
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_cam_cci.c b/bsd/dev/laurel_cam_cci.c
+--- a/bsd/dev/laurel_cam_cci.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_cam_cci.c	2026-11-01 07:58:20.110955526 +0530
+@@ -0,0 +1,261 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) camera (laurel 2770), step 1b: the CCI (camera control interface) I2C controller
++ * at 0x5c0c000, two masters (M0 gpio 37/38, M1 gpio 39/40). Register map and command words: Linux
++ * drivers/i2c/busses/i2c-qcom-cci.c (external/laurel-mainline); the trinket DT timing sets (trinket-camera.dtsi
++ * i2c_freq_100Khz / 400Khz at cci-clk-src 37.5 MHz) are the cci_v2 values there; at 19.2 MHz the cci_v1 sets.
++ * Polled: the status bits of CCI_IRQ_STATUS_0 are read, the GIC line (SPI 207) is not used.
++ * A transfer: queue words (SET_PARAM slave, WRITE/READ, REPORT), EXEC_WORD_CNT = CUR_WORD_CNT, QUEUE_START, then
++ * wait for the queue report / read done or an error. NACK = ENXIO; other errors halt the master, reset it and
++ * program its timing again (the next transfer starts clean).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include "laurel_cam.h"
++#include "laurel_cam_core.h"
++
++#define CCI_HW_VERSION                  0x000u
++#define CCI_RESET_CMD                   0x004u
++#define CCI_RESET_ALL                   0x0f73f3f7u
++#define CCI_RESET_M0                    0x000003f1u
++#define CCI_RESET_M1                    0x0003f001u
++#define CCI_QUEUE_START                 0x008u
++#define CCI_HALT_REQ                    0x034u
++#define SCL_CTL(m)                      (0x100u + 0x100u * (m))
++#define SDA_CTL_0(m)                    (0x104u + 0x100u * (m))
++#define SDA_CTL_1(m)                    (0x108u + 0x100u * (m))
++#define SDA_CTL_2(m)                    (0x10cu + 0x100u * (m))
++#define MISC_CTL(m)                     (0x110u + 0x100u * (m))
++#define READ_DATA(m)                    (0x118u + 0x100u * (m))
++#define READ_BUF_LEVEL(m)               (0x11cu + 0x100u * (m))
++#define EXEC_WORD_CNT(m, q)             (0x300u + 0x200u * (m) + 0x100u * (q))
++#define CUR_WORD_CNT(m, q)              (0x304u + 0x200u * (m) + 0x100u * (q))
++#define LOAD_DATA(m, q)                 (0x310u + 0x200u * (m) + 0x100u * (q))
++#define IRQ_GLOBAL_CLEAR                0xc00u
++#define IRQ_MASK_0                      0xc04u
++#define IRQ_CLEAR_0                     0xc08u
++#define IRQ_STATUS_0                    0xc0cu
++
++#define ST_RD_DONE(m)                   (1u << (12 * (m)))
++#define ST_Q_REPORT(m, q)               (1u << (4 + 4 * (q) + 12 * (m)))
++#define ST_RST_DONE                     (1u << 24)
++#define ST_HALT_ACK(m)                  (1u << (25 + (m)))
++#define ST_NACK(m)                      (3u << (27 + 2 * (m)))
++#define ST_ERROR(m)                     ((m) ? 0x60ee6000u : 0x18000ee6u)
++#define IRQ_MASK_ALL                    (0x00111111u | ST_RST_DONE | ST_HALT_ACK(0) | ST_HALT_ACK(1) | \
++	                                 ST_ERROR(0) | ST_ERROR(1))
++#define QUEUE_W                         0u      /* queue 0: 64 words */
++#define QUEUE_R                         1u      /* queue 1: 16 words */
++#define TIMEOUT_US                      100000u
++
++struct timing {
++	uint16_t thigh, tlow, tsu_sto, tsu_sta, thd_dat, thd_sta, tbuf, trdhld, tsp;
++};
++/* [speed]: 37.5 MHz (cci_v2 = trinket DT), 19.2 MHz (cci_v1) */
++static const struct timing t37[2] = {
++	{ 201, 174, 204, 231, 22, 162, 227, 6, 3 }, { 38, 56, 40, 40, 22, 35, 62, 6, 3 },
++};
++static const struct timing t19[2] = {
++	{ 78, 114, 28, 28, 10, 77, 118, 6, 1 }, { 20, 28, 21, 21, 13, 18, 32, 6, 3 },
++};
++static vm_offset_t base;
++static unsigned speed[2] = { LCAM_I2C_400K, LCAM_I2C_400K };
++
++static inline uint32_t
++rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++clear(uint32_t bits)
++{
++	wr(IRQ_CLEAR_0, bits);
++	wr(IRQ_GLOBAL_CLEAR, 1u);
++}
++
++/* the first status with any of the bits set within us, or 0 (no bit came) */
++static uint32_t
++wait_status(uint32_t bits, uint32_t us)
++{
++	for (uint32_t t = 0; t <= us; t += 10) {
++		uint32_t st = rd(IRQ_STATUS_0);
++		if (st & bits) {
++			return st;
++		}
++		delay(10);
++	}
++	return 0;
++}
++
++static void
++timing(unsigned m)
++{
++	const struct timing *t = &(lcam_cci_hz() == 37500000 ? t37 : t19)[speed[m]];
++
++	wr(SCL_CTL(m), (uint32_t)t->thigh << 16 | t->tlow);
++	wr(SDA_CTL_0(m), (uint32_t)t->tsu_sto << 16 | t->tsu_sta);
++	wr(SDA_CTL_1(m), (uint32_t)t->thd_dat << 16 | t->thd_sta);
++	wr(SDA_CTL_2(m), t->tbuf);
++	wr(MISC_CTL(m), (uint32_t)t->trdhld << 4 | t->tsp);   /* SCL stretch off */
++}
++
++static int
++reset(uint32_t what)
++{
++	clear(0xffffffffu);
++	wr(CCI_RESET_CMD, what);
++	uint32_t st = wait_status(ST_RST_DONE, TIMEOUT_US);
++	clear(0xffffffffu);
++	return st ? 0 : ETIMEDOUT;
++}
++
++uint32_t
++lcam_cci_version(void)
++{
++	return base ? rd(CCI_HW_VERSION) : 0;
++}
++
++void
++lcam_cci_speed(unsigned m, unsigned s)
++{
++	if (m < 2 && s <= LCAM_I2C_400K && base) {
++		speed[m] = s;
++		timing(m);
++	}
++}
++
++int
++lcam_cci_init(const char **why)
++{
++	base = lcam_cci_base();
++	if (!base) {
++		*why = "CCI not mapped";
++		return ENODEV;
++	}
++	wr(IRQ_MASK_0, IRQ_MASK_ALL);           /* status bits latch; the GIC line stays unused */
++	if (reset(CCI_RESET_ALL) != 0) {
++		LCAM_SAY("cci: version %#x, reset: no RST_DONE (status %#x)\n", rd(CCI_HW_VERSION), rd(IRQ_STATUS_0));
++		*why = "CCI reset does not finish";
++		return ETIMEDOUT;
++	}
++	timing(0);
++	timing(1);
++	return 0;
++}
++
++void
++lcam_cci_stop(void)
++{
++	if (base) {
++		wr(IRQ_MASK_0, 0);
++		clear(0xffffffffu);
++	}
++}
++
++/* after an error or a timeout: halt the master, reset it, its timing again */
++static void
++recover(unsigned m)
++{
++	clear(0xffffffffu);
++	wr(CCI_HALT_REQ, 1u << m);
++	(void)wait_status(ST_HALT_ACK(m), TIMEOUT_US);
++	(void)reset(m ? CCI_RESET_M1 : CCI_RESET_M0);
++	timing(m);
++}
++
++static int
++run(unsigned m, unsigned q)
++{
++	uint32_t done = q == QUEUE_R ? ST_RD_DONE(m) | ST_Q_REPORT(m, q) : ST_Q_REPORT(m, q), st;
++
++	clear(0xffffffffu);
++	wr(EXEC_WORD_CNT(m, q), rd(CUR_WORD_CNT(m, q)));
++	wr(CCI_QUEUE_START, 1u << (m * 2 + q));
++	st = wait_status(done | ST_ERROR(m), TIMEOUT_US);
++	if (st & ST_ERROR(m)) {
++		recover(m);
++		return (st & ST_NACK(m)) ? ENXIO : EIO;
++	}
++	if (st == 0) {
++		LCAM_SAY("cci: M%u Q%u timeout (status %#x, words %u)\n", m, q, rd(IRQ_STATUS_0), rd(CUR_WORD_CNT(m, q)));
++		recover(m);
++		return ETIMEDOUT;
++	}
++	if (q == QUEUE_R && !(st & ST_RD_DONE(m))) {
++		/* REPORT came first: the read-done bit follows at once */
++		(void)wait_status(ST_RD_DONE(m), 1000);
++	}
++	clear(0xffffffffu);
++	return 0;
++}
++
++/* a queue that still holds words from an aborted transfer is reset first */
++static void
++queue_clean(unsigned m, unsigned q)
++{
++	if (rd(CUR_WORD_CNT(m, q)) != 0) {
++		recover(m);
++	}
++}
++
++int
++lcam_cci_write(unsigned m, uint8_t addr7, const uint8_t *w, uint32_t wn)
++{
++	uint32_t words[3];
++	unsigned n = lcam_cci_write_words(w, wn, words);
++
++	if (!base || m > 1 || n == 0) {
++		return EINVAL;
++	}
++	queue_clean(m, QUEUE_W);
++	wr(LOAD_DATA(m, QUEUE_W), lcam_cci_set_param(addr7));
++	for (unsigned i = 0; i < n; i++) {
++		wr(LOAD_DATA(m, QUEUE_W), words[i]);
++	}
++	wr(LOAD_DATA(m, QUEUE_W), lcam_cci_report());
++	return run(m, QUEUE_W);
++}
++
++int
++lcam_cci_write_read(unsigned m, uint8_t addr7, const uint8_t *w, uint32_t wn, uint8_t *r, uint32_t rn)
++{
++	uint32_t words[4], level, want = lcam_cci_read_words(rn);
++	int e;
++
++	if (!base || m > 1 || rn == 0 || rn > LCAM_CCI_MAX_READ) {
++		return EINVAL;
++	}
++	if (wn && (e = lcam_cci_write(m, addr7, w, wn)) != 0) {
++		return e;
++	}
++	queue_clean(m, QUEUE_R);
++	wr(LOAD_DATA(m, QUEUE_R), lcam_cci_set_param(addr7));
++	wr(LOAD_DATA(m, QUEUE_R), lcam_cci_read_cmd(rn));
++	if ((e = run(m, QUEUE_R)) != 0) {
++		return e;
++	}
++	level = rd(READ_BUF_LEVEL(m));
++	if (level != want || want > 4) {
++		LCAM_SAY("cci: M%u read: %u words in the buffer, %u expected\n", m, level, want);
++		for (uint32_t i = 0; i < level && i < 16; i++) {
++			(void)rd(READ_DATA(m));         /* drain */
++		}
++		return EIO;
++	}
++	for (uint32_t i = 0; i < want; i++) {
++		words[i] = rd(READ_DATA(m));
++	}
++	return lcam_cci_unpack(words, want, r, rn) == rn ? 0 : EIO;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_cam_core.h b/bsd/dev/laurel_cam_core.h
+--- a/bsd/dev/laurel_cam_core.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_cam_core.h	2026-11-01 07:51:10.708585778 +0530
+@@ -0,0 +1,296 @@
++/*
++ * laurel_sprout (Xiaomi Mi A3, SM6125) camera (laurel 2770): the pure part. No kernel calls, so the host test
++ * (iOSPlus10 scripts/laurel/cam-test.sh, tools/laurel-cam-test) checks exactly the code that goes into the kernel.
++ *
++ * Camera slots = DT cell-index = Android camera id (external/laurel-kernel-los laurel_sprout-trinket-camera.dtsi
++ * over trinket-camera-sensor-qrd.dtsi; vendor /etc/camera/camera_config.xml). Sensor facts (CCI address, chip ID
++ * register and value, power-up / power-down order and delays) come from the stock sensor libraries
++ * /vendor/lib/libmmcamera_laurus_<sensor>.so of V12.0.26.0.RFQMIXM, read by scripts/laurel/camera-sensors.py
++ * (out/laurel/camera/sensors.txt). Only those numbers are here; no Xiaomi or Qualcomm file is copied.
++ *
++ *   slot  role       sensor (module makers)                CCI   pins (TLMM)                                  MCLK
++ *   0     rear       IMX586 (qtech, sunny) or IMX582       M0    reset 48, VIO 49, VANA 15, VDIG 14, VAF 123   0 (gpio 34)
++ *   1     depth      GC2375H (qtech) or OV02A10 (sunny)    M1    reset 46, VANA 20                             1 (gpio 35)
++ *   2     front      S5KGD1 (ofilm, sunny)                 M1    reset 42, VANA 20, VDIG 82, sw 114/115        2 (gpio 36)
++ *   3     ultrawide  S5K4H7 (qtech, sunny)                 M1    reset 41, VANA 20, VDIG 21, sw 114/115        3 (gpio 44)
++ * VIO of every slot is also PM6125 L12A 1.8 V (DT cam_vio-supply; the libraries' "VREG VIO" step) over the RPM.
++ * GPIO 114/115 (CUSTOM1/2) drive the MIPI switch in front of CSIPHY2 that the front and the ultrawide share.
++ */
++#ifndef LAUREL_CAM_CORE_H
++#define LAUREL_CAM_CORE_H
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++
++/* ---- sensors and slots ---------------------------------------------------------------------- */
++
++enum { LCAM_RESET, LCAM_VIO, LCAM_VANA, LCAM_VDIG, LCAM_VAF, LCAM_CUSTOM1, LCAM_CUSTOM2, LCAM_NPINS };
++enum { LCAM_I2C_100K, LCAM_I2C_400K };          /* CCI timing sets used for the chip-ID read */
++enum { LCAM_GPIO, LCAM_RAIL, LCAM_MCLK, LCAM_END };     /* power step kinds; RAIL = L12A (VREG VIO) */
++
++struct lcam_step {
++	uint8_t kind, pin, on;                  /* pin: LCAM_RESET.. (GPIO steps only); on: level / rail / clock */
++	uint8_t ms;                             /* delay after the step */
++};
++
++struct lcam_sensor {
++	const char *name;
++	uint8_t addr;                           /* 7-bit CCI slave address (the libraries hold the 8-bit form) */
++	bool reg16;                             /* 16-bit register addresses (else 8-bit) */
++	uint16_t id_reg, id;                    /* the 16-bit chip ID, read big-endian at id_reg, id_reg + 1 */
++	uint8_t speed;                          /* LCAM_I2C_*: at most 400 kHz for the ID read */
++};
++
++#define LCAM_MAX_CAND           2
++#define LCAM_NSLOTS             4
++
++struct lcam_slot {
++	const char *role;
++	uint8_t master, mclk;                   /* CCI master, GCC MCLK n (= TLMM MCLK pin of the slot) */
++	int16_t pin[LCAM_NPINS];                /* TLMM GPIO per role, -1 = none */
++	const struct lcam_step *up, *down;
++	const struct lcam_sensor *cand[LCAM_MAX_CAND];
++};
++
++/* sensors.txt: "CCI slave 0x34 (7-bit 0x1a), 1M, 16-bit register addresses, chip ID 0x0586 at 0x0016" etc. */
++static const struct lcam_sensor lcam_imx586 = { "IMX586", 0x1a, true, 0x0016, 0x0586, LCAM_I2C_400K };
++static const struct lcam_sensor lcam_imx582 = { "IMX582", 0x1a, true, 0x0016, 0x0582, LCAM_I2C_400K };
++static const struct lcam_sensor lcam_gc2375 = { "GC2375H", 0x17, false, 0x00f0, 0x2375, LCAM_I2C_400K };
++static const struct lcam_sensor lcam_ov02a10 = { "OV02A10", 0x3d, false, 0x0002, 0x2509, LCAM_I2C_100K };
++static const struct lcam_sensor lcam_s5kgd1 = { "S5KGD1", 0x2d, true, 0x0000, 0x0841, LCAM_I2C_400K };
++static const struct lcam_sensor lcam_s5k4h7 = { "S5K4H7", 0x10, true, 0x0000, 0x487b, LCAM_I2C_400K };
++
++#define G(p, v, d)      { LCAM_GPIO, LCAM_##p, v, d }
++#define RAIL(v, d)      { LCAM_RAIL, 0, v, d }
++#define MCLK(v, d)      { LCAM_MCLK, 0, v, d }
++#define END             { LCAM_END, 0, 0, 0 }
++
++/* IMX586/IMX582 (same tables in all three libraries) */
++static const struct lcam_step lcam_rear_up[] = {
++	G(RESET, 0, 1), G(VIO, 1, 1), G(VANA, 1, 1), G(VDIG, 1, 1), RAIL(1, 0), MCLK(1, 1), G(VAF, 1, 1),
++	G(RESET, 1, 11), END
++};
++static const struct lcam_step lcam_rear_down[] = {
++	MCLK(0, 1), G(RESET, 0, 1), G(VAF, 0, 1), RAIL(0, 0), G(VDIG, 0, 1), G(VANA, 0, 1), G(VIO, 0, 1), END
++};
++/*
++ * Depth: one order that meets both modules. GC2375H: reset (PWDN, active high) high +1, VIO +10, VANA +10,
++ * MCLK +5, reset low +1. OV02A10: reset high +1, VIO +5, VANA +5, reset low +5, MCLK +10. Both: MCLK runs
++ * before the sensor leaves power-down here (the Linux ov02a10 driver also starts the clock first).
++ */
++static const struct lcam_step lcam_depth_up[] = {
++	G(RESET, 1, 1), RAIL(1, 10), G(VANA, 1, 10), MCLK(1, 10), G(RESET, 0, 10), END
++};
++static const struct lcam_step lcam_depth_down[] = {
++	G(RESET, 1, 5), MCLK(0, 10), G(VANA, 0, 5), RAIL(0, 0), G(RESET, 0, 1), END
++};
++/* S5KGD1 (front): the libraries ask for MCLK 19.2 MHz, switch CUSTOM1 low + CUSTOM2 high */
++static const struct lcam_step lcam_front_up[] = {
++	G(RESET, 0, 1), G(VANA, 1, 0), G(VDIG, 1, 1), RAIL(1, 5), G(RESET, 1, 10), MCLK(1, 1),
++	G(CUSTOM1, 0, 1), G(CUSTOM2, 1, 1), END
++};
++static const struct lcam_step lcam_front_down[] = {
++	G(CUSTOM2, 0, 1), G(CUSTOM1, 1, 5), MCLK(0, 5), G(RESET, 0, 1), RAIL(0, 0), G(VDIG, 0, 0), G(VANA, 0, 0), END
++};
++/* S5K4H7 (ultrawide): switch CUSTOM1 low + CUSTOM2 low */
++static const struct lcam_step lcam_ultra_up[] = {
++	G(RESET, 0, 1), G(VANA, 1, 1), G(VDIG, 1, 1), RAIL(1, 1), G(RESET, 1, 1), MCLK(1, 10),
++	G(CUSTOM1, 0, 1), G(CUSTOM2, 0, 1), END
++};
++static const struct lcam_step lcam_ultra_down[] = {
++	G(CUSTOM2, 1, 1), G(CUSTOM1, 1, 1), MCLK(0, 5), G(RESET, 0, 1), RAIL(0, 0), G(VDIG, 0, 0), G(VANA, 0, 0), END
++};
++#undef G
++#undef RAIL
++#undef MCLK
++#undef END
++
++#define NP      (-1)
++/*          RESET VIO VANA VDIG VAF CUSTOM1 CUSTOM2 */
++static const struct lcam_slot lcam_slots[LCAM_NSLOTS] = {
++	{ "rear", 0, 0, { 48, 49, 15, 14, 123, NP, NP }, lcam_rear_up, lcam_rear_down, { &lcam_imx586, &lcam_imx582 } },
++	{ "depth", 1, 1, { 46, NP, 20, NP, NP, NP, NP }, lcam_depth_up, lcam_depth_down, { &lcam_gc2375, &lcam_ov02a10 } },
++	{ "front", 1, 2, { 42, NP, 20, 82, NP, 114, 115 }, lcam_front_up, lcam_front_down, { &lcam_s5kgd1, NULL } },
++	{ "ultrawide", 1, 3, { 41, NP, 20, 21, NP, 114, 115 }, lcam_ultra_up, lcam_ultra_down, { &lcam_s5k4h7, NULL } },
++};
++#undef NP
++
++/*
++ * A slot table is usable when every GPIO step names a pin the slot has, every list ends, and a power-up
++ * ends with the clock and rail on (each sensor needs MCLK and VIO for I2C).
++ */
++static inline bool
++lcam_slot_ok(const struct lcam_slot *s)
++{
++	bool clk = false, rail = false;
++	unsigned n;
++
++	for (n = 0; n < 16 && s->up[n].kind != LCAM_END; n++) {
++		const struct lcam_step *t = &s->up[n];
++		if (t->kind == LCAM_GPIO && (t->pin >= LCAM_NPINS || s->pin[t->pin] < 0)) {
++			return false;
++		}
++		clk = t->kind == LCAM_MCLK ? t->on != 0 : clk;
++		rail = t->kind == LCAM_RAIL ? t->on != 0 : rail;
++	}
++	if (n == 16 || !clk || !rail) {
++		return false;
++	}
++	for (n = 0; n < 16 && s->down[n].kind != LCAM_END; n++) {
++		const struct lcam_step *t = &s->down[n];
++		if (t->kind == LCAM_GPIO && (t->pin >= LCAM_NPINS || s->pin[t->pin] < 0)) {
++			return false;
++		}
++	}
++	return n < 16 && s->cand[0] != NULL && s->master < 2 && s->mclk < 4;
++}
++
++/* ---- CCI command words (Linux i2c-qcom-cci.c, cci_v2: the trinket DT timing values are the same) ----------- */
++
++#define LCAM_CCI_SET_PARAM      1u
++#define LCAM_CCI_REPORT         8u
++#define LCAM_CCI_WRITE          9u
++#define LCAM_CCI_READ           10u
++#define LCAM_CCI_REPORT_IRQ_EN  (1u << 8)
++#define LCAM_CCI_MAX_WRITE      11u             /* bytes per WRITE command */
++#define LCAM_CCI_MAX_READ       12u
++
++static inline uint32_t
++lcam_cci_set_param(uint8_t addr7)
++{
++	return LCAM_CCI_SET_PARAM | (uint32_t)(addr7 & 0x7fu) << 4;
++}
++
++static inline uint32_t
++lcam_cci_read_cmd(uint32_t len)
++{
++	return LCAM_CCI_READ | len << 4;
++}
++
++static inline uint32_t
++lcam_cci_report(void)
++{
++	return LCAM_CCI_REPORT | LCAM_CCI_REPORT_IRQ_EN;
++}
++
++/*
++ * The WRITE command and its data bytes, packed 4 per queue word, LSB first: words[] gets the words, the
++ * return value is how many (0 = len not 1..11).
++ */
++static inline unsigned
++lcam_cci_write_words(const uint8_t *buf, uint32_t len, uint32_t words[3])
++{
++	uint8_t load[12] = { 0 };
++	unsigned i = 0, n;
++
++	if (len == 0 || len > LCAM_CCI_MAX_WRITE) {
++		return 0;
++	}
++	load[i++] = (uint8_t)(LCAM_CCI_WRITE | len << 4);
++	for (n = 0; n < len; n++) {
++		load[i++] = buf[n];
++	}
++	for (n = 0; n * 4 < i; n++) {
++		words[n] = load[4 * n] | (uint32_t)load[4 * n + 1] << 8 | (uint32_t)load[4 * n + 2] << 16 |
++		    (uint32_t)load[4 * n + 3] << 24;
++	}
++	return n;
++}
++
++/* the register address bytes that start a read (big-endian for 16-bit addresses): their count */
++static inline unsigned
++lcam_reg_addr_bytes(const struct lcam_sensor *s, uint16_t reg, uint8_t out[2])
++{
++	if (s->reg16) {
++		out[0] = (uint8_t)(reg >> 8);
++		out[1] = (uint8_t)reg;
++		return 2;
++	}
++	out[0] = (uint8_t)reg;
++	return 1;
++}
++
++/* words the CCI read buffer holds after a read of len bytes (one more byte: the address echo) */
++static inline uint32_t
++lcam_cci_read_words(uint32_t len)
++{
++	return len / 4u + 1u;
++}
++
++/*
++ * The read buffer words -> data bytes. The LS byte of the first word is the slave address byte the
++ * controller echoes (i2c-qcom-cci.c cci_i2c_read skips it). Returns the bytes stored.
++ */
++static inline uint32_t
++lcam_cci_unpack(const uint32_t *words, uint32_t nwords, uint8_t *buf, uint32_t len)
++{
++	uint32_t index = 0;
++	bool first = true;
++
++	for (uint32_t w = 0; w < nwords; w++) {
++		for (uint32_t i = 0; i < 4 && index < len; i++) {
++			if (first) {
++				first = false;
++				continue;
++			}
++			buf[index++] = (uint8_t)(words[w] >> (i * 8));
++		}
++	}
++	return index;
++}
++
++/* chip ID bytes (big-endian, as mm-camera's 16-bit data read) -> the candidate that matches, or NULL */
++static inline const struct lcam_sensor *
++lcam_match(const struct lcam_slot *s, uint8_t addr, const uint8_t b[2])
++{
++	uint16_t id = (uint16_t)(b[0] << 8 | b[1]);
++
++	for (unsigned i = 0; i < LCAM_MAX_CAND && s->cand[i]; i++) {
++		if (s->cand[i]->addr == addr && s->cand[i]->id == id) {
++			return s->cand[i];
++		}
++	}
++	return NULL;
++}
++
++/* ---- TLMM (pinctrl-trinket.c: tiles, functions) ------------------------------------------------------ */
++
++#define LCAM_TLMM_PA            0x00400000u
++#define LCAM_TILE_WEST          0x00100000u
++#define LCAM_TILE_SOUTH         0x00500000u
++#define LCAM_TILE_EAST          0x00900000u
++
++/* the tile of each GPIO the camera uses, from the PINGROUP table (0 = not a camera pin) */
++static inline uint32_t
++lcam_tile(unsigned gpio)
++{
++	switch (gpio) {
++	case 14: case 15:
++		return LCAM_TILE_WEST;
++	case 34: case 35: case 36: case 37: case 44: case 46: case 48: case 49: case 82:
++		return LCAM_TILE_SOUTH;
++	case 20: case 21: case 38: case 39: case 40: case 41: case 42: case 114: case 115: case 123:
++		return LCAM_TILE_EAST;
++	default:
++		return 0;
++	}
++}
++
++/* TLMM control register: pull 1:0 (0 none, 1 down, 3 up), function 5:2, drive 8:6 (2 mA = 0), OE 9 */
++#define LCAM_PULL_NONE          0u
++#define LCAM_PULL_DOWN          1u
++#define LCAM_PULL_UP            3u
++static inline uint32_t
++lcam_pin_ctl(uint32_t func, uint32_t pull, bool oe)
++{
++	return pull | func << 2 | (oe ? 1u << 9 : 0u);
++}
++
++/* MCLK n: the TLMM pin and its cam_mclk function number (gpio 44 has it as function 7) */
++static const struct {
++	uint8_t gpio, func;
++} lcam_mclk_pin[4] = { { 34, 1 }, { 35, 1 }, { 36, 1 }, { 44, 7 } };
++/* CCI masters: SDA, SCL pins, function cci_i2c = 1 (trinket-camera.dtsi cci gpios 37-40) */
++static const uint8_t lcam_cci_pin[2][2] = { { 37, 38 }, { 39, 40 } };
++
++#endif /* LAUREL_CAM_CORE_H */
+diff -ruN a/bsd/dev/laurel_cam.h b/bsd/dev/laurel_cam.h
+--- a/bsd/dev/laurel_cam.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_cam.h	2026-11-01 07:58:20.110801736 +0530
+@@ -0,0 +1,45 @@
++/*
++ * laurel_sprout (Xiaomi Mi A3, SM6125) camera (laurel 2770): kernel-side declarations.
++ * Docs: iOSPlus10 docs/laurel_sprout/camera.md.
++ *
++ * Files (one step each):
++ *   laurel_cam_core.h  slot/sensor tables from the stock sensor libraries, CCI command packing, TLMM numbers (pure)
++ *   laurel_cam_hw.c    mappings, camss_top GDSC, GCC camera branches + CCI/MCLK RCGs, TLMM pins, PM6125 L12A (RPM)
++ *   laurel_cam_cci.c   the CCI I2C controller 0x5c0c000 (2 masters), polled
++ *   laurel_cam.c       start: kill switch camera=0, power-up + chip ID per slot, the one result line, sysctl
++ * Rules (CLAUDE.md, laurel): RPM only through topaz_rpm_write; no SPMI, TrustZone, SMMU or memory pool use in step 1.
++ */
++#ifndef LAUREL_CAM_H
++#define LAUREL_CAM_H
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <mach/vm_types.h>
++
++#define LCAM_SAY(...)           printf("LAUREL CAMERA: " __VA_ARGS__)
++
++/* ---- hardware (laurel_cam_hw.c) --------------------------------------------------------------- */
++
++struct lcam_hw_state;                           /* what the boot left on: restored by lcam_hw_off */
++
++int lcam_hw_on(const char **why);               /* GDSC, AHB + CCI clocks, CCI pins; 0 or errno */
++void lcam_hw_off(void);                         /* CCI clocks, MCLKs, GDSC back as the boot left them */
++uint32_t lcam_cci_hz(void);                     /* the CCI core clock set by lcam_hw_on */
++int lcam_mclk(unsigned n, bool on);             /* GCC MCLK n at 19.2 MHz (TCXO) + its pin; 0 or errno */
++void lcam_gpio(unsigned gpio, bool high);       /* output, no pull, 2 mA */
++void lcam_gpio_release(unsigned gpio);          /* input, pull-down (sensor unpowered) */
++int lcam_rail(bool on, const char **why);       /* PM6125 L12A 1.8 V over the RPM; 0 or errno */
++vm_offset_t lcam_cci_base(void);
++void lcam_sleep_ms(uint32_t ms);
++
++/* ---- CCI (laurel_cam_cci.c) -------------------------------------------------------------------- */
++
++int lcam_cci_init(const char **why);            /* reset, timing of both masters; 0 or errno */
++uint32_t lcam_cci_version(void);
++void lcam_cci_stop(void);                       /* status bits masked and cleared (before the clocks go off) */
++void lcam_cci_speed(unsigned master, unsigned speed);  /* LCAM_I2C_100K / LCAM_I2C_400K */
++/* write then read (STOP between, as Linux i2c-qcom-cci); 0, ENXIO (NACK), EIO, ETIMEDOUT */
++int lcam_cci_write_read(unsigned master, uint8_t addr7, const uint8_t *w, uint32_t wn, uint8_t *r, uint32_t rn);
++int lcam_cci_write(unsigned master, uint8_t addr7, const uint8_t *w, uint32_t wn);
++
++#endif /* LAUREL_CAM_H */
+diff -ruN a/bsd/dev/laurel_cam_hw.c b/bsd/dev/laurel_cam_hw.c
+--- a/bsd/dev/laurel_cam_hw.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_cam_hw.c	2026-11-01 07:52:42.255531864 +0530
+@@ -0,0 +1,312 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) camera (laurel 2770), step 1a: the camera subsystem's power, clocks, pins, rail.
++ * Numbers [V external/laurel-kernel-los]: gcc-trinket.c (branches, RCGs, GPLL0), trinket-gdsc.dtsi (camss_top_gdsc
++ * 0x145607c), trinket-camera.dtsi (CCI 0x5c0c000, clocks 19.2/37.5 MHz, pins 37-40 cci_i2c pull-up 2 mA),
++ * pinctrl-trinket.c (tiles, cam_mclk functions), trinket-regulator.dtsi (L12A 1.8-1.996 V).
++ * Order: GDSC on, camera AHB + camss top AHB, CCI RCG 37.5 MHz (GPLL0 early / 16; 19.2 MHz TCXO when GPLL0 is not
++ * locked, with the matching CCI timing set), CCI AHB + core clocks, CCI pins. Every branch must report on
++ * (CLK_OFF clear) before the CCI is touched: a block without its clock can stall the bus.
++ * MCLK: 19.2 MHz straight from the TCXO (RCG source 0, no divider, no PLL). The sensor libraries ask for 24 MHz
++ * (19.2 MHz for the S5KGD1); I2C works with any input clock in the sensors' range, so the ID read does not need
++ * GPLL9. Streaming (step 2) moves to GPLL9 M/N 1/24 for the 24 MHz modes.
++ * Off = everything back as the boot left it (the enable bits and the GDSC are saved by lcam_hw_on).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include "laurel_cam.h"
++#include "laurel_cam_core.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void IOSleep(unsigned int milliseconds);
++extern bool topaz_soc_map(void);
++extern bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++
++#define MAP_ALIGN               0x4000u
++#define GCC_PA                  0x01400000u
++#define GCC_SIZE                0x80000u
++#define CCI_PA                  0x05c0c000u
++#define CCI_SIZE                0x4000u
++
++#define GPLL0_MODE              0x00000u        /* alpha PLL mode: bit 31 lock detect */
++#define GPLL_VOTE               0x79000u        /* APCS GPLL vote: bit 0 GPLL0 */
++#define CBCR_CAMERA_AHB         0x17008u        /* BRANCH_HALT_DELAY: no status, wait */
++#define CBCR_TOP_AHB            0x560a0u
++#define CBCR_CCI_AHB            0x52020u
++#define CBCR_CCI                0x5201cu
++#define RCG_CCI                 0x52004u
++#define RCG_MCLK(n)             (0x51000u + 0x1cu * (n))
++#define CBCR_MCLK(n)            (0x51018u + 0x1cu * (n))
++#define GDSC_CAMSS_TOP          0x5607cu
++#define GDSC_SW_COLLAPSE        (1u << 0)
++#define GDSC_PWR_ON             (1u << 31)
++#define CLK_ENABLE              (1u << 0)
++#define CLK_OFF                 (1u << 31)
++#define RCG_CMD_UPDATE          (1u << 0)
++#define RCG_CFG                 0x4u
++#define RCG_CFG_MASK            (0x1fu | 7u << 8 | 3u << 12)
++
++#define RPM_LDOA                0x616f646cu     /* "ldoa" */
++#define RPM_KEY_UV              0x00007675u     /* "uv" */
++#define RPM_KEY_SWEN            0x6e657773u     /* "swen" */
++#define L12A                    12u
++
++static vm_offset_t gcc, cci;
++static vm_offset_t tlmm[133];
++static uint32_t cci_hz;
++static struct {
++	bool saved;
++	uint32_t gdsc, camera_ahb, top_ahb, cci_ahb, cci, cci_rcg_cfg;
++} boot;
++
++static inline uint32_t
++rd(vm_offset_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static inline void
++wr(vm_offset_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static vm_offset_t
++map(uint32_t pa, uint32_t size)
++{
++	uint32_t base = pa & ~(MAP_ALIGN - 1u), len = (pa + size - base + MAP_ALIGN - 1u) & ~(MAP_ALIGN - 1u);
++	vm_offset_t va = ml_io_map(base, len);
++	return va ? va + (pa - base) : 0;
++}
++
++static bool
++wait_bits(vm_offset_t reg, uint32_t mask, bool set, uint32_t us)
++{
++	for (uint32_t t = 0; t <= us; t += 5) {
++		if (((rd(reg) & mask) != 0) == set) {
++			return true;
++		}
++		delay(5);
++	}
++	return false;
++}
++
++void
++lcam_sleep_ms(uint32_t ms)
++{
++	if (ms) {
++		IOSleep(ms);
++	}
++}
++
++vm_offset_t
++lcam_cci_base(void)
++{
++	return cci;
++}
++
++uint32_t
++lcam_cci_hz(void)
++{
++	return cci_hz;
++}
++
++/* BRANCH_HALT: CLK_OFF clears within 500 us of the enable */
++static bool
++branch_on(uint32_t cbcr)
++{
++	wr(gcc + cbcr, rd(gcc + cbcr) | CLK_ENABLE);
++	return wait_bits(gcc + cbcr, CLK_OFF, false, 500);
++}
++
++static void
++branch_restore(uint32_t cbcr, uint32_t was)
++{
++	wr(gcc + cbcr, (rd(gcc + cbcr) & ~CLK_ENABLE) | (was & CLK_ENABLE));
++}
++
++/* clk-rcg2.c: CFG = source 10:8 | mode 13:12 | hid 4:0; then CMD bit 0 (update), cleared by the hardware */
++static bool
++rcg_set(uint32_t rcg, uint32_t src, uint32_t hid)
++{
++	wr(gcc + rcg + RCG_CFG, (rd(gcc + rcg + RCG_CFG) & ~RCG_CFG_MASK) | src << 8 | hid);
++	wr(gcc + rcg, rd(gcc + rcg) | RCG_CMD_UPDATE);
++	return wait_bits(gcc + rcg, RCG_CMD_UPDATE, false, 500);
++}
++
++static vm_offset_t
++pin(unsigned gpio)
++{
++	uint32_t tile = lcam_tile(gpio);
++
++	if (gpio >= sizeof(tlmm) / sizeof(tlmm[0]) || tile == 0) {
++		return 0;
++	}
++	if (!tlmm[gpio]) {
++		tlmm[gpio] = map(LCAM_TLMM_PA + tile + 0x1000u * gpio, 8u);
++	}
++	return tlmm[gpio];
++}
++
++/* output level first (io register bit 1), then the direction: no glitch to the other level */
++void
++lcam_gpio(unsigned gpio, bool high)
++{
++	vm_offset_t p = pin(gpio);
++
++	if (p) {
++		wr(p + 4u, high ? 2u : 0u);
++		wr(p, lcam_pin_ctl(0, LCAM_PULL_NONE, true));
++	}
++}
++
++void
++lcam_gpio_release(unsigned gpio)
++{
++	vm_offset_t p = pin(gpio);
++
++	if (p) {
++		wr(p, lcam_pin_ctl(0, LCAM_PULL_DOWN, false));
++	}
++}
++
++int
++lcam_mclk(unsigned n, bool on)
++{
++	vm_offset_t p;
++
++	if (n >= 4 || !gcc || !(p = pin(lcam_mclk_pin[n].gpio))) {
++		return ENODEV;
++	}
++	if (!on) {
++		wr(p, lcam_pin_ctl(0, LCAM_PULL_DOWN, false));   /* trinket-pinctrl cam_sensor_mclk*_suspend: pull-down */
++		wr(gcc + CBCR_MCLK(n), rd(gcc + CBCR_MCLK(n)) & ~CLK_ENABLE);
++		return 0;
++	}
++	if (!rcg_set(RCG_MCLK(n), 0, 0) || !branch_on(CBCR_MCLK(n))) {
++		LCAM_SAY("clk: MCLK%u RCG cmd %#x cfg %#x CBCR %#x\n", n, rd(gcc + RCG_MCLK(n)),
++		    rd(gcc + RCG_MCLK(n) + RCG_CFG), rd(gcc + CBCR_MCLK(n)));
++		return ENXIO;
++	}
++	wr(p, lcam_pin_ctl(lcam_mclk_pin[n].func, LCAM_PULL_NONE, false));
++	return 0;
++}
++
++int
++lcam_rail(bool on, const char **why)
++{
++	static bool mapped;
++	bool ok = true;
++
++	if (!mapped) {
++		(void)topaz_soc_map();          /* maps APCS (the RPM doorbell); its pool answer is not needed here */
++		mapped = true;
++	}
++	for (uint32_t set = 0; set <= 1; set++) {
++		if (on) {
++			ok &= topaz_rpm_write(set, RPM_LDOA, L12A, RPM_KEY_UV, 1800000u);
++		}
++		ok &= topaz_rpm_write(set, RPM_LDOA, L12A, RPM_KEY_SWEN, on ? 1u : 0u);
++	}
++	if (!ok) {
++		*why = "RPM refused PM6125 L12A (camera VIO 1.8 V)";
++		return EIO;
++	}
++	return 0;
++}
++
++int
++lcam_hw_on(const char **why)
++{
++	if (!gcc) {
++		gcc = map(GCC_PA, GCC_SIZE);
++	}
++	if (!cci) {
++		cci = map(CCI_PA, CCI_SIZE);
++	}
++	if (!gcc || !cci) {
++		*why = "register mapping failed";
++		return ENOMEM;
++	}
++	boot.gdsc = rd(gcc + GDSC_CAMSS_TOP);
++	boot.camera_ahb = rd(gcc + CBCR_CAMERA_AHB);
++	boot.top_ahb = rd(gcc + CBCR_TOP_AHB);
++	boot.cci_ahb = rd(gcc + CBCR_CCI_AHB);
++	boot.cci = rd(gcc + CBCR_CCI);
++	boot.cci_rcg_cfg = rd(gcc + RCG_CCI + RCG_CFG);
++	boot.saved = true;
++
++	/* gdsc-regulator.c: clear SW_COLLAPSE, PWR_ON within the timeout */
++	if (!(boot.gdsc & GDSC_PWR_ON)) {
++		wr(gcc + GDSC_CAMSS_TOP, rd(gcc + GDSC_CAMSS_TOP) & ~GDSC_SW_COLLAPSE);
++		if (!wait_bits(gcc + GDSC_CAMSS_TOP, GDSC_PWR_ON, true, 1000)) {
++			LCAM_SAY("clk: camss_top GDSC %#x -> %#x\n", boot.gdsc, rd(gcc + GDSC_CAMSS_TOP));
++			*why = "camss_top GDSC does not power on";
++			return ENXIO;
++		}
++	}
++	wr(gcc + CBCR_CAMERA_AHB, rd(gcc + CBCR_CAMERA_AHB) | CLK_ENABLE);
++	delay(10);
++	if (!branch_on(CBCR_TOP_AHB)) {
++		LCAM_SAY("clk: camss top AHB CBCR %#x\n", rd(gcc + CBCR_TOP_AHB));
++		*why = "camss top AHB clock does not run";
++		return ENXIO;
++	}
++	/* CCI core clock: 37.5 MHz = GPLL0 early (600 MHz) / 16 (hid 31) as trinket-camera.dtsi asks */
++	wr(gcc + GPLL_VOTE, rd(gcc + GPLL_VOTE) | 1u);
++	if (wait_bits(gcc + GPLL0_MODE, 1u << 31, true, 200) && rcg_set(RCG_CCI, 1, 31)) {
++		cci_hz = 37500000;
++	} else if (rcg_set(RCG_CCI, 0, 0)) {
++		cci_hz = 19200000;
++	} else {
++		LCAM_SAY("clk: CCI RCG cmd %#x cfg %#x, GPLL0 mode %#x\n", rd(gcc + RCG_CCI),
++		    rd(gcc + RCG_CCI + RCG_CFG), rd(gcc + GPLL0_MODE));
++		*why = "CCI clock source does not switch";
++		return ENXIO;
++	}
++	if (!branch_on(CBCR_CCI_AHB) || !branch_on(CBCR_CCI)) {
++		LCAM_SAY("clk: CCI AHB CBCR %#x, CCI CBCR %#x\n", rd(gcc + CBCR_CCI_AHB), rd(gcc + CBCR_CCI));
++		*why = "CCI clocks do not run";
++		return ENXIO;
++	}
++	for (unsigned m = 0; m < 2; m++) {
++		for (unsigned i = 0; i < 2; i++) {
++			vm_offset_t p = pin(lcam_cci_pin[m][i]);
++			if (!p) {
++				*why = "TLMM mapping failed";
++				return ENOMEM;
++			}
++			wr(p, lcam_pin_ctl(1, LCAM_PULL_UP, false));
++		}
++	}
++	LCAM_SAY("clk: camss_top GDSC on (was %s), CCI %u Hz, GDSC %#x\n",
++	    (boot.gdsc & GDSC_PWR_ON) ? "on" : "off", cci_hz, rd(gcc + GDSC_CAMSS_TOP));
++	return 0;
++}
++
++void
++lcam_hw_off(void)
++{
++	if (!gcc || !boot.saved) {
++		return;
++	}
++	for (unsigned n = 0; n < 4; n++) {
++		(void)lcam_mclk(n, false);
++	}
++	branch_restore(CBCR_CCI, boot.cci);
++	branch_restore(CBCR_CCI_AHB, boot.cci_ahb);
++	wr(gcc + RCG_CCI + RCG_CFG, (rd(gcc + RCG_CCI + RCG_CFG) & ~RCG_CFG_MASK) | (boot.cci_rcg_cfg & RCG_CFG_MASK));
++	wr(gcc + RCG_CCI, rd(gcc + RCG_CCI) | RCG_CMD_UPDATE);
++	(void)wait_bits(gcc + RCG_CCI, RCG_CMD_UPDATE, false, 500);
++	branch_restore(CBCR_TOP_AHB, boot.top_ahb);
++	branch_restore(CBCR_CAMERA_AHB, boot.camera_ahb);
++	if (!(boot.gdsc & GDSC_PWR_ON)) {
++		wr(gcc + GDSC_CAMSS_TOP, rd(gcc + GDSC_CAMSS_TOP) | GDSC_SW_COLLAPSE);
++	}
++	boot.saved = false;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

@@ -4259,7 +4259,70 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - [V] Host test `scripts/laurel/test-cell.sh` (8 scenarios, simulated modem) found 2 bugs before any boot: the first `on`
   line came before provisioning finished and before the first signal answer.
 - Build [V]: kernel-linux.sh 246/246 patches, 0 LSE, no warnings in the new code. No root change for step 1.
-## Mi A3: brightness slider without effect = LP commands with no DMA line in video mode; 2201 fix. Flashlight = 2770 + LaurelFlashlight.driver (2026-11-01 08:10, branch t3/laurel-brightness-torch; build only, NOT BOOTED)
+## Mi A3: kernel log "flashes" on the idle GL UI = surface-1 frames flipped to a back buffer with a boot console frame; 2104 (2026-11-01 07:50, branch t3/laurel-fb-console-flash)
+- Details: docs/laurel_sprout/gpu.md section "Console flash".
+- [V log 07:20:52 boot, usblog-20261101-001446 lines 53628-55557] backboardd presents surface 1 (= AppleCLCD fSurface =
+  boot framebuffer 0x5c000000, GL draws into it: `RedwoodGPU: surface 1 ... shared at 0x5c000000`) between GPU-pool
+  frames: `SWEET FB: swap 6/8/.../70 layer 0 surface 1`. Every GL boot since 06:12 has such swaps.
+- [V source] Such a swap took the copy path, which skipped fSurface ("already on the panel") and flipped to the back
+  buffer. GPU-pool frames are scanned directly and never write the flip buffers, so they still held console frames from
+  boot: each surface-1 frame showed the old kernel log until the next GPU-pool frame. Without GL the direct frames go
+  through flipFrom (back buffer = a recent UI frame): no text.
+- [V source] After sweet_console_retarget the video console draws only into the cached shadow fCons (scanned only by
+  sweet_cons_show at a panic); kprintf is ring-only (2014); sweet_early is off after arm_init. So nothing draws text into
+  the scanout after the UI starts; the text was old frames.
+- Fix 2104: surface-1 swaps direct (MDP scans 0x5c000000); 0x5c000000 cleared of boot text at start after the first
+  console flip latched; copy path copies surface 1 and clears stale flip buffers; `LAUREL FB HANDOFF:` self-check at the
+  first iOS frame (console on its shadow, else muted; panic still draws). Kill switch fbhandoff=0.
+- Rule: a surface that the panel does not scan must never be "skipped" in a compose; any buffer the MDP may flip to must
+  hold an iOS frame (or black), never a kernel frame, once iOS presents.
+- Base fix: origin/laurel-int-1 1c04a5e did not build: 2720 and 2760 both add a line after laurel_reboot.c in
+  bsd/conf/files (`patch 2760 ... does not apply`, 247 of 249). 2760's hunk now has 2720's line as context.
+- Built 07:41 in the worktree: 249/249 patches applied, 0 LSE, no warnings in the changed files,
+  kernel.development.sweet.4k sha256 793f6122c78e2d8ef2b7b2ba73997f8cc82419d8de32231eb06f15bb25519658. NOT BOOTED.
+
+## Mi A3: stage-1 check failure turned the GPU off; BT chip is WCN3950 family (2026-11-01 07:45, branch t3/laurel-smmu-pool-bt, 2157 + 2600)
+- Details: docs/laurel_sprout/gpu.md "Stage-1 check failure", docs/laurel_sprout/bluetooth.md "The chip is WCN3950 family".
+- [V log 07:19] 2154's hw_start seeded the GPU VA allocator through `redwood_gpu_address_free` = the pool free in pass-through;
+  2156 refuses it (`free of 0x1000000+0xef000000 refused`, caller topaz_adreno_thread + 0x178). Fix: `va_seed()` sets the range.
+- [V source] The "ring stuck ... FSR 00000400" line came AFTER `back:` cleared FSR: only FORMAT (bits 10:9 = 2) is left; FAR
+  survives. Rule: read and log FSR/FAR/FSYNR0 before any FSR write. FAR 0xc0020040 = ring + 0x40 = the check's first fence.
+- [V source] A terminated CP fetch hangs the CP; going back to pass-through does not wake it. 2157 stalls faults during the
+  check (SCTLR.CFCFG) and retries the stalled access in pass-through (CB_RESUME TnR 0) only when it wanted our own memory
+  (CP buffers, GPU pool); else terminate + power cycle. [I] stall + retry-after-bypass is per the SMMUv2 design; not seen yet.
+- [V Linux] A610 has no usable RBBM_SW_RESET (a6xx_gpu_sw_reset skips it, "11nm ... reset line"); recovery = GPU power
+  collapse + zap resume (SCM SVC_BOOT 0x0a, args 0, 0) + re-init. The GPU SMMU is in the GPU CX domain: program it again.
+- [I] Cause of the ring fault still open: candidates CBA2R0.VA64 not taken (FORMAT 2), CBAR BPSHCFG 0 (reserved), TCR2
+  without AS/SEP. 2157 uses Linux's values and logs CBA2R0 + the decoded fault + the CPU-side walk of FAR.
+- [V BTFM.bin + Linux btqca] Mi A3 BT chip: product 0x000f, ROM 0x0102, soc 0x40070120 = WCN3950 family; Linux number =
+  ((rom & 0xf00) >> 4) | (rom & 0xf) from the ROM version (soc_ver low 16 bits), not the SoC id -> cmbtfw12.tlv (product
+  0x000f, ROM build 0x0102) + cmnv12.bin. apbtfw*/crbtfw* are product 0x000a. cmnv12 tag 17 = `15 11 22 00 2e 00`: speed
+  index in byte 1 [I], not byte 2.
+- Tool: scripts/laurel/bt-fw-test.sh (host test of laurel_bt_fw.c from the patch on the stock BTFM files; firmware stays in
+  out/bt-fw, git-ignored).
+- Built 07:45 in the worktree: 248/248 patches, 0 LSE, kernel.development.sweet.4k sha256
+  64df80382164024d78dd90f85d06fe6307e4246a095db80af2073af39b472f0b. NOT BOOTED.
+## Mi A3: camera step 1 = power + CCI + chip ID of the 4 cameras; patch 2770 (2026-11-01, camera agent, branch t3/laurel-camera; build + host test only, NOT BOOTED)
+- Details: docs/laurel_sprout/camera.md (hardware table, path decision, steps, expected lines).
+- [V] SM6125 CAMSS is the old gen1 (sdm660 type): CCI, CSIPHY v3.5, CSID v5.0, ISPIF v3.0, VFE48, CPP, JPEG; no ICP and no camera
+  firmware in the DT. Mainline Linux has no sm6125 camss/cci node, but its sdm660 code (camss-csid-4-7, -vfe-4-8, -ispif,
+  -csiphy-3ph-1-0) and i2c-qcom-cci cci_v2 (= the trinket DT timing values) are the register reference.
+- [V] Sensor facts live in the stock `/vendor/lib/libmmcamera_laurus_<sensor>.so`: data-only libraries, one sensor_lib_t in .data.
+  Layout: name[32]; u32 slave (8-bit form), freq, addr_type, data_type; u16 id_reg, id at +0x30; power-up 12 x 16-byte steps at
+  +0x5e08 (count +0x5ec8), power-down at +0x5ecc (count +0x5f8c); steps {type 0 CLK/1 GPIO/2 VREG, val, config, delay ms} with the
+  4.14 uapi enums; mode table = count + 0x60-byte records {x, y, line_length, frame_length, 0, vt_pixel_clk, ...}; register tables
+  {u16 addr, u16 data, u32 delay}. scripts/laurel/camera-sensors.py decodes it (camera-inventory.sh extracts from vendor.img).
+- [V] Mi A3 rails are GPIO-switched LDOs (the QRD PM8008 L1P-L5P are disabled in trinket.dtsi) + PM6125 L12A for VIO ("VREG VIO").
+  Front and ultrawide share CSIPHY2/CSID2 through a MIPI switch on gpio 114/115. MCLK3 is gpio 44 function 7 (not 1).
+- [V] The IMX586 init table sets INCK 0x0136 = 0x1800 (24 MHz); step 1 uses 19.2 MHz TCXO MCLK only for the ID read [I: fine for
+  I2C]; streaming needs 24 MHz (GPLL9 M/N 1/24).
+- Fix on the base: 2760's bsd/conf/files hunk did not apply after 2720 (laurel_rtc.c line); context refreshed, no code change.
+- Build [V]: kernel-linux.sh 252/252 patches (merged laurel-int-1 16b1a73), 0 LSE, no warnings in laurel_cam*.c; kernel sha256 e0707f0d...; cam-test 69/69 (9
+  library entries cross-checked against sensors.txt).
+- Next: boot (boot_b flash, owner), expect `LAUREL CAMERA: on: rear IMX586 (0x1a id 0x0586), depth ..., front S5KGD1 ...,
+  ultrawide S5K4H7 ...`; a NACK on one slot = check that slot's rail/reset pins. Then step 2 (RDI frames), step 3 (/dev node),
+  step 4 (iOS plug-in from userland/camera).
+## Mi A3: brightness slider without effect = LP commands with no DMA line in video mode; 2201 fix. Flashlight = 2780 + LaurelFlashlight.driver (2026-11-01 08:10, branch t3/laurel-brightness-torch; build only, NOT BOOTED)
 - Details: docs/laurel_sprout/brightness.md, docs/laurel_sprout/torch.md.
 - [V log 07:20:52 boot] slider 129..237 -> DBV 523..1768 at 07:27:28, no `panel level` line after. [V code] setPanelLevel
   logged its first 8 calls only (self-check + 0x203 + 6 fade steps = 8): the writes after were silent, not missing. No
@@ -4283,7 +4346,7 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - [V] origin/laurel-int-1 at 1c04a5e did not build: 2760's bsd/conf/files hunk failed after 2720; context refreshed here.
 - Worktree build recipe: link external/* refs and out/laurel-kernel/{deps,theos,cache} from the main checkout, then
   `AUDIT=1 scripts/laurel/kernel-linux.sh` gives a patched tree in ~10 s (commit it as a local baseline, edit, git diff).
-- Build [V]: 249/249 patches, 0 LSE, kernel.development.sweet.4k sha256 f5e631b49c0833ff62bfc51582a698a51841c370f7819895a29e80f4aeed29aa; LaurelFlashlight.driver built.
+- Build [V]: 252/252 patches (after the merge of laurel-int-1 16b1a73; torch renumbered 2770 -> 2780, 2770 = camera), 0 LSE, kernel.development.sweet.4k sha256 468b1abc685ceb351d8a87e13f9cb40d6edb2d3392ca602f7992079ea25195e9; LaurelFlashlight.driver built.
 - Next boot lines: `LAUREL BACKLIGHT: on: ... DCS HS, DMA at line 1567 ...`, `LAUREL BACKLIGHT: brightness N of 255 from
   backboardd -> DBV D (...): panel at it, W panel writes, 0 failed`, `LAUREL TORCH: on: PMI632 flash LED SID3 0xd300 ...`,
   `LAUREL TORCH UI: on: ...` (root with the plug-in), `LAUREL FLASHLIGHT: on: FigFlashlight server started ...`.

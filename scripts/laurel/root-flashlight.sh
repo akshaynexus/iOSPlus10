@@ -1,5 +1,5 @@
 #!/bin/bash
-# The Mi A3 flashlight in the iOS 16 root (kernel side: patches/laurel/xnu/2770, /dev/laureltorch).
+# The Mi A3 flashlight in the iOS 16 root (kernel side: patches/laurel/xnu/2780, /dev/laureltorch).
 #   sudo scripts/laurel/root-flashlight.sh MOUNTED_ROOT      (root.sh step 2 calls this; TORCH=0 skips)
 # Installs /System/Library/Audio/Plug-Ins/HAL/LaurelFlashlight.driver (root:wheel, 755/644): the mediaserverd plug-in
 # that gives FigFlashlight (Control Center, AVFlashlight) a torch device and starts its server

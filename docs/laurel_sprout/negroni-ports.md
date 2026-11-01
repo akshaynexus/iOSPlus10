@@ -30,7 +30,7 @@ mechanically: each port is re-written on the topaz files as `patches/laurel/xnu/
 
 Also ADAPT later: 0220 (AKS selectors topaz lacks), 0210/0360 USB command server, 0367 UFS boot log,
 0398 framebuffer blend/scale, 0399 wired-memory guard, 0288 PSCI cpuidle (trinket idle states), 0382 adaptive polls,
-0297 mmio-try, 0387 torch (**done as laurel 2770**: PMI632 flash LED, `torch.md`), 0253 refresh step, 0363/0378 (only if laurel moves to Mu + UniXNU).
+0297 mmio-try, 0387 torch (**done as laurel 2780**: PMI632 flash LED, `torch.md`), 0253 refresh step, 0363/0378 (only if laurel moves to Mu + UniXNU).
 
 ## Skip [V]
 

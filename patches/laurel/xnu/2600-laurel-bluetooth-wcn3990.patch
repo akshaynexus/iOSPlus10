@@ -1,4 +1,4 @@
-laurel 2600: Bluetooth on the Mi A3. WCN3990 over the GENI UART of QUP1 SE9 (0x4c90000, GPIO 10-13 qup14): GCC wrap 1 votes + s4 RCG (DFS levels or the Linux table), FIFO mode, or SE DMA mode when the boot left the CPU FIFO interface off (GENI_IF_DISABLE_RO bit 0; as the 4.14 kernel drives the BT port: TX/RX DMA, RX ended by the stale timeout; apps SMMU identity for the QUP1 stream 0x143; buffers in the modem pool below 4 GiB; SE + 0x2000..0x2008 never touched), polled, RTS/CTS. Power: PM6125 L9/L16/L17/L23 through the RPM (topaz_rpm_write), power pulses 0xC0 at 2400 and 0xFC at 115200 (no BT_EN). Bring-up as Linux hci_qca/btqca: EDL version (vendor event), 0xfc48 to 3000000 baud, crbtfw%02x.tlv rampatch + crnv%02x.bin NVM (speed tag 17) read at run time from the phone's FAT16 bluetooth_b (then _a) partition, HCI reset, BD_ADDR (the chip's own if unique, else the ADT local-mac-address, 0xfc14 + read back). iOS side (negroni 0332/0333/0336/0337 path): kernel control com.apple.uart.bluetooth, /dev/uart.bluetooth, /dev/cu.bluetooth, /dev/btwake, HCI answers for bluetoothd's Broadcom vendor commands, in-band sleep bytes. LaurelBluetooth.cpp: ADT /arm-io/bluetooth nub gets the address in use, or is hidden when Bluetooth is off. One line: 'LAUREL BT: on: WCN3990 product .. rom .., crbtfw21.tlv + crnv21.bin, 3000000 baud, BD_ADDR ..' or 'LAUREL BT: off: <why>'. Kill switch laurelbt=0. One small file per step (bsd/dev/laurel_bt*.c). Details: docs/laurel_sprout/bluetooth.md.
+laurel 2600: Bluetooth on the Mi A3. WCN3990 over the GENI UART of QUP1 SE9 (0x4c90000, GPIO 10-13 qup14): GCC wrap 1 votes + s4 RCG (DFS levels or the Linux table), FIFO mode, or SE DMA mode when the boot left the CPU FIFO interface off (GENI_IF_DISABLE_RO bit 0; as the 4.14 kernel drives the BT port: TX/RX DMA, RX ended by the stale timeout; apps SMMU identity for the QUP1 stream 0x143; buffers in the modem pool below 4 GiB; SE + 0x2000..0x2008 never touched), polled, RTS/CTS. Power: PM6125 L9/L16/L17/L23 through the RPM (topaz_rpm_write), power pulses 0xC0 at 2400 and 0xFC at 115200 (no BT_EN). Bring-up as Linux hci_qca/btqca: EDL version (vendor event), 0xfc48 to 3000000 baud, crbtfw%02x.tlv rampatch + crnv%02x.bin NVM (speed tag 17) read at run time from the phone's FAT16 bluetooth_b (then _a) partition, HCI reset, BD_ADDR (the chip's own if unique, else the ADT local-mac-address, 0xfc14 + read back). iOS side (negroni 0332/0333/0336/0337 path): kernel control com.apple.uart.bluetooth, /dev/uart.bluetooth, /dev/cu.bluetooth, /dev/btwake, HCI answers for bluetoothd's Broadcom vendor commands, in-band sleep bytes. LaurelBluetooth.cpp: ADT /arm-io/bluetooth nub gets the address in use, or is hidden when Bluetooth is off. One line: 'LAUREL BT: on: WCN3990 product .. rom .., crbtfw21.tlv + crnv21.bin, 3000000 baud, BD_ADDR ..' or 'LAUREL BT: off: <why>'. Kill switch laurelbt=0. One small file per step (bsd/dev/laurel_bt*.c). Details: docs/laurel_sprout/bluetooth.md. laurel 2601 (in this patch, bsd/dev/laurel_bt_fw.c): the Mi A3 chip is WCN3950 family (product 0x000f rom 0x0102 soc 0x40070120, boot 07:19); the file names come from the EDL ROM version as in Linux qca_uart_setup (cm: rom >> 4, cr: rom >> 4, ap: rom >> 5, WCN3998: rom >> 7), every candidate in the partition is read and its rampatch header picks it (product, then ROM build; product-only match = sent anyway, as Linux): cmbtfw12.tlv + cmnv12.bin. NVM tag-17 speed byte: Linux's byte (2, or 1 on WCN3991+) if it holds a speed index, else the other byte (cmnv12.bin: byte 1). Host test: scripts/laurel/bt-fw-test.sh.
 
 diff -ruN a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files	2026-11-01 05:15:56.526294173 +0530
@@ -1308,17 +1308,29 @@ diff -ruN a/bsd/dev/laurel_bt_fat.c b/bsd/dev/laurel_bt_fat.c
 diff -ruN a/bsd/dev/laurel_bt_fw.c b/bsd/dev/laurel_bt_fw.c
 --- a/bsd/dev/laurel_bt_fw.c	1970-01-01 05:30:00.000000000 +0530
 +++ b/bsd/dev/laurel_bt_fw.c	2026-11-01 05:15:56.551294408 +0530
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,280 @@
 +/*
 + * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 3b: rampatch + NVM download (Linux btqca.c
-+ * qca_uart_setup / qca_download_firmware / qca_tlv_check_data for the WCN3990).
-+ *   names: crbtfw%02x.tlv + crnv%02x.bin, %02x = ((rom & 0x0f00) >> 4) | (rom & 0x000f) (rom 0x0201 -> 21)
++ * qca_uart_setup / qca_download_firmware / qca_tlv_check_data for the WCN39xx family).
++ *   names (Linux qca_uart_setup; "rom" = the ROM version of the EDL answer, NOT the SoC id):
++ *     WCN3950 (product 0x0f)  cmbtfw%02x.tlv + cmnv%02x[t|s].bin, %02x = ((rom & 0x0f00) >> 4) | (rom & 0x000f)
++ *     WCN3990/3991 (0x0a)     crbtfw%02x.tlv + crnv%02x[u].bin, same number (rom 0x0201 -> 21)
++ *     WCN3988 (0x0a)          apbtfw%02x.tlv + apnv%02x.bin, %02x = ((rom & 0x0f00) >> 5) | (rom & 0x000f)
++ *     WCN3998 (0x0a)          crbtfw%02x.tlv, %02x = ((rom & 0xf000) >> 7) | (rom & 0x000f)
++ *   Linux takes the family from the DT compatible; here every candidate that exists in the firmware partition
++ *   is read and its rampatch header decides (patch_check): product = the chip's product, and the ROM build =
++ *   the chip's ROM (a product-only match is the fallback, as Linux sends any file).
++ *   Mi A3 (laurel 2601, 2026-11-01): product 0x000f patch 0x0001 rom 0x0102 soc 0x40070120 -> cmbtfw12.tlv
++ *   (product 0x000f, ROM build 0x0102) + cmnv12.bin. apbtfw10.tlv / crbtfw21.tlv are product 0x000a files.
 + *   each file goes whole, in 243-byte EDL segments: HCI 0xfc00 {0x1e, len, bytes}
 + *   answers: vendor event 04 ff 03 00 04 <result>; download mode (rampatch byte 14) 1 or 3 = only the last
 + *   segment is answered, 0 or 2 = every one (the last one always)
-+ *   NVM: tag 17 (HCI transport) byte 2 = the UART speed index (byte 1 on WCN3991 and newer); tag 2 = the NVM's
-+ *   own address (little-endian). The in-band sleep and deep-sleep bits stay as the file has them (the transport
-+ *   handles the in-band sleep bytes).
++ *   NVM: tag 17 (HCI transport): the UART speed index is byte 2 (Linux, < WCN3991) or byte 1 (WCN3991 and
++ *   newer). The WCN3950 file cmnv12.bin has another tag-17 layout (15 11 22 00 2e 00: byte 1 = 0x11 =
++ *   3200000, byte 2 = 0x22 is no speed index): the speed goes to the Linux byte if it holds a speed index,
++ *   else to the other byte if that one does; neither: the NVM is refused. Tag 2 = the NVM's own address
++ *   (little-endian). The in-band sleep and deep-sleep bits stay as the file has them (the transport handles
++ *   the in-band sleep bytes).
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -1328,6 +1340,9 @@ diff -ruN a/bsd/dev/laurel_bt_fw.c b/bsd/dev/laurel_bt_fw.c
 +
 +#define WCN3991_SOC     0x40014320u
 +#define ACK_MS          2000u
++#define QCA_SPEED_MAX   0x12u           /* Linux enum qca_baudrate: 0 (115200) .. 0x12 (3500000) */
++#define WCN3950_SOC_T   0x40074130u
++#define WCN3950_SOC_S   0x40075130u
 +
 +static int
 +wait_ack(const char **why)
@@ -1379,11 +1394,16 @@ diff -ruN a/bsd/dev/laurel_bt_fw.c b/bsd/dev/laurel_bt_fw.c
 +	return 0;
 +}
 +
-+/* rampatch (TLV type 1): length, product; 0 or EINVAL. *every = each segment is answered */
++/*
++ * rampatch (TLV type 1, Linux struct tlv_type_patch): TLV length = file size - 4, total size <= TLV length, data
++ * length < total size, product = the chip's product; strict: also ROM build = the chip's ROM. 0 or EINVAL (*why).
++ * *every = each segment is answered (download mode 0 or 2).
++ */
 +static int
-+patch_check(const uint8_t *p, uint32_t n, const struct lbt_qca_version *v, bool *every, const char **why)
++patch_check(const uint8_t *p, uint32_t n, const struct lbt_qca_version *v, bool strict, bool *every, const char **why)
 +{
-+	if (n < 28 || p[0] != 1 || (lbt_le32(p) >> 8) != n - 4) {
++	if (n < 28 || p[0] != 1 || (lbt_le32(p) >> 8) != n - 4 || lbt_le32(p + 4) > n - 4 ||
++	    lbt_le32(p + 8) >= lbt_le32(p + 4)) {
 +		*why = "not a TLV rampatch";
 +		return EINVAL;
 +	}
@@ -1391,8 +1411,9 @@ diff -ruN a/bsd/dev/laurel_bt_fw.c b/bsd/dev/laurel_bt_fw.c
 +		*why = "the rampatch is for another product";
 +		return EINVAL;
 +	}
-+	if (lbt_le16(p + 18) != v->rom) {
-+		LBT_SAY("fw: rampatch ROM build %#x, chip ROM %#x (sent anyway, as Linux does)\n", lbt_le16(p + 18), v->rom);
++	if (strict && lbt_le16(p + 18) != v->rom) {
++		*why = "the rampatch is for another ROM build";
++		return EINVAL;
 +	}
 +	*every = !(p[14] == 1 || p[14] == 3);
 +	return 0;
@@ -1400,7 +1421,8 @@ diff -ruN a/bsd/dev/laurel_bt_fw.c b/bsd/dev/laurel_bt_fw.c
 +
 +/* NVM (TLV type 2, or type 4 whose first member is type 2): every tag checked, then tag 17 gets the speed */
 +static int
-+nvm_prepare(uint8_t *d, uint32_t n, uint8_t baud, bool wcn3991, uint8_t addr[6], bool *have_addr)
++nvm_prepare(uint8_t *d, uint32_t n, uint8_t baud, bool wcn3991, uint8_t addr[6], bool *have_addr,
++    uint32_t *speed_byte)
 +{
 +	uint32_t base = 4, len, hci = 0;
 +
@@ -1444,7 +1466,16 @@ diff -ruN a/bsd/dev/laurel_bt_fw.c b/bsd/dev/laurel_bt_fw.c
 +	if (!hci) {
 +		return EINVAL;
 +	}
-+	d[hci + (wcn3991 ? 1 : 2)] = baud;
++	uint32_t at = hci + (wcn3991 ? 1 : 2), other = hci + (wcn3991 ? 2 : 1);
++	if (d[at] > QCA_SPEED_MAX && d[other] <= QCA_SPEED_MAX) {
++		LBT_SAY("fw: NVM tag 17 byte %u is %#x (no speed index), byte %u is %#x: the speed goes there\n", at - hci,
++		    d[at], other - hci, d[other]);
++		at = other;
++	} else if (d[at] > QCA_SPEED_MAX) {
++		return EINVAL;
++	}
++	*speed_byte = at - hci;
++	d[at] = baud;
 +	return 0;
 +}
 +
@@ -1459,50 +1490,99 @@ diff -ruN a/bsd/dev/laurel_bt_fw.c b/bsd/dev/laurel_bt_fw.c
 +	return e;
 +}
 +
++/* laurel 2601: the rampatch/NVM name pairs Linux would use for this chip, one per WCN39xx family */
++struct fw_pair {
++	char tlv[24], nvm[24];
++};
++
++static unsigned
++fw_pairs(const struct lbt_qca_version *v, struct fw_pair *c)
++{
++	unsigned r = v->rom, cr = ((r & 0x0f00u) >> 4) | (r & 0x000fu), ap = ((r & 0x0f00u) >> 5) | (r & 0x000fu);
++	unsigned w98 = ((r & 0xf000u) >> 7) | (r & 0x000fu), k = 0;
++	const char *cmv = v->soc == WCN3950_SOC_T ? "t" : v->soc == WCN3950_SOC_S ? "s" : "";
++
++	snprintf(c[k].tlv, sizeof(c[k].tlv), "cmbtfw%02x.tlv", cr & 0xffu);
++	snprintf(c[k].nvm, sizeof(c[k].nvm), "cmnv%02x%s.bin", cr & 0xffu, cmv);
++	k++;
++	snprintf(c[k].tlv, sizeof(c[k].tlv), "crbtfw%02x.tlv", cr & 0xffu);
++	snprintf(c[k].nvm, sizeof(c[k].nvm), v->soc == WCN3991_SOC ? "crnv%02xu.bin" : "crnv%02x.bin", cr & 0xffu);
++	k++;
++	snprintf(c[k].tlv, sizeof(c[k].tlv), "apbtfw%02x.tlv", ap & 0xffu);
++	snprintf(c[k].nvm, sizeof(c[k].nvm), "apnv%02x.bin", ap & 0xffu);
++	k++;
++	if ((w98 & 0xffu) != (cr & 0xffu)) {
++		snprintf(c[k].tlv, sizeof(c[k].tlv), "crbtfw%02x.tlv", w98 & 0xffu);
++		snprintf(c[k].nvm, sizeof(c[k].nvm), "crnv%02x.bin", w98 & 0xffu);
++		k++;
++	}
++	return k;
++}
++
 +int
 +lbt_fw_download(const struct lbt_qca_version *v, uint8_t baud_idx, uint8_t nvm_addr[6], bool *have_addr,
 +    char *names, size_t names_len, const char **why)
 +{
 +	/*
-+	 * Linux btqca qca_uart_setup: the file number comes from the SoC version, not the ROM field:
-+	 * ((soc & 0xf00) >> 4) | (soc & 0xf). WCN3990/3991/3998 use crbtfw/crnv, WCN3988 uses apbtfw/apnv.
-+	 * Mi A3 seen 2026-11-01: soc 0x40070120, rom 0x0102 -> 10; the partition has apbtfw10.tlv + apnv10.bin
-+	 * (WCN3988) and no crbtfw10. Linux picks the prefix from the DT compatible; here the file that exists
-+	 * decides (cr first), and patch_check still checks the rampatch against the chip.
++	 * laurel 2601: every candidate name that exists is read once; its header picks it (patch_check): the first
++	 * exact match (product + ROM build) wins, else the first product match (the ROM differs: sent anyway, as
++	 * Linux sends any file). Linux checks nothing in the header; the product check keeps a rampatch for another
++	 * chip family off this one (the 07:19:32 boot: apbtfw10.tlv is product 0x000a, the chip is 0x000f).
 +	 */
-+	unsigned rom = ((v->soc & 0x0f00u) >> 4) | (v->soc & 0x000fu);
++	struct fw_pair c[4];
++	unsigned count = fw_pairs(v, c), loose = ~0u, pick = ~0u;
 +	bool wcn3991 = v->soc == WCN3991_SOC, every = true;
-+	char tlv[24], nvm[24], part[16];
++	char part[16], tried[96] = "";
++	uint32_t n = 0, speed_byte = 0;
 +	uint8_t *d = NULL;
-+	uint32_t n = 0;
 +	int e;
 +
-+	snprintf(tlv, sizeof(tlv), "crbtfw%02x.tlv", rom);
-+	snprintf(nvm, sizeof(nvm), wcn3991 ? "crnv%02xu.bin" : "crnv%02x.bin", rom);
-+	if ((e = lbt_fat_load(tlv, &d, &n, part, why)) != 0) {
-+		snprintf(tlv, sizeof(tlv), "apbtfw%02x.tlv", rom);
-+		snprintf(nvm, sizeof(nvm), "apnv%02x.bin", rom);
-+		if ((e = load(tlv, &d, &n, part, why)) != 0) {
-+			snprintf(names, names_len, "crbtfw%02x.tlv / %s", rom, tlv);
-+			return e;
++	for (unsigned i = 0; i < count && pick == ~0u; i++) {
++		const char *w = NULL;
++		size_t l = strlen(tried);
++
++		snprintf(tried + l, sizeof(tried) - l, "%s%.23s", l ? " " : "", c[i].tlv);
++		if (lbt_fat_load(c[i].tlv, &d, &n, part, &w) != 0) {
++			continue;                       /* not in the partition */
++		}
++		if (patch_check(d, n, v, true, &every, &w) == 0) {
++			pick = i;
++		} else {
++			LBT_SAY("fw: %s: product %#06x ROM build %#06x: %s\n", c[i].tlv, n >= 20 ? lbt_le16(d + 16) : 0,
++			    n >= 20 ? lbt_le16(d + 18) : 0, w);
++			if (loose == ~0u && patch_check(d, n, v, false, &every, &w) == 0) {
++				loose = i;
++			}
++			lbt_fw_free(d, n);
++			d = NULL;
 +		}
 +	}
-+	snprintf(names, names_len, "%s + %s", tlv, nvm);
-+	if ((e = patch_check(d, n, v, &every, why)) == 0) {
-+		LBT_SAY("fw: %s %u bytes from %s, mode %u\n", tlv, n, part, d[14]);
-+		e = send_file(d, n, every, why);
++	if (pick == ~0u && loose != ~0u && load(c[loose].tlv, &d, &n, part, why) == 0) {
++		pick = loose;
++		LBT_SAY("fw: %s: ROM build %#x, chip ROM %#x (sent anyway, as Linux does)\n", c[pick].tlv, lbt_le16(d + 18), v->rom);
 +	}
++	if (pick == ~0u) {
++		snprintf(names, names_len, "%s", tried);
++		*why = "no rampatch for this product in the firmware partition";
++		return ENOENT;
++	}
++	snprintf(names, names_len, "%s + %s", c[pick].tlv, c[pick].nvm);
++	(void)patch_check(d, n, v, false, &every, why);
++	LBT_SAY("fw: %s %u bytes from %s, product %#06x ROM build %#06x patch %#06x, mode %u\n", c[pick].tlv, n, part,
++	    lbt_le16(d + 16), lbt_le16(d + 18), lbt_le16(d + 20), d[14]);
++	e = send_file(d, n, every, why);
 +	lbt_fw_free(d, n);
 +	if (e) {
 +		return e;
 +	}
-+	if ((e = load(nvm, &d, &n, part, why)) != 0) {
++	if ((e = load(c[pick].nvm, &d, &n, part, why)) != 0) {
 +		return e;
 +	}
-+	if ((e = nvm_prepare(d, n, baud_idx, wcn3991, nvm_addr, have_addr)) != 0) {
++	if ((e = nvm_prepare(d, n, baud_idx, wcn3991, nvm_addr, have_addr, &speed_byte)) != 0) {
 +		*why = "NVM file format not known";
 +	} else {
-+		LBT_SAY("fw: %s %u bytes from %s, speed index %u\n", nvm, n, part, baud_idx);
++		LBT_SAY("fw: %s %u bytes from %s, speed index %u in tag 17 byte %u\n", c[pick].nvm, n, part, baud_idx,
++		    speed_byte);
 +		e = send_file(d, n, true, why);
 +	}
 +	lbt_fw_free(d, n);

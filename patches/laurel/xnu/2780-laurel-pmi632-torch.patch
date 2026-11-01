@@ -1,4 +1,4 @@
-laurel 2770: rear flashlight (torch) on the Mi A3. PMI632 flash LED module (qcom,qpnp-flash-led-v2, SPMI SID 3 0xD300, pmi632.dtsi:519; laurel uses torch_0 = LED1 only, ires 12.5 mA, DT max 950 mA) through the one SPMI core (user SWEET_SPMI_TORCH, sweet_spmi.c 2710 rule). Sequence as leds-qpnp-flash-v2.c qpnp_flash_led_switch_set: IRES 0x47, STROBE_CTRL 0x49 bit 2 = 0 (SW), TGR_CURRENT 0x43, SAFETY_TMR 0x40 = 0x13 (off: torch), MOD_CTRL 0x46 bit 7, then the PMI632 charger flash boost VREG_OK (SID 2 0xA607 bit 4, 5 ms x 60; 0xA608 & 7 = 7 = error), then EN_LED_CTRL 0x4C bit 0; off = EN_LED 0, MOD_CTRL off, TGR 0, timer 0x13. Every write read back; a failure = off for the boot (the off sequence still runs). Policy: 1..100 % = 12.5..150 mA (cap 150 mA, static assert <= DT max), auto-off 600 s, no light at an OTST level (LED_STATUS2 0x09 bits 0-2), lit: an OTST level, the led-fault bit (INT_RT bit 0; STATUS1 short/open and VPH droop named in the line) or a charger flash error turn it off (watch 100 ms); 3 faults = off. Halt/restart/panic: laurel_torch_quiesce (emergency SPMI writes, SweetPlatformExpert). iOS: /dev/laureltorch root:mobile 0660 (write "0".."100", read the state), LaurelTorch IOService (IOResources match) starts it; after the root mount IODeviceTree:/product/camera "flash" (MobileGestalt camera-flash = the Control Center button) only when the root has LaurelFlashlight.driver (userland/laurel/flashlight: mediaserverd plug-in that gives FigFlashlight a device whose TorchLevel lands here and starts the FigFlashlight server). Lines: `LAUREL TORCH: on: PMI632 flash LED SID3 0xd300 (...)` or `LAUREL TORCH: off: <why>`, `LAUREL TORCH UI: on|off: <why>`, `LAUREL TORCH: lit: P % = M mA (code C) by PROC`, `LAUREL TORCH: dark: <why> (lit N ms)`. Kill switch torch=0. Details: docs/laurel_sprout/torch.md.
+laurel 2780: rear flashlight (torch) on the Mi A3. PMI632 flash LED module (qcom,qpnp-flash-led-v2, SPMI SID 3 0xD300, pmi632.dtsi:519; laurel uses torch_0 = LED1 only, ires 12.5 mA, DT max 950 mA) through the one SPMI core (user SWEET_SPMI_TORCH, sweet_spmi.c 2710 rule). Sequence as leds-qpnp-flash-v2.c qpnp_flash_led_switch_set: IRES 0x47, STROBE_CTRL 0x49 bit 2 = 0 (SW), TGR_CURRENT 0x43, SAFETY_TMR 0x40 = 0x13 (off: torch), MOD_CTRL 0x46 bit 7, then the PMI632 charger flash boost VREG_OK (SID 2 0xA607 bit 4, 5 ms x 60; 0xA608 & 7 = 7 = error), then EN_LED_CTRL 0x4C bit 0; off = EN_LED 0, MOD_CTRL off, TGR 0, timer 0x13. Every write read back; a failure = off for the boot (the off sequence still runs). Policy: 1..100 % = 12.5..150 mA (cap 150 mA, static assert <= DT max), auto-off 600 s, no light at an OTST level (LED_STATUS2 0x09 bits 0-2), lit: an OTST level, the led-fault bit (INT_RT bit 0; STATUS1 short/open and VPH droop named in the line) or a charger flash error turn it off (watch 100 ms); 3 faults = off. Halt/restart/panic: laurel_torch_quiesce (emergency SPMI writes, SweetPlatformExpert). iOS: /dev/laureltorch root:mobile 0660 (write "0".."100", read the state), LaurelTorch IOService (IOResources match) starts it; after the root mount IODeviceTree:/product/camera "flash" (MobileGestalt camera-flash = the Control Center button) only when the root has LaurelFlashlight.driver (userland/laurel/flashlight: mediaserverd plug-in that gives FigFlashlight a device whose TorchLevel lands here and starts the FigFlashlight server). Lines: `LAUREL TORCH: on: PMI632 flash LED SID3 0xd300 (...)` or `LAUREL TORCH: off: <why>`, `LAUREL TORCH UI: on|off: <why>`, `LAUREL TORCH: lit: P % = M mA (code C) by PROC`, `LAUREL TORCH: dark: <why> (lit N ms)`. Kill switch torch=0. Details: docs/laurel_sprout/torch.md.
 
 diff --git a/bsd/conf/files b/bsd/conf/files
 index e55b7f7..d8e9a65 100644
@@ -19,7 +19,7 @@ index 0000000..5951c65
 +++ b/bsd/dev/laurel_torch.c
 @@ -0,0 +1,613 @@
 +/*
-+ * laurel_sprout (Xiaomi Mi A3, SM6125): the rear flashlight (torch) on the PMI632 flash LED (laurel 2770).
++ * laurel_sprout (Xiaomi Mi A3, SM6125): the rear flashlight (torch) on the PMI632 flash LED (laurel 2780).
 + *
 + * Hardware [V external/laurel-kernel-los]:
 + *   pmi632.dtsi:519   qcom,leds@d300 "qcom,qpnp-flash-led-v2", SPMI SID 3, base 0xD300; interrupts led-fault (0xd3, 0),
@@ -664,7 +664,7 @@ index 4fb99fa..6b46b13 100644
  	SWEET_SPMI_BATTERY,     /* laurel_pmi632.c, SweetBattery.cpp, laurel_thermal.c (sweet_spmi_read/_write) */
  	SWEET_SPMI_HAPTIC,      /* laurel_haptic.c */
  	SWEET_SPMI_RTC,         /* laurel_rtc.c (laurel 2720: PM6125 RTC_RW 0x6000, reads only) */
-+	SWEET_SPMI_TORCH,       /* laurel_torch.c (laurel 2770: PMI632 flash LED SID 3 0xd300, charger flash SID 2 0xa600 reads) */
++	SWEET_SPMI_TORCH,       /* laurel_torch.c (laurel 2780: PMI632 flash LED SID 3 0xd300, charger flash SID 2 0xa600 reads) */
  	SWEET_SPMI_USERS
  };
  int sweet_spmi_register(int user);
@@ -675,7 +675,7 @@ index 0000000..c543fb0
 +++ b/iokit/Kernel/arm/LaurelTorch.cpp
 @@ -0,0 +1,84 @@
 +/*
-+ * laurel_sprout (Mi A3): the flashlight service (laurel 2770). The hardware driver is bsd/dev/laurel_torch.c
++ * laurel_sprout (Mi A3): the flashlight service (laurel 2780). The hardware driver is bsd/dev/laurel_torch.c
 + * (PMI632 flash LED, /dev/laureltorch); this class starts it from IOKit matching (IOResources, as LaurelVibrator)
 + * and gives iOS the one thing it reads in the device tree:
 + *
@@ -766,7 +766,7 @@ index 77f54be..29f8188 100644
  /* laurel 2720: calendar from the PM6125 RTC + saved offset (bsd/dev/laurel_rtc.c) */
  void laurel_rtc_get(clock_sec_t *secs, clock_nsec_t *nsecs);
  void laurel_rtc_set(clock_sec_t secs, clock_nsec_t nsecs);
-+/* laurel 2770: torch LED off before halt, restart and the panic hold (bsd/dev/laurel_torch.c) */
++/* laurel 2780: torch LED off before halt, restart and the panic hold (bsd/dev/laurel_torch.c) */
 +void laurel_torch_quiesce(void);
  }
  
@@ -780,7 +780,7 @@ index 77f54be..29f8188 100644
 +	case kPEPanicDiagnosticsDone:
 +	case kPEPanicRestartCPU:
 +	case kPEPanicRestartCPUNoCallouts:
-+		laurel_torch_quiesce();         /* laurel 2770: no lit LED in a halt, a restart or a panic hold */
++		laurel_torch_quiesce();         /* laurel 2780: no lit LED in a halt, a restart or a panic hold */
 +		break;
 +	default:
 +		break;
