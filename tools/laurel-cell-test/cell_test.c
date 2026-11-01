@@ -50,7 +50,8 @@ static struct {
 	int prov_reqs, prov_session[4], prov_slot[4], set_online, binds[2];
 	int opmode_reads, opmode_err_left, opmode_later, opmode_after;   /* GET_OPERATING_MODE: errors first; the mode changes after opmode_after reads */
 	int set_refuse_left, bind_err_left[2], rsrp, rssi_only;          /* SET refused; BIND error 3; signal */
-	bool no_signal;
+	bool no_signal, mode_sticky;
+	int set_lpm, lpm_refuse, event_reports;                          /* laurel 2930: SET low power; its error; SET_EVENT_REPORT with mode reporting */
 } M;
 static uint32_t q_port[32], q_len[32];
 static uint8_t q_msg[32][512];
@@ -148,7 +149,12 @@ topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *dat
 		answer(src_port, 2, txn, msg, 0, tl, tn);
 		break;
 	case 0x4013:                                        /* DMS */
-		if (msg == 0x0023) {
+		if (msg == 0x0001) {
+			M.event_reports += d[7] == 0x14 && d[10] == 1;
+		} else if (msg == 0x0020) {
+			static const uint8_t cap[14] = { 0x00, 0x75, 0x12, 0x03, 0x00, 0x10, 0x5E, 0x5F, 1, 1, 3, 4, 5, 8 };
+			put_tlv(tl, &tn, 0x01, cap, sizeof(cap));
+		} else if (msg == 0x0023) {
 			put_tlv(tl, &tn, 0x01, "MPSS.AT.4.3.1.c1-00047", 22);
 		} else if (msg == 0x002D) {
 			uint8_t m;
@@ -164,6 +170,20 @@ topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *dat
 			}
 			m = (uint8_t)M.opmode;
 			put_tlv(tl, &tn, 0x01, &m, 1);
+			{
+				uint16_t why = 0;
+				put_tlv(tl, &tn, 0x10, &why, 2);
+				put_tlv(tl, &tn, 0x11, &m, 1);
+			}
+		} else if (msg == 0x002E && d[10] == 1) {
+			M.set_lpm++;
+			if (M.lpm_refuse != 0) {
+				answer(src_port, 2, txn, msg, (uint16_t)M.lpm_refuse, tl, 0);
+				return;
+			}
+			if (!M.mode_sticky) {
+				M.opmode = 1;
+			}
 		} else if (msg == 0x002E) {
 			M.set_online++;
 			if (M.set_refuse_left != 0) {
@@ -171,7 +191,9 @@ topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *dat
 				answer(src_port, 2, txn, msg, 0x34, tl, 0);
 				return;
 			}
-			M.opmode = 0;
+			if (!M.mode_sticky) {
+				M.opmode = 0;
+			}
 		}
 		answer(src_port, 2, txn, msg, 0, tl, tn);
 		break;
@@ -400,7 +422,7 @@ scenario(char s)
 int
 main(void)
 {
-	const char *all = "ABCDEFGHIJKLMNO";
+	const char *all = "ABCDEFGHIJKLMNOPQR";
 	int bad = 0;
 
 	for (const char *p = all; *p; p++) {

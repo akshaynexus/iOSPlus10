@@ -1,0 +1,345 @@
+laurel 2930: cellular: the radio goes online although DMS reports mode 5. Boot 22:50: both USIMs ready, Wi-Fi up, DMS 5 for the whole boot: no block on 5 after a 20 s grace time: low power, then online, 6 bounded rounds, each answer one line. Mode line with offline reason + hardware restricted, DMS mode indication, DMS GET_CAPABILITIES (LTE at most, X12), NAS bind ok line, state keys mode, caps, subN.plmn/ps/rsrp/rssi. SMP2P "master-kernel" entry = stock order, value 0. Docs: docs/laurel_sprout/cellular.md section 11.
+
+diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
+--- a/bsd/dev/laurel_cell.c	2026-11-01 23:19:26.768343129 +0530
++++ b/bsd/dev/laurel_cell.c	2026-11-01 23:20:45.282779780 +0530
+@@ -68,6 +68,8 @@
+ #define SVC_UIM             0x0B
+ 
+ /* message ids (libqmi qmi-service-*.json [V]; NAS BIND_SUBSCRIPTION from Qualcomm's NAS IDL [I]) */
++#define DMS_SET_EVENT       0x0001              /* also the indication's id */
++#define DMS_GET_CAPS        0x0020
+ #define DMS_GET_REVISION    0x0023
+ #define DMS_GET_OPMODE      0x002D
+ #define DMS_SET_OPMODE      0x002E
+@@ -93,7 +95,10 @@
+ #define NAS_PERIOD_MS       10000u
+ #define OPMODE_PERIOD_MS    10000u              /* DMS mode: read again until the modem is online */
+ #define OPMODE_ONLINE_MS    60000u              /* and more slowly after that */
+-#define ONLINE_TRIES        6u                  /* SET_OPERATING_MODE online, each after a read of the mode */
++#define ONLINE_TRIES        6u                  /* laurel 2930: rounds of (low power when needed, then online), 10 s apart, 30 s after an "ok" that changes nothing */
++#define MODE_GRACE_MS       20000u              /* laurel 2930: mode 4, 5 or unknown this long after DMS came up: ask all the same */
++#define LPM_GAP_MS          2000u               /* low power answered -> online */
++#define ONLINE_RECHECK_MS   30000u
+ #define BIND_TRIES          6u                  /* NAS BIND_SUBSCRIPTION: UIM still starting answers an error */
+ #define SAY_MIN_GAP_MS      10000u
+ 
+@@ -154,6 +159,10 @@
+ static uint64_t opmode_next, online_next;       /* next read of the mode, next ONLINE try */
+ static uint8_t online_tries;
+ static uint16_t online_err;                     /* last SET_OPERATING_MODE error */
++/* laurel 2930: the radio's start, one request at a time; every answer is one line */
++static bool dms_ev_done, caps_done, lpm_done, set_is_lpm;
++static uint64_t t_dms;
++static char caps[32];                           /* radio technologies the modem says it has: GSM,UMTS,LTE */
+ /*
+  * Self-check of the radio: the AP side of IPA (laurel 2780 laurel_ipa.c: firmware, GSI up, INIT_MODEM_DRIVER
+  * done over QMI 0x31). While it is not on, the modem is never set online; radio_why is its reason.
+@@ -209,7 +218,7 @@
+     NULL, 0, cell_sysctl, "A", "LAUREL cellular status (SIM 1/2, registration, signal; no ICCID/IMSI/IMEI)");
+ 
+ /* laurel 2786: the state for the SpringBoard bridge (the watch thread writes it), and the bridge's own result in the USB log (syslog does not reach it) */
+-static char state_text[512] = "state=starting\n";
++static char state_text[768] = "state=starting\n";
+ static void machine_text(char *out, size_t max);
+ 
+ static void
+@@ -531,7 +540,10 @@
+ 	if (n < max && opmode != 0 && sub_slot(0) >= 0 && !ipa_up()) {
+ 		n += snprintf(out + n, max - n, "; radio off: %s", radio_why);
+ 	} else if (n < max && opmode != 0 && online_tries >= ONLINE_TRIES) {
+-		n += snprintf(out + n, max - n, "; radio off: modem refused ONLINE %u times, error 0x%x", online_tries, online_err);
++		n += online_err != 0 ? snprintf(out + n, max - n, "; radio off: modem refused ONLINE %u times, error 0x%x", online_tries, online_err) :
++		    snprintf(out + n, max - n, "; radio off: modem answered ONLINE ok %u times and stays in this mode", online_tries);
++	} else if (n < max && opmode != 0 && online_tries > 0) {
++		n += snprintf(out + n, max - n, "; radio: asked ONLINE %u of %u times, last error 0x%x", online_tries, ONLINE_TRIES, online_err);
+ 	}
+ 	for (int sub = 0; sub < 2 && n < max && opmode == 0; sub++) {
+ 		int s = sub_slot(sub);
+@@ -637,7 +649,8 @@
+ 	size_t n = 0;
+ 	const char *st = state == -1 ? "off" : (state == 0 ? "starting" : "on");
+ 
+-	n += snprintf(out + n, max - n, "state=%s\nradio=%s\ndata=off\nsms=off\nvoice=off\n", st, state != -1 && opmode == 0 ? "online" : "off");
++	n += snprintf(out + n, max - n, "state=%s\nradio=%s\ndata=off\nsms=off\nvoice=off\nmode=%s\ncaps=%s\n", st,
++	    state != -1 && opmode == 0 ? "online" : "off", opmode_name(opmode), caps);
+ 	for (int sub = 0; sub < 2 && n < max; sub++) {
+ 		int s = sub_view_slot(sub);
+ 		const struct reg *r = &reg[sub];
+@@ -652,6 +665,19 @@
+ 		if (n >= max) {
+ 			return;
+ 		}
++		/* laurel 2930: what the bars come from, and the network: for XNUtils and the later network search UI */
++		if (live && r->rsrp != 0) {
++			n += snprintf(out + n, max - n, "sub%d.rsrp=%d\n", sub, r->rsrp);
++		}
++		if (live && r->rssi != 0 && n < max) {
++			n += snprintf(out + n, max - n, "sub%d.rssi=%d\n", sub, r->rssi);
++		}
++		if (rs == 1 && r->mcc != 0 && n < max) {
++			n += snprintf(out + n, max - n, "sub%d.plmn=%03u-%0*u\nsub%d.ps=%d\n", sub, r->mcc, r->mnc3 ? 3 : 2, r->mnc, sub, r->ps == 1 ? 1 : 0);
++		}
++		if (n >= max) {
++			return;
++		}
+ 		if (rs == 1 && r->op[0] != 0) {
+ 			n += snprintf(out + n, max - n, "sub%d.op=%s\n", sub, r->op);
+ 		} else if (rs == 1 && r->mcc != 0) {
+@@ -664,7 +690,7 @@
+ static bool
+ online_pending(void)
+ {
+-	return online_sent && t_online == 0 && qc[C_DMS].up && qc[C_DMS].want != 0;
++	return online_sent && qc[C_DMS].up && qc[C_DMS].want != 0;
+ }
+ 
+ /* is the state final enough for the first "on" line? */
+@@ -884,11 +910,52 @@
+ 
+ /* ---------------------------------------------------------------- DMS */
+ 
++/* laurel 2930: mode + why, one line on a change. TLV 0x10 offline reason bits, TLV 0x11 hardware restricted (RF calibration, thermal) */
++static void
++mode_changed(const uint8_t *d, uint32_t len, const uint8_t *v, const char *how)
++{
++	uint16_t l = 0, reason = 0;
++	const uint8_t *r = tlv(d, len, 0x10, &l);
++	bool have_reason = r != NULL && l >= 2;
++	uint8_t hw = 0;
++
++	if (have_reason) {
++		memcpy(&reason, r, 2);
++	}
++	r = tlv(d, len, 0x11, &l);
++	if (r != NULL && l >= 1) {
++		hw = r[0];
++	}
++	if (opmode != v[0]) {
++		LOG("operating mode %s (raw %u%s, offline reason 0x%x, hardware restricted %u)\n", opmode_name(v[0]), v[0], how, reason, hw);
++	}
++	opmode = v[0];
++	if (opmode == 0 && t_online == 0) {
++		t_online = now_ms();
++	}
++}
++
++/* DMS GET_CAPABILITIES TLV 1: max tx u32, max rx u32, data capability, SIM capability, count, radio interfaces. The SM6125 modem is X12: LTE at most */
++static void
++caps_read(const uint8_t *v, uint16_t l)
++{
++	size_t n = 0;
++
++	caps[0] = 0;
++	if (l < 11) {
++		return;
++	}
++	for (unsigned i = 0; i < v[10] && 11u + i < l && n + 1 < sizeof(caps); i++) {
++		n += snprintf(caps + n, sizeof(caps) - n, "%s%s", n != 0 ? "," : "", rat_name(v[11 + i]));
++	}
++}
++
+ static void
+ dms_rx(uint16_t msg, const uint8_t *d, uint32_t len)
+ {
+ 	uint16_t e = qerr(d, len), l = 0;
+ 	const uint8_t *v;
++	uint64_t now = now_ms();
+ 
+ 	switch (msg) {
+ 	case DMS_GET_REVISION:
+@@ -900,32 +967,51 @@
+ 			revision[l] = 0;
+ 			LOG("modem revision %s\n", revision);
+ 		}
+-		qc_simple(C_DMS, DMS_GET_OPMODE);
++		break;
++	case DMS_SET_EVENT:
++		dms_ev_done = true;
++		if (e != 0) {
++			LOG("DMS SET_EVENT_REPORT (mode changes): error 0x%x; the mode is still read every 10 s\n", e);
++		}
++		break;
++	case DMS_GET_CAPS:
++		caps_done = true;
++		v = tlv(d, len, 0x01, &l);
++		if (e == 0 && v != NULL) {
++			caps_read(v, l);
++			LOG("modem radio technologies: %s\n", caps);
++		} else {
++			LOG("DMS GET_CAPABILITIES: error 0x%x\n", e);
++		}
+ 		break;
+ 	case DMS_GET_OPMODE:
++		online_sent = false;            /* the read after SET online is back: no line with the old mode before it */
+ 		v = tlv(d, len, 0x01, &l);
+ 		if (e == 0 && v != NULL && l >= 1) {
+-			if (opmode != v[0]) {
+-				LOG("operating mode %s\n", opmode_name(v[0]));
+-			}
+-			opmode = v[0];
+-			if (opmode == 0 && t_online == 0) {
+-				t_online = now_ms();
+-			}
++			mode_changed(d, len, v, "");
+ 		} else if (opmode_errs++ < 3) {
+ 			LOG("DMS GET_OPERATING_MODE error 0x%x\n", e);
+ 		}
+ 		break;
+ 	case DMS_SET_OPMODE:
+-		if (e != 0 && e != QMI_ERR_NO_EFFECT) {
+-			LOG("DMS SET_OPERATING_MODE online: error 0x%x (modem stays %s, try %u of %u)\n", e, opmode_name(opmode), online_tries, ONLINE_TRIES);
++		if (set_is_lpm) {
++			/* a refusal does not stop the round: online is asked next all the same, each answer in the log */
++			LOG("DMS SET_OPERATING_MODE low power: %s0x%x (reported %s, round %u of %u)\n", e == 0 || e == QMI_ERR_NO_EFFECT ? "ok " : "error ", e,
++			    opmode_name(opmode), online_tries, ONLINE_TRIES);
++			online_err = e == QMI_ERR_NO_EFFECT ? 0 : e;
++			lpm_done = true;
++			online_next = now + LPM_GAP_MS;
++		} else if (e != 0 && e != QMI_ERR_NO_EFFECT) {
++			LOG("DMS SET_OPERATING_MODE online: error 0x%x (modem stays %s, round %u of %u)\n", e, opmode_name(opmode), online_tries, ONLINE_TRIES);
+ 			online_err = e;
+-			online_sent = false;            /* the modem can refuse while it starts (scion: not ready until tftp + servreg served) */
+-			online_next = now_ms() + OPMODE_PERIOD_MS;
++			lpm_done = online_sent = false;
++			online_next = now + OPMODE_PERIOD_MS;
+ 		} else {
+-			LOG("DMS SET_OPERATING_MODE online: ok\n");
++			LOG("DMS SET_OPERATING_MODE online: ok (reported %s, round %u of %u)\n", opmode_name(opmode), online_tries, ONLINE_TRIES);
++			lpm_done = false;
++			online_next = now + ONLINE_RECHECK_MS;
+ 		}
+-		opmode_next = now_ms() + OPMODE_PERIOD_MS;
++		opmode_next = now + OPMODE_PERIOD_MS;
+ 		qc_simple(C_DMS, DMS_GET_OPMODE);
+ 		break;
+ 	default:
+@@ -933,6 +1019,46 @@
+ 	}
+ }
+ 
++/*
++ * laurel 2930: boot 22:50:54: DMS said 5 for the whole boot with both USIMs ready and Wi-Fi up, so the modem is not going down [V]: 5 is what it reports
++ * until somebody asks for a mode [I]. So after a grace time the mode no longer blocks: low power first (the mode Android's RIL starts from), then online.
++ * A modem assert here stops Wi-Fi for the boot: only images without ipa=0 reach this (ipa_up). True = a request went out.
++ */
++static bool
++radio_step(uint64_t now)
++{
++	struct qb m;
++	uint8_t mode = 0;
++	bool early = opmode < 0 || opmode == 4 || opmode == 5;
++
++	if (!ipa_up() || sub_slot(0) < 0 || opmode == 0 || now < online_next) {
++		return false;
++	}
++	if (early && now - t_dms < MODE_GRACE_MS) {
++		return false;
++	}
++	if (!lpm_done && online_tries >= ONLINE_TRIES) {
++		return false;
++	}
++	if (!lpm_done) {
++		online_tries++;
++	}
++	/* 1 = low power already; 6, 7 are low power modes that ONLINE leaves */
++	if (!lpm_done && opmode != 1 && opmode != 6 && opmode != 7) {
++		mode = 1;
++		set_is_lpm = true;
++		LOG("radio on: DMS SET_OPERATING_MODE low power (reported %s, round %u)\n", opmode_name(opmode), online_tries);
++	} else {
++		set_is_lpm = false;
++		online_sent = true;
++		LOG("radio on: DMS SET_OPERATING_MODE online (reported %s, round %u)\n", opmode_name(opmode), online_tries);
++	}
++	qb_init(&m, DMS_SET_OPMODE);
++	qb_tlv(&m, 0x01, &mode, 1);
++	qc_send(&qc[C_DMS], &m);
++	return true;
++}
++
+ /* ---------------------------------------------------------------- NAS */
+ 
+ static void
+@@ -1040,6 +1166,9 @@
+ 				return;
+ 			}
+ 		}
++		if (e == 0 || e == QMI_ERR_NO_EFFECT) {
++			LOG("%s: BIND_SUBSCRIPTION %s: ok (retry %u)\n", qc[i].name, i == C_NAS1 ? "primary" : "secondary", r->bind_tries);
++		}
+ 		r->bound = true;
+ 		r->bind_ok = e == 0 || e == QMI_ERR_NO_EFFECT || i == C_NAS1;   /* primary without a binding = the modem's default subscription */
+ 		r->next = 0;
+@@ -1141,6 +1270,12 @@
+ 			}
+ 		} else if (i == C_NAS1 || i == C_NAS2) {
+ 			nas_rx(i, msg, d, len, true);
++		} else if (i == C_DMS && msg == DMS_SET_EVENT) {
++			uint16_t l = 0;
++			const uint8_t *v = tlv(d, len, 0x14, &l);       /* laurel 2930: the modem tells a mode change */
++			if (v != NULL && l >= 1) {
++				mode_changed(d, len, v, ", indication");
++			}
+ 		}
+ 		report(now_ms());
+ 		return true;
+@@ -1192,6 +1327,15 @@
+ 			qc_simple(C_UIM, UIM_GET_CARD_STATUS);
+ 		} else if (i == C_DMS && !rev_done) {
+ 			rev_done = true;
++		} else if (i == C_DMS && msg == DMS_SET_EVENT) {
++			dms_ev_done = true;
++		} else if (i == C_DMS && msg == DMS_GET_CAPS) {
++			caps_done = true;
++		} else if (i == C_DMS && msg == DMS_SET_OPMODE) {
++			/* no answer: this round is lost, the next one comes */
++			LOG("DMS SET_OPERATING_MODE: no answer (round %u of %u)\n", online_tries, ONLINE_TRIES);
++			online_sent = lpm_done = false;
++			online_next = now + OPMODE_PERIOD_MS;
+ 		} else if (i == C_WDS) {
+ 			wds_done = true;
+ 		} else if (i == C_NAS1 || i == C_NAS2) {
+@@ -1247,18 +1391,21 @@
+ 	}
+ 	/* DMS: revision, operating mode, online when a SIM is in a provisioned session */
+ 	if (qc[C_DMS].up && qc[C_DMS].want == 0) {
++		if (t_dms == 0) {
++			t_dms = now;
++		}
+ 		if (!rev_done) {
+ 			qc_simple(C_DMS, DMS_GET_REVISION);
+-		} else if (ipa_up() && opmode > 0 && opmode != 4 && opmode != 5 && !online_sent && sub_slot(0) >= 0 &&
+-		    online_tries < ONLINE_TRIES && now >= online_next) {
++		} else if (!dms_ev_done) {
+ 			struct qb m;
+-			uint8_t mode = 0;
+-			online_sent = true;
+-			online_tries++;
+-			LOG("radio on: DMS SET_OPERATING_MODE online (was %s, try %u)\n", opmode_name(opmode), online_tries);
+-			qb_init(&m, DMS_SET_OPMODE);
+-			qb_tlv(&m, 0x01, &mode, 1);
++			uint8_t on = 1;
++			qb_init(&m, DMS_SET_EVENT);
++			qb_tlv(&m, 0x14, &on, 1);       /* report operating mode changes */
+ 			qc_send(&qc[C_DMS], &m);
++		} else if (!caps_done) {
++			qc_simple(C_DMS, DMS_GET_CAPS);
++		} else if (radio_step(now)) {
++			/* one request at a time */
+ 		} else if (now >= opmode_next) {
+ 			/* laurel 2786: one read at ~450 ms said "shutting down" (5) and blocked ONLINE for the boot. Read until online, then slowly */
+ 			opmode_next = now + (opmode == 0 ? OPMODE_ONLINE_MS : OPMODE_PERIOD_MS);
+diff -ruN a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp	2026-11-01 23:19:26.771343162 +0530
++++ b/iokit/Kernel/arm/TopazModem.cpp	2026-11-01 23:20:02.396145452 +0530
+@@ -5766,6 +5766,9 @@
+ 		laurel_ipa_off("cannot create the SMP2P item for the modem");
+ 		return;
+ 	}
++	/* laurel 2930: stock's first entry (trinket.dtsi modem_smp2p_out: master-kernel, then ipa). Its bit 0 asks a graceful shutdown (modem sys_m: "SMP2P graceful
++	 * shutdown request"): value 0 and we never set it. The modem's sys_m opens this name; without it nobody tells the modem the AP is there */
++	(void)smp2p_add_out(out, "master-kernel", 0);
+ 	ipa_out = smp2p_add_out(out, "ipa", 0);
+ 	bool glink = false;
+ 	for (unsigned ms = 0; seconds == 0 || ms < seconds * 1000; ms++) {
