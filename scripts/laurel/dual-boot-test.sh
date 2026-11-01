@@ -500,6 +500,21 @@ if start "RO gate: image rw with no result: refused before any build"; then
   run sh "$DB" image rw
   exit_not0; said "read-only boot"; done_
 fi
+if start "Image: the installed root's hash goes to the image build (the Android app's root mark), rw only after the gate"; then
+  ready
+  printf 'ro-on %s x\nandroid-opened-after-ro x\n' "$M" >> "$RES"
+  S26=$T/repo/scripts/laurel/ios26-image.sh
+  cat > "$S26" <<'EOS'
+#!/bin/sh
+echo "$LAUREL_READONLY $IOSROOT_HEAD_SHA" > "$UEFI_W.env"
+mkdir -p "$UEFI_W"; : > "$UEFI_W/laurel-uefi-boot.img"; printf 'mode %s\nos 17.0.0 2026-10\n' "$([ "$LAUREL_READONLY" = 1 ] && echo ro || echo rw)" > "$UEFI_W/laurel-uefi-boot.img.dualboot"
+EOS
+  chmod +x "$S26"
+  run sh "$DB" image rw
+  exit_is 0; said "mode rw"
+  [ "$(cat "${RWIMG%/*}.env")" = "0 $(sha256sum "$T/first1m" | cut -d' ' -f1)" ] || no "image rw got: $(cat "${RWIMG%/*}.env")"
+  rm -f "$S26" "${RWIMG%/*}.env"; done_
+fi
 if start "RO gate: a writable image named as the read-only path: refused by its text"; then
   ready; mkimg "$ROIMG" " ufsrw=1 rootrw=1 $M LAURELESP"; sidecar "$ROIMG" ro; cp "$ROIMG" "$P/dev/block/by-name/boot_b"
   run "$SW" sh "$DB" switch

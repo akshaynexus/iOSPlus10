@@ -5039,3 +5039,10 @@ Next: owner decisions O1-O5; the first phone test is section 9 (keys in the menu
 - Decision [owner, 2026-11-02]: first boot is iOS 26, with the default stack only. Selector, Hot, XNUtils screen, bench: kept, not in that root, no more work until after the first boot.
 - Trap: `build.txt` had a date, which would have broken the root's same-bytes rule. Removed. A bundle built with class `NegroniMTLDeviceImpl` gets no device from a kernel that names `NegroniMTLDevice`: the plain default build now uses the kernel's name.
 - Guess [I]: `present_fps` counts command buffers that write a screen-size surface; one CA frame may be more than one. Use it only between runs of this bench.
+
+## Mi A3: boot menu merged with iosroot + read-only flow (2026-11-02, branch t3/laurel-boot-menu; host and QEMU only, nothing flashed)
+- S1 must hold for every image while `config/laurel-android-data` exists: moved in front of the MU_ONLY branch of `uefi-image.sh` (before: `MU_ONLY=1` still got 11.0.0). `mk()` is the one mkbootimg call. os_version, patch and the command line lie in the header page, so the app's hash over the rest is the same [V test].
+- The app cannot read the host's `first-boot.result`, so the flow is held by marks: read-only image = no menu, no refill, no marks (`LAUREL_READONLY=1` forces `BOOT_MENU=0`); the root mark comes only from `dual-boot.sh image`, and for `rw` only after its gate. Also on the phone: fence text, OS field against boot_a, layout numbers, first MiB of iosroot. A new fence needs a new APK.
+- `scripts/lib/laurel-layout.sh` sets `LAUREL_BACKUP=~/laurel-backup`: my tests' dump variable is now `GPT_DUMP`.
+- `scripts/laurel/shim.sh` keeps 11.0.0: it has no sidecar, so the guard refuses its image while the flag exists.
+Next: the owner's O1 before step 12 of dual-boot.md. Without it: `BOOT_MENU=0 dual-boot.sh image rw`.

@@ -2,7 +2,7 @@
 #   sh to-ios.sh check    all checks, no change
 #   sh to-ios.sh switch   checks, then slot b through the boot control HAL, then a normal Android reboot
 # Each outcome ends in one line: LAUREL SWITCH: ok ... | LAUREL SWITCH: refused: <reason>. Nothing is written before all checks pass.
-# POSIX sh: mksh on the phone, dash in the host test (scripts/laurel/boot-menu-test.sh). @NAMES@ come from scripts/laurel/switcher-asset.sh at build time.
+# POSIX sh: mksh on the phone, dash in the host test (scripts/laurel/boot-menu-test.sh). The fence text and sizes are filled in by scripts/laurel/switcher-asset.sh at build time.
 # It does not replace the flow of docs/laurel_sprout/dual-boot.md: a read-only image, or a writable one not built by `dual-boot.sh image rw` after the read-only run, is refused. The gate on the host
 # (ro-result, android-check) is in android-guard.sh and dual-boot.sh; what this script can see on the phone is that image's marks.
 B=${LS_BLOCK:-/dev/block/by-name}

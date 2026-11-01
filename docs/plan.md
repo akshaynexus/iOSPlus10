@@ -1098,3 +1098,7 @@ Results [V host]: Mu FD builds, FVMAIN_COMPACT 1,404,888 of 3,145,728. Images iO
 Changed from the request: "Android" does not write boot_a's active bit; ABL rejects that. It sets boot_b retries to 0, ABL's own fallback does the change. Observation in boot-menu.md section 2.
 Owner decides: O1 GPT write in Mu; O2 app + TCP 5555 or Magisk; O3 hold-Power reset in the PMIC; O4 endless loop on a kernel that always panics; O5 panic reset after 30 s.
 Next: owner's decisions; merge after fix2 (`iosroot`); phone test in the order of section 9, keys in the menu first. About 1 hour if each step passes.
+
+## Mi A3: boot menu merged with origin/laurel-sprout 9cad90f (2026-11-02; NOT RUN on the phone)
+Done: merge; S1 in every image while the flag exists; read-only image has no menu and the app refuses it; the app needs a writable image from `dual-boot.sh image rw`. Results [V host]: both kernels 0 failed, 0 LSE/RCpc, fence V3; images 52,867,072 bytes, os 17.0.0, 2026-10 in both modes; test-dualboot, build-honest, boot-menu-test, boot-menu-qemu PASS. Numbers: `docs/laurel_sprout/boot-menu.md` section 7.
+Next: steps 0-11 of dual-boot.md, owner's O1 before step 12, then boot-menu.md section 9.
