@@ -23,7 +23,7 @@ this repository (no fork). ios-redfin (A620) shows the same stack at ~60 fps hom
 CoreAnimation (backboardd, SpringBoard, apps)
   Metal.framework  _MTLRegisterDevices: IOAcceleratorES -> MetalPluginName -> /System/Library/Extensions/NegroniMetal.bundle
   NegroniMetal.bundle (userland/metal/plugin/NegroniMetal.mm + ios-flame NativeBridgeMetalFrontend.mm + bridge .a)
-    metal2vulkan f6a96b7d + userland/metal/patches (Rust, static)        AIR -> SPIR-V, Metal objects on Vulkan
+    metal2vulkan 219f013 + userland/metal/patches (Rust, static)         AIR -> SPIR-V, Metal objects on Vulkan
     libvulkan_freedreno.dylib  Turnip, Mesa 25.0.7 + HackiOS + userland/turnip patches, msm KMD
       src/redwood-drm = userland/negronigl/drm/negroni_drm.c (libdrm + msm stand-in, syncobjs in user space)
   kernel: IOAcceleratorES (topaz 0138, names set by laurel 2850) + RedwoodGPU user client (topaz 0901, AREA B's driver)
@@ -66,7 +66,7 @@ Turnip as it is**, if it keeps this table:
 | 0x46 GEM_SUBMIT: CMD_BUF cmds, bo list, SYNCOBJ flags ignored | 1..128 cmds, <= 8192 bos | OK; the stand-in answers 0-cmd submits and the syncobjs itself [V negroni_drm.c:717-756] |
 | 0x4a SUBMITQUEUE_NEW, 0x4c QUERY (FAULTS) | yes | OK |
 | 0x7e IOSurface import by ID (CA's render targets) | yes, physically contiguous surfaces only (identity mode) | OK for topaz 0937-0940 surfaces (BGRA, 64-byte rows, <= 16 MB) |
-| 0x49 host-page import (`VK_EXT_external_memory_host` of plain memory, `newBufferWithBytesNoCopy:`) | no | **not done**: with GPU VA = PA scattered user pages cannot be mapped. The stand-in sees no `NegroniGPUABI` "userptr" and imports only noted IOSurfaces (logs it once) |
+| 0x49 host-page import (`VK_EXT_external_memory_host` of plain memory, `newBufferWithBytesNoCopy:`) | no | **not done**. With 2153's stage-1 tables scattered pages can be mapped (the kernel half is negroni 0232's design over `redwood_gpu_map`); open. The stand-in sees no `NegroniGPUABI` "userptr" and imports only noted IOSurfaces (logs it once) |
 | **IOAcceleratorES with `MetalPluginName` / `MetalPluginClassName`** | topaz 0138: empty service | **laurel 2850** (below) |
 
 ### Patch 2850 `laurel-metal-registration` (range 2850-2899)
@@ -163,12 +163,40 @@ not run on the A610, and a failure in backboardd would freeze the UI that the so
 passes. When B's GL wrapper is in the root (`/usr/libexec/real/backboardd`), a list with `*` gets `-backboardd` unless it
 names backboardd. A root that already has a list keeps it when `METAL_CLIENTS` is empty. `METAL_ENV=` adds env lines.
 
+## 5a. Compiled target and caches (2026-11-01, gpu-upstream-opt)
+
+`scripts/laurel/metal-env.sh` sets, for this port only (negroni's scripts read none of it unless metal-env.sh is sourced):
+
+| Part | Setting | Why |
+|---|---|---|
+| Turnip C/C++ | `TU_CPU_FLAGS = -mcpu=cortex-a53 -mfix-cortex-a53-835769` (meson cross file c_args/cpp_args) | ARMv8.0 floor; A53 tuning measured best (gpu.md "Compiled target"); before: Apple's default `apple-a7` tuning |
+| Turnip build | `TU_MESON_ARGS = -Db_lto=true -Db_lto_mode=thin -Ddebug=true` (+ the existing `--buildtype=release -Db_ndebug=true`) | ThinLTO through ld64.lld; dSYM `out/gpu/turnip/libvulkan_freedreno.dylib.dSYM`, the bundle copy is stripped |
+| Plug-in, probes (CMake) | `NMTL_CPU_FLAGS` -> `CMAKE_<LANG>_FLAGS_INIT` in `ios-arm64-linux.cmake` (a flags change makes a new build directory) | same CPU floor; plug-in dSYM `out/metal/NegroniMetal.dSYM` (build.sh) |
+| Rust bridge + metal2vulkan | `CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS = -C target-cpu=cortex-a53 -C target-feature=+fix-cortex-a53-835769`, `CARGO_PROFILE_RELEASE_LTO=thin`, `CODEGEN_UNITS=4` | Rust's default for aarch64-apple-ios is `apple-a7`; `-Z tune-cpu` is nightly only. (`-C llvm-args=-aarch64-fix-cortex-a53-835769` does not exist in Rust 1.98's LLVM: the target feature does) |
+| metal2vulkan shader cache | `NMB_SHADER_MEMO_MB=32`, `NMB_SHADER_DISK_MB=1024` (cargo-time, `flame/0018`) | defaults are a 256 MiB memo per process and a 25 GiB directory; every Metal process has its own device |
+| Check | `metal-build.sh check`: Mesa A610 entry, 0102 in the Turnip tree, every staged Mach-O minos 16.0 and 0 instructions newer than ARMv8.0 (`scripts/laurel/armv80-check.py`) | |
+
+Caching that exists already [V metal2vulkan `shader_cache/mod.rs`]: translated functions, compute/render pipelines and the
+driver's `VkPipelineCache` data (Turnip's compiled ir3 binaries) on disk per process in `/var/db/negronimetal/cache/<proc>`,
+written off the creating thread; a memo in memory first. 219f013 adds: the directory no longer hashes the runtime's own
+source (8c09b7c: our patches no longer start it cold) and warm render creations decode no AIR. Turnip's own disk cache
+stays off (`-Dshader-cache=disabled`): metal2vulkan keeps the VkPipelineCache data. Not wired yet: 6e88d18 (warm a device
+from an earlier process's pipeline records at open).
+
+Turnip patch 0102 (`0102-turnip-darwin-a6xx-gen1-vulkan13.patch`) [V source]: Mesa 25.0.7 `tu_device.cc` reports
+`apiVersion` 1.0 when `has_hw_multiview` is false (A605/A608/A610/A612) unless `TU_DEBUG=noconform`; metal2vulkan refuses
+devices below 1.2 (`device/create.rs`). On Darwin 0102 reports what noconform reports for the API level and multiview
+(Vulkan 1.3, KHR_multiview, EXT_shader_viewport_index_layer, maxMultiviewViewCount, maxViewports), nothing else; parts
+with HW multiview are unchanged. Kill switch `TU_DARWIN_API=0`; line `TU DARWIN API: on: Vulkan 1.3 on FD610 ...`.
+
 ## 7. Open items and risks
 
 1. [U] Nothing ran on the A610 yet. First failure points: Turnip device creation (chip, GMEM 132 KiB), first submit
    (topaz's ring framing for Turnip's IBs: Turnip expects the kernel's `a6xx_submit` wrapper, CCU invalidate at the start,
    CACHE_FLUSH_TS fence; flame's first submits failed without it, docs/metal-design.md 4.3 item 4).
-2. Contiguous memory: every GEM_NEW and every imported surface must be physically contiguous (pass-through SMMU); one
+2. (Lifted by 2153 when `LAUREL GPU SMMU: on`: GEM_NEW up to 256 MiB from scattered pages, surfaces from wired pages,
+   `RedwoodMaxBuffer` 256 MiB. The text below is the pass-through fallback.)
+   Contiguous memory: every GEM_NEW and every imported surface must be physically contiguous (pass-through SMMU); one
    buffer < 64 MiB (pool chunk). Turnip 0101 reports that limit (`maxMemoryAllocationSize`, `maxBufferSize` =
    `RedwoodMaxBuffer`), so Metal's `maxBufferLength` is < 64 MiB and too-large buffers are refused at creation. A texture
    of 64 MiB or more (4096x4096 RGBA8) still fails at allocation [I]. metal2vulkan heaps (8 MB blocks, flame 0100) fit.
@@ -195,9 +223,9 @@ names backboardd. A root that already has a list keeps it when `METAL_CLIENTS` i
 
 | Component | Pin |
 |---|---|
-| Mesa | 25.0.7 (SHA-256 `592272df...`), HackiOS b4c5513 patches, `userland/turnip/mesa-patches` 0001-0002 |
-| metal2vulkan | f6a96b7d + `userland/metal/patches/m2v-flame` + `m2v` |
-| ios-flame frontend/bridge | 745c434 + `userland/metal/patches/flame` |
+| Mesa | 25.0.7 (SHA-256 `592272df...`), HackiOS b4c5513 patches, `userland/turnip/mesa-patches` 0001-0002, `userland/laurel/metal/turnip-patches` 0101-0102 |
+| metal2vulkan | 219f013 + `userland/metal/patches/m2v-flame` + `m2v` (rollback f6a96b7d: `m2v-flame-f6a96b7d`, `m2v-f6a96b7d`) |
+| ios-flame frontend/bridge | 745c434 + `userland/metal/patches/flame` (0017 needs m2v 219f013, 0018 cache caps) |
 | Rust | 1.98.0 |
 | SDK | theos/sdks 0222fd54 `iPhoneOS16.5.sdk` (Version 16.4) |
 | ipsw | 3.1.741 linux x86_64 |
@@ -217,3 +245,15 @@ Measured 2026-11-01 (CachyOS, clang 23.1.4, LLD 23.1.4, 20 cores) [V logs/laurel
 | review fixes, base laurel-int-1 (1e793cb), `all` with the Turnip rebuild (0101) | exit 0, import check PASS, check PASS | 113 s |
 | kernel with 2850 on laurel-int-1 | 228 patches, 0 LSE/RCpc; weak `topaz_gpu_wanted`/`topaz_gpu_failed` | 97 s |
 | kernel with 2850 + B's 2150 (link test, not committed) | 229 patches, 0 LSE; B's strong `topaz_gpu_wanted` taken | ~90 s |
+
+Measured 2026-11-01 06:30 (gpu-upstream-opt: metal2vulkan 219f013, Turnip 0101+0102, metal-env.sh flags) [V logs/gpuopt-*.log]:
+
+| Item | Before (f6a96b7d, default flags; main checkout build) | After | Note |
+|---|---|---|---|
+| Turnip build (615 steps, -O3, ThinLTO, -g) | ~2 min | 42 s (20 cores, alone) | lto objects kept for the dSYM |
+| Turnip dylib unstripped / in the bundle (stripped) | 11 636 592 / 11 072 128 bytes | 12 060 864 / 10 906 080 bytes | dSYM 50 MB beside it |
+| weak symbols looked up at load | 4222 | 3312 | fewer dyld lookups per process start |
+| bridge staticlib (thin LTO, 4 CGUs, target-cpu cortex-a53) | 364 MB | 293 MB | 129 s rebuild |
+| NegroniMetal (stripped, in the bundle) | 26 834 768 bytes | 22 878 464 bytes | -15 %; dSYM `out/metal/NegroniMetal.dSYM` 206 MB |
+| m2vtest | 22 467 280 bytes | 21 498 656 bytes | |
+| check | PASS | PASS: 0102 in the tree; 8 Mach-O, minos 16.0, 0 instructions newer than ARMv8.0; import check vs 20H392 PASS (0 missing) | |

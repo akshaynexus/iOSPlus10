@@ -102,6 +102,10 @@ step_plugin() {
   laurel_metal_tools
   if [ $LINUX = 0 ]; then "$REPO/scripts/metal/build.sh"; return; fi   # macOS: negroni's build, unchanged
   dsc_mount
+  # CMake reads the toolchain's CPU flags (NMTL_CPU_FLAGS) only when it configures: other flags = a new build directory
+  local b=$OUT/metal/build
+  [ "$(cat "$b/.laurel-flags" 2>/dev/null)" = "$NMTL_CPU_FLAGS" ] || rm -rf "$b"
+  mkdir -p "$b"; echo "$NMTL_CPU_FLAGS" > "$b/.laurel-flags"
   # scripts/metal/build.sh with our Linux toolchain file (clang -target arm64-apple-ios16.0 + ld64.lld)
   NMTL_CMAKE_TOOLCHAIN=$LMSRC/cmake/ios-arm64-linux.cmake "$REPO/scripts/metal/build.sh"
 }
@@ -112,6 +116,12 @@ step_check() {
   command -v llvm-objdump > /dev/null && command -v llvm-otool > /dev/null || { echo "check: needs llvm-objdump, llvm-otool"; return 1; }
   if [ -d "$tu" ]; then
     python3 -I "$REPO/scripts/laurel/metal-a610.py" "$tu" "$LAUREL_CHIP_ID" || fail=1
+    # Turnip 0102: without it the A610 (no HW multiview) reports Vulkan 1.0 and metal2vulkan (needs 1.2) finds no device
+    if grep -q 'tu_darwin_full_api(pdevice))' "$tu/src/freedreno/vulkan/tu_device.cc"; then
+      echo "check: Turnip reports Vulkan 1.3 for the A610 (0102 in the tree)"
+    else
+      echo "check: Turnip tree lacks 0102: the A610 would report Vulkan 1.0 (metal2vulkan refuses it)"; fail=1
+    fi
   else
     echo "check: no Turnip tree $tu (step turnip)"; fail=1
   fi
@@ -120,16 +130,14 @@ step_check() {
            "$st/System/Library/Extensions/NegroniMetal.bundle/libvulkan_freedreno.dylib" "$st"/usr/local/bin/*; do
     [ -f "$b" ] || { echo "check: missing $b"; fail=1; continue; }
     file -b "$b" | grep -q 'Mach-O' || continue
-    local minos lse
+    local minos v80
     minos=$(llvm-otool -l "$b" | awk '/LC_BUILD_VERSION/{p=1;next} p&&/minos/{print $2;exit}')
-    # ARMv8.0 (Kryo 260): LSE atomics and LDAPR trap; XNU emulates them (topaz), but each one is a trap: count them
-    # every LSE form: CAS/CASP, LD<op>/ST<op> (ST<op> = LD<op> to xzr) with A/L/AL and B/H, SWP; RCpc LDAPR/LDAPUR
-    local dis
-    dis=$(llvm-objdump -d --no-show-raw-insn "$b") || { echo "check: llvm-objdump failed on $b"; fail=1; continue; }
-    lse=$(printf '%s\n' "$dis" | grep -cE '\s((casp?|ld(add|clr|eor|set|[su]m(ax|in))|st(add|clr|eor|set|[su]m(ax|in))|swp)(a|l|al)?(b|h)?|ldapu?r(b|h)?)\s' || true)
-    printf 'check: %-60s minos %s, %s LSE/RCpc\n' "${b#$st/}" "$minos" "$lse"
+    # ARMv8.0 (Kryo 260): nothing newer than ARMv8.0 + CRC + AES/SHA (LSE and LDAPR trap into XNU's emulation, the
+    # rest is SIGILL): scripts/laurel/armv80-check.py counts every later extension (LSE, RCpc, RDM, FP16, dot product,
+    # PAC, JSCVT, FCMA, FlagM, SHA3, BF16, I8MM, MTE, SVE)
+    v80=$(python3 -I "$REPO/scripts/laurel/armv80-check.py" "$b") || fail=1
+    printf 'check: %-60s minos %s, %s\n' "${b#$st/}" "$minos" "${v80#*: }"
     [ "$minos" = 16.0 ] || fail=1
-    [ "$lse" = 0 ] || fail=1
   done
   [ $fail = 0 ] && echo "check: PASS" || { echo "check: FAIL"; return 1; }
 }

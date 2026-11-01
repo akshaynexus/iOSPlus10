@@ -19,6 +19,10 @@ TU_BUILD=$TU/build-ios
 TU_PATCHES=$REPO/userland/turnip/mesa-patches
 # Device ports add their own Turnip patches after these (e.g. scripts/laurel/metal-build.sh: userland/laurel/metal/turnip-patches)
 TU_EXTRA_PATCHES=${TU_EXTRA_PATCHES:-}
+# Device ports may set CPU flags and extra meson options (scripts/laurel/metal-env.sh: -mcpu=cortex-a53, ThinLTO,
+# debug info). Empty (negroni) = the build as before. Part of the stamp: other flags = a new tree and configure.
+TU_CPU_FLAGS=${TU_CPU_FLAGS:-}
+TU_MESON_ARGS=${TU_MESON_ARGS:-}
 A=$DL/mesa-$MESA_VERSION.tar.xz
 
 stamp() {
@@ -28,6 +32,7 @@ stamp() {
   for d in $TU_EXTRA_PATCHES; do for p in "$d"/*.patch; do echo "extra $p $(shasum -a 256 "$p" | cut -c1-16)"; done; done
   for f in negroni_drm.c negroni_drm.h ngl_abi.h xf86drm.h; do echo "drm $f $(shasum -a 256 "$NGL/drm/$f" | cut -c1-16)"; done
   echo "log.c $(shasum -a 256 "$NGL/log.c" | cut -c1-16)"
+  [ -z "$TU_CPU_FLAGS$TU_MESON_ARGS" ] || echo "flags $TU_CPU_FLAGS | $TU_MESON_ARGS | lto objects kept"
 }
 
 # $1 = directory: Mesa + HackiOS patches + the redwood-drm files (no Turnip patches)
@@ -73,6 +78,10 @@ make_tree() {
 
 setup() {
   CROSS=$TU/ios-cross.ini
+  CPU_ARGS= LTO_LINK=
+  for f in $TU_CPU_FLAGS; do CPU_ARGS="$CPU_ARGS, '$f'"; done
+  # with LTO the debug map names temporary objects: keep them, so dsymutil finds the debug info (TU_MESON_ARGS -Db_lto)
+  case "$TU_MESON_ARGS" in *b_lto=true*) LTO_LINK=", '-Wl,-object_path_lto,$TU/lto-objects'"; mkdir -p "$TU/lto-objects" ;; esac
   cat > "$CROSS" <<EOF
 [binaries]
 c = ['$CLANG', '-arch', 'arm64', '-target', 'arm64-apple-ios$IOS_MIN', '-isysroot', '$SDK']
@@ -85,9 +94,10 @@ nm = '$NM'
 pkg-config = 'false'
 
 [built-in options]
-c_args = ['-Wno-error=incompatible-function-pointer-types']
-c_link_args = ['-Wl,-ios_version_min,$IOS_MIN']
-cpp_link_args = ['-Wl,-ios_version_min,$IOS_MIN']
+c_args = ['-Wno-error=incompatible-function-pointer-types'$CPU_ARGS]
+cpp_args = [${CPU_ARGS#, }]
+c_link_args = ['-Wl,-ios_version_min,$IOS_MIN'$LTO_LINK]
+cpp_link_args = ['-Wl,-ios_version_min,$IOS_MIN'$LTO_LINK]
 
 [host_machine]
 system = 'darwin'
@@ -114,7 +124,7 @@ EOF
     -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled -Dbuild-tests=false \
     -Dperfetto=false -Dgallium-va=disabled -Dgallium-vdpau=disabled -Dgallium-xa=disabled \
     -Dgallium-rusticl=false -Dteflon=false -Dvideo-codecs= -Dtools= -Dhtml-docs=disabled \
-    -Dvulkan-layers= "$@"
+    -Dvulkan-layers= $TU_MESON_ARGS "$@"
 }
 
 case "$(uname -s)" in
@@ -170,6 +180,10 @@ done
 [ $fail = 0 ] || exit 1
 
 cp "$VK" "$OUTVK"
+# debug info (TU_MESON_ARGS -Ddebug=true): kept next to it as a dSYM; scripts/metal/build.sh strips the bundle copy
+if [ -n "$TU_MESON_ARGS" ] && command -v dsymutil >/dev/null; then
+  rm -rf "$OUTVK.dSYM"; dsymutil "$VK" -o "$OUTVK.dSYM" 2>/dev/null || echo "turnip: note: no dSYM"
+fi
 codesign -s - -f "$OUTVK" 2>/dev/null || ldid -S "$OUTVK"
 echo "turnip: arm64, minos $minos, chained fixups, $weak weak symbols looked up at load time (resolve to NULL when absent)"
 echo "turnip: exports: $(echo "$exports" | tr '\n' ' ')"

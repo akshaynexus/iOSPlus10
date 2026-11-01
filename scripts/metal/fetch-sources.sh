@@ -1,8 +1,8 @@
 #!/bin/bash
 # Fetch the sources of the Metal path into out/metal/src (git-ignored):
 #   1. metal2vulkan (steelbrain/metal2vulkan, GPL-2.0-or-later OR LGPL-3.0-or-later) at the submodule's pin
-#      (f6a96b7d since 2026-10-27; UniXNU and ios-flame use 720ef1ce), plus the bridge patches from ios-flame
-#      (0001-0006 from UniXNU, 0100-0101 flame; rebased copies in userland/metal/patches/m2v-flame for a newer pin).
+#      (219f013 since 2026-11-01; UniXNU and ios-flame use 720ef1ce), plus the bridge patches from ios-flame
+#      (0001-0006 from UniXNU, 0100-0101 flame; rebased copies in userland/metal/patches/m2v-flame* per pin, below).
 #   2. ios-flame's Metal v2 frontend + bridge (MIT; phone/metal2/{NativeBridgeMetalFrontend.*,bridge/*})
 #      exported from the external/ios-flame submodule's git objects at FLAME_COMMIT (no copy in this repo),
 #      then our patches from userland/metal/patches/flame/*.patch on top.
@@ -29,32 +29,36 @@ git -C "$FLAME" archive "$FLAME_COMMIT" phone/metal2 phone/turnip/NativeAdrenoAB
 git -C "$FLAME_SRC" init -q && git -C "$FLAME_SRC" add -A && git -C "$FLAME_SRC" -c user.name=negroni -c user.email=negroni@local commit -q -m "ios-flame $FLAME_COMMIT"
 echo "ios-flame $FLAME_COMMIT -> $FLAME_SRC/phone/metal2"
 
-# metal2vulkan patches: UniXNU's (0001-0006, as ios-flame carries them) + ios-flame's 0100/0101. ios-flame's copies are
-# for metal2vulkan 720ef1ce; for a newer pin our rebased copies in userland/metal/patches/m2v-flame are used instead
-# (0005 is upstream since 4348323b/cba1270d; docs/metal-widgets-2026-10-27.md section 8 has the table).
-# Our own m2v patches follow the pin too: m2v/ is for the newer pin, m2v-720ef1ce/ keeps the copies for 720ef1ce (the
-# rollback pin); flame patches named *-m2v-<commit>.patch need that metal2vulkan API and are left out at 720ef1ce.
+# metal2vulkan patches by pin (docs/metal-design.md "Versions"):
+#   219f013 (current, 2026-11-01): userland/metal/patches/m2v-flame + m2v (rebased; m2v/0003 dropped: upstream's
+#            native-arithmetic round removed the policies it set and does by default what it did)
+#   f6a96b7d (rollback): m2v-flame-f6a96b7d + m2v-f6a96b7d            720ef1ce (older rollback): ios-flame's own
+#            bridge patches + m2v-720ef1ce
+#   `git -C external/metal2vulkan checkout <pin>` selects one; this script follows the submodule's HEAD.
+# Flame patches named *-m2v-<commit>.patch need that metal2vulkan API: applied only when the pin contains <commit>.
 OLD_PIN=
-if [ "$M2V_COMMIT" = 720ef1ce9ae2a2068999a8675717418b9416283e ]; then
-  OLD_PIN=1
+case "$M2V_COMMIT" in
+720ef1ce9ae2a2068999a8675717418b9416283e)
+  OLD_PIN=720ef1ce
   for p in "$FLAME_SRC"/phone/metal2/bridge/patches/*.patch; do
     case "$(basename "$p")" in 0006-*) continue ;; esac   # UniXNU does not apply 0006 either
     git -C "$M2V" apply --whitespace=nowarn "$p" && echo "applied $(basename "$p")"
-  done
-else
-  for p in "$METAL"/patches/m2v-flame/*.patch; do
-    git -C "$M2V" apply --whitespace=nowarn "$p" && echo "applied m2v-flame/$(basename "$p")"
-  done
-fi
-# our own patches (if any) on top of both trees
-M2V_OWN=$METAL/patches/m2v; [ -n "$OLD_PIN" ] && M2V_OWN=$METAL/patches/m2v-720ef1ce
-for p in "$M2V_OWN"/*.patch; do
+  done ;;
+f6a96b7da82f3032e3fd7b1dc52c07bfd9b78dc8) OLD_PIN=f6a96b7d ;;
+esac
+M2V_FLAME=$METAL/patches/m2v-flame M2V_OWN=$METAL/patches/m2v
+[ -n "$OLD_PIN" ] && M2V_FLAME=$METAL/patches/m2v-flame-$OLD_PIN M2V_OWN=$METAL/patches/m2v-$OLD_PIN
+for p in "$M2V_FLAME"/*.patch "$M2V_OWN"/*.patch; do
   [ -f "$p" ] || continue
-  git -C "$M2V" apply --whitespace=nowarn "$p" && echo "applied $(basename "$M2V_OWN")/$(basename "$p")"
+  git -C "$M2V" apply --whitespace=nowarn "$p" || { echo "$(basename "$(dirname "$p")")/$(basename "$p") does not apply" >&2; exit 1; }
+  echo "applied $(basename "$(dirname "$p")")/$(basename "$p")"
 done
 for p in "$METAL"/patches/flame/*.patch; do
   [ -f "$p" ] || continue
-  case "$(basename "$p")" in *-m2v-*.patch) [ -n "$OLD_PIN" ] && { echo "skipped flame/$(basename "$p") (metal2vulkan 720ef1ce)"; continue; } ;; esac
+  need=$(basename "$p" | sed -n 's/.*-m2v-\([0-9a-f]\{7,40\}\)\.patch$/\1/p')
+  if [ -n "$need" ] && ! git -C "$M2V_SUB" merge-base --is-ancestor "$need" "$M2V_COMMIT" 2>/dev/null; then
+    echo "skipped flame/$(basename "$p") (needs metal2vulkan $need, pin is ${M2V_COMMIT:0:9})"; continue
+  fi
   git -C "$FLAME_SRC" apply --whitespace=nowarn "$p" 2>/dev/null || (cd "$FLAME_SRC" && patch -p1 --forward < "$p")
   echo "applied flame/$(basename "$p")"
 done

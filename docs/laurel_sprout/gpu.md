@@ -2,6 +2,9 @@
 
 Status 2026-11-01 05:10: review fixes on top of laurel-int-1 (areas A, C, H); built on Linux (kernel, Mesa, userland,
 firmware extract, UEFI image). **NOT BOOTED.**
+Update 2026-11-01 06:40 (branch t3/laurel-gpu-upstream-opt): **2153 stage-1 SMMU tables** (on by default, fallback =
+pass-through), compiled-target flags + full ARMv8.0 check + dSYMs, eagl still-surface patch, upstream check
+([upstream-2026-11-01.md](upstream-2026-11-01.md)). Built on Linux, **NOT BOOTED**.
 Labels: [V] read in source or measured on the host, [I] inference, [U] unknown.
 
 ## What runs where
@@ -115,7 +118,7 @@ tables (`gpu_identity=0` path, untested on the Mi A3) before this check can go.
 | root | `scripts/bg.sh laurel-root sudo scripts/laurel/root.sh` (calls `scripts/laurel/root-add-gpu.sh`) | root image |
 | kernel | `scripts/bg.sh laurel-kernel scripts/laurel/kernel-linux.sh` | 2150-2152 in the patch set |
 
-Toolchain: host clang (23 on CachyOS) `-target arm64-apple-ios16.0 -mcpu=cortex-a53` + the theos cctools `ld64`/`ldid`
+Toolchain: host clang (23 on CachyOS) `-target arm64-apple-ios16.0 -mcpu=cortex-a53 -mfix-cortex-a53-835769` + the theos cctools `ld64`/`ldid`
 from `out/laurel-kernel/theos` (kernel-linux.sh fetches and checks it) + `iPhoneOS16.5.sdk` (theos/sdks, sparse clone
 at a pinned commit; a user-given `SDK=` is used as it is, nothing is linked outside out/). Mesa: host meson + ninja +
 bison/flex; Mako, MarkupSafe, PyYAML, packaging pinned with the sha256 of every PyPI file in
@@ -127,6 +130,9 @@ the wrapper `out/laurel/gpu/bin/ios-clang` passes `--ld-path` only on link lines
 `mu-build.sh`). Hashing is portable (`gpu_sha256`); a macOS path needs Xcode clang/ld/codesign in gpu-env.sh. Exception
 written in docs/plan.md for the owner to decide.
 
+Measured 2026-11-01 06:14 (gpu-upstream-opt, `-mfix-cortex-a53-835769`, `-O3 -g`) [V logs/gpuopt-gl.log]: Mesa 57 s,
+libOSMesa 17 119 120 bytes stripped (dSYM 77 MB), 0 instructions newer than ARMv8.0 in all 4 Mach-O; kernel with 2153:
+242 patches, 0 LSE/RCpc, 59 s.
 Measured 2026-11-01 (20 cores) [V]: Mesa configure + build 47 s (18 s with a configured tree), 17 102 608 bytes, 1296 gl*
 functions, links only libSystem, libc++, libz, IOKit; userland 3 binaries in a few s (mkeagl.py: 409 entries, 356 passed
 on, 30 by hand, 23 without a function); 0 ARMv8.1+ instructions in every Mach-O (`gpu_check_v80`: cas*, swp*,
@@ -140,6 +146,90 @@ read only by `fdl6_memcpy_*` (`src/freedreno/fdl/fd6_tiled_memcpy.cc`), and only
 freedreno GL never uses it; the UBWC bank swizzle is the GPU's own (NC_MODE_CNTL, set by the kernel). Turnip takes the
 value from `MSM_PARAM_HIGHEST_BANK_BIT` (14, `tu_knl_drm_msm.cc`). So no Mesa patch for the GL path.
 
+## Lessons from negroni (OnePlus 10 Pro, Adreno 730) and what this port does
+
+Sources: docs/gpu-comparison-2026-10-27.md, docs/gpu-status.md, notes.md sections 17, 67 and the Metal sections.
+
+| Negroni mistake [V there] | Applies to the A610? | What this port does |
+|---|---|---|
+| Features behind default-off boot-args were never tested: per-client tables (0233, `negronigpu_pt=1`), zero-copy scanout (0234) stayed "written, not run" | yes: topaz's stage-1 path (`gpu_identity=0`) was the same | 2153 is **on by default**, checks itself at bring-up and falls back to pass-through with one line; `gpu_smmu=0` is only a kill switch |
+| GPU clock wrong for days (kHz vs MHz: the A730 ran at ~5 MHz, 0237); nothing measured the real clock | partly: no GMU, the RCG is set directly (GPLL0 / 2 = 300 MHz) | [I] the fence self-check time and `SWEET FPS` are the first clues. Open: a CP perf-counter clock in the `LAUREL GPU` line (like negroni `gxclk`) and the CX/MX RPM vote before clocks above 300 MHz |
+| GX powered for the whole boot (IFPC refused, `pm off`): hot phone | yes: topaz never collapses GX | open (no change here): GX/CX power collapse when idle is the next kernel item |
+| Frames waited on fences while the GPU was 12-26 % busy: the frame cost was CPU (frontend + metal2vulkan encode, copies, cache upkeep) | yes, more: A73/A53 cores | user space built for the A53 (measured, below), metal2vulkan 219f013 (native arithmetic: fewer emulated ALU ops), eagl still surfaces summed every 8th frame, no TLBIALL per buffer made |
+| IOSurface shadow copies and host-import cache upkeep (22.9 MB invalidated per command buffer; eagl texture copies 3 of 8 ms) | yes | with 2153 the GPU maps scattered pages: wired-page surfaces (LAUREL SURF) and kernel surfaces go to the GPU as they are, no eagl copy; GEM buffers from the write-combined pool first (no cache upkeep) |
+| A Metal device with the wrong floor (metal2vulkan refuses a device below Vulkan 1.2) would show only as "no device" | **yes, found now**: Turnip 25.0.7 reports Vulkan 1.0 for the A610 | Turnip 0102 (Vulkan 1.3 on Darwin for parts without HW multiview); `metal-build.sh check` checks the patched tree |
+| Per-process memory (widgets killed at 30-64 MiB jetsam; Turnip + metal2vulkan 15-20 MiB each) | yes: 4-6 GB phone | metal2vulkan's shader-cache memo capped at 32 MiB per process (default 256 MiB), disk at 1 GiB (flame/0018 + metal-env.sh) |
+| Debug Turnip: 58 pipelines in 68 s (UniXNU/flame) | yes | release `-O3 -DNDEBUG` + ThinLTO; debug info only in dSYMs |
+| Polled fences (200 us) before the fence IRQ (0384) | yes: RedwoodGPU still polls every 200 us | open: CACHE_FLUSH_TS interrupt for the A610 (GIC SPI from the trinket DT) |
+| Metal on backboardd before the path was measured froze the UI | yes | backboardd keeps the GL path (topaz/HakiOS: 56-58 fps class); Metal clients stepwise (metal.md section 6); with 2153 the kernel no longer refuses non-backboardd clients |
+
+## SMMU stage 1 (2153)
+
+Design [V source of the patch; hardware behaviour I until the phone runs it]:
+
+- **Bring-up order.** 2150's path is unchanged up to the CP fence test in pass-through (`SCTLR = 0xE0`, GPU VA = PA). Then,
+  with the CP idle, `smmu_stage1()`:
+  1. maps the CP's own buffers (ring, SQE, fence page) at **VA = PA** in topaz's tables (they are contiguous pool memory
+     below 4 GiB), so CP_RB_BASE, CP_SQE_INSTR_BASE and the fence address stay valid across the switch;
+  2. programs context bank 0: CBA2R0 AArch64, CBAR0 type 1 (S1, S2 bypass), TTBR0 = root table, TCR = T0SZ 32
+     (4 GiB, 3-level LPAE, 4 KiB), non-cacheable walks, EPD1, TCR2 PASize 36 bit, MAIR0 attr0 = Normal NC;
+     TLBIALL; `SCTLR = M | TRE | AFE | CFRE | HUPCF` (no fault interrupt: nothing handles it; faults terminate, no stall);
+  3. self-check: read-back of SCTLR.M, TTBR0, CBAR0 type, S2CR0 (translate, CB 0), SMR0 valid; one CP fence through the
+     tables at VA = PA; one CP fence into an ordinary kernel page (above 4 GiB with area A's map) at a VA that is not its
+     PA (proves translation and the 36-bit output). That VA is a pool unit reserved for the test (the allocator's when
+     there is no pool): a write that bypassed the tables lands in reserved RAM, never in MMIO, and fails the check
+     (`the fence for VA .. landed at PA ..: the tables are bypassed`); FSR = 0;
+  4. any failure: `SCTLR` back to pass-through, one more fence checks the CP, 2150's backboardd-only rule stays.
+- **GPU VA layout** (one address space for all clients, kernel-managed addresses; Turnip/Mesa use GET_IOVA):
+  `0x01000000-0x7fffffff` allocator (64 KiB granule, first fit): scattered buffers, IOSurfaces; `0x80000000-0xffffffff`
+  VA = PA for contiguous memory below 4 GiB (CP buffers, GPU-pool GEM buffers), so the pool's bookkeeping (address =
+  physical, `pool_give_back`) is the same in both modes. A pool outside that window turns stage 1 off (reason in the line).
+- **RedwoodGPU with the tables**: GEM_NEW takes the pool first (write-combined, nobody else maps it: no cache upkeep, no
+  cacheable alias), entered at VA = PA; pool full or a buffer above one pool chunk: ordinary pages, scattered, cached, with
+  the existing per-submit cache push (darwin-redwood design). Surfaces: page by page at allocator VAs, the 64 guard rows
+  required (SweetSurface now gives every surface the guard rows and asks for no contiguous memory while the tables run).
+  Pool buffers and pool surfaces are mapped write-combined in user space. `RedwoodMaxBuffer` = 256 MiB (pass-through:
+  64 MiB - 64 KiB), property `LaurelGPUSMMU` = `stage 1` / `pass-through`. **The backboardd-only rule is off** (it
+  checks `redwood_gpu_identity()`): every process may open RedwoodGPU (Metal clients, WebKit GPU process).
+- **TLB**: new entries are written only over invalid ones, and an SMMU caches no invalid entry: no TLBIALL on map, only a
+  barrier (HakiOS does the same); unmap keeps TLBIALL + TLBSYNC.
+- **Faults**: with HUPCF and no stall a refused access is terminated; RedwoodGPU's 5 s statistics call
+  `redwood_gpu_worked()`, which logs `LAUREL GPU SMMU: fault FSR .. FAR .. FSYNR0 ..` (16 at most) and clears FSR.
+- Not done (open): per-process tables (one context bank per client, or TTBR0 switches at submit: CP_SMMU_TABLE_UPDATE
+  needs the GPU in a context that TrustZone allows, negroni found the same); the 32-bit GPU VA is shared by all clients
+  (about 1.9 GiB for scattered buffers). A client can still write another client's GPU buffers, but no kernel or
+  TrustZone memory.
+
+Kill switch: `gpu_smmu=0` (pass-through, 2150 behaviour). `gpu_identity` is no longer parsed: it is the result of the check.
+
+## Compiled target (Kryo 260: A73 + A53, ARMv8.0)
+
+| Part | Flags | Check |
+|---|---|---|
+| Mesa GL (libOSMesa) | `-mcpu=cortex-a53 -mfix-cortex-a53-835769`, `-O3 -DNDEBUG`, `-g` -> dSYM in `out/laurel/gpu/dsym/`, installed copy `strip -x`; no LTO (theos ld64 cannot read clang 23 bitcode [I]) | `scripts/laurel/armv80-check.py` |
+| libtopaz-gl, libtopaz-inject, backboardd wrapper | same CPU flags, `-O2 -g` -> dSYM, stripped | same |
+| Turnip, plug-in, probes, bridge | `scripts/laurel/metal-env.sh` (metal.md "Compiled target") | same, in `metal-build.sh check` |
+
+Tuning measured [llvm-mca estimate, `scripts/laurel/cpu-tune-mca.sh`, kernels in `userland/laurel/gpu/tune/mca-kernels.c`,
+cycles per 100 runs of each block]:
+
+| Block | -mtune=a53: A53 / A73 model | -mtune=a73: A53 / A73 | generic: A53 / A73 |
+|---|---|---|---|
+| float RGBA -> BGRA8 pack (16 px) | 13801 / 6070 | 27202 / 6078 | 11801 / 6067 |
+| tiled copy (8 x 64 B) | 14501 / 7818 | 31601 / 7628 | 15502 / 8115 |
+| PM4 emit with parity (8 packets) | 20202 / 3679 | 20402 / 3646 | 20402 / 3679 |
+| premultiply (16 px) | 7302 / 3366 | 16202 / 3372 | 8001 / 3518 |
+
+A73 tuning makes the A53 blocks 1.9-2.2x slower and the A73 ones at most 2.4 % faster; so `-mcpu=cortex-a53` (A53
+scheduling) is the measured best, not `-mtune=cortex-a73`. (The hash kernel is left out: the A53 tuning unrolls its loop,
+so the blocks are not the same work.) `-mfix-cortex-a53-835769` puts a NOP between a load/store and a 64-bit
+multiply-accumulate, as Android's arm64 toolchains do [I: Kryo 260 Silver = A53 r0p4 derivative].
+
+`scripts/laurel/armv80-check.py` (self-test: `--self-test`) counts every instruction newer than ARMv8.0 + CRC + AES/SHA:
+LSE, RCpc, RDM, FP16 arithmetic/conversion, FHM, dot product, SHA3/SM, JSCVT/FCMA, non-hint PAuth, FlagM, FRINTTS, MTE,
+BF16/I8MM, SVE. Hint-space PAC/BTI are NOPs on ARMv8.0 and not counted. Used by `gpu_check_v80` (GL) and `metal-build.sh
+check`. (On the kernel it finds 21 "instructions" in the K256 SHA table data in __text: the kernel keeps its own check.)
+
 ## Log lines to check (first boot)
 
 1. `TopazGPU: kernel RAM 0xe1004000+0xcc000000, GPU pool 0xc0000000+0x20000000 (ADT laurel-ram-reserved)`
@@ -147,8 +237,16 @@ value from `MSM_PARAM_HIGHEST_BANK_BIT` (14, `tu_knl_drm_msm.cc`). So no Mesa pa
    `TopazGPU: zap auth_and_reset: 0/0`
 3. `TopazGPU: SMMU TTBR0 ... (identity)`, `TopazGPU: cp: SQE 32304 bytes (own, version 01001f0b)`, `CP up (ME_INIT, SET_SECURE_MODE 0), core 300 MHz`,
    `TopazGPU: fence test ok in N us`
-4. **`LAUREL GPU: on: Adreno 610 chip 0x06010000, core 300 MHz, zap PAS 13 at 0x57515000 (own a610_zap, 6860+2096 bytes), SQE own 01001f0b, SMMU pass-through, pool 0xc0000000+0x20000000; RedwoodGPU published`**
-   or `LAUREL GPU: off: <step> failed: <reason>` (steps: MMIO map, power (GDSC/clocks), zap shader, SMMU, CP start).
+4. **`LAUREL GPU: on: Adreno 610 chip 0x06010000, core 300 MHz, zap PAS 13 at 0x57515000 (own a610_zap, 6860+2096 bytes), SQE own 01001f0b, SMMU stage 1, pool 0xc0000000+0x20000000; RedwoodGPU published`**
+   or `LAUREL GPU: off: <step> failed: <reason>` (steps: MMIO map, power (GDSC/clocks), zap shader, SMMU, CP start,
+   pass-through after the stage-1 check).
+4a. (2153) **`LAUREL GPU SMMU: on: stage 1, context bank 0, 32-bit GPU VA, fence at VA = PA 0xc00xxxxx in N us, kernel page PA 0x1xxxxxxxx (above 4 GiB) at VA 0x1000000 in N us; any process may open the GPU`**
+   or `LAUREL GPU SMMU: off: <reason>: pass-through (GPU VA = PA), only backboardd may open the GPU` (reasons: `boot-arg
+   gpu_smmu=0`, `registers do not hold: SCTLR .. TTBR0 .. CBAR0 .. S2CR0 .. SMR0 ..`, `no fence write through the tables
+   at VA = PA ..`, `no fence write to kernel page PA .. at VA ..`, `fault FSR .. during the checks`, `GPU pool .. outside
+   the VA = PA window`). During use: `LAUREL GPU SMMU: fault FSR .. FAR .. FSYNR0 ..` only when a GPU access was refused.
+   With stage 1, the RedwoodGPU client lines show other processes too (`RedwoodGPU: client SpringBoard (open N)`), and
+   no `client X refused` line.
 5. `/var/tmp/laurel-bbd.log` and syslog: `LAUREL BBD: on: /topaz/lib/libtopaz-inject.dylib inserted` (or `off: <reason>`),
    then `topaz: /topaz/lib/libtopaz-gl.dylib loaded`, kernel `RedwoodGPU: client backboardd (open 1)` and
    **`LAUREL GPU: GL: backboardd opened the GPU: its screen surfaces from the GPU pool, direct scanout off`**.
@@ -160,7 +258,8 @@ live FDT `gpu_zap` region).
 
 ## Recovery (no UI after the GPU root)
 
-1. Boot with `gl=0` (backboardd without the loader, software renderer) or `gpu=0` (no GPU at all, no loader). Add the
+1. Boot with `gl=0` (backboardd without the loader, software renderer) or `gpu=0` (no GPU at all, no loader), or
+   `gpu_smmu=0` (GPU on, stage-1 tables off: 2150's pass-through and backboardd-only rule). Add the
    boot-arg to the UniXNU/DarwinBoot command line (`scripts/laurel/uefi-image.sh` boot-args) and `fastboot boot` the image.
 2. The wrapper turns the loader off by itself after 2 backboardd starts within 30 s of each other in one boot
    (`/var/tmp/laurel-bbd.state`, line `LAUREL BBD: off: backboardd exited N times ...`).
@@ -174,7 +273,8 @@ live FDT `gpu_zap` region).
 
 - CX rail / bus bandwidth: no RPM votes (as topaz). 300 MHz is inside the lowest CX level; BIMC bandwidth not voted.
 - Pool region 0xC0000000-0xE0000000: reserved in Mu 0101 ("Pool RAM") and the ADT (area A); not measured on the phone.
-- SMMU pass-through: see "SMMU pass-through risk"; only backboardd may use the GPU.
+- SMMU pass-through: see "SMMU pass-through risk"; only backboardd may use the GPU. With 2153 on (default) this is the
+  fallback only; the remaining risk is one shared GPU address space for all clients (no per-process tables).
 - Area J (Metal) uses `RedwoodGPU`, `redwood_gpu_ready`, `redwood_gpu_parameter`, `topaz_root_mounted` and the 0138
   block: kept unchanged by 2150-2152. Its clients other than backboardd are refused while the SMMU passes through.
 - `eagl_slots.txt` offsets are hackios-scion's (iOS 16.5 OpenGLES dispatch table) used with the 16.7.16 root, as topaz

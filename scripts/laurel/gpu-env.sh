@@ -21,7 +21,13 @@ SDK=${SDK:-$SDK_DEFAULT}
 IOS_MIN=16.0
 # ARMv8.0 only (Kryo 260 Gold A73 + Silver A53: no LSE, no RCpc, no PAC). The kernel emulates LSE/LDAPR in
 # user space (topaz 0081) but a trap per atomic is slow; -mcpu=cortex-a53 emits none.
-CPU_FLAGS="-mcpu=cortex-a53"
+# Tuning (measured, scripts/laurel/cpu-tune-mca.sh, llvm-mca): -mtune=cortex-a73 makes the hot blocks 1.9-2.2x slower
+# on the A53 model and at most 2.4 % faster on the A73 model, so the A53 tuning of -mcpu=cortex-a53 stays.
+# -mfix-cortex-a53-835769: the A53 erratum workaround (a NOP between a load/store and a 64-bit multiply-accumulate),
+# as Android's arm64 toolchains do by default [I: the Kryo 260 Silver is an A53 r0p4 derivative].
+CPU_FLAGS="-mcpu=cortex-a53 -mfix-cortex-a53-835769"
+# Debug info: built with -g, kept as .dSYM in $G/dsym (dsymutil), the installed binaries are stripped.
+DSYM=$G/dsym
 
 # The theos cctools toolchain (ld64, ldid, install_name_tool, nm) that scripts/laurel/kernel-linux.sh fetches
 # (pinned there: theos 6e7b8c4 + L1ghtmann iOSToolchain test-210562a, sha256 checked).
@@ -101,15 +107,23 @@ gpu_sha256() {
 gpu_cc() {
   local out=$1; shift
   "$CLANG" -target "arm64-apple-ios$IOS_MIN" -isysroot "$SDK" $CPU_FLAGS --ld-path="$LD64" \
-    -fno-stack-check -O2 -Wall -Wno-unused-function -o "$out" "$@"
+    -fno-stack-check -O2 -g -Wall -Wno-unused-function -o "$out" "$@"
 }
 
-# ARMv8.0 check on a Mach-O: no LSE atomics (cas*, swp*, ld<op>*, st<op>* aliases), no RCpc (ldapr*, ldapur*, stlur*)
-# (prints the count; fails on any)
-V81_PAT='\t(cas\w*|swp\w*|ld(add|set|clr|eor|smax|smin|umax|umin)\w*|st(add|set|clr|eor|smax|smin|umax|umin)\w*|ldapr\w*|ldapur\w*|stlur\w*)\s'
+# ARMv8.0 check on a Mach-O: no instruction newer than ARMv8.0 + CRC + AES/SHA (LSE, RCpc, RDM, FP16, dot product,
+# v8.3 PAC/JSCVT/FCMA, v8.4 flag ops, SHA3/SM, BF16/I8MM, MTE, SVE): scripts/laurel/armv80-check.py (fails on any)
 gpu_check_v80() {
-  local n
-  n=$(llvm-objdump -d --mattr=+v8.5a "$1" 2>/dev/null | grep -cP "$V81_PAT" || true)
-  echo "$(basename "$0"): $(basename "$1"): LSE/RCpc instructions: $n"
-  [ "$n" = 0 ]
+  python3 -I "$REPO/scripts/laurel/armv80-check.py" "$@"
+}
+
+# gpu_dsym FILE: the debug info of FILE (built with -g) into $DSYM/NAME.dSYM, then FILE is stripped (local symbols)
+gpu_dsym() {
+  mkdir -p "$DSYM"
+  rm -rf "$DSYM/$(basename "$1").dSYM"
+  if [ -d "$1.dSYM" ]; then
+    mv "$1.dSYM" "$DSYM/"            # clang made it (compile + link in one step with -g, as on macOS)
+  else
+    dsymutil "$1" -o "$DSYM/$(basename "$1").dSYM" 2>/dev/null || echo "$(basename "$0"): note: no dSYM for $(basename "$1")"
+  fi
+  "$STRIP" -x "$1"
 }

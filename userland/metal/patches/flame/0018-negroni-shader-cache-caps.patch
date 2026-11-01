@@ -1,0 +1,35 @@
+NegroniMetal change to ios-flame 745c434 phone/metal2 (after flame/0001-0017): build-time caps of metal2vulkan's shader
+cache (NMB_SHADER_MEMO_MB, NMB_SHADER_DISK_MB at cargo time; scripts/laurel/metal-env.sh sets them for the Mi A3).
+Unset (negroni) = metal2vulkan's defaults (256 MiB memo per process, 25 GiB directory): no change there.
+
+diff --git a/phone/metal2/bridge/NativeMetalBridge.rs b/phone/metal2/bridge/NativeMetalBridge.rs
+index a129e1f..c37d62d 100644
+--- a/phone/metal2/bridge/NativeMetalBridge.rs
++++ b/phone/metal2/bridge/NativeMetalBridge.rs
+@@ -90,2 +90,3 @@ fn open(loader: &CStr, cache: &CStr) -> Result<Device, String> {
+     options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
++    objects::shader_cache_caps(&mut options.shader_cache);
+     Device::system_default_with(&options).map_err(|e| format!("device: {e:?}"))
+diff --git a/phone/metal2/bridge/NativeMetalObjects.rs b/phone/metal2/bridge/NativeMetalObjects.rs
+index 73c4441..2a89622 100644
+--- a/phone/metal2/bridge/NativeMetalObjects.rs
++++ b/phone/metal2/bridge/NativeMetalObjects.rs
+@@ -188,2 +188,3 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
+         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
++        shader_cache_caps(&mut options.shader_cache);
+         options.messages = Some(MessageSink::new(observe_message));
+@@ -2411 +2412,14 @@ pub extern "C" fn nmb_blit_texture_to_buffer_options(encoder: *mut NmbEncoder, s
+ }
++
++/// Build-time caps of metal2vulkan's shader cache, set by a device port (scripts/laurel/metal-env.sh: NMB_SHADER_MEMO_MB,
++/// NMB_SHADER_DISK_MB). Unset (negroni) = metal2vulkan's defaults: a 256 MiB memo of compiled pipelines per device
++/// (per process) and a 25 GiB directory. The Mi A3 (4-6 GB RAM, every Metal process its own device) takes far less.
++pub fn shader_cache_caps(c: &mut metal2vulkan_runtime::ShaderCacheOptions) {
++    let mb = |v: Option<&str>| v.and_then(|v| v.parse::<u64>().ok()).filter(|&v| v > 0);
++    if let Some(m) = mb(option_env!("NMB_SHADER_MEMO_MB")) {
++        c.memory_capacity = m << 20;
++    }
++    if let Some(m) = mb(option_env!("NMB_SHADER_DISK_MB")) {
++        c.capacity = m << 20;
++    }
++}

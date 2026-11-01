@@ -1,0 +1,143 @@
+ios-flame bridge patch 0101 (MIT, 745c434), ported to metal2vulkan f6a96b7d by NegroniMetal: upstream removed PaddedReadsPolicy and Holds::Padding (every padded texture became a shadow). holding() lets padded rows and slices alias under PADDING_ALIASES (true), and aliases() takes an image whose subresources hold the padding up to the last row's pitch (padded_alone, the old Holds::Padding check). Since upstream e35bf78b every texture over host pages (each IOSurface the frontend imports) is a shadow before holding() is asked, so this reaches padded textures over the runtime's own buffers only. The unit tests follow the switch.
+
+diff --git a/crates/metal2vulkan-runtime/src/linear_plan.rs b/crates/metal2vulkan-runtime/src/linear_plan.rs
+index 1901cb3..f940706 100644
+--- a/crates/metal2vulkan-runtime/src/linear_plan.rs
++++ b/crates/metal2vulkan-runtime/src/linear_plan.rs
+@@ -878,10 +878,17 @@ pub(super) fn aliases(
+         && image.offset == 0
+         && image.row_pitch == layout.row_pitch
+         && (layout.slices == 1 || image.array_pitch == layout.slice_pitch)
+-        && texels_alone(layout, image.subresource, image.array_pitch)
++        && (texels_alone(layout, image.subresource, image.array_pitch)
++            || (PADDING_ALIASES
++                && apart(layout) != (false, false)
++                && padded_alone(layout, image.subresource, image.array_pitch)))
+         && image.size <= room
+ }
+ 
++/// negroni / ios-on-pixel: a padded texture aliases its buffer's bytes on Turnip ([`holding`]), its
++/// image's subresources holding the bytes between its rows too ([`padded_alone`] in [`aliases`]).
++pub(super) const PADDING_ALIASES: bool = true;
++
+ /// Whether an image over `layout`'s texels, for a texture of Metal `usage`, may hold them: where
+ /// its rows (and slices) lie one after another, or it has one row (one slice); else why not,
+ /// where consecutive rows share bytes (an IOSurface plane's on Metal's GPU, which no image holds
+@@ -938,6 +945,18 @@ pub(super) fn holding(layout: &BufferLayout, usage: TextureUsage) -> Result<(),
+     } else {
+         return Ok(());
+     };
++    // ios-on-pixel / negroni (Turnip on Adreno 640/730): a padded texture aliases its bytes, whatever
++    // its usage. Turnip's linear images carry no UBWC/metadata, so their layout transitions touch no
++    // memory, and draws (viewport, scissor) and GMEM stores (blit scissor) stay inside the image's
++    // width: the bytes between the rows are left alone. Upstream removed PaddedReadsPolicy (it
++    // shadows every padded texture); this keeps the old Alias behaviour for every usage, and
++    // [`aliases`] takes the image's padded subresource ([`padded_alone`]). Since upstream e35bf78b
++    // a texture over host pages (a no-copy buffer: every IOSurface the frontend imports) is a
++    // shadow before this is asked (`texture.rs`), so this reaches padded textures over the
++    // runtime's own buffers alone, not CA's IOSurface frames.
++    if PADDING_ALIASES {
++        return Ok(());
++    }
+     let writers = if usage.contains(TextureUsage::RENDER_TARGET) {
+         "its layout transitions read and write, and a render pass's load and store operations \
+          write back"
+@@ -965,6 +984,23 @@ pub(super) fn texels_alone(layout: &BufferLayout, size: u64, array_pitch: u64) -
+     apart(layout) == (false, false) && last.saturating_add(size) <= texels
+ }
+ 
++/// negroni (ios-flame 0101 on metal2vulkan 720ef1ce, `Holds::Padding`): whether a linear image over
++/// `layout`'s texels, whose subresources take `size` bytes each from the first texel of their slice,
++/// `array_pitch` apart, holds no byte but the texture's texels and the bytes between its rows and
++/// slices: its last subresource ends at its last row's pitch or before ([`rows_end`]).
++pub(super) fn padded_alone(layout: &BufferLayout, size: u64, array_pitch: u64) -> bool {
++    let last = array_pitch.saturating_mul(layout.slices - 1);
++    last.saturating_add(size) <= rows_end(layout) - layout.offset
++}
++
++/// One past `layout`'s last row at its row pitch: the texels' end with the last row's padding.
++fn rows_end(layout: &BufferLayout) -> u64 {
++    layout
++        .offset
++        .saturating_add(layout.slice_pitch.saturating_mul(layout.slices - 1))
++        .saturating_add(layout.row_pitch.saturating_mul(layout.rows))
++}
++
+ /// Whether `layout`'s rows, and its slices, lie with bytes between them that are not texels.
+ fn apart(layout: &BufferLayout) -> (bool, bool) {
+     let rows = layout.rows > 1 && layout.row_pitch != layout.row_bytes;
+diff --git a/crates/metal2vulkan-runtime/src/tests/linear_plan.rs b/crates/metal2vulkan-runtime/src/tests/linear_plan.rs
+index eb932cd..4ae5c54 100644
+--- a/crates/metal2vulkan-runtime/src/tests/linear_plan.rs
++++ b/crates/metal2vulkan-runtime/src/tests/linear_plan.rs
+@@ -798,13 +798,17 @@ fn a_linear_image_aliases_only_metals_layout() {
+         row_bytes: 68,
+         ..single
+     };
+-    assert!(!aliases(&padded, 4096, 320, &image));
++    // negroni: padded rows alias on Turnip (`PADDING_ALIASES`), the image's subresource ending at
++    // the last row's pitch or before.
++    assert_eq!(aliases(&padded, 4096, 320, &image), super::super::linear_plan::PADDING_ALIASES);
++    assert!(!aliases(&padded, 4096, 4096, &LinearImage { subresource: 336, ..image }));
+     // Whatever its usage: a texture that only reads takes a first move over them too.
+     for usage in [
+         TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ,
+         TextureUsage::SHADER_READ,
+     ] {
+-        assert!(holding(&padded, usage).is_err(), "{usage:?}");
++        // negroni: padded rows alias on Turnip (`PADDING_ALIASES`).
++        assert_eq!(holding(&padded, usage).is_err(), !super::super::linear_plan::PADDING_ALIASES, "{usage:?}");
+         assert_eq!(holding(&single, usage), Ok(()), "{usage:?}");
+     }
+     // One row has nothing between rows, but its pitch's padding past the texels.
+@@ -859,9 +863,10 @@ fn a_linear_image_aliases_only_metals_layout() {
+         TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ,
+         TextureUsage::SHADER_READ,
+     ] {
+-        assert!(holding(&apart, usage).is_err(), "{usage:?}");
++        // negroni: slices apart alias too (`PADDING_ALIASES`).
++        assert_eq!(holding(&apart, usage).is_err(), !super::super::linear_plan::PADDING_ALIASES, "{usage:?}");
+     }
+-    assert!(!aliases(
++    assert_eq!(super::super::linear_plan::PADDING_ALIASES, aliases(
+         &apart,
+         4096,
+         1088,
+@@ -871,6 +876,18 @@ fn a_linear_image_aliases_only_metals_layout() {
+             ..image
+         }
+     ));
++    // negroni: never past the last row's pitch, padding or not.
++    assert!(!aliases(
++        &apart,
++        4096,
++        4096,
++        &LinearImage {
++            size: 1104,
++            subresource: 336,
++            array_pitch: 384,
++            ..image
++        }
++    ));
+     // A driver that reports the array's whole bytes as its first subresource's.
+     assert!(!aliases(
+         &slices,
+@@ -914,6 +931,18 @@ fn a_padded_texture_s_shadow_names_what_may_write_its_padding() {
+     let passes = "its rows lie 80 bytes apart, 68 bytes of texels each: an image over them holds \
+                   the bytes between them, which Vulkan lets its layout transitions read and write, \
+                   and a render pass's load and store operations write back";
++    // negroni: on Turnip a padded texture aliases its bytes, whatever its usage (`PADDING_ALIASES`).
++    if super::super::linear_plan::PADDING_ALIASES {
++        for usage in [
++            TextureUsage::SHADER_READ,
++            TextureUsage::SHADER_WRITE,
++            TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ,
++            effective_usage(TextureUsage::UNKNOWN),
++        ] {
++            assert_eq!(holding(&padded, usage), Ok(()), "{usage:?}");
++        }
++        return;
++    }
+     for usage in [
+         TextureUsage::SHADER_READ,
+         TextureUsage::SHADER_READ | TextureUsage::PIXEL_FORMAT_VIEW,

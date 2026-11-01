@@ -1,0 +1,79 @@
+NegroniMetal change to ios-flame 745c434 phone/metal2 (on top of flame/0001-0016) for metal2vulkan 219f013:
+- MetalLevel and DeviceOptions::metal_level are gone upstream (ec72c05: one macOS release, 27.0.1, on every host): drop both uses.
+- negroni_policy(): ColorWritesPolicy / Unorm8LinearFilterPolicy and their DevicePolicy fields are gone (native-arithmetic round); exact = exact_answers(), compositor = default.
+
+diff --git a/phone/metal2/bridge/NativeMetalBridge.rs b/phone/metal2/bridge/NativeMetalBridge.rs
+index 44d817d..a129e1f 100644
+--- a/phone/metal2/bridge/NativeMetalBridge.rs
++++ b/phone/metal2/bridge/NativeMetalBridge.rs
+@@ -14,7 +14,7 @@ pub mod objects;
+ use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
+ use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
+ use metal2vulkan_runtime::{
+-    BlitOption, ClearColor, CommandBuffer, CommandBufferStatus, Device, DeviceOptions, HostMemory, LoadAction, MetalLevel,
++    BlitOption, ClearColor, CommandBuffer, CommandBufferStatus, Device, DeviceOptions, HostMemory, LoadAction,
+     Origin, PipelineOptions, RenderPassDescriptor, ResourceOptions, Size, StoreAction, TextureDescriptor,
+ };
+ use std::ffi::{c_char, c_void, CStr};
+@@ -86,8 +86,7 @@ fn open(loader: &CStr, cache: &CStr) -> Result<Device, String> {
+     let mut options = DeviceOptions::default();
+     options.policy = objects::negroni_policy();
+     options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
+-    // No macOS release names this host; answer as the newest measured Metal.
+-    options.metal_level = Some(MetalLevel::NEWEST);
++    // metal2vulkan 219f013 answers as one macOS release (27.0.1) on every host: no level to pick.
+     options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
+     Device::system_default_with(&options).map_err(|e| format!("device: {e:?}"))
+ }
+diff --git a/phone/metal2/bridge/NativeMetalObjects.rs b/phone/metal2/bridge/NativeMetalObjects.rs
+index 9bd7979..73c4441 100644
+--- a/phone/metal2/bridge/NativeMetalObjects.rs
++++ b/phone/metal2/bridge/NativeMetalObjects.rs
+@@ -19,7 +19,7 @@ use metal2vulkan::pipeline::{
+ use metal2vulkan_runtime::{
+     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
+     ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
+-    MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
++    Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
+     SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
+ };
+ use std::cell::RefCell;
+@@ -150,20 +150,21 @@ impl NmbDevice {
+ }
+ 
+ /// NegroniMetal: the device policy from env NEGRONIMETAL_POLICY (docs/metal-management.md).
+-/// - `exact`: metal2vulkan's defaults (Metal's 8-bit linear filter and color-write rounding emulated, containment on).
+-/// - `compositor` (default, also when unset or unknown): the device's 8-bit unorm linear filter (Turnip row, m2v/0003)
+-///   and the device's 8-bit unorm color-write conversion; containment and isolation on.
+-/// - `compositor-srgb`: `compositor` plus the device's 8-bit sRGB encode on color writes.
+-/// - `unsafe`: `compositor` plus containment UnsafeOff and isolation Off (no bounds checks).
++/// metal2vulkan 219f013 takes the device's native arithmetic on every device (8-bit unorm linear
++/// filter, color-write conversion and sRGB encode included), so the compositor values need no
++/// switch of their own any more (the m2v/0003 policy fields are gone upstream).
++/// - `exact`: `DevicePolicy::exact_answers()` (uncompressed heap textures, each command buffer
++///   complete at its own end, host-page textures as shadows, no pipeline-wait bound).
++/// - `compositor` / `compositor-srgb` (default, also when unset or unknown): metal2vulkan's
++///   default policy (containment and isolation on).
++/// - `unsafe`: the default plus containment UnsafeOff and isolation Off (no bounds checks).
+ pub(crate) fn negroni_policy() -> metal2vulkan::device::DevicePolicy {
+-    use metal2vulkan::device::{ColorWritesPolicy, ContainmentPolicy, DevicePolicy, GuestIsolation, Unorm8LinearFilterPolicy};
++    use metal2vulkan::device::{ContainmentPolicy, DevicePolicy, GuestIsolation};
+     let mut policy = DevicePolicy::default();
+     let name = std::env::var("NEGRONIMETAL_POLICY").unwrap_or_default();
+     if name == "exact" {
+-        return policy;
++        return policy.exact_answers();
+     }
+-    policy.unorm8_linear_filter = Unorm8LinearFilterPolicy::DeviceWithinOneCode;
+-    policy.color_writes = if name == "compositor-srgb" { ColorWritesPolicy::DeviceUnorm8Srgb } else { ColorWritesPolicy::DeviceUnorm8 };
+     if name == "unsafe" {
+         policy.containment = ContainmentPolicy::UnsafeOff;
+         policy.isolation = GuestIsolation::Off;
+@@ -184,7 +185,6 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
+         let mut options = DeviceOptions::default();
+         options.policy = negroni_policy();
+         options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
+-        options.metal_level = Some(MetalLevel::NEWEST);
+         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
+         options.messages = Some(MessageSink::new(observe_message));
+         Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::new(()))))

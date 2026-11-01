@@ -614,6 +614,22 @@ exception, or ask for a macOS path (Xcode clang/ld/codesign in gpu-env.sh).
   100 ms poll, stop on topaz_gpu_wanted/failed); clients default = probes only; Turnip 0101 caps buffers at the kernel's
   RedwoodMaxBuffer (< 64 MiB); macOS path runs the negroni scripts unchanged; LLVM >= 18 floor; wider LSE check.
   Merge: A -> B (2150-2152; B adds root-add-gpu.sh before root-add-metal.sh in root.sh) -> J 2850.
+## Mi A3: GPU upstream sync + full-acceleration work (2026-11-01 06:45, branch t3/laurel-gpu-upstream-opt, build only)
+
+- Done [V build]: upstream check (docs/laurel_sprout/upstream-2026-11-01.md, `scripts/setup/upstream-check.sh`);
+  metal2vulkan f6a96b7d -> 219f013 (rollback sets kept); Turnip 0102 (the A610 reported **Vulkan 1.0**, metal2vulkan needs
+  1.2: Metal had no device); kernel **2153** stage-1 SMMU tables on by default with self-check and fallback (lifts the
+  backboardd-only rule, scattered buffers/surfaces, 256 MiB buffers); compiled target `-mcpu=cortex-a53` (measured with
+  llvm-mca against `-mtune=cortex-a73`) + A53 erratum fix + ThinLTO (Turnip, Rust) + dSYMs; full ARMv8.0 check
+  (`scripts/laurel/armv80-check.py`); metal2vulkan cache caps 32 MiB / 1 GiB; eagl still surfaces every 8th frame.
+  Kernel 242 patches, 0 LSE; GL, Turnip, bridge, plug-in: check PASS, import check PASS.
+- Next (coordinator, phone): kernel with 2153 + root with GPU + Metal stage; read `LAUREL GPU:`, `LAUREL GPU SMMU:`,
+  `LAUREL METAL:`; then `vkprobe` (expect `TU DARWIN API: on` and apiVersion 1.3), `m2vtest`, `metalprobe`; then
+  METAL_CLIENTS steps (metal.md section 8). If `LAUREL GPU SMMU: off`, send the reason line: stage 1 then needs work on
+  the register access or the >4 GiB reach.
+- Open: fence IRQ (polled 200 us), GX/CX idle power collapse, CX/MX vote for > 300 MHz, 0x49 host import (possible now),
+  HakiOS RedwoodGPU fixes G3/G4/G11/G13/G14, gpu_recover, metal2vulkan 6e88d18 warm start, per-process GPU tables.
+
 ## Mi A3 Wi-Fi: patches 2400-2402 built (2026-11-01 04:35, area E, branch t3/laurel-wifi-modem-firmware)
 
 - Done [V build]: 2400 modem firmware through a runtime FAT16/FAT32 index of `modem_<active slot>` (GPT A/B bit; Mi A3: modem_b),
