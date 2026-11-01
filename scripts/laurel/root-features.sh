@@ -2,7 +2,7 @@
 # Install every Mi A3 root feature into a mounted root, then write the one table (scripts/laurel/root-manifest.py). root.sh calls it.
 #   scripts/laurel/root-features.sh MOUNTED_ROOT --inputs FILE --sidecar PATH
 # A step that fails or skips does not stop the next one: each feature gets its row. Exit 1 = a feature is missing (not by its own =0 switch).
-# Switches (one each; =0 = off): GPU METAL HEVC AUDIO BT CAMERA STATUSBAR NOTCH CELL TORCH BRIGHTNESS XNUTILS SSH. Runs as the user too (test on a copy: no chown).
+# Switches (one each; =0 = off): GPU METAL HEVC AUDIO BT CAMERA STATUSBAR NOTCH CELL TORCH BRIGHTNESS XNUTILS AIRPLAY SSH. Runs as the user too (test on a copy: no chown).
 # A new feature: one `feature` line here, one row in root-manifest.py FEATURES.
 set -uo pipefail
 R=${1:?usage: $0 MOUNTED_ROOT --inputs FILE --sidecar PATH}
@@ -42,6 +42,8 @@ feature torch env TORCH="${TORCH:-1}" bash "$L/root-flashlight.sh" "$R"
 feature brightness env BRIGHTNESS="${BRIGHTNESS:-1}" python3 -I "$L/root-brightness.py" "$R"
 # XNUtils (docs/laurel_sprout/xnutils.md): system app + setuid helper; live stats, Metal and GL switches, power actions
 feature xnutils env XNUTILS="${XNUTILS:-1}" bash "$L/root-xnutils.sh" "$R"
+# AirPlay self-check (LAUREL AIRPLAY line) + AirDrop on en0 (managed preferences; AIRDROP_LAN=0 skips them). docs/laurel_sprout/airplay-airdrop.md
+feature airplay env AIRPLAY="${AIRPLAY:-1}" AIRDROP_LAN="${AIRDROP_LAN:-1}" bash "$L/root-airplay.sh" "$R"
 # SSH (dropbear on 192.168.7.2:22, dash, toybox, usbreboot, oslogstream; docs/usb-network.md). Host key and known_hosts as root-add-ssh.py.
 if [ "${SSH:-1}" != 0 ]; then feature ssh env SSH=1 sh "$REPO/scripts/net/root-add-ssh.sh" "$R"; fi
 

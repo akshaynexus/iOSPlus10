@@ -73,7 +73,7 @@ EOF
   echo laurel > "$R/patches/laurel/xnu/2000-c.patch"; echo fix > "$R/patches/laurel/xnu-linux-fixes/0100-d.patch"; echo skips > "$R/patches/laurel/known-skips.txt"
   for f in 0001-kalloc-stock-clang-void-ptr.patch 0003-corecrypto-sha256-asm-operands.patch; do echo "$f" > "$R/external/ios-sweet-linux/linux/fixes/$f"; done
   for d in userland/laurel/gpu userland/laurel/metal userland/laurel/hevc userland/laurel/audio userland/laurel/bt userland/bluetooth userland/laurel/camera \
-           userland/camera userland/laurel/flashlight userland/laurel/notch userland/laurel/cell userland/laurel/xnutils userland/rebootapp userland/ssh; do mkdir -p "$R/$d"; echo src > "$R/$d/src.c"; done
+           userland/camera userland/laurel/flashlight userland/laurel/notch userland/laurel/cell userland/laurel/xnutils userland/laurel/airplay userland/rebootapp userland/ssh; do mkdir -p "$R/$d"; echo src > "$R/$d/src.c"; done
   echo gate > "$R/userland/laurel/metal/metal_gate.c"
   find "$R/userland" "$R/patches" "$R/external" -type f -exec touch -d '2 days ago' {} +
   git -C "$R" init -q; git -C "$R" add -A scripts patches userland; git -C "$R" -c user.name=t -c user.email=t@t commit -qm fake
@@ -101,6 +101,7 @@ make_stages() {
   mkdir -p "$X/Applications/XNUtils.app" "$X/usr/local/libexec" "$X/usr/local/bin"
   echo x > "$X/Applications/XNUtils.app/XNUtils"; chmod +x "$X/Applications/XNUtils.app/XNUtils"; echo x > "$X/Applications/XNUtils.app/Info.plist"
   echo x > "$X/usr/local/libexec/powermenu-helper"; echo x > "$X/usr/local/bin/pmregister"
+  mkdir -p "$R/out/laurel/airplay/root/usr/libexec"; echo x > "$R/out/laurel/airplay/root/usr/libexec/laurel-airplay"; chmod +x "$R/out/laurel/airplay/root/usr/libexec/laurel-airplay"
 }
 make_root() {
   rm -rf -- "$ROOT"
@@ -229,7 +230,7 @@ mv "$T/bt.saved" "$R/out/laurel/bt"
 echo "== build-all with stub stages"
 mkdir -p "$R/userland/ssh" "$R/userland/laurel/camera" "$R/userland/laurel/audio" "$R/userland/laurel/bt" "$R/out/laurel-kernel/theos/toolchain/linux/iphone/bin"
 printf '#!/bin/sh\n' > "$R/out/laurel-kernel/theos/toolchain/linux/iphone/bin/ld"; chmod +x "$R/out/laurel-kernel/theos/toolchain/linux/iphone/bin/ld"
-for s in scripts/laurel/{camera-inventory,gpu-firmware,gpu-userland,metal-build,notch-build,cell-build,hevc-build,xnutils-build,kernel-linux,uefi-image}.sh userland/laurel/{camera,audio,bt,flashlight}/build.sh userland/ssh/{fetch,fetch-sdk,build}.sh; do
+for s in scripts/laurel/{camera-inventory,gpu-firmware,gpu-userland,metal-build,notch-build,cell-build,hevc-build,xnutils-build,airplay-build,kernel-linux,uefi-image}.sh userland/laurel/{camera,audio,bt,flashlight}/build.sh userland/ssh/{fetch,fetch-sdk,build}.sh; do
   mkdir -p "$(dirname "$R/$s")"; printf '#!/bin/sh\nexit 0\n' > "$R/$s"; chmod +x "$R/$s"
 done
 git -C "$R" add -A scripts userland; git -C "$R" -c user.name=t -c user.email=t@t commit -qm stubs
