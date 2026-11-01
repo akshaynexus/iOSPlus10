@@ -23,4 +23,12 @@
 
 /* key=value text + kern.laurel_stats, in a buffer of the collector; valid until the next call. NULL: no memory. */
 char *collect(void);
+
+/* the parts of collect(): collect_files.c, collect_procs.c, collect_dev.c. kv: one key=value line (collect_ios.c). */
+void kv(const char *key, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+void xt_collect_files(void);
+void xt_collect_procs(void);
+void xt_collect_memory(void);
+void xt_collect_battery(void);
+void xt_collect_network(void);
 #endif

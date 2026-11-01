@@ -184,7 +184,7 @@ diff --git a/bsd/dev/laurel_stats_core.h b/bsd/dev/laurel_stats_core.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/laurel_stats_core.h
-@@ -0,0 +1,570 @@
+@@ -0,0 +1,299 @@
 +/*
 + * laurel 2911: the line table behind kern.laurel_stats (bsd/dev/laurel_stats.c). C without kernel calls: the host test
 + * (scripts/laurel/xnutils-test.sh) compiles this same text and feeds it a real boot log.
@@ -419,6 +419,77 @@ new file mode 100644
 +	r->n++;
 +	r->ms = now;
 +}
++
++struct ls_out {
++	char *p;
++	uint32_t at, cap;
++};
++
++static inline void
++ls_s(struct ls_out *o, const char *s)
++{
++	while (*s != 0 && o->at + 1 < o->cap) {
++		o->p[o->at++] = *s++;
++	}
++	o->p[o->at] = 0;
++}
++
++static inline void
++ls_u(struct ls_out *o, uint64_t v)
++{
++	char b[24];
++	uint32_t n = sizeof(b) - 1;
++
++	b[n] = 0;
++	do {
++		b[--n] = (char)('0' + v % 10);
++		v /= 10;
++	} while (v != 0);
++	ls_s(o, b + n);
++}
++
++/* one record per line, fields separated by a tab, the text last: S age n key on text | R age n key text | C age n name sig reason | D age n kind name note */
++static inline void
++ls_print(const struct ls_table *t, struct ls_out *o, uint64_t now)
++{
++	for (uint32_t i = 0; i < LS_STATE_N && t->state[i].n != 0; i++) {
++		const struct ls_state *s = &t->state[i];
++
++		ls_s(o, "S\t"); ls_u(o, (now - s->ms) / 1000); ls_s(o, "\t"); ls_u(o, s->n); ls_s(o, "\t");
++		ls_s(o, s->key); ls_s(o, s->on ? "\ton\t" : "\toff\t"); ls_s(o, s->text); ls_s(o, "\n");
++	}
++	for (uint32_t i = 0; i < LS_RECENT_N && t->recent[i].n != 0; i++) {
++		const struct ls_recent *r = &t->recent[i];
++
++		ls_s(o, "R\t"); ls_u(o, (now - r->ms) / 1000); ls_s(o, "\t"); ls_u(o, r->n); ls_s(o, "\t");
++		ls_s(o, r->key); ls_s(o, "\t"); ls_s(o, r->text); ls_s(o, "\n");
++	}
++	for (uint32_t i = 0; i < LS_CRASH_N && t->crash[i].n != 0; i++) {
++		const struct ls_crash *c = &t->crash[i];
++
++		ls_s(o, "C\t"); ls_u(o, (now - c->ms) / 1000); ls_s(o, "\t"); ls_u(o, c->n); ls_s(o, "\t");
++		ls_s(o, c->name); ls_s(o, "\t"); ls_u(o, (uint64_t)(unsigned)c->sig); ls_s(o, "\t"); ls_s(o, c->reason); ls_s(o, "\n");
++	}
++	for (uint32_t i = 0; i < LS_DEVICE_N && t->device[i].name[0] != 0; i++) {
++		const struct ls_device *d = &t->device[i];
++		char kind[2] = { d->kind, 0 };
++
++		if (d->n == 0) {
++			continue;
++		}
++		ls_s(o, "D\t"); ls_u(o, (now - d->ms) / 1000); ls_s(o, "\t"); ls_u(o, d->n); ls_s(o, "\t");
++		ls_s(o, kind); ls_s(o, "\t"); ls_s(o, d->name); ls_s(o, "\t"); ls_s(o, d->note); ls_s(o, "\n");
++	}
++}
++
++#include "laurel_stats_lines.h"
++#endif /* LAUREL_STATS_CORE_H */
+diff --git a/bsd/dev/laurel_stats_lines.h b/bsd/dev/laurel_stats_lines.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/laurel_stats_lines.h
+@@ -0,0 +1,272 @@
++/* laurel 2911: the second half of laurel_stats_core.h: state lines, crashes, devices, one console line. */
 +
 +/*
 + * The state word of a body: "on:" / "off:" as a whole word in its first 40 characters, or a body that is "on" / "off", or
@@ -690,71 +761,6 @@ new file mode 100644
 +		}
 +	}
 +}
-+
-+/* ---- the text of kern.laurel_stats ---------------------------------------------------------------------------------- */
-+
-+struct ls_out {
-+	char *p;
-+	uint32_t at, cap;
-+};
-+
-+static inline void
-+ls_s(struct ls_out *o, const char *s)
-+{
-+	while (*s != 0 && o->at + 1 < o->cap) {
-+		o->p[o->at++] = *s++;
-+	}
-+	o->p[o->at] = 0;
-+}
-+
-+static inline void
-+ls_u(struct ls_out *o, uint64_t v)
-+{
-+	char b[24];
-+	uint32_t n = sizeof(b) - 1;
-+
-+	b[n] = 0;
-+	do {
-+		b[--n] = (char)('0' + v % 10);
-+		v /= 10;
-+	} while (v != 0);
-+	ls_s(o, b + n);
-+}
-+
-+/* one record per line, fields separated by a tab, the text last: S age n key on text | R age n key text | C age n name sig reason | D age n kind name note */
-+static inline void
-+ls_print(const struct ls_table *t, struct ls_out *o, uint64_t now)
-+{
-+	for (uint32_t i = 0; i < LS_STATE_N && t->state[i].n != 0; i++) {
-+		const struct ls_state *s = &t->state[i];
-+
-+		ls_s(o, "S\t"); ls_u(o, (now - s->ms) / 1000); ls_s(o, "\t"); ls_u(o, s->n); ls_s(o, "\t");
-+		ls_s(o, s->key); ls_s(o, s->on ? "\ton\t" : "\toff\t"); ls_s(o, s->text); ls_s(o, "\n");
-+	}
-+	for (uint32_t i = 0; i < LS_RECENT_N && t->recent[i].n != 0; i++) {
-+		const struct ls_recent *r = &t->recent[i];
-+
-+		ls_s(o, "R\t"); ls_u(o, (now - r->ms) / 1000); ls_s(o, "\t"); ls_u(o, r->n); ls_s(o, "\t");
-+		ls_s(o, r->key); ls_s(o, "\t"); ls_s(o, r->text); ls_s(o, "\n");
-+	}
-+	for (uint32_t i = 0; i < LS_CRASH_N && t->crash[i].n != 0; i++) {
-+		const struct ls_crash *c = &t->crash[i];
-+
-+		ls_s(o, "C\t"); ls_u(o, (now - c->ms) / 1000); ls_s(o, "\t"); ls_u(o, c->n); ls_s(o, "\t");
-+		ls_s(o, c->name); ls_s(o, "\t"); ls_u(o, (uint64_t)(unsigned)c->sig); ls_s(o, "\t"); ls_s(o, c->reason); ls_s(o, "\n");
-+	}
-+	for (uint32_t i = 0; i < LS_DEVICE_N && t->device[i].name[0] != 0; i++) {
-+		const struct ls_device *d = &t->device[i];
-+		char kind[2] = { d->kind, 0 };
-+
-+		if (d->n == 0) {
-+			continue;
-+		}
-+		ls_s(o, "D\t"); ls_u(o, (now - d->ms) / 1000); ls_s(o, "\t"); ls_u(o, d->n); ls_s(o, "\t");
-+		ls_s(o, kind); ls_s(o, "\t"); ls_s(o, d->name); ls_s(o, "\t"); ls_s(o, d->note); ls_s(o, "\n");
-+	}
-+}
-+#endif /* LAUREL_STATS_CORE_H */
 diff --git a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
 index 201c8d9..31f49f1 100644
 --- a/bsd/dev/laurel_thermal.c

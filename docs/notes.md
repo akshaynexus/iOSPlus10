@@ -4693,3 +4693,15 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - Gotcha: `llvm-strip` refuses ld64's LC_SEGMENT_SPLIT_INFO on a dylib: use the theos `strip`. ffmpeg.org gave no tarball bytes here: pin by git commit. zsh: `echo =====` is an error, and `$VAR` with spaces does not split.
 - Refused by this session's permission check, so not done: running a prebuilt `ipsw`; fetching musl to run the arm64 test under qemu. So FFmpeg's NEON assembly has never run here. Owner decides.
 
+## Mi A3: XNUtils as a system app with live stats; kern.laurel_stats (2026-11-01, branch t3/laurel-xnutils; built + host test + dry run, NOT RUN ON THE PHONE)
+- Details, table of sources, test steps: docs/laurel_sprout/xnutils.md. Sources: userland/laurel/xnutils; the OnePlus version in userland/rebootapp stays.
+- Decision [V]: no sysctl per driver. The 4 MiB console ring (sweet_ufs.c) already holds every driver line. 2911 parses new bytes at a read and in the log thread that wakes every 10 s: no hook in the print path, no driver work. Only 3 small readers of driver variables (thermal + governor, GPU level, Wi-Fi), because those lines come once a minute or stop at the line limit.
+- Gotcha [V]: the negroni helper's Restart UI finds no process here: Apple's backboardd runs from /usr/libexec/real/backboardd (bbd_wrap.c execs it). The Laurel helper takes both paths.
+- Gotcha [V]: on laurel nothing reads /var/db/negronigl: bbd_wrap.c had boot-args only. The GL switch is a new file /private/var/db/laurelgl/off, read at each start of backboardd.
+- Gotcha [V]: `NMTL[..]` lines + `RedwoodGPU: client X (open N)` are the only list of processes with a device. There is no close line: the report checks the name against the running processes ("running" or "exited").
+- Gotcha [V]: the slot key needs 3 words without a digit: with 2, `LAUREL CAMERA: ios session: start`, `: 30 frames` and `: end` shared a slot. With a word that has a digit dropped, `wake 3:` and `wake 4:` share one, as they must. Names in a key (`refused: backboardd`) make many slots: the report sums them (rp_count).
+- Gotcha: `sysctl -n` of an unknown name on an older kernel: the report says "this kernel has no kern.laurel_stats" and shows what files and system calls give.
+- Gotcha: a python heredoc inside a shell heredoc with the same delimiter ends early (zsh: "unmatched"). Use another delimiter. zsh is the agent shell here.
+- Tool: `scripts/laurel/xnutils-test.sh LOG` runs the table + report on any real log: a quick way to read one boot's state lines and crash table.
+- Build [V]: kernel-linux.sh 293/293, 0 LSE, sha256 763609fb4fb3b0fa...; xnutils-build.sh no warning, ARMv8.0 clean; xnutils-test.sh PASS; root-dry-run.sh PASS.
+- Next: owner test, xnutils.md section 6.

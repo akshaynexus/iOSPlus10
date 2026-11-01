@@ -27,10 +27,11 @@ cc_log() { # NAME OUT ARGS...: warnings stop the build, as in notch-build.sh
   [ ! -s "$N/obj/$name.log" ] || { cat "$N/obj/$name.log"; gpu_die "compiler warnings in $name"; }
 }
 cc_log app "$A/XNUtils" -Wextra -Wno-unused-parameter -fobjc-arc -framework UIKit -framework Foundation -framework CoreGraphics \
-  "$S/main.m" "$S/stream.m"
+  "$S/main.m" "$S/list.m" "$S/stream.m"
 cc_log helper "$R/usr/local/libexec/powermenu-helper" -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -I"$S" \
   -framework CoreFoundation -framework IOKit \
-  "$S/helper.c" "$S/collect_ios.c" "$S/report_core.c" "$S/report_gfx.c" "$S/report_sys.c" "$S/report_io.c"
+  "$S/helper.c" "$S/helper_files.c" "$S/collect_ios.c" "$S/collect_files.c" "$S/collect_procs.c" "$S/collect_dev.c" \
+  "$S/report_core.c" "$S/report_row.c" "$S/report_gfx.c" "$S/report_sys.c" "$S/report_io.c"
 cc_log pmregister "$R/usr/local/bin/pmregister" -fobjc-arc -framework Foundation "$OLD/pmregister.m"
 install -m 644 "$S/Info.plist" "$A/Info.plist"
 python3 -I "$S/mkicon.py" "$A/AppIcon60x60@2x.png"

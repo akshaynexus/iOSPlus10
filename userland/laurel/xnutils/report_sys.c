@@ -170,7 +170,7 @@ rp_sec_kernel(struct rp *r)
 	rp_row(r, "Version", rp_kv(r, "kern.version"), -1);
 	rp_row(r, "OS build", rp_kv(r, "kern.osversion"), -1);
 	rp_row(r, "Boot-args", rp_kv(r, "kern.bootargs"), -1);
-	long up = rp_kvn(r, "up_ms", -1) / 1000;
+	long up = rp_kvn(r, "up_ms", -1000) / 1000;
 
 	if (up < 0) {
 		up = rp_kvn(r, "kern.uptime_s", -1);

@@ -9,13 +9,15 @@ P=$REPO/patches/laurel/xnu/2911-laurel-stats.patch
 S=$REPO/userland/laurel/xnutils
 D=$OUT/laurel/xnutils-test
 rm -rf "$D"; mkdir -p "$D"
-awk '/^\+\+\+ b\/bsd\/dev\/laurel_stats_core\.h/ {p=1; next}
-     p && /^diff / {exit}
-     p && /^@@/ {next}
-     p && /^\+/ {print substr($0, 2)}' "$P" > "$D/laurel_stats_core.h"
-[ -s "$D/laurel_stats_core.h" ] || { echo "xnutils-test: no laurel_stats_core.h in $P" >&2; exit 1; }
+for f in laurel_stats_core.h laurel_stats_lines.h; do
+  awk -v f="+++ b/bsd/dev/$f" '$0 == f {p=1; next}
+       p && /^diff / {exit}
+       p && /^@@/ {next}
+       p && /^\+/ {print substr($0, 2)}' "$P" > "$D/$f"
+  [ -s "$D/$f" ] || { echo "xnutils-test: no $f in $P" >&2; exit 1; }
+done
 ${CC:-cc} -g -O1 -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -fno-sanitize-recover=undefined -I"$D" -I"$S" -o "$D/host_main" \
-  "$S/test/host_main.c" "$S/report_core.c" "$S/report_gfx.c" "$S/report_sys.c" "$S/report_io.c"
+  "$S/test/host_main.c" "$S/report_core.c" "$S/report_row.c" "$S/report_gfx.c" "$S/report_sys.c" "$S/report_io.c"
 LOG=${1:-$S/test/sample.log}
 export ASAN_OPTIONS=detect_leaks=0     # the test tool keeps its buffers until it exits
 "$D/host_main" "$LOG" "$S/test/sample.kv" --plain > "$D/report.txt"
@@ -56,7 +58,7 @@ if unshare -r true 2>/dev/null; then
   : > "$F/private/var/db/negronimetal/strikes/SpringBoard"
   mkdir -p "$D/shim/sys"; cp "$S/test/shim_sysctl.h" "$D/shim/sys/sysctl.h"
   ${CC:-cc} -g -O1 -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -I"$D/shim" -I"$S" -I"$S/test" -DXT_ROOT="\"$F\"" -Dsyscall=xt_no_syscall \
-    -include sys/types.h -include stdint.h -o "$D/helper" "$S/helper.c" "$S/test/host_stubs.c" "$S/report_core.c" "$S/report_gfx.c" "$S/report_sys.c" "$S/report_io.c" 2>"$D/helper.log" || { cat "$D/helper.log"; exit 1; }
+    -include sys/types.h -include stdint.h -o "$D/helper" "$S/helper.c" "$S/helper_files.c" "$S/test/host_stubs.c" "$S/report_core.c" "$S/report_row.c" "$S/report_gfx.c" "$S/report_sys.c" "$S/report_io.c" 2>"$D/helper.log" || { cat "$D/helper.log"; exit 1; }
   h() { unshare -r "$D/helper" "$@"; }
   C=$F/private/var/db/negronimetal/clients L=$F/System/Library/Extensions/NegroniMetal.bundle/clients.local
   h metal all; [ "$(tail -1 "$C")" = "* -backboardd -mediaserverd" ] && cmp -s "$C" "$L" && ! head -1 "$C" | grep -q laurel-metal-gate || { echo "xnutils-test: FAIL: metal all" >&2; fail=1; }
