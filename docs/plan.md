@@ -743,3 +743,14 @@ the modem, which here also stops Wi-Fi), data, SMS, voice, iOS UI. No root chang
 Next: boot; expect `LAUREL CELL: on: SIM1 present (USIM ready), SIM2 ...; modem low power; radio off: ...` and Wi-Fi unchanged.
 Then step 2: IPA v4.2 AP side (RPM IPA clock, PAS 15 from vendor, SMMU 0xE0, QMI 0x31 INIT_MODEM_DRIVER) -> `ipa_up` ->
 ONLINE -> registration + signal.
+
+## Mi A3: GPU-drawn iOS UI runs without panic (2026-11-01 07:21-07:28, coordinator)
+
+Observed [V, usblog 07:20:52 boot, laurel-int-1 at e2c29b4 + EXTRA_ARGS=gpu_smmu=0, root of 07:16 with GPU-Opt userland]:
+- `LAUREL GPU: on`, `LAUREL METAL: on: Turnip a610 ...`, backboardd GL; first frame 29 s after boot.
+- 7+ min of use (103 touch/key events, 160 logged GL frames): no panic; pool 2156 lines `0 frees refused, 0 lost, 0 bad
+  ranges passed over`; SWEET FPS up to 61 frames/s while scrolling, 17-50 in heavier moments (longest gap up to 474 ms).
+- Thermal 37 C idle. Only daemon crashes: syncdefaultsd, webbookmarksd (no network).
+Open: 2154 SMMU stage-1 faults on the CP ring and turns the GPU off (fix agent t3/laurel-smmu-pool-bt), so tests use
+gpu_smmu=0 until then; BT rampatch check rejects apbtfw10.tlv (same agent); RTC/status bar (2720 + root-statusbar.py, merged,
+needs a root rebuild); cellular step 1 (2760) merged, step 2 IPA in progress.
