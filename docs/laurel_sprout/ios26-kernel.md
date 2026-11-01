@@ -9,7 +9,19 @@ Series method and work flow: [`patches/laurel/xnu-12377/README.md`](../../patche
 
 ## 1. Result
 
-RESULT_TABLE
+| Item | Value [V] |
+|---|---|
+| Output | `out/laurel-kernel-ios26/out/kernel.ios26.development.sweet.4k` (+ `.unstripped`, `.stamp`, `SHA256SUMS`, `series-report.txt`) |
+| `file` | `Mach-O 64-bit arm64 executable, flags:<NOUNDEFS\|PIE>` |
+| Size | 20,104,248 bytes (unstripped 25,344,192) |
+| SHA-256 | `e9c14c5e7219dd9b1571e0c2d4ca24bbc45f7aee89d545d87f7066bed4b83b1b` |
+| Link base | `0xfffffff007004000`, plain arm64, 0 chained rebases (`mkdarwinboot.py`) |
+| Stamp | `LAUREL BUILD: 18661e6c55 315 patches, series bd0958b2d49e5a2e, ios26_4k` (309 + base 5 + post 1) |
+| Clean run | 66 s, 20 cores, clang 23.1.4; `build.log`: 0 `linker command failed` |
+| LSE/RCpc check (`kernel-linux.sh` regex) | `LSE/RCpc instructions in the kernel: 0` |
+| `armv80-check.py` | `0 instructions newer than ARMv8.0` (with `--data-syms`: 22 data words decode as instructions, under K256, lz4 and panic strings; the iOS 16 kernel has 21 under the same symbols) |
+| `printf-arg-check.py` | `OK (limit 22 values)` |
+| Boot image | `out/laurel-ios26/uefi/laurel-uefi-boot.img`, 52,862,976 bytes, SHA-256 `c0574e291739526500f7c7f34ba8506c0217b7ab947d6ab2edc68e52126ddfb5`, ADT donor N104AP. Not written anywhere |
 
 ## 2. Series totals
 

@@ -4907,3 +4907,4 @@ Traps of 12377 that compile fine and fail at run time [V code]:
 - `sched_clutch.c` stir-the-pot: `#error` on LL/SC and a 16-byte CAS; 64 bits are enough for 8 CPUs.
 Donor [owner, 2026-11-02]: N104AP, iPhone12,1, `artwork-device-subtype` 0x700, scale 2. `mkadt.py --donor`; iOS 16 D22AP unchanged.
 Guess [I]: first failure is the 4K bootstrap in `start.s`/`arm_vm_init`, then kalloc startup with stock clang.
+Negroni series tool after the `--profile` change: same result as before it (`0401-negroni-ram-7g` is an ERROR with both: that patch changes base-owned files and is not listed in `patch-rules.py`; older than this work and not fixed here).
