@@ -4442,3 +4442,15 @@ Details: `docs/laurel_sprout/battery-power.md`.
   libraries; cam-frame-test (mock phone, 5 % loss, 51 resends): frame byte-equal, PNG written.
 - Next: boot with the new root (tables) + kernel; expect `LAUREL CAMERA: rear stream: 1280x720 RAW10 at ~93 fps, frame ~186`;
   then `scripts/laurel/cam-frame.sh`. Then step 3 (/dev/negronicam NCFRAME1) and step 4 (iOS plug-in).
+## Mi A3: camera steps 3 + 4 = /dev/negronicam + mediaserverd plug-in + root + ADT; patch 2772 + 2903 (2026-11-01, camera agent, branch t3/laurel-camera-app; build + host tests only, NOT BOOTED)
+- Details: docs/laurel_sprout/camera.md section 9.
+- [V log 15:30:57] Camera runs (`exec Camera`), never crashes, no line of its own; no plug-in, no ADT camera nodes, only 2770 in that kernel. [I, strong, negroni stackshot chain]
+  it waits for ever in `-[AVCaptureSession init]`: `StartRecorderServer` false [V topaz sweet-root-tweaks.py:120] and launchd holds `com.apple.coremedia.capturesource`.
+- [V] `mmap` of a character device: ENODEV (`bsd/kern/kern_mman.c:546`). Frames by read() from the kernel's NC mapping.
+- [V] S5KGD1 tables: trailer data_type 2 (16-bit data), the parser refuses them; front not done. S5K4H7: trailer 0/0.
+- [V] IMX586 mode 6: line 13714 ns; frame 780 = 93.5 fps; a session uses frame length 2431 = 30 fps (0x0340, group hold).
+- [V] apfs-fuse works without root on `087-86593-047.dmg` (cache) and `087-86698-044.dmg` (OS): stock mediaserverd job UserName mobile, 5 capture services in MachServices.
+- Gotcha: a new patch numbered before others must take its `bsd/conf/files` context from its own place in the series: 2775 has `laurel_cam_ctl.c` in its context, so 2772 inserts after `laurel_cam_cci.c`.
+- Gotcha: the macOS SDK's CVImageBuffer.h pulls the ApplicationServices umbrella, whose Security headers fail on an iOS target: `userland/laurel/camera/sdk-stub`.
+- Build [V]: 259/259 patches, 0 LSE, kernel sha256 04a59dd993aa...; NegroniCamera 74f5043092c3...; cam-test OK (cam3 2543 checks); camera-cache-check PASS (57 OK, 126 imports).
+- Next: owner boot: root + boot image; lines in camera.md section 9.

@@ -585,6 +585,76 @@ isp_render_nv12(const struct isp *isp, const struct negronicam_frame *f, const u
 }
 
 void
+isp_cells_size(const struct isp *isp, const struct negronicam_frame *f, uint32_t width, uint32_t height, uint32_t *cw, uint32_t *ch)
+{
+	uint32_t x0, y0;
+
+	crop(isp, f, width, height, &x0, &y0, cw, ch);
+}
+
+void
+isp_render_cells(const struct isp *isp, const struct negronicam_frame *f, const uint8_t *raw, uint8_t *rgb, uint32_t cw, uint32_t ch,
+    uint32_t first_row, uint32_t end_row)
+{
+	for (uint32_t row = first_row; row < end_row && row < ch; row++) {
+		render_line(isp, f, raw, cw, ch, row, rgb + (size_t)row * 3 * cw);
+	}
+}
+
+/* in 1/256ths of a cell: the place in the cells of the middle of output pixel i of n */
+static inline uint32_t
+scale_at(uint32_t i, uint32_t cells, uint32_t n)
+{
+	uint64_t at = ((uint64_t)(2 * i + 1) * cells * 128) / n;
+
+	return at < 128 ? 0 : (uint32_t)(at - 128);
+}
+
+static void
+scale_row(const uint8_t *rgb, uint32_t cw, uint32_t ch, const uint16_t *cx, const uint8_t *tx, uint32_t width, uint32_t height,
+    uint32_t row, uint8_t *out)
+{
+	uint32_t at = scale_at(row, ch, height), y0 = at >> 8, y1 = y0 + 1 < ch ? y0 + 1 : y0, ty = y0 + 1 < ch ? at & 255 : 0;
+	const uint8_t *t = rgb + (size_t)(y0 < ch ? y0 : ch - 1) * 3 * cw, *b = rgb + (size_t)y1 * 3 * cw;
+
+	for (uint32_t x = 0; x < width; x++, out += 3) {
+		uint32_t i = 3u * cx[x], j = cx[x] + 1u < cw ? i + 3u : i, a = tx[x];
+
+		for (uint32_t c = 0; c < 3; c++) {
+			uint32_t top = t[i + c] * (256 - a) + t[j + c] * a, bot = b[i + c] * (256 - a) + b[j + c] * a;
+
+			out[c] = (uint8_t)((top * (256 - ty) + bot * ty + 32768) >> 16);
+		}
+	}
+}
+
+void
+isp_scale_nv12(const uint8_t *rgb, uint32_t cw, uint32_t ch, uint8_t *y, size_t y_stride, uint8_t *uv, size_t uv_stride,
+    uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
+{
+	uint8_t line[2][3 * 8192], tx[8192];
+	uint16_t cx[8192];
+
+	if (width > 8192 || cw == 0 || ch == 0) {
+		return;
+	}
+	for (uint32_t x = 0; x < width; x++) {
+		uint32_t at = scale_at(x, cw, width);
+
+		cx[x] = (uint16_t)((at >> 8) < cw ? at >> 8 : cw - 1);
+		tx[x] = (uint8_t)(at & 255);
+	}
+	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
+		bool second = row + 1 < height;
+
+		scale_row(rgb, cw, ch, cx, tx, width, height, row, line[0]);
+		scale_row(rgb, cw, ch, cx, tx, width, height, second ? row + 1 : row, line[1]);
+		nv12_pair(line[0], line[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
+		    uv + (size_t)(row / 2) * uv_stride, video_range);
+	}
+}
+
+void
 isp_render_bgra(const struct isp *isp, const struct negronicam_frame *f, const uint8_t *raw, uint8_t *out, size_t stride,
     uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row)
 {

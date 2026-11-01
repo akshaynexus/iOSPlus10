@@ -64,6 +64,20 @@ say(const char *format, ...)
 	if (n > (int)sizeof(line) - 1) {
 		n = sizeof(line) - 1;
 	}
+#ifdef LAUREL_CAMERA
+	/* the Mi A3's prefix for every line of this bundle: grep "LAUREL CAMERA:" in the USB log */
+	{
+		static const char from[] = "negroni: camera hooks: ", to[] = "LAUREL CAMERA: ios hooks: ";
+		char other[sizeof(line)];
+
+		if (strncmp(line, from, sizeof(from) - 1) == 0) {
+			n = snprintf(other, sizeof(other), "%s%s", to, line + sizeof(from) - 1);
+			n = n > (int)sizeof(line) - 1 ? (int)sizeof(line) - 1 : n;
+			memcpy(line, other, (size_t)n);
+			line[n] = 0;
+		}
+	}
+#endif
 	(void)write(2, line, (size_t)n);
 	negronicam_console(line, (size_t)n);
 	if (n > 0 && line[n - 1] == '\n') {
@@ -720,8 +734,15 @@ negroni_camera_init(void)
 	}
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
 	say("negroni: camera hooks: in mediaserverd (pid %d), cache 20H392, slide %#lx, %s %s\n", getpid(), (unsigned long)slide,
-	    NEGRONICAM_DEVICE, access(NEGRONICAM_DEVICE, F_OK) == 0 ? "there" : "NOT there (boot-arg negronicam=7)");
+	    NEGRONICAM_DEVICE, access(NEGRONICAM_DEVICE, F_OK) == 0 ? "there" :
+#ifdef LAUREL_CAMERA
+	    "not there yet (kernel patch 2772 makes it when the sensor tables are read)");
+	/* (the node may come a moment after this process starts; a failed camera costs only this registration) */
+	{
+#else
+	    "NOT there (boot-arg negronicam=7)");
 	if (access(NEGRONICAM_DEVICE, F_OK) == 0) {
+#endif
 		register_hevc_encoder();
 	}
 	previous_exception_handler = objc_setUncaughtExceptionHandler(uncaught_exception);

@@ -113,6 +113,15 @@ void isp_render_nv12(const struct isp *isp, const struct negronicam_frame *f, co
 void isp_render_bgra(const struct isp *isp, const struct negronicam_frame *f, const uint8_t *raw, uint8_t *out, size_t stride,
     uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row);
 /*
+ * A moving picture larger than the frame's cells, cheaply (Mi A3: 640x360 cells, a preview of 1504x1128): the cells the
+ * picture shows as 8-bit R, G, B (cw x ch, 3 bytes each, whole frame in pieces of rows), then bilinear to the picture.
+ */
+void isp_cells_size(const struct isp *isp, const struct negronicam_frame *f, uint32_t width, uint32_t height, uint32_t *cw, uint32_t *ch);
+void isp_render_cells(const struct isp *isp, const struct negronicam_frame *f, const uint8_t *raw, uint8_t *rgb, uint32_t cw, uint32_t ch,
+    uint32_t first_row, uint32_t end_row);
+void isp_scale_nv12(const uint8_t *rgb, uint32_t cw, uint32_t ch, uint8_t *y, size_t y_stride, uint8_t *uv, size_t uv_stride,
+    uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range);
+/*
  * Every pixel at the sensor's own size (f->width x f->height): the two colours a site does not have
  * from the same colour's sites around it (bilinear); rows from first_row to end_row (even), NV12.
  */

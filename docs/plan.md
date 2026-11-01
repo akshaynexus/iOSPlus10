@@ -843,3 +843,9 @@ simple AE, 2 s self-check with fps line, `camframe`/`caminfo`/`camread` on the U
 cam-frame-test). Details: docs/laurel_sprout/camera.md section 8.
 Next: owner flash (root with tables + boot image), read `LAUREL CAMERA: rear stream:` and run `scripts/laurel/cam-frame.sh`;
 then step 3 `/dev/negronicam` (NCFRAME1) and step 4 the iOS plug-in.
+
+## Mi A3: camera steps 3 + 4 built: Camera app path (2026-11-01, branch t3/laurel-camera-app, patch 2772 + 2903; NOT BOOTED)
+Why the app did not open: the process waits for capture servers that nobody starts [V log + root setting; I the wait itself, negroni chain]. Done: `/dev/negronicam` (NCFRAME1 by read, session only while a client reads, exposure + gain + frame length, 30 fps),
+TCC tokens (2903), plug-in built on Linux with `userland/laurel/camera/build.sh`, 8-bit preview scaler, `root-camera.sh` (plug-in), `mkadt.py` (camera nodes), `scripts/laurel/camera-cache-check.sh` PASS, cam-test OK (mock client).
+259/259 patches, 0 LSE, kernel sha256 04a59dd9.... Not done: front (S5KGD1 tables do not parse), user-space mapped buffers (ENODEV in XNU; read instead).
+Next: owner flash (root + boot image), open Camera, compare `LAUREL CAMERA:` lines; expected preview + photo [I]. Details: docs/laurel_sprout/camera.md section 9.

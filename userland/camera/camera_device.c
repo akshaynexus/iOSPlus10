@@ -59,6 +59,17 @@
 #include <os/log.h>
 #include "camera_isp.h"
 
+/* userland/laurel/camera/build.sh (Mi A3): the rear IMX586 at 1280x720, kernel patch 2772 (docs/laurel_sprout/camera.md) */
+#ifdef LAUREL_CAMERA
+#define CAM_LINE_PREFIX "LAUREL CAMERA: ios: "
+#define CAM_SENSOR_NAME "IMX586"
+#define CAM_KERNEL_HINT "kernel patch 2772: see the LAUREL CAMERA lines of the boot, camera=0 or a failed self-check"
+#else
+#define CAM_LINE_PREFIX "negroni: camera: "
+#define CAM_SENSOR_NAME "IMX789"
+#define CAM_KERNEL_HINT "boot-arg negronicam=7, kernel patch 0318"
+#endif
+
 void negronicam_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
 void negronicam_console(const char *line, size_t n);
 
@@ -85,7 +96,7 @@ negronicam_say(const char *format, ...)
 {
 	char line[400];
 	va_list ap;
-	int n = snprintf(line, sizeof(line), "negroni: camera: ");
+	int n = snprintf(line, sizeof(line), CAM_LINE_PREFIX);
 
 	va_start(ap, format);
 	n += vsnprintf(line + n, sizeof(line) - (size_t)n, format, ap);
@@ -861,7 +872,19 @@ struct render_job {
 	CVPixelBufferRef pb;
 	uint32_t format, width, height, pieces;
 	bool still;                     /* the photograph: every pixel of the sensor (isp_render_still_nv12) */
+	const uint8_t *cells;           /* Mi A3: the frame's cells as R, G, B (isp_render_cells), scaled up to the picture */
+	uint32_t cells_w, cells_h;
 };
+
+/* the cell image of one frame, in pieces (isp_scale_nv12 then scales it, 8-bit, far cheaper than the ISP's float path) */
+static void
+cells_piece(void *context, size_t i)
+{
+	struct render_job *j = context;
+	uint32_t rows = (j->cells_h + j->pieces - 1) / j->pieces, first = (uint32_t)i * rows;
+
+	isp_render_cells(j->isp, j->f, j->raw, (uint8_t *)j->cells, j->cells_w, j->cells_h, first, first + rows);
+}
 
 static void
 render_piece(void *context, size_t i)
@@ -871,7 +894,11 @@ render_piece(void *context, size_t i)
 
 	first &= ~1u;
 	end = i + 1 == j->pieces ? j->height : end & ~1u;
-	if (j->format == PF_BGRA) {
+	if (j->cells != NULL) {
+		isp_scale_nv12(j->cells, j->cells_w, j->cells_h, CVPixelBufferGetBaseAddressOfPlane(j->pb, 0),
+		    CVPixelBufferGetBytesPerRowOfPlane(j->pb, 0), CVPixelBufferGetBaseAddressOfPlane(j->pb, 1),
+		    CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1), j->width, j->height, first, end, j->format == PF_420V);
+	} else if (j->format == PF_BGRA) {
 		isp_render_bgra(j->isp, j->f, j->raw, CVPixelBufferGetBaseAddress(j->pb), CVPixelBufferGetBytesPerRow(j->pb), j->width,
 		    j->height, first, end);
 	} else if (j->still) {
@@ -1042,9 +1069,35 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	}
 	CVPixelBufferLockBaseAddress(pb, 0);
 
-	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA };
+	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA,
+		NULL, 0, 0 };
 	uint64_t began = mach_absolute_time();
 
+#ifdef LAUREL_CAMERA
+	/*
+	 * The 1280x720 frame has 640x360 cells; the graph's preview is 1504x1128 or so. Every pixel of that through the float
+	 * path of render_line() would take the whole CPU: the cells go through the colour pipe once, then 8-bit bilinear.
+	 */
+	if (!job.still && pf != PF_BGRA) {
+		static uint8_t *cells;
+		static size_t cells_bytes;
+		size_t need;
+
+		isp_cells_size(isp, f, width, height, &job.cells_w, &job.cells_h);
+		need = (size_t)job.cells_w * job.cells_h * 3;
+		if (job.cells_w < width && job.cells_h < height) {
+			if (need > cells_bytes) {
+				free(cells);
+				cells = malloc(need);
+				cells_bytes = cells != NULL ? need : 0;
+			}
+			if (cells != NULL) {
+				job.cells = cells;
+				dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, cells_piece);
+			}
+		}
+	}
+#endif
 	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
 	if (job.still) {
 		static mach_timebase_info_data_t tb;
@@ -1351,7 +1404,11 @@ load_tuning(struct isp *isp, uint32_t sensor)
 	 * tools/camtuning.py format; none made yet from the OnePlus CAMX tuning). Without one: identity colour
 	 * matrix, no lens shading, grey-world white balance.
 	 */
+#ifdef LAUREL_CAMERA
+	static const char *const names[] = { "none", "imx586" };
+#else
 	static const char *const names[] = { "none", "imx789" };
+#endif
 	char path[128];
 
 	if (sensor >= sizeof(names) / sizeof(names[0])) {
@@ -1735,7 +1792,7 @@ static CFStringRef
 stream_description(CMBaseObjectRef o)
 {
 	(void)o;
-	return CFRetain(CFSTR("<NegroniCaptureStream: the rear main camera (IMX789)>"));
+	return CFRetain(CFSTR("<NegroniCaptureStream: the rear main camera (" CAM_SENSOR_NAME ")>"));
 }
 
 static const struct base_class stream_base = {
@@ -1921,7 +1978,7 @@ negroni_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, 
 	*out = NULL;
 	if (negronicam_failed || access(NEGRONICAM_DEVICE, F_OK) != 0) {
 		if (refused++ < 5) {
-			say("no device: %s %s (boot-arg negronicam=7, kernel patch 0318)", NEGRONICAM_DEVICE,
+			say("no device: %s %s (" CAM_KERNEL_HINT ")", NEGRONICAM_DEVICE,
 			    negronicam_failed ? "has failed in this process (EIO or no header)" : "is not there");
 		}
 		return ERR_NOT_AVAILABLE;
@@ -1948,6 +2005,6 @@ negroni_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, 
 	d->supported = supported(device_props, sizeof(device_props) / sizeof(device_props[0]));
 	CFRelease(stream[0]);
 	*out = device;
-	say("the device made: one stream, the back camera (IMX789, %s)", NEGRONICAM_DEVICE);
+	say("the device made: one stream, the back camera (" CAM_SENSOR_NAME ", %s)", NEGRONICAM_DEVICE);
 	return 0;
 }

@@ -184,7 +184,21 @@ def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwin
     cpus.children = cpu_nodes(cores, phandles, boot)
     arm_io.children = [c for c in arm_io.children if c.name != 'bluetooth']
     arm_io.children.append(bluetooth_node(next(phandles)))
+    if os.environ.get('CAMERA', '1') != '0':
+        camera_nodes(root, arm_io, phandles)
     return root
+
+
+def camera_nodes(root, arm_io, phandles):
+    """Camera capability (docs/laurel_sprout/camera.md section 9): /arm-io/isp with camera-rear = 1 and no compatible (no driver
+    matches it; no launchd job of 20H392 waits for it [V negroni notes section 43]) and /product/camera, no flash, no
+    camera-front. MobileGestalt reads them for rear-facing-camera, still-camera, video-camera [I from HakiOS, negroni]."""
+    isp = adt.Node()
+    isp.props = [('name', 0, cstr('isp')), ('AAPL,phandle', 0, u32(next(phandles))), ('camera-rear', 0, u32(1))]
+    arm_io.children.append(isp)
+    cam = adt.Node()
+    cam.props = [('name', 0, cstr('camera')), ('AAPL,phandle', 0, u32(next(phandles)))]
+    find(root, 'product').children.append(cam)
 
 
 def bluetooth_node(phandle):

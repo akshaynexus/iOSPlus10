@@ -2,8 +2,8 @@
 
 Status 2026-11-01: step 1 (power + CCI + chip ID of all four cameras) is code, kernel patch 2770, built (249/249
 patches, 0 LSE). Step 2 (rear IMX586 RDI raw frames 1280x720, fps line, `camframe` picture over USB) is code, kernel
-patch 2771, built (252/252 patches, 0 LSE), host-tested (section 8). Neither ran on the phone yet. The Camera app does
-not work yet: no iOS side.
+patch 2771, built (252/252 patches, 0 LSE), host-tested (section 8). Steps 3 + 4 (`/dev/negronicam`, mediaserverd plug-in, root step, ADT nodes) are code,
+kernel patch 2772 + 2903, built (259/259 patches, 0 LSE), host-tested (section 9). **None of this ran on the phone yet.**
 Labels: [V] read in a file or seen in a tool output (source given), [I] inference, [U] unknown.
 
 ## 1. Hardware
@@ -148,11 +148,11 @@ and the mm-camera ISP configuration in user space); UVC-style USB gadget (no hos
    (`topaz_smmu_identity`), VFE GDSC + vfe0/csi/cphy/ispif clocks, frame done by polling the VFE bus status. Self-
    check: the first frame arrives (sequence, line count). TPG first in the same code path when the sensor does not
    stream (the CSID TG is the CSID's own input, not a separate test path).
-3. Next: `/dev/negronicam`-compatible node (`NCFRAME1`, RAW10, bayer order of the mode, black level 64 [I]) + exposure /
-   gain writes (IMX586 0x0202 coarse integration, 0x0204 analog gain).
-4. iOS: build `userland/camera` for laurel (sensor 1 = rear), root step (plug-in + ADT `camera-rear`), test Camera.app
-   preview + photo.
-5. Later: front (S5KGD1, CSIPHY2 + switch), ultrawide, focus (DW9800W on M0), flash (PMI632), GPU demosaic.
+3. **Done (code, patch 2772, section 9):** `/dev/negronicam` (`NCFRAME1`, RAW10, Bayer of the mode, black level 64 [I]), session
+   only while a client reads, exposure + gain + frame length writes (IMX586 0x0202, 0x0204, 0x0340).
+4. **Done (code, section 9):** `userland/laurel/camera/build.sh` builds the plug-in on Linux, `root-camera.sh` installs it, `mkadt.py`
+   adds the camera nodes. Test: Camera.app preview + photo.
+5. Later: front (S5KGD1, CSIPHY2 + switch: section 9), ultrawide, focus (DW9800W on M0), flash (PMI632), GPU demosaic.
 
 ## 6. Step 1 (patch 2770)
 
@@ -326,10 +326,129 @@ then `camread G O` with 32 requests in flight and resends after 300 ms (823 part
 - The ext4 reader of branch t3/laurel-cellular-ipa2 (`laurel_ext4.c`, WIP, in a patch also numbered 2770: a number
   clash to fix at merge) could read the libraries straight from the vendor partition and drop the root step.
 
-### Next steps (not done)
+## 9. Steps 3 + 4: `/dev/negronicam` and the Camera app (patch 2772, 2903, plug-in, root step, ADT)
 
-- Step 3: `/dev/negronicam` with the NCFRAME1 ABI of negroni `userland/camera` (120-byte header + RAW10 frame; write =
-  exposure/gain), a continuous stream mode (the capture loop of laurel_cam_stream.c without the time limit, frames
-  handed to readers), bayer RGGB and black level 64 in the header.
-- Step 4: the iOS side: `userland/camera` plug-in built for laurel (sensor 1 = rear), root step (plug-in + ADT
-  `camera-rear` + `/product/camera`), Camera.app preview + photo.
+Status 2026-11-01: code, built, host tests pass. **Not run on the phone: every statement about the phone in this section is [I].**
+
+### Why the app did not open (log `logs/usblog-20261101-001446.txt`, from 15:28:00)
+
+[V] in the log:
+- 15:30:57 tap at 264,860, then `exec Camera`. The same at 07:49:58. No `CRASH Camera` line in the whole log: the process runs and
+  stays. No line with `|Camera|`, `IOK Camera`, `SWEET AKS: Camera`, or `NMTL[... Camera]`.
+- No `cameracaptured` process and no line from it: iOS 16 has none, the capture servers are part of mediaserverd [V negroni].
+- `mediaserverd` starts at 15:27:18; no line of it after the tap. No plug-in line (`negroni: camera`).
+- `IOK SpringBoard: path IODeviceTree:/arm-io/isp -> none`, `.../product/camera -> none`. The ADT has no camera nodes.
+- Kernel: `LAUREL CAMERA: on: ...; capture path: step 2`: this boot had only 2770 (chip IDs). No `rear stream` line, no `/dev/negronicam`.
+
+[V] on the root: topaz `sweet-root-tweaks.py` line 120 sets `StartRecorderServer` false; the stock mediaserverd job has
+`com.apple.coremedia.capturesource` + `capturesession` in MachServices, so launchd holds these names and nobody serves them.
+
+Cause [I, strong: the same signs and the same root setting as negroni, whose stackshots show the chain, `docs/camera-ios-2026-10-27.md`
+section 8]: `-[AVCaptureSession init]` in Camera sends its first XPC message to `com.apple.coremedia.capturesource` and waits for ever;
+the main thread waits on the same `dispatch_once` in `didFinishLaunching`; so no window comes. Not a crash, and not the camera hardware.
+
+### What had to change, chain from negroni, one line each
+
+| Blocker on negroni | State on the Mi A3 |
+| --- | --- |
+| No capture servers (`StartRecorderServer` false) | plug-in starts them after its hooks, without the Metal shader preload (`media_hooks.c`) |
+| No device vendor (no AppleH10CamIn) | hook 1 of the table; `scripts/laurel/camera-cache-check.sh` PASS on the 20H392 dmg: UUID 8F970452-..., 9 hooks, 57 OK lines; 126 imports OK |
+| tccd: `Failed to issue Sandbox Extension` -> -11852 "not authorized" | topaz sandbox ops 5/6 gave ENOENT [V 0050]: patch 2903 (same file as branch t3/laurel-kernel-infra-ports, so a later merge is clean) |
+| `DisplayPipePlaneBaseAlignment` number -> uncaught exception | patch 2002 + the plug-in's seed |
+| Plane bytesPerRow 0 | patch 2001 |
+| Preview in a Metal window server | Mi A3 backboardd is GL: `eagl.c` `surface_to_texture` copies each plane of a 420f surface into a texture [V source; I that CoreAnimation's GL path draws it, HakiOS's path]. No Metal in the plug-in or the ISP. The bundle does not depend on t3/laurel-metal-everywhere |
+| No camera nodes in the ADT | `mkadt.py` `camera_nodes`: `/arm-io/isp` `camera-rear` = 1, `/product/camera`; `CAMERA=0` skips |
+
+### Kernel (patch 2772; each file < 300 lines, kcheck OK)
+
+| File | Content |
+| --- | --- |
+| `laurel_cam_dev.h` | pure, host-tested: NCFRAME1 layout, Bayer map, line time, 30 fps frame length, limits, gain code, ring of 3 buffers |
+| `laurel_cam_dev.c` | cdev: open/close/read/write, node root:mobile 0660 |
+| `laurel_cam_sess.c` | one session on the stream thread |
+| changed | `laurel_cam_stream.c` (`lcam_stream_up/down` split out of `lcam_capture`), `laurel_cam_sensor.c` (`lcam_sensor_frame_exposure`: 0x0340 + 0x0202 + 0x0204 in one group hold), `laurel_cam_ctl.c` (node before the self-check, session loop) |
+
+- The node comes after the tables and buffers, before the 2 s self-check, so mediaserverd sees it. A self-check without a frame removes
+  it (`/dev/negronicam: off: ...`); the plug-in then refuses the device at once: Camera opens with no picture, no hang [I].
+- A session: first read -> bring-up of 2771; last close or 3 s without a read -> all off (sensor power-down, CSI, VFE, clocks, GDSC). The
+  camera has no power otherwise. `camframe` still works when no session runs. A fault (no frame for 1 s) answers EIO until reboot and
+  touches nothing else. Kill switch `camera=0` (no node).
+- Numbers [V library]: line 5376 at 392 MHz = 13714 ns. Mode 6 is 780 lines = 93.5 fps, 10 ms maximum exposure. A session sets frame
+  length 2431 lines = 30 fps, maximum 9724 lines (7.5 fps); the margin is 48 lines.
+- Bayer: library filter 3 -> header 0 (RGGB) [I: enum]. Black 64 [I]. Android mount angle 90 for the rear [V camera_config.xml], so no half
+  turn [I]; `/var/db/negronicam/turned` turns the picture if that is wrong.
+
+**Delivery: read(), not mmap.** The ask was "mapped buffers". `mmap` of a character device gives ENODEV in this XNU [V `kern_mman.c:546`],
+the NCFRAME1 client uses read(), and the buffers are Normal NC: a client that reads them in place reads uncached [I: slower than one
+copy to cached memory]. read() copies from the kernel's mapped buffers; a buffer under copy does not go back to the VFE, so no torn frame.
+
+**Front camera: not done.** The S5KGD1 tables do not parse: trailer data_type 2 (16-bit data) [V `camera-tables.py`: `table at 0x9f2c: trailer 2/2`],
+and its 1280x720 entry says 5.2 fps. It also needs CSIPHY2/CSID2 in code that has CSIPHY1/CSID1 fixed. No `camera-front` in the ADT;
+the SENSOR command answers ENODEV for others than 1.
+
+### iOS side
+
+- `userland/laurel/camera/build.sh`: native Linux build of `userland/camera` with `-DLAUREL_CAMERA` (no fork of the sources): theos clang +
+  ld64 + MacOSX13.3 headers (+ one stub header, `sdk-stub/`) + text stubs + ldid. 163552 bytes, arm64, minos 16.0, sha256 74f50430...
+  `LAUREL_CAMERA` changes: line prefix `LAUREL CAMERA: ios:`, IMX586 names, HEVC encoder registered also when the node comes later,
+  8-bit bilinear preview (below).
+- ISP: identity colour matrix (no Mi A3 tuning file), grey-world white balance, AE in `camera_isp.c`, all CPU, Metal-free.
+- Preview [V host test, I on the phone]: the frame has 640x360 cells; 4:3 uses 480x360. The graph asked 1504x1128 on negroni. The float path
+  per output pixel is too slow here, so the cells go through the colour pipe once, then 8-bit bilinear (`isp_render_cells`,
+  `isp_scale_nv12`). Photo: 4032x3024 output from 960x720 pixels, so it is soft: the frame mode is 1280x720.
+- `scripts/laurel/root-camera.sh` (root.sh, `CAMERA=0` skips): tables, plug-in in `/System/Library/Audio/Plug-Ins/HAL`, `/var/db/negronicam`,
+  MobileGestalt cache out, check of the mediaserverd job. No entitlements in the bundle: mediaserverd (user mobile [V plist]) has its own; the
+  app's TCC entitlement is stock. `StartRecorderServer` stays false.
+
+### Build and host test [V]
+
+- `scripts/bg.sh camapp-kernel scripts/laurel/kernel-linux.sh`: 259/259 patches, 0 LSE, no warning in the camera files, sha256 04a59dd9...
+- `scripts/laurel/cam-test.sh`: all old checks + `cam3_test`: 2543 checks, 0 failed. Mock NCFRAME1 client with the plug-in's own header (layout
+  compared at compile time) and ISP; each Bayer order; ring (never torn), limits, AE closes (green 141, target 144), green and blue bars
+  right, 8-bit preview within 6 steps of the float one away from edges.
+- `scripts/laurel/camera-cache-check.sh` PASS (section above). Only on a host: no XNU, no CMCapture, no real sensor ran.
+
+### Expected lines (USB log; grep -a `LAUREL CAMERA`) [I]
+
+```
+LAUREL CAMERA: /dev/negronicam: on: rear IMX586 1280x720 RAW10, Bayer RGGB, black 64; open + read starts the camera, the last close stops it
+LAUREL CAMERA: rear stream: 1280x720 RAW10 at 93.5 fps, frame 186 (kept for camframe), ...
+LAUREL SANDBOX: privileges 1002/1007/12000 on, extension tokens on
+LAUREL CAMERA: ios hooks: in mediaserverd (pid N), cache 20H392, slide 0x..., /dev/negronicam there
+LAUREL CAMERA: ios hooks: ... replaced (k of 9)                                  (9 lines; "left alone" = report it)
+LAUREL CAMERA: ios hooks: capture servers started (6 of 6, shader preload skipped): ...
+-- open Camera --
+LAUREL CAMERA: ios hooks: the camera's device vendor made (camera_device.c) (/dev/negronicam there)
+LAUREL CAMERA: ios: the device made: one stream, the back camera (IMX586, /dev/negronicam)
+LAUREL CAMERA: ios session: start (rear IMX586 1280x720, line 13714 ns, frame 2431 lines = 29 fps)
+LAUREL CAMERA: ios: frames of 1280x720 from the kernel (the Back Camera)
+LAUREL CAMERA: ios: stream: the graph starts the stream (format N)
+LAUREL CAMERA: ios: PrimaryScaler: the first picture given (WxH 420f)
+LAUREL CAMERA: ios session: 30 frames in N ms, ...
+-- shutter --
+LAUREL CAMERA: ios: StillImage: 4032x3024 made of every pixel in N ms
+LAUREL CAMERA: ios: the photograph is given (1 so far)
+LAUREL CAMERA: ios hooks: a photograph of 4032x3024 encoded in N ms
+-- close Camera --
+LAUREL CAMERA: rear stream: ios session: end (closed) after N frames, ...
+```
+
+How to read a stop: no `ios hooks:` line = the HAL did not load the bundle. `capture servers NOT started` = the reason is in the line.
+`Failed to issue Sandbox Extension` or `-11852` = 2903 not in the kernel. `UNCAUGHT EXCEPTION` + `throw stack:` = report them. `ios session: no frame`
+= CSID/VFE numbers in the line, section 8. Preview black with frames running = backboardd planar path: look for `redwood-gl: a new kind of texture`.
+
+### Test steps (owner approval for each partition write)
+
+1. `scripts/bg.sh cam-inv scripts/laurel/camera-inventory.sh` (only when `out/laurel/camera/lib` is empty), `scripts/bg.sh laurel-kernel scripts/laurel/kernel-linux.sh`,
+   `userland/laurel/camera/build.sh`.
+2. Root: `scripts/bg.sh laurel-root sudo scripts/laurel/root.sh`, flash userdata as usual. Boot image: `scripts/laurel/uefi-image.sh` (new kernel, new ADT), `scripts/laurel/flash-boot.sh`.
+3. Open Camera. Compare the lines above. Expected result [I]: preview from the rear camera, shutter saves a photo.
+4. Wrong colours: `scripts/laurel/cam-frame.sh` after the app closes (`camframe`), `--bayer`; `caminfo` shows the exposure. Upside down: `touch /var/db/negronicam/turned`, restart mediaserverd.
+5. mediaserverd crash loop (audio goes too): `touch /var/db/negronicam/off` over the USB shell or `camera=0` plus a root without the plug-in (`CAMERA=0`).
+
+### Open points [I]
+
+- The whole iOS chain: Camera on GL only: an app part that needs Metal has only the gate's list (`NMTL ... not listed`): AegirPoster dies this way today, Camera did not get so far.
+- Backboardd refill of 2.5 MB planes per frame through glTexImage2D (BGRA 11 MB took 120-145 ms, `eagl.c`): UI may drop while the camera runs. Next if so: BGRA preview for zero copy.
+- CPU load of 30 fps ISP on this SoC; the 2 s self-check at each boot stays.
+- Graph with a 16:9 sensor under a 4:3 format name: the format table stays the iPhone X names; the ISP crops.

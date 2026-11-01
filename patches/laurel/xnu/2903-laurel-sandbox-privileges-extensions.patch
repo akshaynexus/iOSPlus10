@@ -1,0 +1,158 @@
+laurel 2903: sandbox privileges and extension tokens (port of negroni 0222 + 0386).
+
+- Privileges 1002 PRIV_GLOBAL_PROC_INFO and 1007 PRIV_DARKBOOT for platform binaries, 12000
+  PRIV_SKYWALK_REGISTER_USER_PIPE for processes with com.apple.private.skywalk.register-user-pipe
+  (all three denied in the Mi A3 log of 2026-11-01: logd, cloudd, healthd, SpringBoard, rapportd,
+  identityservicesd). Kill switch laurelsandbox=0.
+- Sandbox ops 5/6 (extension issue/consume): a fixed token / accept, so tccd can answer TCC requests
+  (it logged "op 5" and got ENOENT). Kill switch laurelsbext=0.
+- Line at the policy registration: "LAUREL SANDBOX: privileges 1002/1007/12000 on, extension tokens on".
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 49ead96..b3a1004 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -297,8 +297,8 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+  * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
+- * use of each operation number is logged.
++ * data (container paths) fail with ENOENT; extension tokens: ops 5/6 below
++ * (laurel 2903). The first use of each operation number is logged.
+  */
+ int sweet_sandbox_container_path(user_addr_t arg);
+ static uint64_t sweet_sandbox_seen;
+@@ -310,6 +310,37 @@ sweet_sandbox_container_path(__unused user_addr_t arg)
+ 	return ENOENT;
+ }
+ 
++/*
++ * laurel 2903 (port of negroni 0386). Op 5, extension issue (libsystem_sandbox
++ * __sandbox_extension_issue, 20H392): arg -> { char *class; u64 type; char
++ * *data; u64 flags; char *token_buf (malloc 0x800); i64 pid; u64 pidversion };
++ * the policy writes the token string into token_buf. Op 6, extension consume:
++ * arg -> { char *token; u64 length; i64 *handle }; 0 = the handle (left 0 by
++ * the library). With ENOENT for both, tccd answered every TCC request "Failed
++ * to issue Sandbox Extension" (kTCCErrorDomain 6): no camera/microphone/photos
++ * authorization (negroni camera doc section 9; "tccd op 5" in the Mi A3 log of
++ * 2026-11-01). Without a sandbox an extension grants nothing: issue gives a
++ * fixed token, consume accepts any. Kill switch laurelsbext=0 (ENOENT, as before).
++ */
++static TUNABLE(uint32_t, laurel_sandbox_extensions, "laurelsbext", 1);
++
++static int
++laurel_sandbox_extension_issue(user_addr_t arg)
++{
++	static const char token[] =
++	    "0000000000000000000000000000000000000000000000000000000000000000;00;00000000;00000000;00000000;"
++	    "000000000000001a;laurel.sandbox.extension;00000001;00000000;0000000000000000";
++	uint64_t a[7];
++
++	if (!laurel_sandbox_extensions) {
++		return ENOENT;
++	}
++	if (copyin(arg, a, sizeof(a)) != 0 || a[4] == 0) {
++		return EINVAL;
++	}
++	return copyout(token, (user_addr_t)a[4], sizeof(token));
++}
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+@@ -322,8 +353,10 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
+ 		return sweet_sandbox_container_path(arg);
+-	case 5:         /* extension issue */
+-	case 6:         /* extension consume */
++	case 5:         /* extension issue (laurel 2903) */
++		return laurel_sandbox_extension_issue(arg);
++	case 6:         /* extension consume (laurel 2903) */
++		return laurel_sandbox_extensions ? 0 : ENOENT;
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:
+@@ -382,7 +415,57 @@ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+  * apps die in CoreAnimation setup: work_interval_create(CA_CLIENT) needs
+  * PRIV_WORK_INTERVAL ("Failed to create work interval", SpringBoard).
+  * Grant that one; log the first denial of each other privilege per process.
++ *
++ * laurel 2903 (port of negroni 0222): three more (bsd/sys/priv.h), denied in
++ * the Mi A3 log of 2026-11-01 as on negroni, granted to the system's own code
++ * only (kill switch laurelsandbox=0):
++ *   1002 PRIV_GLOBAL_PROC_INFO  proc_info about processes of other users
++ *        (read only). logd, cloudd, healthd, rapportd, aggregated. Platform binaries.
++ *   1007 PRIV_DARKBOOT          write the kern.darkboot sysctl. SpringBoard.
++ *        Platform binaries.
++ *   12000 PRIV_SKYWALK_REGISTER_USER_PIPE  register a Skywalk user pipe nexus.
++ *        identityservicesd, rapportd. Processes with the entitlement
++ *        com.apple.private.skywalk.register-user-pipe.
++ * The check is made on the current process, so only when the credential
++ * asked about is the current thread's.
+  */
++static TUNABLE(uint32_t, laurel_sandbox_privs, "laurelsandbox", 1);
++
++static const struct {
++	int priv;
++	const char *entitlement;        /* NULL: platform binaries */
++} laurel_priv_grants[] = {
++	{ PRIV_GLOBAL_PROC_INFO, NULL },
++	{ PRIV_DARKBOOT, NULL },
++	{ PRIV_SKYWALK_REGISTER_USER_PIPE, "com.apple.private.skywalk.register-user-pipe" },
++};
++static uint32_t laurel_priv_granted_logged;
++
++static bool
++laurel_sandbox_priv_allowed(kauth_cred_t cred, int priv)
++{
++	if (!laurel_sandbox_privs || cred != kauth_cred_get()) {
++		return false;
++	}
++	for (unsigned int i = 0; i < sizeof(laurel_priv_grants) / sizeof(laurel_priv_grants[0]); i++) {
++		if (laurel_priv_grants[i].priv != priv) {
++			continue;
++		}
++		proc_t p = current_proc();
++		bool ok = laurel_priv_grants[i].entitlement != NULL ?
++		    sweet_entitlements_bool(sweet_proc_entitlements(p), laurel_priv_grants[i].entitlement) :
++		    csproc_get_platform_binary(p) != 0;
++		if (ok && !(laurel_priv_granted_logged & (1u << i))) {
++			laurel_priv_granted_logged |= 1u << i;
++			char name[20];
++			proc_selfname(name, sizeof(name));
++			printf("LAUREL SANDBOX: %s privilege %d granted (first grant)\n", name, priv);
++		}
++		return ok;
++	}
++	return false;
++}
++
+ #define SWEET_PRIV_LOG_MAX      64
+ static struct {
+ 	int  priv;
+@@ -391,11 +474,14 @@ static struct {
+ static int sweet_priv_logged_count;
+ 
+ static int
+-sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
++sweet_sandbox_priv_grant(kauth_cred_t cred, int priv)
+ {
+ 	if (priv == PRIV_WORK_INTERVAL) {
+ 		return 0;
+ 	}
++	if (laurel_sandbox_priv_allowed(cred, priv)) {
++		return 0;
++	}
+ 	char name[20];
+ 	proc_selfname(name, sizeof(name));
+ 	for (int i = 0; i < sweet_priv_logged_count; i++) {
+@@ -446,5 +532,7 @@ sweet_amfi_policy_register(void)
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	printf("LAUREL SANDBOX: privileges 1002/1007/12000 %s, extension tokens %s\n",
++	    laurel_sandbox_privs ? "on" : "off (laurelsandbox=0)", laurel_sandbox_extensions ? "on" : "off (laurelsbext=0)");
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

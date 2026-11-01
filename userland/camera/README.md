@@ -3,6 +3,9 @@
 Status (2026-10-27): built and checked on the host only. Not run on the phone. Marks: [V] seen in a tool output or
 a source, [I] inference.
 
+Mi A3 (laurel_sprout): the same sources build natively on Linux with `-DLAUREL_CAMERA` (`userland/laurel/camera/build.sh`,
+`docs/laurel_sprout/camera.md` section 9).
+
 ## What it is
 
 - A bundle that mediaserverd loads from `/System/Library/Audio/Plug-Ins/HAL/NegroniCamera.driver`, the same way it

@@ -1,0 +1,806 @@
+laurel 2772: camera step 3 on the Mi A3: /dev/negronicam (NCFRAME1 ABI of negroni 0318 / HakiOS) on the rear RDI stream of 2771. A read starts a session (bring-up, 30 fps frame length, frames polled from the VFE, exposure + gain + frame length writes from the client between frames); the last close or 3 s without a read ends it and everything goes off. Frames: read() copies the newest finished buffer from the kernel's NC mapping; a reader never sees a torn frame and never holds up the VFE. Node published before the boot self-check, removed when the check gets no frame. A failure turns off only the camera (EIO). Rear only: the S5KGD1 tables have 16-bit data and the parser refuses them. Kill switch camera=0. Docs: docs/laurel_sprout/camera.md section 9. Not run on the phone.
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -146,6 +146,8 @@
+ bsd/dev/laurel_cam.c			standard
+ bsd/dev/laurel_cam_hw.c			standard
+ bsd/dev/laurel_cam_cci.c			standard
++bsd/dev/laurel_cam_dev.c			standard
++bsd/dev/laurel_cam_sess.c			standard
+ bsd/dev/laurel_cam_clk.c			standard
+ bsd/dev/laurel_cam_csi.c			standard
+ bsd/dev/laurel_cam_ispif.c			standard
+diff -ruN a/bsd/dev/laurel_cam.h b/bsd/dev/laurel_cam.h
+--- a/bsd/dev/laurel_cam.h
++++ b/bsd/dev/laurel_cam.h
+@@ -16,6 +16,9 @@
+  *   laurel_cam_sensor.c the library file from the root, sensor init/mode tables, exposure, stream on/off
+  *   laurel_cam_stream.c buffers (GPU pool), SMMU streams 0x420/0x421, one capture run, fps, kept frame
+  *   laurel_cam_ctl.c   USB commands camframe / caminfo / camread (sweet_usb.c), sysctl kern.laurel_camera_stream
++ * laurel 2772 (step 3, iOS):
++ *   laurel_cam_dev.h   /dev/negronicam ABI (NCFRAME1), ring of frame buffers, exposure limits (pure)
++ *   laurel_cam_dev.c   /dev/negronicam: read = newest frame, write = exposure; a session runs only while a client reads
+  * Rules (CLAUDE.md, laurel): RPM only through topaz_rpm_write; no SPMI, TrustZone, SMMU or memory pool use in step 1.
+  */
+ #ifndef LAUREL_CAM_H
+@@ -91,6 +94,7 @@
+ int lcam_sensor_start(const struct lcam_slot *s, const struct lcam_sensor *chip, const char **why);
+ int lcam_sensor_stream(bool on);
+ int lcam_sensor_exposure(uint32_t lines, uint32_t gain_code);
++int lcam_sensor_frame_exposure(uint32_t lines, uint32_t gain_code, uint32_t frame_lines);  /* laurel 2772: + frame length */
+ void lcam_sensor_stop(const struct lcam_slot *s);
+ const char *lcam_sensor_file(void);
+ 
+@@ -101,4 +105,12 @@
+ void lcam_frame_info(char *s, size_t n);
+ bool lcam_capture_request(char *reply, size_t n);       /* "camframe": wake the capture thread */
+ 
++/* laurel 2772 */
++int lcam_stream_up(unsigned *up, struct lcam_clk_info *ci, uint32_t *settle, const char **why);  /* stream.c: all but stream on */
++void lcam_stream_down(unsigned up);
++void lcam_dev_publish(void);                            /* laurel_cam_dev.c: /dev/negronicam */
++void lcam_dev_off(const char *why);
++bool lcam_dev_wanted(void);
++void lcam_dev_session(void);
++
+ #endif /* LAUREL_CAM_H */
+diff -ruN a/bsd/dev/laurel_cam_st.h b/bsd/dev/laurel_cam_st.h
+--- a/bsd/dev/laurel_cam_st.h
++++ b/bsd/dev/laurel_cam_st.h
+@@ -7,6 +7,7 @@
+ #include <kern/locks.h>
+ #include "laurel_cam_lib.h"
+ #include "laurel_cam_rdi.h"
++#include "laurel_cam_dev.h"
+ 
+ #define LST_NBUF            3
+ #define LST_W               1280u
+@@ -35,4 +36,24 @@
+ extern lck_mtx_t lcam_st_lock;
+ void lcam_stream_say(const char *s);
+ 
++/* laurel 2772: /dev/negronicam (laurel_cam_dev.c, laurel_cam_sess.c); all fields under lcam_dev_lock */
++#define LCAM_DEV_IDLE_MS        3000u           /* no read for this long: the session ends */
++struct lcam_dev_state {
++	bool opened, want, running, broken;
++	uint64_t last_read_ms, given;
++	struct lcam_nc_ring ring;
++	struct lcam_nc_limits lim;
++	uint32_t line_ns;
++	uint64_t time;                          /* of ring.latest */
++	uint32_t lines, gain, frame;            /* of ring.latest: what the sensor has been told */
++	struct {
++		bool pending;
++		uint32_t lines, gain, frame;
++	} ask;
++};
++extern struct lcam_dev_state lcam_dev;
++#define ld_lock lcam_dev_lock
++extern lck_mtx_t lcam_dev_lock;
++uint64_t lcam_dev_ms(void);
++
+ #endif /* LAUREL_CAM_ST_H */
+diff -ruN a/bsd/dev/laurel_cam_ctl.c b/bsd/dev/laurel_cam_ctl.c
+--- a/bsd/dev/laurel_cam_ctl.c
++++ b/bsd/dev/laurel_cam_ctl.c
+@@ -72,12 +72,18 @@
+ 		(void)thread_terminate(current_thread());
+ 		return;
+ 	}
++	lcam_dev_publish();                     /* laurel 2772: before the self-check (mediaserverd starts soon after the root) */
+ 	(void)lcam_capture(2000, line, sizeof(line));
+ 	lcam_stream_say(line);
+ 	st.off = strncmp(line, "off:", 4) == 0 || st.tpg;
++	if (st.off) {
++		lcam_dev_off("the boot self-check got no frame (line above)");
++	}
+ 	while (!st.off) {
+ 		lcam_sleep_ms(50);
+-		if (st.request) {
++		if (lcam_dev_wanted()) {        /* laurel 2772: stream only while a client reads */
++			lcam_dev_session();
++		} else if (st.request) {
+ 			st.request = false;
+ 			(void)lcam_capture(1500, line, sizeof(line));
+ 			lcam_stream_say(line);
+diff -ruN a/bsd/dev/laurel_cam_stream.c b/bsd/dev/laurel_cam_stream.c
+--- a/bsd/dev/laurel_cam_stream.c
++++ b/bsd/dev/laurel_cam_stream.c
+@@ -10,7 +10,8 @@
+  *      everything off again; the last complete frame stays as the kept frame (USB "camread");
+  *      no frame in 1 s: the CSID counters are logged and the same path runs once with the CSID test generator
+  *      (back end check), then the camera RDI path is off for this boot;
+- *   4. then sleeps; USB "camframe" (laurel_cam_ctl.c) asks for a new run of 1.5 s (fresh kept frame).
++ *   4. then sleeps; USB "camframe" (laurel_cam_ctl.c) asks for a new run of 1.5 s (fresh kept frame); a client of
++ *      /dev/negronicam (laurel_cam_dev.c, laurel 2772) gets a session for as long as it reads.
+  * Lines: "LAUREL CAMERA: rear stream: 1280x720 RAW10 at N fps, frame M ..." or "LAUREL CAMERA: rear stream: off: ...".
+  * sysctl kern.laurel_camera_stream = the last line. A failure turns off only this path (no other block is touched).
+  */
+@@ -137,45 +138,65 @@
+ 	r->fps10 = lcam_fps10(r->frames, r->first, r->last);
+ }
+ 
++/* laurel 2772: everything up to "stream on" (also for the iOS session, laurel_cam_dev.c); on failure the caller tears *up down */
+ int
+-lcam_capture(uint32_t ms, char *line, size_t len)
++lcam_stream_up(unsigned *up_out, struct lcam_clk_info *ci, uint32_t *settle_out, const char **why)
+ {
+-	struct lcam_clk_info ci = { 0, 0, 0, 0 };
+-	const char *why = "";
+ 	unsigned up = 0;
+-	uint32_t settle;
+-	struct run r;
++	uint32_t settle = 0;
+ 	int e;
+ 
+-	lck_mtx_lock(&lst_lock);
+-	st.busy = true;
+-	st.gen++;                               /* the old kept frame is gone from here on */
+-	st.kept = -1;
+-	lck_mtx_unlock(&lst_lock);
+-	if ((e = lcam_hw_on(&why)) == 0) {
++	if ((e = lcam_hw_on(why)) == 0) {
+ 		up |= S_HW;
+-		e = lcam_cci_init(&why);
++		e = lcam_cci_init(why);
+ 	}
+-	if (e == 0 && (e = lcam_sclk_on(&ci, &why)) == 0) {
++	if (e == 0 && (e = lcam_sclk_on(ci, why)) == 0) {
+ 		up |= S_SCLK;
+ 	}
+ 	if (e == 0) {
+ 		up |= S_SENSOR;                 /* (the power-up list runs inside: its down list on any failure) */
+-		e = lcam_sensor_start(st.slot, st.chip, &why);
++		e = lcam_sensor_start(st.slot, st.chip, why);
+ 	}
+-	settle = lcam_settle(st.lib->settle, ci.timer_hz);
+-	if (e == 0 && (e = lcam_vfe_on((uint32_t)st.pa[0], (uint32_t)st.pa[1], &why)) == 0) {
++	settle = lcam_settle(st.lib->settle, ci->timer_hz);
++	if (e == 0 && (e = lcam_vfe_on((uint32_t)st.pa[0], (uint32_t)st.pa[1], why)) == 0) {
+ 		up |= S_VFE;
+ 	}
+-	if (e == 0 && (e = lcam_ispif_on(&why)) == 0) {
++	if (e == 0 && (e = lcam_ispif_on(why)) == 0) {
+ 		up |= S_ISPIF;
+ 	}
+-	if (e == 0 && (e = lcam_csid_on(st.lib->lanes, LST_XML_ASSIGN, st.m.dt, st.m.decode, false, LST_W, LST_H, &why)) == 0) {
++	if (e == 0 && (e = lcam_csid_on(st.lib->lanes, LST_XML_ASSIGN, st.m.dt, st.m.decode, false, LST_W, LST_H, why)) == 0) {
+ 		up |= S_CSID;
+ 	}
+-	if (e == 0 && (e = lcam_csiphy_on(st.lib->lanes, settle, &why)) == 0) {
++	if (e == 0 && (e = lcam_csiphy_on(st.lib->lanes, settle, why)) == 0) {
+ 		up |= S_PHY;
+ 	}
++	*up_out = up;
++	*settle_out = settle;
++	return e;
++}
++
++void
++lcam_stream_down(unsigned up)
++{
++	teardown(up);
++}
++
++int
++lcam_capture(uint32_t ms, char *line, size_t len)
++{
++	struct lcam_clk_info ci = { 0, 0, 0, 0 };
++	const char *why = "";
++	unsigned up = 0;
++	uint32_t settle;
++	struct run r;
++	int e;
++
++	lck_mtx_lock(&lst_lock);
++	st.busy = true;
++	st.gen++;                               /* the old kept frame is gone from here on */
++	st.kept = -1;
++	lck_mtx_unlock(&lst_lock);
++	e = lcam_stream_up(&up, &ci, &settle, &why);
+ 	if (e != 0) {
+ 		teardown(up);
+ 		snprintf(line, len, "off: %s", why);
+diff -ruN a/bsd/dev/laurel_cam_sensor.c b/bsd/dev/laurel_cam_sensor.c
+--- a/bsd/dev/laurel_cam_sensor.c
++++ b/bsd/dev/laurel_cam_sensor.c
+@@ -186,6 +186,26 @@
+ 	return e;
+ }
+ 
++/* laurel 2772: exposure, gain and frame length (0x0340) in one group hold: the AE of the iOS client can make frames longer */
++int
++lcam_sensor_frame_exposure(uint32_t lines, uint32_t gain_code, uint32_t frame_lines)
++{
++	uint8_t f[4] = { 0x03, 0x40, (uint8_t)(frame_lines >> 8), (uint8_t)frame_lines };
++	uint8_t c[4] = { 0x02, 0x02, (uint8_t)(lines >> 8), (uint8_t)lines };
++	uint8_t g[4] = { 0x02, 0x04, (uint8_t)(gain_code >> 8), (uint8_t)gain_code };
++	int e;
++
++	if (!slot) {
++		return ENODEV;
++	}
++	(void)reg8(0x0104, 1);
++	e = lcam_cci_write(slot->master, sensor->addr, f, 4);
++	e = e ? e : lcam_cci_write(slot->master, sensor->addr, c, 4);
++	e = e ? e : lcam_cci_write(slot->master, sensor->addr, g, 4);
++	(void)reg8(0x0104, 0);
++	return e;
++}
++
+ void
+ lcam_sensor_stop(const struct lcam_slot *s)
+ {
+diff -ruN a/bsd/dev/laurel_cam_dev.h b/bsd/dev/laurel_cam_dev.h
+--- a/bsd/dev/laurel_cam_dev.h
++++ b/bsd/dev/laurel_cam_dev.h
+@@ -0,0 +1,173 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) camera (laurel 2772): the pure part of /dev/negronicam (no kernel calls; host-tested by
++ * tools/laurel-cam-test/cam3_test.c, which also compares the layout with iOSPlus10 userland/camera/negronicam.h).
++ * ABI = negroni patch 0318 = HakiOS /dev/hakios-camera: 120-byte "NCFRAME1" header + frame bytes, 24-byte command.
++ */
++#ifndef LAUREL_CAM_DEV_H
++#define LAUREL_CAM_DEV_H
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++
++#define LCAM_NC_MAGIC           "NCFRAME1"
++#define LCAM_NC_GAIN_UNITY      256u            /* gain x256 linear */
++#define LCAM_NC_GAIN_MAX        (16u * 256u)    /* the library's max analog gain */
++#define LCAM_NC_NO_FOCUS        0xffffffffu     /* no lens motor driver (DW9800W) yet */
++#define LCAM_NC_REAR            1u              /* HakiOS's numbering: the wide (rear main) camera */
++#define LCAM_NC_BLACK           64u             /* RAW10 black level [I: the usual Sony pedestal] */
++#define LCAM_NC_MARGIN          48u             /* library exp_gain_info vert_offset (.data 0x5fcc) */
++#define LCAM_NC_FPS             30u             /* mode 6 runs at 93.5 fps; a longer frame gives the AE 33 ms */
++#define LCAM_NC_FRAME_MULT      4u              /* longest frame = 4 x the shortest: about 7.5 fps */
++
++struct lcam_nc_frame {
++	char            magic[8];
++	uint32_t        header_bytes;           /* sizeof(this) */
++	uint32_t        width, height, stride;
++	uint32_t        format;                 /* 1: MIPI RAW10 */
++	uint32_t        bayer;                  /* 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR */
++	uint32_t        black;
++	uint64_t        sequence;               /* from 1, per session */
++	uint64_t        time;                   /* mach_absolute_time at the end of the frame */
++	uint32_t        exposure_lines, line_ns;
++	uint32_t        gain, gain_unity, gain_max;
++	uint32_t        frame_lines, frame_lines_min, frame_lines_max, margin;
++	uint32_t        sensor, focus;
++	uint32_t        reserved[5];
++};
++_Static_assert(sizeof(struct lcam_nc_frame) == 120, "NCFRAME1 header");
++
++enum { LCAM_NC_EXPOSURE = 1, LCAM_NC_KEEP = 2, LCAM_NC_SENSOR = 3, LCAM_NC_FOCUS = 4 };
++
++struct lcam_nc_command {
++	uint32_t        command, bytes;         /* bytes: of what follows this structure */
++	uint32_t        a, b, c, d;             /* EXPOSURE: a lines, b gain x256, c frame lines (0: shortest that holds a) */
++};
++_Static_assert(sizeof(struct lcam_nc_command) == 24, "NCFRAME1 command");
++
++/* mm-camera sensor_filter_arrangement (0 BGGR, 1 GBRG, 2 GRBG, 3 RGGB [I]) -> the header's order */
++static inline uint32_t
++lcam_nc_bayer(uint32_t filter)
++{
++	static const uint8_t map[4] = { 3, 2, 1, 0 };
++	return filter < 4 ? map[filter] : 0;
++}
++
++/* one line in ns: line length in pixel clocks / vt pixel clock */
++static inline uint32_t
++lcam_nc_line_ns(uint32_t line, uint32_t vt_pclk)
++{
++	return vt_pclk ? (uint32_t)(((uint64_t)line * 1000000000ull + vt_pclk / 2) / vt_pclk) : 0;
++}
++
++/* the shortest frame of a session: the lines of fps frames a second, never under the mode's own frame */
++static inline uint32_t
++lcam_nc_frame_lines(uint32_t mode_frame, uint32_t line_ns, uint32_t fps)
++{
++	uint32_t n = line_ns && fps ? (uint32_t)((1000000000ull / fps + line_ns / 2) / line_ns) : 0;
++	return n > mode_frame ? n : mode_frame;
++}
++
++struct lcam_nc_limits {
++	uint32_t frame_min, frame_max, margin;
++};
++
++static inline uint32_t
++lcam_nc_gain_clamp(uint32_t gain)
++{
++	return gain < LCAM_NC_GAIN_UNITY ? LCAM_NC_GAIN_UNITY : gain > LCAM_NC_GAIN_MAX ? LCAM_NC_GAIN_MAX : gain;
++}
++
++/* what the client asked for -> what the sensor can do (as 0318 exposure_limits) */
++static inline void
++lcam_nc_clamp(const struct lcam_nc_limits *l, uint32_t *lines, uint32_t *gain, uint32_t *frame)
++{
++	uint32_t f = *frame ? *frame : (*lines + l->margin > l->frame_min ? *lines + l->margin : l->frame_min);
++
++	f = f < l->frame_min ? l->frame_min : f > l->frame_max ? l->frame_max : f;
++	*frame = f;
++	*lines = *lines < 4 ? 4 : *lines > f - l->margin ? f - l->margin : *lines;
++	*gain = lcam_nc_gain_clamp(*gain);
++}
++
++/* IMX586: code = 1024 - 1024 / gain (gain x256 here; laurel_cam_rdi.h lcam_gain_code has x1024) */
++static inline uint32_t
++lcam_nc_gain_code(uint32_t gain)
++{
++	gain = lcam_nc_gain_clamp(gain);
++	return 1024u - (1024u * LCAM_NC_GAIN_UNITY + gain / 2) / gain;
++}
++
++/*
++ * The frame buffers: two in the VFE (PING, PONG), one out: the newest finished frame, which readers copy from. A buffer
++ * that a reader copies from does not go back into the VFE: the frame that ended meanwhile is lost, its buffer is
++ * written again. So a reader never sees a torn frame and never holds up the VFE.
++ */
++#define LCAM_NC_NBUF            3u
++
++struct lcam_nc_ring {
++	uint32_t cur[2], latest;                /* buffer index */
++	int reading;                            /* buffer a reader copies from, -1 none */
++	uint64_t frames;                        /* frames given (the sequence of `latest`) */
++	uint64_t lost;                          /* frames written over because `latest` was being read */
++};
++
++static inline void
++lcam_nc_ring_init(struct lcam_nc_ring *r)
++{
++	r->cur[0] = 0;
++	r->cur[1] = 1;
++	r->latest = 2;
++	r->reading = -1;
++	r->frames = 0;
++	r->lost = 0;
++}
++
++/* master `slot` finished a buffer: true = a new frame in r->latest; *refill = the buffer `slot` writes next */
++static inline bool
++lcam_nc_ring_done(struct lcam_nc_ring *r, uint32_t slot, uint32_t *refill)
++{
++	uint32_t done = r->cur[slot & 1u];
++
++	if (r->reading == (int)r->latest) {
++		*refill = done;
++		r->lost++;
++		return false;
++	}
++	r->cur[slot & 1u] = r->latest;
++	*refill = r->latest;
++	r->latest = done;
++	r->frames++;
++	return true;
++}
++
++static inline void
++lcam_nc_header(struct lcam_nc_frame *h, uint32_t w, uint32_t hh, uint32_t stride, uint32_t filter,
++    const struct lcam_nc_limits *l, uint32_t line_ns)
++{
++	static const char magic[8] = { 'N', 'C', 'F', 'R', 'A', 'M', 'E', '1' };
++	uint8_t *z = (uint8_t *)h;
++
++	for (size_t i = 0; i < sizeof(*h); i++) {
++		z[i] = 0;
++	}
++	for (size_t i = 0; i < 8; i++) {
++		h->magic[i] = magic[i];
++	}
++	h->header_bytes = (uint32_t)sizeof(*h);
++	h->width = w;
++	h->height = hh;
++	h->stride = stride;
++	h->format = 1;
++	h->bayer = lcam_nc_bayer(filter);
++	h->black = LCAM_NC_BLACK;
++	h->line_ns = line_ns;
++	h->gain_unity = LCAM_NC_GAIN_UNITY;
++	h->gain_max = LCAM_NC_GAIN_MAX;
++	h->frame_lines_min = l->frame_min;
++	h->frame_lines_max = l->frame_max;
++	h->margin = l->margin;
++	h->sensor = LCAM_NC_REAR;
++	h->focus = LCAM_NC_NO_FOCUS;
++}
++
++#endif /* LAUREL_CAM_DEV_H */
+diff -ruN a/bsd/dev/laurel_cam_dev.c b/bsd/dev/laurel_cam_dev.c
+--- a/bsd/dev/laurel_cam_dev.c
++++ b/bsd/dev/laurel_cam_dev.c
+@@ -0,0 +1,219 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) camera (laurel 2772), step 3: /dev/negronicam for iOS, on the RDI stream of laurel 2771.
++ * ABI (laurel_cam_dev.h): the one of negroni 0318 and HakiOS /dev/hakios-camera, read by iOSPlus10 userland/camera:
++ *   open()   no hardware action.
++ *   read()   starts a session (the stream thread brings the camera up); waits (1 s; 8 s for the first frame) for the
++ *            newest frame not read yet; gives the 120-byte header, then as many frame bytes as fit. A buffer of the
++ *            header's size gets the header only. EAGAIN on a time-out, EIO after a fault (until reboot).
++ *   write()  struct lcam_nc_command: EXPOSURE (a lines, b gain x256, c frame lines or 0), SENSOR (only 1, the rear main
++ *            camera, exists: others give ENODEV), KEEP and FOCUS accepted and ignored.
++ * The camera has power only during a session (laurel_cam_sess.c): it ends after the last close or 3 s without a read
++ * (a photograph takes the reader that long), and everything goes off
++ * (sensor power-down, CSI, VFE, clocks, GDSC: laurel_cam_stream.c teardown). Only the stream thread touches the hardware;
++ * read and write only queue requests. A failure turns off only the camera: the node then answers EIO.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/proc.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/thread.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include "laurel_cam.h"
++#include "laurel_cam_core.h"
++#include "laurel_cam_st.h"
++
++#define d lcam_dev
++
++#define GID_MOBILE              501             /* mediaserverd runs as mobile */
++#define FIRST_WAIT_MS           8000u           /* the boot self-check (2 s) + bring-up + first frame */
++#define NEXT_WAIT_MS            1000u
++
++static LCK_GRP_DECLARE(ld_grp, "laurel_camera_dev");
++LCK_MTX_DECLARE(lcam_dev_lock, &ld_grp);
++struct lcam_dev_state lcam_dev;
++static void *node;
++
++uint64_t
++lcam_dev_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ull;
++}
++
++static int
++ld_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	lck_mtx_lock(&ld_lock);
++	d.opened = true;
++	lck_mtx_unlock(&ld_lock);
++	return 0;
++}
++
++/* (a character device gets d_close at the last close only) */
++static int
++ld_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	lck_mtx_lock(&ld_lock);
++	d.opened = false;
++	lck_mtx_unlock(&ld_lock);
++	return 0;
++}
++
++static int
++ld_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	struct lcam_nc_frame h;
++	uint64_t t0 = lcam_dev_ms(), limit = NEXT_WAIT_MS;
++	int buf = -1, error;
++
++	lck_mtx_lock(&ld_lock);
++	if (!d.running) {
++		limit = FIRST_WAIT_MS;
++	}
++	d.want = true;
++	d.last_read_ms = t0;
++	for (;;) {
++		if (d.broken) {
++			lck_mtx_unlock(&ld_lock);
++			return EIO;
++		}
++		if (d.running && d.ring.frames > d.given && d.ring.reading < 0) {
++			buf = (int)d.ring.latest;
++			break;
++		}
++		if (lcam_dev_ms() - t0 > limit) {
++			lck_mtx_unlock(&ld_lock);
++			return EAGAIN;
++		}
++		lck_mtx_unlock(&ld_lock);
++		lcam_sleep_ms(2);
++		lck_mtx_lock(&ld_lock);
++		d.want = true;                  /* (a session that was ending when this read began) */
++		d.last_read_ms = lcam_dev_ms();
++	}
++	lcam_nc_header(&h, LST_W, LST_H, LST_STRIDE, st.lib->filter, &d.lim, d.line_ns);
++	h.sequence = d.ring.frames;
++	h.time = d.time;
++	h.exposure_lines = d.lines;
++	h.gain = d.gain;
++	h.frame_lines = d.frame;
++	d.given = d.ring.frames;
++	bool body = uio_resid(uio) > (user_ssize_t)sizeof(h);
++	if (body) {
++		d.ring.reading = buf;           /* (the stream thread leaves this buffer alone until it is -1 again) */
++	}
++	lck_mtx_unlock(&ld_lock);
++	error = uiomove((caddr_t)&h, (int)MIN((user_ssize_t)sizeof(h), uio_resid(uio)), uio);
++	if (body) {
++		/* the kernel's Normal NC mapping of the GPU pool buffer: no cache maintenance */
++		if (error == 0 && uio_resid(uio) > 0) {
++			error = uiomove((caddr_t)st.va[buf], (int)MIN((user_ssize_t)LST_BYTES, uio_resid(uio)), uio);
++		}
++		lck_mtx_lock(&ld_lock);
++		d.ring.reading = -1;
++		lck_mtx_unlock(&ld_lock);
++	}
++	return error;
++}
++
++static int
++ld_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	struct lcam_nc_command c;
++	int error;
++
++	if (uio_resid(uio) < (user_ssize_t)sizeof(c)) {
++		return EINVAL;
++	}
++	if ((error = uiomove((caddr_t)&c, sizeof(c), uio)) != 0) {
++		return error;
++	}
++	switch (c.command) {
++	case LCAM_NC_EXPOSURE:
++		lck_mtx_lock(&ld_lock);
++		d.ask.lines = c.a;
++		d.ask.gain = c.b;
++		d.ask.frame = c.c;
++		d.ask.pending = true;
++		lck_mtx_unlock(&ld_lock);
++		return 0;
++	case LCAM_NC_SENSOR:
++		return c.a == LCAM_NC_REAR ? 0 : ENODEV;
++	case LCAM_NC_KEEP:
++	case LCAM_NC_FOCUS:
++		if (c.bytes && uio_resid(uio) > 0) {
++			uio_update(uio, MIN((user_size_t)c.bytes, (user_size_t)uio_resid(uio)));
++		}
++		return 0;
++	default:
++		return EINVAL;
++	}
++}
++
++static const struct cdevsw ld_cdevsw = {
++	.d_open = ld_open,
++	.d_close = ld_close,
++	.d_read = ld_read,
++	.d_write = ld_write,
++	.d_ioctl = eno_ioctl,
++	.d_stop = eno_stop,
++	.d_reset = eno_reset,
++	.d_ttys = NULL,
++	.d_select = eno_select,
++	.d_mmap = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type = 0,
++};
++
++/* after the sensor library + buffers are ready: before the self-check, so mediaserverd's constructor sees the node */
++void
++lcam_dev_publish(void)
++{
++	int major = cdevsw_add(-1, &ld_cdevsw);
++
++	node = major < 0 ? NULL : devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_MOBILE, 0660, "negronicam");
++	if (node == NULL) {
++		LCAM_SAY("/dev/negronicam: off: no node (cdevsw %d)\n", major);
++		return;
++	}
++	LCAM_SAY("/dev/negronicam: on: rear %s %ux%u RAW10, Bayer %s, black %u; open + read starts the camera, the last "
++	    "close stops it\n", st.chip->name, LST_W, LST_H, st.lib->filter == LCAM_BAYER_RGGB ? "RGGB" : "other", LCAM_NC_BLACK);
++}
++
++/* the boot self-check failed: no camera this boot (iOS: the device create is refused, Camera.app opens without a picture) */
++void
++lcam_dev_off(const char *why)
++{
++	lck_mtx_lock(&ld_lock);
++	d.broken = true;
++	lck_mtx_unlock(&ld_lock);
++	if (node != NULL) {
++		devfs_remove(node);
++		node = NULL;
++		LCAM_SAY("/dev/negronicam: off: %s\n", why);
++	}
++}
++
++/* the stream thread (laurel_cam_ctl.c), every 50 ms: does a client want frames? */
++bool
++lcam_dev_wanted(void)
++{
++	bool w;
++
++	lck_mtx_lock(&ld_lock);
++	w = d.want && !d.broken && d.opened && lcam_dev_ms() - d.last_read_ms < LCAM_DEV_IDLE_MS;
++	d.want = w;
++	lck_mtx_unlock(&ld_lock);
++	return w;
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_cam_sess.c b/bsd/dev/laurel_cam_sess.c
+--- a/bsd/dev/laurel_cam_sess.c
++++ b/bsd/dev/laurel_cam_sess.c
+@@ -0,0 +1,167 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) camera (laurel 2772): one client session of /dev/negronicam, on the stream thread
++ * (laurel_cam_ctl.c): the bring-up of laurel 2771 with the frame length of 30 fps (mode 6 runs at 93.5 fps: its 10 ms
++ * exposure is too short for a room and the CPU ISP cannot use more frames), frames polled from the VFE every 1 ms, exposure
++ * requests of the client between frames, everything off at the end. The AE and white balance run in the client (camera_isp.c).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include "laurel_cam.h"
++#include "laurel_cam_core.h"
++#include "laurel_cam_st.h"
++
++#define d lcam_dev
++
++#define NO_FRAME_FIRST_MS       2000u
++#define NO_FRAME_MS             1000u
++
++static void
++session_end(const char *why, unsigned up, const struct lcam_nc_ring *r, uint32_t errors, uint32_t bits, bool fault)
++{
++	char line[sizeof(st.line)];
++
++	lcam_stream_down(up);
++	lck_mtx_lock(&ld_lock);
++	d.running = false;
++	d.want = false;
++	d.broken = d.broken || fault;
++	lck_mtx_unlock(&ld_lock);
++	lck_mtx_lock(&lst_lock);
++	st.kept = r->frames ? (int)r->latest : -1;
++	st.frames = (uint32_t)r->frames;
++	st.runs++;
++	st.busy = false;
++	lck_mtx_unlock(&lst_lock);
++	snprintf(line, sizeof(line), "ios session: end (%s) after %llu frames, %llu read over, VFE errors %u (%#x)%s", why,
++	    r->frames, r->lost, errors, bits, fault ? "; FAULT: /dev/negronicam answers EIO until reboot" : "");
++	lcam_stream_say(line);
++}
++
++/* one client session, on the stream thread: from the first read to the last close or 1 s without a read */
++void
++lcam_dev_session(void)
++{
++	struct lcam_nc_ring ring;
++	struct lcam_clk_info ci = { 0, 0, 0, 0 };
++	const char *why = "";
++	unsigned up = 0;
++	uint32_t settle = 0, errors = 0, bits = 0, slot, err, refill, lines, gain, frame;
++	struct lcam_nc_limits lim;
++	uint32_t line_ns = lcam_nc_line_ns(st.m.line, st.m.vt_pclk);
++	uint64_t started, last;
++	bool fault = false;
++	const char *end = "closed";
++
++	lck_mtx_lock(&lst_lock);
++	st.busy = true;
++	st.gen++;
++	st.kept = -1;
++	lck_mtx_unlock(&lst_lock);
++	lim.frame_min = lcam_nc_frame_lines(st.m.frame, line_ns, LCAM_NC_FPS);
++	lim.frame_max = lim.frame_min * LCAM_NC_FRAME_MULT;
++	lim.margin = LCAM_NC_MARGIN;
++	LCAM_SAY("ios session: start (rear %s %ux%u, line %u ns, frame %u lines = %u fps)\n", st.chip->name, LST_W, LST_H,
++	    line_ns, lim.frame_min, line_ns ? (uint32_t)(1000000000ull / ((uint64_t)lim.frame_min * line_ns)) : 0);
++	if (lcam_stream_up(&up, &ci, &settle, &why) != 0) {
++		LCAM_SAY("ios session: off: %s\n", why);
++		lcam_nc_ring_init(&ring);
++		session_end("the bring-up failed", up, &ring, 0, 0, true);
++		return;
++	}
++	/* from the exposure the last run ended with (x1024 -> x256) */
++	lines = st.ae.lines ? st.ae.lines : lim.frame_min - lim.margin;
++	gain = st.ae.gain ? st.ae.gain / 4u : 4u * LCAM_NC_GAIN_UNITY;
++	frame = 0;
++	lcam_nc_clamp(&lim, &lines, &gain, &frame);
++	(void)lcam_sensor_frame_exposure(lines, lcam_nc_gain_code(gain), frame);
++	lcam_nc_ring_init(&ring);
++	lck_mtx_lock(&ld_lock);
++	d.ring = ring;
++	d.lim = lim;
++	d.line_ns = line_ns;
++	d.lines = lines;
++	d.gain = gain;
++	d.frame = frame;
++	d.given = 0;
++	d.ask.pending = false;
++	d.running = true;
++	d.last_read_ms = lcam_dev_ms();
++	lck_mtx_unlock(&ld_lock);
++	(void)lcam_sensor_stream(true);
++	started = last = lcam_dev_ms();
++	for (;;) {
++		uint64_t now = lcam_dev_ms();
++		int got = lcam_vfe_poll(&slot, &err);
++
++		if (err) {
++			errors++;
++			bits |= err;
++		}
++		lck_mtx_lock(&ld_lock);
++		bool open = d.opened, idle = now - d.last_read_ms > LCAM_DEV_IDLE_MS, ask = false;
++		uint32_t al = d.ask.lines, ag = d.ask.gain, af = d.ask.frame;
++		uint64_t frames = d.ring.frames;
++		if (got) {
++			bool fresh = lcam_nc_ring_done(&d.ring, slot, &refill);
++			lcam_vfe_refill(slot, (uint32_t)st.pa[refill]);
++			if (fresh) {
++				d.time = mach_absolute_time();
++				last = now;
++				frames = d.ring.frames;
++			}
++			ask = d.ask.pending;
++			d.ask.pending = false;
++		}
++		ring = d.ring;
++		lck_mtx_unlock(&ld_lock);
++		if (!open || idle) {
++			end = open ? "nobody reads" : "closed";
++			break;
++		}
++		if (!got) {
++			if (now - last > (frames ? NO_FRAME_MS : NO_FRAME_FIRST_MS)) {
++				uint32_t pk, ecc, crc, irq, phy;
++				char vn[96];
++				lcam_csid_counts(&pk, &ecc, &crc, &irq, &phy);
++				lcam_vfe_note(vn, sizeof(vn));
++				LCAM_SAY("ios session: no frame for %llu ms (CSID packets %u ECC %u CRC %u irq %#x, CSIPHY status "
++				    "%#x, ISPIF %#x, %s)\n", now - last, pk, ecc, crc, irq, phy, lcam_ispif_status(), vn);
++				end = "no frame";
++				fault = true;
++				break;
++			}
++			lcam_sleep_ms(1);
++			continue;
++		}
++		if (ask) {
++			lcam_nc_clamp(&lim, &al, &ag, &af);
++			if ((al != lines || ag != gain || af != frame) &&
++			    lcam_sensor_frame_exposure(al, lcam_nc_gain_code(ag), af) == 0) {
++				/* [I] takes effect 2 frames later; the header says it now, as 0318 */
++				lines = al;
++				gain = ag;
++				frame = af;
++				lck_mtx_lock(&ld_lock);
++				d.lines = lines;
++				d.gain = gain;
++				d.frame = frame;
++				lck_mtx_unlock(&ld_lock);
++			}
++		}
++		if (frames == 30 || (frames && frames % 900 == 0)) {
++			LCAM_SAY("ios session: %llu frames in %llu ms, %llu read over, exposure %u lines gain %u/256, frame %u lines, "
++			    "mean %u, VFE errors %u (%#x)\n", frames, now - started, ring.lost, lines, gain, frame,
++			    lcam_raw10_mean(st.va[ring.latest], LST_W, LST_H, 40), errors, bits);
++		}
++	}
++	/* a read still copying only reads memory that stays allocated; the VFE stops writing in the teardown */
++	st.ae.lines = st.ae.max_lines && lines > st.ae.max_lines ? st.ae.max_lines : lines;
++	st.ae.gain = gain * 4u;
++	session_end(end, up, &ring, errors, bits, fault);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

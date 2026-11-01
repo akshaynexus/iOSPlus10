@@ -6,7 +6,7 @@
 #        dyld cache link, plain system keybag); 2. topaz sweet-root-tweaks.py (build 20H392 fixes, launchd,
 #        CommCenter drop, Setup, migration) + negroni root-tweaks-extra.py (vmd etc. dropped) and
 #        root-tweaks-boldtext.py, root-add-gpu.sh (GPU), root-add-metal.sh (Metal, METAL=0 skips), root-audio.sh
-#        (speaker HAL plug-in; AUDIO=0 skips), root-bt.sh (Bluetooth userland; BT=0 skips), root-camera.sh (sensor tables;
+#        (speaker HAL plug-in; AUDIO=0 skips), root-bt.sh (Bluetooth userland; BT=0 skips), root-camera.sh (sensor tables, NegroniCamera.driver;
 #        CAMERA=0 skips) and root-statusbar.py
 #        (status bar provider for 360x780 pt + the waterdrop dylib for SpringBoard from out/laurel/notch, scripts/laurel/notch-build.sh;
 #        STATUSBAR=0 skips both, NOTCH=0 only the dylib); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
@@ -82,7 +82,7 @@ METAL=${METAL:-1} sh "$REPO/scripts/laurel/root-add-metal.sh" "$mnt"
 AUDIO=${AUDIO:-1} bash "$REPO/scripts/laurel/root-audio.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-audio.sh failed; root built without audio" >&2
 # Bluetooth (kernel patch 2600): bluetoothd job back + the BlueTool stand-in; BT=0 skips
 BT=${BT:-1} bash "$REPO/scripts/laurel/root-bt.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-bt.sh failed; root built without Bluetooth" >&2
-# rear camera (kernel patch 2771): the phone's stock sensor libraries (tables read by the kernel); CAMERA=0 skips
+# rear camera (kernel patches 2771, 2772): the phone's stock sensor libraries (tables read by the kernel) + the mediaserverd plug-in; CAMERA=0 skips
 CAMERA=${CAMERA:-1} bash "$REPO/scripts/laurel/root-camera.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-camera.sh failed; root built without camera tables" >&2
 # status bar at the native 720x1560 @2x screen (2103): UIKit's own provider override = _FixedSplit, else the red
 # rdar:45025538 bar; plus the waterdrop as SpringBoard's notch rect (liblaurel-notch.dylib + laurel-springboard from
