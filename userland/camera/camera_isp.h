@@ -104,6 +104,15 @@ void isp_measure(const struct isp *isp, const struct negronicam_frame *f, const 
  * lens]) the mean of green stays under 2 steps above black and no sample reaches 64.
  */
 bool isp_no_light(const struct negronicam_frame *f, const struct isp_stats *s);
+/*
+ * laurel: the raw bytes as the client got them, every 15th line, no black level off: the same numbers as the kernel's `raw' line
+ * (laurel_cam_light.h), so a difference between the two is in read() and not in the sensor.
+ */
+struct isp_raw {
+	uint32_t        n, min, max, hist[8], byte[5];  /* hist: by the top 3 of 10 bits; byte: mean of each byte of the 5-byte group */
+	double          mean;
+};
+void isp_raw_measure(const struct negronicam_frame *f, const uint8_t *raw, struct isp_raw *r);
 /* the exposure for the frames to come: true, and the command filled in, when it should change */
 bool isp_ae(struct isp *isp, const struct negronicam_frame *f, const struct isp_stats *s, struct negronicam_command *c);
 /*

@@ -250,6 +250,39 @@ isp_no_light(const struct negronicam_frame *f, const struct isp_stats *s)
 	return reach >= 0.25 && s->mean[1] < 2 && s->top < 64;
 }
 
+void
+isp_raw_measure(const struct negronicam_frame *f, const uint8_t *raw, struct isp_raw *r)
+{
+	uint64_t sum = 0, bytes[5] = { 0, 0, 0, 0, 0 };
+	uint32_t groups = 0;
+
+	memset(r, 0, sizeof(*r));
+	r->min = 1023;
+	for (uint32_t y = 0; y < f->height; y += 15) {
+		const uint8_t *g = raw + (size_t)y * f->stride;
+
+		for (uint32_t x = 0; x + 3 < f->width; x += 4, g += 5) {
+			for (int i = 0; i < 5; i++) {
+				bytes[i] += g[i];
+			}
+			groups++;
+			for (int i = 0; i < 4; i++) {
+				uint32_t v = (uint32_t)g[i] << 2 | (g[4] >> (2 * i) & 3u);
+
+				r->min = v < r->min ? v : r->min;
+				r->max = v > r->max ? v : r->max;
+				r->hist[v >> 7]++;
+				sum += v;
+				r->n++;
+			}
+		}
+	}
+	r->mean = r->n ? (double)sum / r->n : 0;
+	for (int i = 0; i < 5; i++) {
+		r->byte[i] = groups ? (uint32_t)(bytes[i] / groups) : 0;
+	}
+}
+
 /*
  * Green's mean towards 15 % of white, unless that would put 1 % of the picture into white. The
  * exposure, longest first: the frame's lines at the shortest frame, then gain to 16x, then frames up

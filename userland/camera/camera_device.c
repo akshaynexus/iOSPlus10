@@ -1786,6 +1786,18 @@ worker(void *context)
 			if (isp_ae(&isp, f, &st, &c)) {
 				(void)write(device, &c, sizeof(c));
 			}
+#ifdef LAUREL_CAMERA
+			/* laurel: the same numbers as the kernel's `raw (session)' line, from the bytes this process got */
+			if (s->frames == 6 || s->frames % 150 == 0) {
+				struct isp_raw rr;
+
+				isp_raw_measure(f, raw, &rr);
+				say("raw as read: frame %llu, %ux%u stride %u, %u samples: min %u max %u mean %.1f (black %u); top 3 bits %u %u %u %u %u %u %u %u; "
+				    "bytes of the group %u %u %u %u %u", (unsigned long long)f->sequence, f->width, f->height, f->stride, rr.n, rr.min, rr.max, rr.mean,
+				    f->black, rr.hist[0], rr.hist[1], rr.hist[2], rr.hist[3], rr.hist[4], rr.hist[5], rr.hist[6], rr.hist[7], rr.byte[0], rr.byte[1],
+				    rr.byte[2], rr.byte[3], rr.byte[4]);
+			}
+#endif
 			/* laurel: said once a time: everything after the sensor runs on noise, and this says why the picture is black */
 			if (isp_no_light(f, &st) != no_light && s->frames >= 30) {
 				no_light = !no_light;

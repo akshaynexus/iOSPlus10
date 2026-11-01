@@ -1,0 +1,749 @@
+laurel 2784: camera: where the signal stops. New laurel_cam_light.h (pure, host-tested) + laurel_cam_light.c: rails line (rail pins' control and in/out words, PM6125 L12A enable, mV, mode, status read from the PMIC, which LDOs are on), read-back of the sensor registers that decide the picture + temperature sensor at the boot self-check and at frame 6 of a session, every value of the init + mode tables read back once a boot in standby, the sensor's own colour bars (0x0601 = 2, the library's test_pattern_info) in memory for 150 ms once a boot before the real frames, statistics straight from the raw bytes (min, max, top 3 bits, Bayer places, 5-byte group) at the boot, at frame 6 and every 150 frames of a session. Stock difference fixed: L12A gets the high power mode vote (lsmd 7) the stock 80 mA load gives; the mode goes back to 4 at power-off. The kernel's "1% over" has one-step bins under 32. SPMI user "camera". Nothing else changes for the frames; a failed read only gives a line. docs/laurel_sprout/camera.md section 12.
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -154,6 +154,7 @@
+ bsd/dev/laurel_cam_sess.c			standard
+ bsd/dev/laurel_cam_vcm.c			standard
+ bsd/dev/laurel_cam_path.c			standard
++bsd/dev/laurel_cam_light.c			standard
+ bsd/dev/laurel_cam_clk.c			standard
+ bsd/dev/laurel_cam_csi.c			standard
+ bsd/dev/laurel_cam_ispif.c			standard
+diff -ruN a/bsd/dev/laurel_cam.h b/bsd/dev/laurel_cam.h
+--- a/bsd/dev/laurel_cam.h
++++ b/bsd/dev/laurel_cam.h
+@@ -99,6 +99,16 @@
+ int lcam_sensor_frame_exposure(uint32_t lines, uint32_t gain_code, uint32_t frame_lines);  /* laurel 2772: + frame length */
+ void lcam_sensor_stop(const struct lcam_slot *s);
+ const char *lcam_sensor_file(void);
++int lcam_sensor_write8(uint16_t reg, uint8_t v);        /* laurel 2784 */
++int lcam_sensor_read(uint16_t reg, uint8_t *v, uint32_t n);
++bool lcam_pin_state(unsigned gpio, uint32_t *ctl, uint32_t *io);
++void lcam_light_tables(void);                           /* laurel_cam_light.c: the self-check of the signal */
++void lcam_light_bars(const uint8_t *buf);
++void lcam_light_power(const char *who);
++void lcam_light_regs(const char *who, uint32_t lines, uint32_t gain_code, uint32_t frame);
++void lcam_light_raw(const char *who, const uint8_t *buf, uint32_t black);
++void lcam_light_session(uint64_t frames, uint64_t ms, uint64_t reads, uint32_t lines, uint32_t line_ns, uint32_t gain, uint32_t frame,
++    unsigned latest, uint32_t errors, uint32_t bits);
+ 
+ void lcam_stream_start(const struct lcam_slot *s, const struct lcam_sensor *chip);  /* laurel_cam_stream.c */
+ int lcam_capture(uint32_t ms, char *line, size_t len);  /* one run; 0 = frames came */
+diff -ruN a/bsd/dev/laurel_cam_hw.c b/bsd/dev/laurel_cam_hw.c
+--- a/bsd/dev/laurel_cam_hw.c
++++ b/bsd/dev/laurel_cam_hw.c
+@@ -60,6 +60,9 @@
+ #define RPM_LDOA                0x616f646cu     /* "ldoa" */
+ #define RPM_KEY_UV              0x00007675u     /* "uv" */
+ #define RPM_KEY_SWEN            0x6e657773u     /* "swen" */
++#define RPM_KEY_LSMD            0x646d736cu     /* "lsmd": laurel 2784: LDO mode, pmic5-ldo: 7 HPM, 4 LPM (rpm-smd-regulator.c) */
++#define RPM_LDO_HPM             7u
++#define RPM_LDO_LPM             4u
+ #define L12A                    12u
+ 
+ static vm_offset_t gcc, cci;
+@@ -220,6 +223,20 @@
+ 	}
+ }
+ 
++/* laurel 2784: a pin's control word and in/out word as they are now (the self-check of laurel_cam_light.c); false: no such pin */
++bool
++lcam_pin_state(unsigned gpio, uint32_t *ctl, uint32_t *io)
++{
++	vm_offset_t p = pin(gpio);
++
++	if (!p) {
++		return false;
++	}
++	*ctl = rd(p);
++	*io = rd(p + 4u);
++	return true;
++}
++
+ void
+ lcam_gpio_release(unsigned gpio)
+ {
+@@ -269,17 +286,30 @@
+ lcam_rail(bool on, const char **why)
+ {
+ 	static bool mapped;
+-	bool ok = true;
++	static bool hpm_said;
++	bool ok = true, hpm = true;
+ 
+ 	if (!mapped) {
+ 		(void)topaz_soc_map();          /* maps APCS (the RPM doorbell); its pool answer is not needed here */
+ 		mapped = true;
+ 	}
++	/*
++	 * laurel 2784: the load vote of the stock kernel. The laurel DT asks 80 mA of cam_vio (qcom,cam-vreg-op-mode), over the 10 mA
++	 * hpm-min-load of this rail, so on Android L12A runs in high power mode. A refusal costs nothing but this mode: one line.
++	 */
+ 	for (uint32_t set = 0; set <= 1; set++) {
+ 		if (on) {
+ 			ok &= topaz_rpm_write(set, RPM_LDOA, L12A, RPM_KEY_UV, 1800000u);
++			hpm &= topaz_rpm_write(set, RPM_LDOA, L12A, RPM_KEY_LSMD, RPM_LDO_HPM);
+ 		}
+ 		ok &= topaz_rpm_write(set, RPM_LDOA, L12A, RPM_KEY_SWEN, on ? 1u : 0u);
++		if (!on) {
++			hpm &= topaz_rpm_write(set, RPM_LDOA, L12A, RPM_KEY_LSMD, RPM_LDO_LPM);
++		}
++	}
++	if (!hpm && !hpm_said) {
++		hpm_said = true;
++		LCAM_SAY("rail: the RPM refused the L12A mode vote: the rail stays in its mode\n");
+ 	}
+ 	if (!ok) {
+ 		*why = "RPM refused PM6125 L12A (camera VIO 1.8 V)";
+diff -ruN a/bsd/dev/laurel_cam_light.c b/bsd/dev/laurel_cam_light.c
+--- a/bsd/dev/laurel_cam_light.c
++++ b/bsd/dev/laurel_cam_light.c
+@@ -0,0 +1,211 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) camera (laurel 2784): the self-check of the signal, kernel side. docs/laurel_sprout/camera.md section 12.
++ * It says where the signal stops, in order from the rails to the bytes, and changes nothing the frames need:
++ *   rails:      the rail pins as they are (control word, in/out word), PM6125 L12A from the PMIC itself, which LDOs are on
++ *   read back:  the sensor's registers that decide the picture; the temperature sensor
++ *   tables:     every value of the init + mode tables read back, once a boot, in standby
++ *   bars:       the sensor's own colour bars in the buffer, once a boot, before the real frames of the boot self-check
++ *   raw:        min, max, top bits, Bayer places, 5-byte group from the raw buffer, at the start of a session and every 150 frames
++ * All on the stream thread. A read that fails gives a line, never an error for the frames.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include "laurel_cam.h"
++#include "laurel_cam_core.h"
++#include "laurel_cam_st.h"
++#include "laurel_cam_light.h"
++#include "sweet_spmi.h"
++
++#define PM6125_SID              0u
++#define PM6125_LDO(n)           (0x40u + (n) - 1u)      /* LDO n: peripheral 0x40 + n - 1 (L12: 0x4b00, qcom_spmi-regulator.c) */
++#define LDO_STATUS              0x08u
++#define LDO_VSET_LSB            0x40u
++#define LDO_MODE                0x45u
++#define LDO_ENABLE              0x46u
++#define LDO_ENABLED             0x80u
++#define PM6125_LDOS             24u
++#define READ_SHOWN              6u
++
++static uint8_t lines[5000];                     /* one line of the largest frame, in cached memory: the buffers are Normal NC */
++
++static int
++ldo_read(unsigned n, unsigned reg, uint8_t *v, unsigned len)
++{
++	int apid = sweet_spmi_apid(PM6125_SID, PM6125_LDO(n), NULL);
++
++	return apid < 0 ? -1 : sweet_spmi_ext_read(SWEET_SPMI_CAMERA, (unsigned)apid, reg, v, len, NULL);
++}
++
++void
++lcam_light_power(const char *who)
++{
++	static const char *const name[] = { "RESET", "VIO", "VANA", "VDIG", "VAF" };
++	char text[220] = "";
++	size_t at = 0;
++	uint8_t en = 0, mode = 0, status = 0, mv[2] = { 0, 0 };
++	uint32_t ctl = 0, io = 0, on = 0;
++
++	for (unsigned p = 0; p < sizeof(name) / sizeof(name[0]); p++) {
++		int gpio = st.slot->pin[p];
++
++		if (gpio >= 0 && lcam_pin_state((unsigned)gpio, &ctl, &io) && at < sizeof(text)) {
++			at += (size_t)snprintf(text + at, sizeof(text) - at, "%s%s %d ctl %#x out %u in %u", at ? ", " : "", name[p], gpio, ctl,
++			    (io >> 1) & 1u, io & 1u);
++		}
++	}
++	LCAM_SAY("rails (%s): %s\n", who, text);
++	if (sweet_spmi_register(SWEET_SPMI_CAMERA) != 0 || ldo_read(12, LDO_ENABLE, &en, 1) != 0 || ldo_read(12, LDO_MODE, &mode, 1) != 0 ||
++	    ldo_read(12, LDO_STATUS, &status, 1) != 0 || ldo_read(12, LDO_VSET_LSB, mv, 2) != 0) {
++		LCAM_SAY("rails (%s): L12A: the PMIC does not answer this read: only the RPM's word for it\n", who);
++		return;
++	}
++	for (unsigned n = 1; n <= PM6125_LDOS; n++) {
++		uint8_t e = 0;
++
++		on |= (ldo_read(n, LDO_ENABLE, &e, 1) == 0 && (e & LDO_ENABLED)) ? 1u << n : 0;
++	}
++	LCAM_SAY("rails (%s): L12A: enable %#x, %u mV, mode %u (7 high power), status %#x; PM6125 LDOs on (bit n = Ln): %#x\n", who, en,
++	    (uint32_t)mv[1] << 8 | mv[0], mode, status, on);
++}
++
++/* a register of n (1 or 2) bytes; bad: one more failed read */
++static uint32_t
++reg_get(uint16_t reg, unsigned n, unsigned *bad)
++{
++	uint8_t b[2] = { 0, 0 };
++
++	if (lcam_sensor_read(reg, b, n) != 0) {
++		++*bad;
++		return 0;
++	}
++	return n == 2 ? (uint32_t)b[0] << 8 | b[1] : b[0];
++}
++
++void
++lcam_light_regs(const char *who, uint32_t lines_want, uint32_t code_want, uint32_t frame_want)
++{
++	unsigned bad = 0;
++	uint32_t stream = reg_get(0x0100, 1, &bad), hold = reg_get(0x0104, 1, &bad), count = reg_get(0x0005, 1, &bad);
++	uint32_t exp = reg_get(0x0202, 2, &bad), code = reg_get(0x0204, 2, &bad), dig = reg_get(0x020e, 2, &bad);
++	uint32_t frame = reg_get(0x0340, 2, &bad), line = reg_get(0x0342, 2, &bad), shift = reg_get(0x3100, 1, &bad);
++	uint32_t ys = reg_get(0x0346, 2, &bad), ye = reg_get(0x034a, 2, &bad), ow = reg_get(0x034c, 2, &bad), oh = reg_get(0x034e, 2, &bad);
++	uint32_t bin = reg_get(0x0901, 1, &bad), mode = reg_get(0x0220, 1, &bad), fmt = reg_get(0x0112, 2, &bad), lanes = reg_get(0x0114, 1, &bad);
++	uint32_t pat = reg_get(0x0600, 2, &bad), ped = reg_get(0x0008, 2, &bad), temp = reg_get(0x013a, 1, &bad);
++
++	LCAM_SAY("sensor: read back (%s): stream %u hold %u frame count %u, exposure %u%s gain code %#x%s digital %#x, frame %u%s line %u shift %u\n",
++	    who, stream, hold, count, exp, exp == lines_want ? "" : " (NOT WRITTEN VALUE)", code, code == code_want ? "" : " (NOT WRITTEN VALUE)",
++	    dig, frame, frame == frame_want ? "" : " (NOT WRITTEN VALUE)", line, shift);
++	LCAM_SAY("sensor: read back (%s): lines %u..%u out %ux%u binning %#x mode %#x format %#x lanes %u test pattern %u pedestal %u temperature %u; %u reads failed\n",
++	    who, ys, ye, ow, oh, bin, mode, fmt, lanes, pat, ped, temp, bad);
++}
++
++void
++lcam_light_tables(void)
++{
++	const struct lcam_smode *m = &st.sm[st.cur];
++	char text[160] = "";
++	size_t at = 0;
++	uint32_t total = 0, same = 0, differ = 0, failed = 0;
++	uint64_t t0 = mach_absolute_time(), ns;
++
++	for (int pass = 0; pass < 2; pass++) {
++		const uint8_t *e;
++		uint32_t n = lcam_lib_table(st.lib, pass ? m->k : LCAM_LIB_INIT_MODE, &e);
++
++		for (uint32_t i = 0; i < n; i++) {
++			uint16_t a;
++			uint8_t x, want, got = 0;
++			uint32_t d;
++
++			lcam_lib_entry(e, i, &a, &x, &d);
++			if (!lcam_light_want(st.lib, m->k, m->window, a, &want)) {
++				continue;
++			}
++			total++;
++			if (lcam_sensor_read(a, &got, 1) != 0) {
++				failed++;
++			} else if (got == want) {
++				same++;
++			} else if (++differ <= READ_SHOWN && at < sizeof(text)) {
++				at += (size_t)snprintf(text + at, sizeof(text) - at, " %#x wrote %#x read %#x", a, want, got);
++			}
++		}
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	LCAM_SAY("sensor: table read-back: %u writes, %u the same, %u differ, %u reads failed, %llu ms%s%s\n", total, same, differ, failed,
++	    ns / 1000000u, differ ? ":" : "", differ ? text : "");
++}
++
++void
++lcam_light_bars(const uint8_t *buf)
++{
++	static struct lcam_bars b;                      /* (not on the kernel stack) */
++
++	if (LST_STRIDE > sizeof(lines)) {
++		return;
++	}
++	bzero(&b, sizeof(b));
++	for (uint32_t y = LST_H / 4; y < LST_H * 3 / 4; y += LCAM_RAW_YSTEP) {
++		memcpy(lines, buf + (size_t)y * LST_STRIDE, LST_STRIDE);
++		lcam_bars_line(&b, lines, LST_W, y);
++	}
++	lcam_bars_end(&b);
++	LCAM_SAY("sensor: test pattern: %s in memory: columns of the 4 Bayer places %#x %#x %#x %#x, levels %u..%u%s%s\n",
++	    b.bars ? "colour bars" : "NO BARS", b.mask[0], b.mask[1], b.mask[2], b.mask[3], b.lo, b.hi,
++	    b.order == LCAM_BAYER_RGGB ? ", Bayer RGGB as the library says" : b.order >= 0 ? ", ANOTHER BAYER ORDER THAN RGGB" : "",
++	    b.bars ? ": sensor -> MIPI -> VFE -> buffer -> RAW10 reading is right" : ": the sensor took no test pattern, or the path or the reading is wrong");
++}
++
++void
++lcam_light_raw(const char *who, const uint8_t *buf, uint32_t black)
++{
++	static struct lcam_raw_stat s;
++	uint32_t m;
++
++	if (LST_STRIDE > sizeof(lines)) {
++		return;
++	}
++	lcam_raw_stat_init(&s);
++	for (uint32_t y = 0; y < LST_H; y += LCAM_RAW_YSTEP) {
++		memcpy(lines, buf + (size_t)y * LST_STRIDE, LST_STRIDE);
++		lcam_raw_stat_line(&s, lines, LST_W, y);
++	}
++	m = lcam_raw_mean10(&s);
++	LCAM_SAY("raw (%s): %ux%u, %u samples: min %u max %u mean %u.%u (black %u); top 3 bits %u %u %u %u %u %u %u %u\n", who, LST_W, LST_H, s.n,
++	    s.min, s.max, m / 10, m % 10, black, s.hist[0], s.hist[1], s.hist[2], s.hist[3], s.hist[4], s.hist[5], s.hist[6], s.hist[7]);
++	LCAM_SAY("raw (%s): Bayer places x10 %u %u %u %u; bytes of the 5-byte group %u %u %u %u %u; %s\n", who, lcam_raw_place10(&s, 0),
++	    lcam_raw_place10(&s, 1), lcam_raw_place10(&s, 2), lcam_raw_place10(&s, 3), lcam_raw_byte(&s, 0), lcam_raw_byte(&s, 1),
++	    lcam_raw_byte(&s, 2), lcam_raw_byte(&s, 3), lcam_raw_byte(&s, 4), lcam_raw_says(&s, black));
++}
++
++/* each new frame of a session: the lines this frame's number asks for */
++void
++lcam_light_session(uint64_t frames, uint64_t ms, uint64_t reads, uint32_t lines_now, uint32_t line_ns, uint32_t gain, uint32_t frame,
++    unsigned latest, uint32_t errors, uint32_t bits)
++{
++	bool still = st.cur == LCAM_SM_STILL;
++
++	if (frames == 6 && !still) {
++		lcam_light_power("session");
++		lcam_light_regs("session", lines_now, lcam_nc_gain_code(gain), frame);
++	}
++	if ((frames == 6 || frames % 150 == 0) && !still) {
++		lcam_light_raw("session", st.va[latest], LCAM_NC_BLACK);
++	}
++	if (still && frames == 2) {
++		lcam_light_raw("photograph", st.va[latest], LCAM_NC_BLACK);
++	}
++	if (frames == 30 || frames % 900 == 0) {
++		uint32_t mean, bright, top;
++
++		lcam_raw10_levels(st.va[latest], LST_W, LST_H, 8, LCAM_NC_BLACK, &mean, &bright, &top);
++		LCAM_SAY("ios session: %llu frames in %llu ms, %llu read, %ux%u exposure %u lines (%u us) gain %u/256, frame %u lines; above black: "
++		    "mean %u, 1%% over %u, top %u; VFE errors %u (%#x)\n", frames, ms, reads, LST_W, LST_H, lines_now,
++		    (uint32_t)((uint64_t)lines_now * line_ns / 1000u), gain, frame, mean, bright, top, errors, bits);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_cam_light.h b/bsd/dev/laurel_cam_light.h
+--- a/bsd/dev/laurel_cam_light.h
++++ b/bsd/dev/laurel_cam_light.h
+@@ -0,0 +1,175 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) camera (laurel 2784): the self-check of the signal, the pure part (no kernel calls; host-tested by
++ * tools/laurel-cam-test/cam7_test.c, with the stock libraries when they are there).
++ *
++ * Why [V boot 20:02]: at 133 ms and 16x the frames have mean 0 and top 9-10 above black, and no line could say where the signal ends.
++ *  - statistics straight from the raw bytes: min, max, the top 3 bits, each place of the Bayer cell, each byte of the 5-byte group.
++ *    A wrong shift or stride shows here: bytes 0-3 are the pixels' high bits, byte 4 their low bits.
++ *  - the sensor's own colour bars (0x0600/0x0601, mode 2: the library's test_pattern_info at .data 0x8244 has modes 1..4): bars in
++ *    memory prove sensor -> MIPI -> CSID -> VFE -> buffer -> RAW10 reading without any pixel of the array.
++ *  - the value each register should hold after the tables, for the read-back.
++ */
++#ifndef LAUREL_CAM_LIGHT_H
++#define LAUREL_CAM_LIGHT_H
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include "laurel_cam_lib.h"
++#include "laurel_cam_mode.h"
++
++#define LCAM_TEST_PATTERN       0x0601u         /* CCS test_pattern_mode, low byte */
++#define LCAM_TEST_BARS          2u
++#define LCAM_BARS_MS            150u            /* some frames at any preview mode: at least 45 fps at boot */
++#define LCAM_LIGHT_SIGNAL       64u             /* above black: the rule of isp_no_light (camera_isp.c) */
++#define LCAM_RAW_YSTEP          15u             /* odd: both kinds of Bayer line; 96 of 1440 lines */
++
++struct lcam_raw_stat {
++	uint32_t n, min, max, hist[8], count[4], groups;
++	uint64_t sum, place[4], byte[5];
++};
++
++static inline void
++lcam_raw_stat_init(struct lcam_raw_stat *s)
++{
++	*s = (struct lcam_raw_stat){ .min = 1023 };
++}
++
++/* one line of a frame (MIPI RAW10: 4 pixels in 5 bytes), line number y */
++static inline void
++lcam_raw_stat_line(struct lcam_raw_stat *s, const uint8_t *line, uint32_t w, uint32_t y)
++{
++	for (uint32_t x = 0; x + 3 < w; x += 4, line += 5) {
++		for (unsigned i = 0; i < 5; i++) {
++			s->byte[i] += line[i];
++		}
++		s->groups++;
++		for (unsigned i = 0; i < 4; i++) {
++			uint32_t v = (uint32_t)line[i] << 2 | ((line[4] >> (2 * i)) & 3u);
++			unsigned p = (y & 1u) << 1 | (i & 1u);
++
++			s->min = v < s->min ? v : s->min;
++			s->max = v > s->max ? v : s->max;
++			s->hist[v >> 7]++;
++			s->sum += v;
++			s->place[p] += v;
++			s->count[p]++;
++			s->n++;
++		}
++	}
++}
++
++/* x10: 643 = 64.3 */
++static inline uint32_t
++lcam_raw_mean10(const struct lcam_raw_stat *s)
++{
++	return s->n ? (uint32_t)(s->sum * 10 / s->n) : 0;
++}
++
++static inline uint32_t
++lcam_raw_place10(const struct lcam_raw_stat *s, unsigned p)
++{
++	return s->count[p] ? (uint32_t)(s->place[p] * 10 / s->count[p]) : 0;
++}
++
++static inline uint32_t
++lcam_raw_byte(const struct lcam_raw_stat *s, unsigned i)
++{
++	return s->groups ? (uint32_t)(s->byte[i] / s->groups) : 0;
++}
++
++/* what the numbers say about this frame, in the words of the line */
++static inline const char *
++lcam_raw_says(const struct lcam_raw_stat *s, uint32_t black)
++{
++	if (s->n == 0) {
++		return "no samples";
++	}
++	if (s->min == s->max) {
++		return "one value in all samples: not a sensor's noise (a test pattern, or the path gives constants)";
++	}
++	if (s->max >= black + LCAM_LIGHT_SIGNAL) {
++		return "signal: samples well above black";
++	}
++	return "no signal: every sample is near black; the sensor gives noise only";
++}
++
++/* the sensor's colour bars: white, yellow, cyan, green, magenta, red, blue, black: R 11001100, G 11110000, B 10101010, left to right */
++#define LCAM_BAR_N              8u
++#define LCAM_BAR_R              0xccu
++#define LCAM_BAR_G              0xf0u
++#define LCAM_BAR_B              0xaau
++
++struct lcam_bars {
++	uint64_t sum[LCAM_BAR_N][4];
++	uint32_t count[LCAM_BAR_N][4];
++	uint32_t level[LCAM_BAR_N][4], lo, hi;
++	uint8_t mask[4];
++	bool bars;                              /* levels far apart, and places that change from column to column */
++	int order;                              /* LCAM_BAYER_*: the order the masks fit, -1: none */
++};
++
++static inline void
++lcam_bars_line(struct lcam_bars *b, const uint8_t *line, uint32_t w, uint32_t y)
++{
++	for (uint32_t x = 0; x + 3 < w; x += 4, line += 5) {
++		for (unsigned i = 0; i < 4; i++) {
++			uint32_t v = (uint32_t)line[i] << 2 | ((line[4] >> (2 * i)) & 3u);
++			uint32_t c = (x + i) * LCAM_BAR_N / w;
++			unsigned p = (y & 1u) << 1 | (i & 1u);
++
++			b->sum[c][p] += v;
++			b->count[c][p]++;
++		}
++	}
++}
++
++static inline void
++lcam_bars_end(struct lcam_bars *b)
++{
++	static const uint8_t want[4][4] = {     /* by LCAM_BAYER_*: BGGR, GBRG, GRBG, RGGB */
++		{ LCAM_BAR_B, LCAM_BAR_G, LCAM_BAR_G, LCAM_BAR_R }, { LCAM_BAR_G, LCAM_BAR_B, LCAM_BAR_R, LCAM_BAR_G },
++		{ LCAM_BAR_G, LCAM_BAR_R, LCAM_BAR_B, LCAM_BAR_G }, { LCAM_BAR_R, LCAM_BAR_G, LCAM_BAR_G, LCAM_BAR_B },
++	};
++	uint32_t mid;
++
++	b->lo = 1023;
++	b->hi = 0;
++	for (unsigned c = 0; c < LCAM_BAR_N; c++) {
++		for (unsigned p = 0; p < 4; p++) {
++			uint32_t v = b->count[c][p] ? (uint32_t)(b->sum[c][p] / b->count[c][p]) : 0;
++
++			b->level[c][p] = v;
++			b->lo = v < b->lo ? v : b->lo;
++			b->hi = v > b->hi ? v : b->hi;
++		}
++	}
++	mid = (b->lo + b->hi) / 2;
++	for (unsigned p = 0; p < 4; p++) {
++		b->mask[p] = 0;
++		for (unsigned c = 0; c < LCAM_BAR_N; c++) {
++			b->mask[p] |= (uint8_t)((b->level[c][p] > mid) << (LCAM_BAR_N - 1 - c));
++		}
++	}
++	b->bars = b->hi >= b->lo + 256 && (b->mask[0] != 0 || b->mask[3] != 0) && (b->mask[0] != 0xff || b->mask[3] != 0xff);
++	b->order = -1;
++	for (int o = 0; o < 4; o++) {
++		if (b->mask[0] == want[o][0] && b->mask[1] == want[o][1] && b->mask[2] == want[o][2] && b->mask[3] == want[o][3]) {
++			b->order = o;
++		}
++	}
++}
++
++/* what a register should hold after the tables of mode k: the last write wins: window, mode, init */
++static inline bool
++lcam_light_want(const struct lcam_lib *l, int k, bool window, uint16_t reg, uint8_t *v)
++{
++	for (size_t i = 0; window && i < sizeof(lcam_window_regs) / sizeof(lcam_window_regs[0]); i++) {
++		if (lcam_window_regs[i].reg == reg) {
++			*v = lcam_window_regs[i].val;
++			return true;
++		}
++	}
++	return lcam_table_value(l, k, reg, v) || lcam_table_value(l, LCAM_LIB_INIT_MODE, reg, v);
++}
++
++#endif /* LAUREL_CAM_LIGHT_H */
+diff -ruN a/bsd/dev/laurel_cam_mode.h b/bsd/dev/laurel_cam_mode.h
+--- a/bsd/dev/laurel_cam_mode.h
++++ b/bsd/dev/laurel_cam_mode.h
+@@ -122,7 +122,7 @@
+ lcam_raw10_levels(const uint8_t *buf, uint32_t w, uint32_t h, uint32_t step, uint32_t black, uint32_t *mean, uint32_t *bright,
+     uint32_t *top)
+ {
+-	uint32_t hist[64] = { 0 }, n = 0, stride = lcam_raw10_stride(w), above = 0;
++	uint32_t hist[64] = { 0 }, fine[32] = { 0 }, n = 0, stride = lcam_raw10_stride(w), above = 0;
+ 	uint64_t sum = 0;
+ 
+ 	*top = 0;
+@@ -135,6 +135,7 @@
+ 			sum += v;
+ 			*top = v > *top ? v : *top;
+ 			hist[v >> 4 > 63 ? 63 : v >> 4]++;
++			fine[v < 32 ? v : 31] += v < 32;
+ 			n++;
+ 		}
+ 	}
+@@ -146,6 +147,20 @@
+ 			break;
+ 		}
+ 	}
++	/* laurel 2784: under 32 one step a bin: the 16-step bins read "8" for a black frame (boot 20:02: every line) */
++	if (*bright < 32) {
++		above = n;
++		for (int j = 0; j < 32; j++) {
++			above -= fine[j];
++		}
++		for (int j = 31; j >= 0; j--) {
++			above += fine[j];
++			if (above * 100 >= n) {
++				*bright = (uint32_t)j;
++				break;
++			}
++		}
++	}
+ }
+ 
+ /*
+diff -ruN a/bsd/dev/laurel_cam_sensor.c b/bsd/dev/laurel_cam_sensor.c
+--- a/bsd/dev/laurel_cam_sensor.c
++++ b/bsd/dev/laurel_cam_sensor.c
+@@ -135,6 +135,21 @@
+ 	return lcam_cci_write(slot->master, sensor->addr, b, 3);
+ }
+ 
++/* laurel 2784: for the self-check (laurel_cam_light.c): one register and n bytes from a register of the sensor that is on */
++int
++lcam_sensor_write8(uint16_t reg, uint8_t v)
++{
++	return slot ? reg8(reg, v) : ENODEV;
++}
++
++int
++lcam_sensor_read(uint16_t reg, uint8_t *v, uint32_t n)
++{
++	uint8_t a[2] = { (uint8_t)(reg >> 8), (uint8_t)reg };
++
++	return slot ? lcam_cci_write_read(slot->master, sensor->addr, a, 2, v, n) : ENODEV;
++}
++
+ /* laurel 2773: standby, then the table of mode k (and the preview window of laurel_cam_mode.h); the receive path is off */
+ int
+ lcam_sensor_mode(int k, bool window)
+@@ -181,6 +196,7 @@
+ 		return e;
+ 	}
+ 	(void)reg8(0x0100, 0);                  /* standby until the receive path is ready */
++	(void)reg8(0x0138, 1);                  /* laurel 2784: the temperature sensor on (read by the self-check, 0x013a) */
+ 	LCAM_SAY("sensor: %s from %s: init %u CCI writes, mode %d%s, MCLK %u Hz\n", lib.name, lib_file, writes, k,
+ 	    window ? " + preview window" : "", lcam_mclk_rate(s->mclk));
+ 	return 0;
+diff -ruN a/bsd/dev/laurel_cam_sess.c b/bsd/dev/laurel_cam_sess.c
+--- a/bsd/dev/laurel_cam_sess.c
++++ b/bsd/dev/laurel_cam_sess.c
+@@ -127,16 +127,6 @@
+ 	return 0;
+ }
+ 
+-static void
+-say_levels(uint64_t frames, uint64_t ms, uint64_t reads, const struct sess *x, unsigned latest, uint32_t errors, uint32_t bits)
+-{
+-	uint32_t mean, bright, top;
+-	lcam_raw10_levels(st.va[latest], LST_W, LST_H, 8, LCAM_NC_BLACK, &mean, &bright, &top);
+-	LCAM_SAY("ios session: %llu frames in %llu ms, %llu read, %ux%u exposure %u lines (%u us) gain %u/256, frame %u lines; above black: "
+-	    "mean %u, 1%% over %u, top %u; VFE errors %u (%#x)\n", frames, ms, reads, LST_W, LST_H, x->lines,
+-	    (uint32_t)((uint64_t)x->lines * x->line_ns / 1000u), x->gain, x->frame, mean, bright, top, errors, bits);
+-}
+-
+ /* one client session, on the stream thread: from the first read to the last close or 3 s without a read */
+ void
+ lcam_dev_session(void)
+@@ -286,9 +276,9 @@
+ 				x.frame = af;
+ 			}
+ 		}
+-		if (frames != shown && (frames == 30 || (frames && frames % 900 == 0))) {
++		if (frames != shown) {
+ 			shown = frames;
+-			say_levels(frames, now - started, reads, &x, ring.latest, errors, bits);
++			lcam_light_session(frames, now - started, reads, x.lines, x.line_ns, x.gain, x.frame, ring.latest, errors, bits);
+ 		}
+ 	}
+ 		if (ring.frames > 30) {
+diff -ruN a/bsd/dev/laurel_cam_st.h b/bsd/dev/laurel_cam_st.h
+--- a/bsd/dev/laurel_cam_st.h
++++ b/bsd/dev/laurel_cam_st.h
+@@ -34,6 +34,7 @@
+ 	uint64_t pa[LST_NBUF];
+ 	uint8_t *va[LST_NBUF];
+ 	bool off, busy, request, tpg;           /* off = no more runs this boot */
++	bool light_done;                        /* laurel 2784: the self-check of the signal ran (once a boot) */
+ 	uint32_t gen, frames, fps10, mean, runs;
+ 	int kept;                               /* buffer of the kept frame, -1 none */
+ 	struct lcam_ae ae;
+diff -ruN a/bsd/dev/laurel_cam_stream.c b/bsd/dev/laurel_cam_stream.c
+--- a/bsd/dev/laurel_cam_stream.c
++++ b/bsd/dev/laurel_cam_stream.c
+@@ -29,6 +29,7 @@
+ #include "laurel_cam_lib.h"
+ #include "laurel_cam_rdi.h"
+ #include "laurel_cam_st.h"
++#include "laurel_cam_light.h"
+ 
+ 
+ static LCK_GRP_DECLARE(lst_grp, "laurel_camera_stream");
+@@ -100,11 +101,16 @@
+ 	uint64_t first, last;
+ };
+ 
++/* laurel 2784: which buffers the VFE has: kept across the collects of one capture */
++struct wm_ring {
++	uint32_t cur[2], spare;
++};
++
+ /* frames for ms (stop early after 1 s without a first frame); buffers rotate: 2 in the VFE, the latest out */
+ static void
+-collect(struct run *r, uint32_t ms, bool ae)
++collect(struct run *r, uint32_t ms, bool ae, struct wm_ring *w)
+ {
+-	uint32_t cur[2] = { 0, 1 }, spare = 2, slot, err;
++	uint32_t slot, err;
+ 	uint64_t t0 = now_ns(), end = t0 + (uint64_t)ms * 1000000ull;
+ 
+ 	bzero(r, sizeof(*r));
+@@ -119,10 +125,10 @@
+ 			lcam_sleep_ms(1);
+ 			continue;
+ 		}
+-		uint32_t done = cur[slot];
+-		cur[slot] = spare;
+-		lcam_vfe_refill(slot, (uint32_t)st.pa[spare]);
+-		spare = done;
++		uint32_t done = w->cur[slot];
++		w->cur[slot] = w->spare;
++		lcam_vfe_refill(slot, (uint32_t)st.pa[w->spare]);
++		w->spare = done;
+ 		r->latest = done;
+ 		r->last = now_ns();
+ 		r->first = r->frames++ == 0 ? r->last : r->first;
+@@ -178,6 +184,8 @@
+ 	unsigned up = 0;
+ 	uint32_t settle;
+ 	struct run r;
++	struct wm_ring ring = { { 0, 1 }, 2 };
++	bool first = !st.light_done;
+ 	int e;
+ 
+ 	lck_mtx_lock(&lst_lock);
+@@ -199,10 +207,31 @@
+ 		st.ae.lines = st.ae.max_lines;
+ 		st.ae.gain = 4 * LCAM_GAIN_ONE;         /* indoor start; the AE goes from here */
+ 	}
++	if (first) {
++		lcam_light_tables();            /* laurel 2784: every table value read back, in standby */
++	}
+ 	lcam_tail_clear();
+ 	(void)lcam_sensor_exposure(st.ae.lines, lcam_gain_code(st.ae.gain));
++	if (first) {
++		(void)lcam_sensor_write8(LCAM_TEST_PATTERN, LCAM_TEST_BARS);
++	}
+ 	(void)lcam_sensor_stream(true);
+-	collect(&r, ms, true);
++	if (first) {
++		/* laurel 2784, once a boot: the sensor's own colour bars first, then the real frames (the kept one is real) */
++		collect(&r, LCAM_BARS_MS, false, &ring);
++		(void)lcam_sensor_write8(LCAM_TEST_PATTERN, 0);
++		if (r.frames > 0 && r.latest < LST_NBUF) {
++			lcam_light_bars(st.va[r.latest]);
++			st.light_done = true;
++		}
++		lcam_vfe_kick();                /* (the reg update chain is polled: the time of the check must not end it) */
++	}
++	collect(&r, ms, true, &ring);
++	if (first) {
++		/* (here, with the sensor still streaming: nothing polls after this, so these slower reads cost no frame) */
++		lcam_light_power("boot");
++		lcam_light_regs("boot", st.ae.lines, lcam_gain_code(st.ae.gain), st.m.frame);
++	}
+ 	(void)lcam_sensor_stream(false);
+ 	st.size_ok = r.frames > 0 && r.latest < LST_NBUF && lcam_tail_check(st.va[r.latest]);
+ 	if (r.frames == 0) {
+@@ -215,7 +244,7 @@
+ 		lcam_csid_off();
+ 		struct run t = { 0, 0, 0, LST_NBUF, 0, 0, 0 };
+ 		if (lcam_csid_on(st.lib->lanes, LST_XML_ASSIGN, 0x2b, 2, true, LST_W, LST_H, &why) == 0) {
+-			collect(&t, 300, false);
++			collect(&t, 300, false, &ring);
+ 		}
+ 		snprintf(line, len, "off: no frame from the sensor in 1 s (CSID packets %u ECC %u CRC %u irq %#x, CSIPHY "
+ 		    "status %#x, ISPIF %#x, %s); CSID test pattern: %u frames at %u.%u fps (%s)", pk, ecc, crc, irq, phy,
+@@ -227,6 +256,7 @@
+ 		uint32_t lm = 0, lb = 0, lt = 0;
+ 
+ 		lcam_raw10_levels(st.va[r.latest], LST_W, LST_H, 8, LCAM_AE_BLACK, &lm, &lb, &lt);
++		lcam_light_raw("boot", st.va[r.latest], LCAM_AE_BLACK);
+ 		snprintf(line, len, "%ux%u RAW10%s at %u.%u fps, frame %u (kept for camframe), above black: mean %u, 1%% over %u, top %u; "
+ 		    "exposure %u lines gain %u.%02ux, VFE errors %u (%#x); %s, MCLK %u Hz, CSIPHY1 %u lanes settle %#x (timer %u MHz), "
+ 		    "VFE %u MHz, buffers %#llx", LST_W, LST_H, st.size_ok ? "" : " NOT OF THIS SIZE", r.fps10 / 10, r.fps10 % 10, r.frames, lm, lb, lt, st.ae.lines,
+diff -ruN a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -69,7 +69,7 @@
+ 
+ /* users and error counts (sweet_spmi_errors) */
+ static const char *const sp_user_name[SWEET_SPMI_USERS] = {
+-	"pon", "keys", "battery", "haptic", "rtc", "torch",
++	"pon", "keys", "battery", "haptic", "rtc", "torch", "camera",
+ };
+ static volatile uint32_t sp_registered;          /* bit per user */
+ static volatile uint32_t sp_errs[SWEET_SPMI_USERS];
+@@ -340,9 +340,9 @@
+ 	if (!buf || !len) {
+ 		return;
+ 	}
+-	(void)snprintf(buf, len, "spmi errors pon %u keys %u battery %u haptic %u rtc %u torch %u, forced %u",
++	(void)snprintf(buf, len, "spmi errors pon %u keys %u battery %u haptic %u rtc %u torch %u camera %u, forced %u",
+ 	    sp_errs[SWEET_SPMI_PON], sp_errs[SWEET_SPMI_KEYS], sp_errs[SWEET_SPMI_BATTERY],
+-	    sp_errs[SWEET_SPMI_HAPTIC], sp_errs[SWEET_SPMI_RTC], sp_errs[SWEET_SPMI_TORCH], sp_forced);
++	    sp_errs[SWEET_SPMI_HAPTIC], sp_errs[SWEET_SPMI_RTC], sp_errs[SWEET_SPMI_TORCH], sp_errs[SWEET_SPMI_CAMERA], sp_forced);
+ }
+ 
+ int
+diff -ruN a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -37,6 +37,7 @@
+ 	SWEET_SPMI_HAPTIC,      /* laurel_haptic.c */
+ 	SWEET_SPMI_RTC,         /* laurel_rtc.c (laurel 2720: PM6125 RTC_RW 0x6000, reads only) */
+ 	SWEET_SPMI_TORCH,       /* laurel_torch.c (laurel 2780: PMI632 flash LED SID 3 0xd300, charger flash SID 2 0xa600 reads) */
++	SWEET_SPMI_CAMERA,      /* laurel_cam_light.c (laurel 2784: reads of the PM6125 LDOs in the camera's self-check) */
+ 	SWEET_SPMI_USERS
+ };
+ int sweet_spmi_register(int user);

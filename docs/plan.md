@@ -964,3 +964,7 @@ Done: Metal stays out; hooks 10 + 11 prepare that node without a filter and copy
 Not fixed, cause [U]: every frame so far holds noise only (mean 0, top 3-10 at up to 133 ms x 16x). Scene or VANA: the next boot in a lit room decides. Never seen on the phone: an `encoded` line, a saved photo, the 4000x3000 mode. Photo file is 4032x3024.
 Build: 291/291 patches, 0 LSE; plug-in sha256 320ac73d62013137...; cam-test, cam-leak-test OK; cache check PASS.
 Next: root + userdata flash (owner approves), docs/laurel_sprout/camera.md section 11 "Test steps".
+
+## Mi A3: camera: no light in the stream, review + self-check (2026-11-01, branch t3/laurel-camera-light, patch 2784; build + host test, NOT BOOTED)
+Result: no code fault explains the dark frames; cause [U]. Rails, delays, MCLK, tables, exposure, gain, pedestal and RAW10 reading equal stock or are right: evidence table in docs/laurel_sprout/camera.md section 12. One stock difference fixed: L12A high power mode vote. New self-check: rails from the pads and the PMIC, register read-back, all table values read back, the sensor's colour bars in memory, raw statistics in the kernel and in the plug-in.
+Next: boot image + root flash (owner approves), then the 5 scene steps of section 12: the lines decide scene, path, or the sensor's analog side.
