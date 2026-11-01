@@ -11,7 +11,7 @@ N=${1:-600}
 rm -rf "$D"; mkdir -p "$D"
 SRC=$REPO/userland/camera
 DEF=""
-EXTRA="$SRC/camera_still.c"
+EXTRA="$SRC/camera_still.c $SRC/camera_fast.c"
 if [ -n "${OLD:-}" ]; then
   mkdir -p "$D/old"
   git -C "$REPO" archive "$OLD" userland/camera | tar -x -C "$D/old"
@@ -31,7 +31,7 @@ ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 LSAN_OPTIONS=max_leaks=2
 if [ -z "${OLD:-}" ]; then
   # the picture checks of boot 20:02 and the filter thumbnails
   # shellcheck disable=SC2086
-  clang -O2 $BASE -o "$D/cam6" "$T/cam6_test.c" "$T/cam5_mock.c" "$T/cam5_mock_cv.c" "$SRC/camera_thumbs.c" "$SRC/camera_isp.c" "$SRC/camera_still.c" -lm
+  clang -O2 $BASE -o "$D/cam6" "$T/cam6_test.c" "$T/cam5_mock.c" "$T/cam5_mock_cv.c" "$SRC/camera_thumbs.c" "$SRC/camera_isp.c" "$SRC/camera_still.c" "$SRC/camera_fast.c" -lm
   "$D/cam6"
   # the memory guard's rule
   clang -O2 -Wall -I"$SRC" -o "$D/cam8" "$T/cam8_memguard_test.c"

@@ -462,7 +462,7 @@ Status: built, host-tested. **Not run on the phone.** Labels: [V] log, disassemb
 
 ### 12.1 What the logs and the cache show
 
-The allocator is still **[U]**. No log has a memory line from inside the growth: the `memory:` step line came after these boots. What is known:
+**Found 2026-11-01 (boot 22:08, camera.md section 13) [V]: the allocator is `-[BWAudioSourceNode _createSampleBuffer...]`, the capture audio's silence. Not Metal.** The text below is the state before it. At that time: the allocator is still **[U]**. No log has a memory line from inside the growth: the `memory:` step line came after these boots. What is known:
 
 | Fact | Evidence |
 | --- | --- |

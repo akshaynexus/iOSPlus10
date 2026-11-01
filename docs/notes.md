@@ -4748,3 +4748,18 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - Gotcha: the buffers are Normal NC: statistics copy a line to cached memory first (`lcam_light_raw`); byte-by-byte reads of a whole frame would hold the stream thread too long.
 - Gotcha: `collect` in `laurel_cam_stream.c` started each call with buffers 0, 1 in the VFE; two calls in one capture need the `wm_ring` state.
 - Built: kernel-linux.sh 293/293 patches, 0 LSE, no warning in the changed files, kernel.development.sweet.4k sha256 840f70f9799d4ae0...; NegroniCamera.driver sha256 b1f371f512523e94... (164368 bytes); cam-test: cam7 3610 checks, 0 failed; all older checks pass. Host only.
+
+## Mi A3: camera: signal proven, kills named, preview budget (2026-11-01, branch t3/laurel-camera-analog, patch 2913; built, host-tested, NOT BOOTED)
+
+Full text: docs/laurel_sprout/camera.md section 13.
+- Read the right log: `laurel-boot-2208.txt` stops at 22:16; the lit test is at 22:19 in `laurel-boot-2208-panic.txt` / `usblog.log`. [V] 22:19:19 `raw (session)` max 842 mean 87.9 `signal`; frame 10 max 1023; kernel top 959; focus curve 0.31 -> 0.62. So no rail, VANA, XCLR or sensor fault. The older dark sessions are dark scenes. **A long hunt for an analog fault stopped here: grep every log for top/max before you suspect hardware.**
+- [V] `low swap` kill = malloc large (VM tag 3) from the capture audio: `-[BWAudioSourceNode _createSampleBufferForTimestampedAudioBufferList:audioBufferIndex:]` + 236 zeroes `[buffer + 0x38] x bytes-per-frame`, called from `_generateSamples`. Set in the render callback at 0x1a1ef081c: host-time jump x sample rate. Off by the ivar `_silenceFramesFillingDisabled`. [U] why the time stamps jump.
+- Gotcha: CMCapture methods with `cbz x0` first and no use of x1, called by `bl`, are `objc_direct`: no method entry. No class_replaceMethod: reach them through an ivar they read. This is probably why `_logActiveSinkNodesAfterGraphStopTimeout` is "not found by name".
+- Gotcha: `dsc-dis.py DIR dis 0x1a1ee8ef0 0x2f760c` gives all of CMCapture's text (780k lines, a minute); ivar offsets are `ldrsw x8, [x8, #0x...]` at page 0x1dd5e8000; names: `ipsw dyld symaddr CACHE --image CMCapture | grep IVAR`.
+- Gotcha: a `/dev/console` fd opened at the load of the first mediaserverd stops printing later [V pid 28]; open per line. Metal's own line opens later and works. Any `ios:` line missing from pid 28 in older logs is this.
+- Gotcha: `say` lines were cut at 400 chars: guard stacks ended in `CMCapture+0xdb`. Now 1100.
+- Numbers: reads a second 2.5-5 in killed sessions, 6.5 at 133 ms (sensor limit), backboardd 25-36 fps (not the limit). Host: old preview 27.6 ms, new 7.1 ms one thread on an i9-12900H ([I] x 5.6 for a Gold core). read() copy: never measured until the new line.
+- Decisions: no GPU ISP and no zero copy before the phone's numbers; AE cap 30 fps in preview (dark rooms get gain, not time). Half-cell step only if the picture work passes 24 ms.
+- Cached alias: write-back, read-only, `topaz_gpu_pool_map_cached` in TopazAdreno.cpp; clean + invalidate before each copy; the buffer is stable while `ring.reading` holds it. Patch number 2913: after all others, base = the full patched tree (`scripts/laurel/camera-patch.sh BASE WORK 2913-laurel-camera-speed`, also takes iokit/).
+- Worktree: symlink `external/{ios-sweet-linux,ios-topaz}`, `out/laurel-kernel/{cache,deps,theos,dl}`, `out/laurel-metal/ipsw`, `out/laurel/camera/{lib,etc}` to the main checkout.
+- Built: kernel-linux.sh 296/296 patches, 0 LSE, kernel.development.sweet.4k sha256 3b5158a5f4082220...; NegroniCamera.driver sha256 e662a7996a01ab04... (183648 bytes); cam-test OK (+ cam9), cam-leak-test OK, camera-cache-check PASS, 161 imports OK.
