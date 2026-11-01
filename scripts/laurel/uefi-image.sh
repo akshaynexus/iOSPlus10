@@ -28,7 +28,9 @@ DRAM=${DRAM:-auto}
 CPUS=${CPUS:-8}
 SIZE_MIB=${SIZE_MIB:-48}
 # boot-args: the shim set (scripts/laurel/shim.sh) without the ones the shim path needed; DarwinBoot copies them unchanged
-CMDLINE=${1:-"debug=0xc serial=3 cpus=$CPUS keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30"}
+CMDLINE=${1:-"debug=0xc serial=3 cpus=$CPUS keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 ipa=0"}
+# ipa=0: phone test 2026-11-01 17:01: the IPA handshake crashes the modem (GSI channel 1 assert), which stops Wi-Fi too. Remove when
+# docs/laurel_sprout/cellular.md says the crash is fixed.
 # EXTRA_ARGS: added to the boot-args, e.g. a kill switch for one test (EXTRA_ARGS=gpu_smmu=0)
 [ -z "${EXTRA_ARGS:-}" ] || CMDLINE="$CMDLINE $EXTRA_ARGS"
 
