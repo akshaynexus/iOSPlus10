@@ -25,7 +25,7 @@ diff -ruN a/bsd/conf/files b/bsd/conf/files
 diff -ruN a/bsd/dev/laurel_bt.c b/bsd/dev/laurel_bt.c
 --- a/bsd/dev/laurel_bt.c	1970-01-01 05:30:00.000000000 +0530
 +++ b/bsd/dev/laurel_bt.c	2026-11-01 05:15:56.551294408 +0530
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,195 @@
 +/*
 + * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 6: start. On by default; kill switch laurelbt=0.
 + * STARTUP(EARLY_BOOT) starts two threads:
@@ -79,6 +79,15 @@ diff -ruN a/bsd/dev/laurel_bt.c b/bsd/dev/laurel_bt.c
 +	IOSleep(ms);
 +}
 +
++/* the result line, repeated when bluetoothd connects (the first line comes before the USB log is up) */
++static char lbt_result[200] = "bring-up not done";
++
++const char *
++laurel_bt_result(void)
++{
++	return lbt_result;
++}
++
 +static void
 +off(const char *why)
 +{
@@ -86,6 +95,7 @@ diff -ruN a/bsd/dev/laurel_bt.c b/bsd/dev/laurel_bt.c
 +	lbt_ios_fail(why);
 +	lbt_dev_detach();
 +	laurel_bt_adt_hide();
++	snprintf(lbt_result, sizeof(lbt_result), "off: %s", why);
 +	LBT_SAY("off: %s\n", why);
 +}
 +
@@ -158,8 +168,10 @@ diff -ruN a/bsd/dev/laurel_bt.c b/bsd/dev/laurel_bt.c
 +	laurel_bt_adt_publish(addr);
 +	lbt_state = 1;
 +	lbt_ios_start();
-+	LBT_SAY("on: WCN3990 product %#06x rom %#06x, %s, %u baud, BD_ADDR %02x:%02x:%02x:%02x:%02x:%02x\n",
++	snprintf(lbt_result, sizeof(lbt_result),
++	    "on: WCN39xx product %#06x rom %#06x, %s, %u baud, BD_ADDR %02x:%02x:%02x:%02x:%02x:%02x",
 +	    v.product, v.rom, names, lbt_uart_baud(), addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
++	LBT_SAY("%s\n", lbt_result);
 +}
 +
 +static void
@@ -1659,7 +1671,7 @@ diff -ruN a/bsd/dev/laurel_bt_geni.h b/bsd/dev/laurel_bt_geni.h
 diff -ruN a/bsd/dev/laurel_bt.h b/bsd/dev/laurel_bt.h
 --- a/bsd/dev/laurel_bt.h	1970-01-01 05:30:00.000000000 +0530
 +++ b/bsd/dev/laurel_bt.h	2026-11-01 05:15:56.551294408 +0530
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,170 @@
 +/*
 + * laurel_sprout (Xiaomi Mi A3, SM6125): Bluetooth of the WCN3990 (laurel 2600). Shared declarations.
 + * Docs: iOSPlus10 docs/laurel_sprout/bluetooth.md.
@@ -1688,6 +1700,7 @@ diff -ruN a/bsd/dev/laurel_bt.h b/bsd/dev/laurel_bt.h
 +#include <stdbool.h>
 +
 +#define LBT_SAY(...)            printf("LAUREL BT: " __VA_ARGS__)
++const char *laurel_bt_result(void);      /* laurel_bt.c: "on: ..." / "off: <why>" */
 +
 +/* ---- small helpers -------------------------------------------------------------------------- */
 +
@@ -2576,7 +2589,7 @@ diff -ruN a/bsd/dev/laurel_bt_ios.c b/bsd/dev/laurel_bt_ios.c
 +		lck_mtx_lock(&tx_lock);
 +		t.txn = 0;
 +		lck_mtx_unlock(&tx_lock);
-+		LBT_SAY("ios: client %s connected\n", owner == 1 ? "control" : "device");
++		LBT_SAY("ios: client %s connected; bring-up %s\n", owner == 1 ? "control" : "device", laurel_bt_result());
 +	}
 +	return e;
 +}
