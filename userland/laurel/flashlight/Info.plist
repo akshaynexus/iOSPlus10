@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>dev.iosplus10.laurel.flashlight</string>
+	<key>CFBundleName</key>
+	<string>LaurelFlashlight</string>
+	<key>CFBundleExecutable</key>
+	<string>LaurelFlashlight</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>MinimumOSVersion</key>
+	<string>16.0</string>
+	<!-- AudioServerPlugIn type -> our factory (laurel_flashlight.c LaurelFlashlight_Create, returns NULL: no audio
+	     driver). The HAL in mediaserverd loads the code to call it; the constructor installs the torch vendor. -->
+	<key>CFPlugInTypes</key>
+	<dict>
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array>
+			<string>C6C15693-B6EC-4302-B2F8-D2CA9F03D96C</string>
+		</array>
+	</dict>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>C6C15693-B6EC-4302-B2F8-D2CA9F03D96C</key>
+		<string>LaurelFlashlight_Create</string>
+	</dict>
+</dict>
+</plist>

@@ -4470,3 +4470,31 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - [V] jetsam 20H392: `com.apple.posterkit.provider` ActiveSoft 15, InactiveHard 15, Rendering Nominal 30 MiB. Raised by root-add-metal.sh (floor 64, posters 128).
 - Lesson [V]: `metal2vulkan` writes a repro bundle (a copy of the input) for EVERY failed try, to `METAL2VULKAN_REPRO_DIR` or else `$TMPDIR`. host-translate's retry loop made 273 GiB (MPS 146, AvatarKit 127) and took the shared disk to 33 MB free, then 16 GiB of tmpfs /tmp when the variable was unset. Now: off by a path that cannot be made (`KEEP_REPROS=1` to keep); `scripts/laurel/metal-corpus.sh` refuses to start and stops the run under 50 GiB free or above 10 GiB of output, and keeps only TSV + summary. The CLI has no off switch.
 - Details: docs/laurel_sprout/metal.md 6.1-6.5 and section 10.
+## Mi A3: brightness slider without effect = LP commands with no DMA line in video mode; 2201 fix. Flashlight = 2780 + LaurelFlashlight.driver (2026-11-01 08:10, branch t3/laurel-brightness-torch; build only, NOT BOOTED)
+- Details: docs/laurel_sprout/brightness.md, docs/laurel_sprout/torch.md.
+- [V log 07:20:52 boot] slider 129..237 -> DBV 523..1768 at 07:27:28, no `panel level` line after. [V code] setPanelLevel
+  logged its first 8 calls only (self-check + 0x203 + 6 fade steps = 8): the writes after were silent, not missing. No
+  NO DONE line: the DMA completed. Lesson: a log cap must never hide the steady state; log failures and settled values.
+- [V DT] Samsung s6e8fco: every command state `dsi_hs_mode` (brightness too); GVO r692a9: brightness/on LP, off HS.
+  [V dsi_ctrl.c / dsi_ctrl_hw_2_2.c] video mode on DSI 2.2+ (trinket v2.3): DMA scheduled at line v_bp + v_sw + v_active
+  (Samsung 1567, GVO 1592) via DSI_DMA_SCHEDULE_CTRL 0x100 = BIT(28) | line. 2201 (topaz way) sent LP, unscheduled.
+  [I] that is why the panel ignored them; no DCS write on laurel has a visible proof yet (display off = black frame too).
+- [V code] blWork could run twice at once (plain thread call) -> THREAD_CALL_OPTIONS_ONCE; a new unfaded value kept an old
+  fade step; the wake level was backboardd's dim-to-0 clamp (4).
+- [V strings 20H392] Auto-Brightness = BKEnableALS (com.apple.backboardd), switch shown with MG ambient-light-sensor.
+  [V laurel-device-los] the ALS (stk3x3x) is on the ADSP sensor hub: none for iOS -> root-brightness.py sets it false.
+- [V DT] Flash: PMI632 `qcom,qpnp-flash-led-v2` SID 3 0xD300, laurel torch_0 = LED1 only, ires 12.5 mA, DT max 950 mA.
+  [V leds-qpnp-flash-v2.c] on = IRES, STROBE_CTRL bit 2 = 0, TGR_CURRENT, SAFETY_TMR 0x13, MOD_CTRL bit 7, then (PMI632)
+  the charger flash boost VREG_OK SID 2 0xA607 bit 4 (5 ms x 60), EN_LED_CTRL 0x4C. Torch cap 150 mA is our choice [I].
+- [V negroni RE, rechecked on the laurel cache 8F970452...] Control Center -> com.apple.coremedia.flashlight (mediaserverd
+  MachService [V root plist]) -> FigFlashlight -> sharedCaptureDeviceVendor (0x1a1f40c84, first word 0xa9bd57f6) ->
+  stream TorchLevel. The laurel root starts no capture server (StartRecorderServer false): the plug-in starts
+  FigFlashlightServerStart alone. Button = MG camera-flash = IODeviceTree:/product/camera flash, published by the kernel
+  after the root mount only with the plug-in in the root (as /product/haptics).
+- [V] origin/laurel-int-1 at 1c04a5e did not build: 2760's bsd/conf/files hunk failed after 2720; context refreshed here.
+- Worktree build recipe: link external/* refs and out/laurel-kernel/{deps,theos,cache} from the main checkout, then
+  `AUDIT=1 scripts/laurel/kernel-linux.sh` gives a patched tree in ~10 s (commit it as a local baseline, edit, git diff).
+- Build [V]: 252/252 patches (after the merge of laurel-int-1 16b1a73; torch renumbered 2770 -> 2780, 2770 = camera), 0 LSE, kernel.development.sweet.4k sha256 468b1abc685ceb351d8a87e13f9cb40d6edb2d3392ca602f7992079ea25195e9; LaurelFlashlight.driver built.
+- Next boot lines: `LAUREL BACKLIGHT: on: ... DCS HS, DMA at line 1567 ...`, `LAUREL BACKLIGHT: brightness N of 255 from
+  backboardd -> DBV D (...): panel at it, W panel writes, 0 failed`, `LAUREL TORCH: on: PMI632 flash LED SID3 0xd300 ...`,
+  `LAUREL TORCH UI: on: ...` (root with the plug-in), `LAUREL FLASHLIGHT: on: FigFlashlight server started ...`.

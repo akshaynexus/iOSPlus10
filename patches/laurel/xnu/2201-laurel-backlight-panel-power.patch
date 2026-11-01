@@ -1,21 +1,21 @@
 laurel 2201: Mi A3 AMOLED brightness and panel power: panel from the INTF_1 timing, DCS max 2047 (Samsung s6e8fco) / 4095 (GVO r692a9), AppleARMBacklight only with the GPU renderer (apollo 0154 slider protocol), fades (apollo 0151). The Mi A3 has two AMOLEDs (laurel_sprout-trinket-display.dtsi): Samsung bl-max 2047, GVO bl-max 4095, both min 4, default 268, DCS 0x51 MSB first (F9S dsi_panel_set_brightness), 0x53 0x20 brightness control on; off-command delays Samsung 0x28 20 ms / 0x10 120 ms, GVO 50 / 20 ms (unknown 50 / 120). ABL/Mu leave the video timing in INTF_1 HSYNC_CTL: htotal 1404 / pulse 40 = Samsung, 1360 / 136 = GVO; unknown = Samsung range. Self-check at start: the DT default level through the DSI command DMA; no DONE = feature off (display off keeps the black frame). AppleARMBacklight (topaz 0105; topaz 0110 made it opt-in because CoreBrightness's digital dimming took the CPU renderer under 1 fps) is published by a thread only after RedwoodGPU appears (TopazAdreno.cpp publishes it when the Adreno runs; wait 180 s), else CoreBrightness keeps IOMFBBrightnessLevel. It publishes IODisplayParameters brightness {0, 255, value} + brightness-nits + max-nits 430 (estimate, no source value) and takes {brightness, FadePeriod} (DBV = max * (v/255)^2); once that slider is used, IOMFBBrightnessLevel is ignored (first use of each is logged). The level is at least 4 while the display is on. blWork walks to a new level in 16 ms steps over the fade time. Power changes are serialized (fPwrLock) and hold blWork off: display off = fade the light out over 300 ms while frames still show, then fPowerOff (black kernel frame), 0x28/0x10 with the panel's delays; on = fPowerOff clear, 0x11, 120 ms, 0x29, 0x53 0x20, one frame (one retry; twice not done = feature off with one line), then fade in to the last level. dsiSend sets COMMAND_MODE_DMA_CTRL bit 28 (embedded mode) as Linux does. Lines: `LAUREL BACKLIGHT: on: DCS max N (<panel>: INTF1 hsync 0x...), level 268, 430 nits (estimate), fade 300 ms, AppleARMBacklight waits for RedwoodGPU`, then `LAUREL BACKLIGHT: on: DCS max N (<panel>), AppleARMBacklight published (RedwoodGPU up: GPU renderer)` or `... AppleARMBacklight off: CPU renderer (digital dimming; no RedwoodGPU in 180 s), IOMFBBrightnessLevel kept`. Kill switches: sweetbl=0 (no backlight service), laurelfade=0 (no fades). The topaz boot-arg sweetfb_stayon=1 (ignore display-off requests) still works.
+Fix (2026-11-01, branch t3/laurel-brightness-torch; the slider moved and the panel stayed): the Samsung s6e8fco DT sends brightness, on and off in HS (qcom,mdss-dsi-*-command-state = dsi_hs_mode; GVO: brightness/on LP, off HS) and Linux schedules each command DMA in video mode on DSI 2.2+ at the front-porch line (DSI_DMA_SCHEDULE_CTRL 0x100 = BIT(28) | v_bp + v_sw + v_active, dsi_ctrl_hw_22_schedule_dma_cmd); 2201 sent everything in LP with no DMA line. Now per panel mode + DMA at line 1567 (Samsung) / 1592 (GVO), DONE wait 50 ms; start self-check falls back to unscheduled, then to LP. blWork is a THREAD_CALL_OPTIONS_ONCE call (one walker; a call entered while it runs runs again with the latest level), a new value without a fade goes there at once (2201 kept the old fade step), the wake level is the user's last level (2201 kept the 4 of backboardd's dim to 0). Logs: the 8-line cap of `SWEET FB: panel level` hid every write after the first fade (now failures only); one `LAUREL BACKLIGHT: brightness V of 255 from PROC -> DBV D (N nits): panel at it, W panel writes, F failed` line 700 ms after the last request (max 200 per boot, then every 50th) instead of 30 per-step lines. No ambient light sensor for iOS (the stk3x3x is on the ADSP sensor hub): the start lines say auto-brightness off; the root sets BKEnableALS false (scripts/laurel/root-brightness.py).
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index a4cfb47..6e7ec82 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -92,6 +92,10 @@ static AppleCLCD *sweet_cons_fb;
+@@ -93,6 +93,10 @@
  static void sweet_cons_show(void);
  class OSDictionary;
  static void sweet_bl_log(const char *who, OSDictionary *d);
 +class AppleCLCD;
 +static uint32_t laurel_level_for(uint32_t value, uint32_t max);         /* laurel 2201 */
 +static uint32_t laurel_value_for(uint32_t level, uint32_t max);
-+static void laurel_bl_set(AppleCLCD *fb, uint32_t level, uint32_t ms);
++static void laurel_bl_set(AppleCLCD *fb, uint32_t level, uint32_t ms, uint32_t value);
  extern "C" void sweet_dcache_clean(vm_offset_t addr, unsigned length);  /* osfmk/arm/caches.c */
  extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  /* laurel 2200: hid/SweetHID.cpp maps touches with this layout */
-@@ -243,11 +247,27 @@ public:
+@@ -245,11 +249,39 @@
  	uint32_t      fBlLevel;       /* panel DBV 1..0x7ff, kept while the display is off */
  	uint32_t      fBlSent;        /* last level sent to the panel */
  	thread_call_t fBlCall;        /* sends the latest level off backboardd's thread */
@@ -33,9 +33,21 @@ index a4cfb47..6e7ec82 100644
 +	bool          fBlIomfbSeen;
 +	uint32_t      fHsync;         /* INTF_1 HSYNC_CTL at start */
 +	IOLock       *fPwrLock;       /* one power change at a time */
++	/* laurel 2201 (2026-11-01 fix): the DSI mode of each command set and the DMA line, as Linux sends them */
++	bool          fDsiHsNow;      /* the mode of the command being sent (set under fBlLock) */
++	bool          fBlHs, fOnHs, fOffHs;   /* qcom,mdss-dsi-{brightness,on,off}-command-state == dsi_hs_mode */
++	uint32_t      fDsiSchedLine;  /* DSI_DMA_SCHEDULE_CTRL line (front porch start), 0 = not scheduled */
++	const char   *fDsiHow;        /* self-check result for the start line */
++	/* laurel 2201: one line per settled value (blLog, 700 ms after the last request) */
++	thread_call_t fBlLogCall;
++	uint32_t      fBlValue;       /* 0..255 of the last request, ~0u: none since the last line */
++	char          fBlFrom[20];    /* process of the last request */
++	uint32_t      fBlWrites, fBlFails, fBlLines;
 +	void          fadeOut(void);
++	bool          dsiSelfCheck(uint32_t level);
 +	static void   blPublisher(void *self, wait_result_t result);
  	static void   blWork(thread_call_param_t p0, thread_call_param_t p1);
++	static void   blLog(thread_call_param_t p0, thread_call_param_t p1);
  	bool          dsiDcsLong(const uint8_t *payload, uint32_t len);
  	bool          dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len);
 -	void          setPanelOn(bool on);
@@ -45,7 +57,7 @@ index a4cfb47..6e7ec82 100644
  	void addClient(IOMobileFramebufferUserClient *client);
  	void removeClient(IOMobileFramebufferUserClient *client);
  	void swap(const uint8_t *rec);
-@@ -265,9 +285,56 @@ class AppleARMBacklight : public IOService {
+@@ -267,9 +299,68 @@
  	OSDeclareDefaultStructors(AppleARMBacklight);
  public:
  	AppleCLCD *fFB;
@@ -67,11 +79,23 @@ index a4cfb47..6e7ec82 100644
 +	uint32_t    htotal, hpw;      /* INTF_1 HSYNC_CTL */
 +	uint32_t    max;              /* DBV at full brightness */
 +	uint32_t    off1_ms, off2_ms; /* after 0x28, after 0x10 (qcom,mdss-dsi-off-command delays) */
++	bool        bl_hs, on_hs, off_hs;   /* qcom,mdss-dsi-{brightness,on,off}-command-state: true = dsi_hs_mode */
++	uint32_t    vbp, vpw;         /* qcom,mdss-dsi-v-back-porch / -v-pulse-width (DMA line = vbp + vpw + 1560) */
 +};
++/*
++ * laurel 2201 fix (2026-11-01): the command modes and DMA timing as the Linux driver sends them [V
++ * dsi-panel-s6e8fco-samsung-amoled-hdp-video.dtsi:217-227, dsi-panel-r692a9-gvo-amoled-hdp-video.dtsi:214-227;
++ * dsi_ctrl.c dsi_message_tx: video mode on DSI 2.2+ = dsi_ctrl_hw_22_schedule_dma_cmd(line v_bp + v_sw + v_active),
++ * dsi_ctrl_hw_2_2.c: DSI_DMA_SCHEDULE_CTRL 0x100 = BIT(28) | line]. The Samsung panel gets every set in HS
++ * (brightness too); the topaz panel needed LP, and 2201 sent everything in LP without a DMA line.
++ */
 +static const struct laurel_panel laurel_panels[] = {
-+	{ "Samsung s6e8fco", 1404, 40, 2047, 20, 120 },
-+	{ "GVO r692a9", 1360, 136, 4095, 50, 20 },
++	{ "Samsung s6e8fco", 1404, 40, 2047, 20, 120, true, true, true, 5, 2 },
++	{ "GVO r692a9", 1360, 136, 4095, 50, 20, false, false, true, 28, 4 },
 +};
++#define LAUREL_PANEL_LINES      1560u
++#define LAUREL_BL_LOG_MS        700u    /* a value is "settled" when no request came for this long */
++#define LAUREL_BL_LOG_MAX       200u    /* settled-value lines per boot, then every 50th */
 +#define LAUREL_BL_MIN           4u
 +#define LAUREL_BL_DEFAULT       268u
 +/*
@@ -102,7 +126,7 @@ index a4cfb47..6e7ec82 100644
  OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
  
  /*
-@@ -505,31 +572,53 @@ AppleCLCD::start(IOService *provider)
+@@ -563,31 +654,68 @@
  	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
  	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
  	fBlLock = IOLockAlloc();
@@ -114,18 +138,33 @@ index a4cfb47..6e7ec82 100644
 +	fBlNits = LAUREL_BL_NITS;
 +	fBlLevel = fBlLast = LAUREL_BL_DEFAULT;  /* qcom,mdss-dsi-bl-default-level */
  	fBlSent = ~0u;
+-	fBlCall = thread_call_allocate(&AppleCLCD::blWork, this);
 +	fFadeMs = LAUREL_FADE_MS;
 +	uint32_t fadeOn = 1;
 +	if (PE_parse_boot_argn("laurelfade", &fadeOn, sizeof(fadeOn)) && fadeOn == 0) {
 +		fFadeMs = 0;
 +	}
- 	fBlCall = thread_call_allocate(&AppleCLCD::blWork, this);
++	/*
++	 * laurel 2201 fix: one blWork at a time (THREAD_CALL_OPTIONS_ONCE; a call entered while it runs runs once
++	 * more after it), so the latest level always reaches the panel and two walkers never interleave.
++	 */
++	fBlCall = thread_call_allocate_with_options(&AppleCLCD::blWork, this, THREAD_CALL_PRIORITY_KERNEL,
++	    THREAD_CALL_OPTIONS_ONCE);
++	fBlLogCall = thread_call_allocate_with_options(&AppleCLCD::blLog, this, THREAD_CALL_PRIORITY_LOW,
++	    THREAD_CALL_OPTIONS_ONCE);
++	fBlValue = ~0u;
++	const struct laurel_panel *mode = fPanel != NULL ? fPanel : &laurel_panels[0];   /* unknown: Samsung's */
++	fBlHs = mode->bl_hs;
++	fOnHs = mode->on_hs;
++	fOffHs = mode->off_hs;
++	fDsiSchedLine = mode->vbp + mode->vpw + LAUREL_PANEL_LINES;
++	fDsiHow = "no DSI";
  	if (fDsi != NULL) {
  		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
 -		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
 +		/* self-check: the default level through the command DMA (also leaves the panel at the DT default) */
 +		fBlSent = fBlLevel;
-+		fDcsOk = fDsiBuf != NULL && fBlLock != NULL && setPanelLevel(fBlLevel);
++		fDcsOk = fDsiBuf != NULL && fBlLock != NULL && dsiSelfCheck(fBlLevel);
 +	}
 +	fHsync = hsync;
 +	fPwrLock = IOLockAlloc();
@@ -162,8 +201,9 @@ index a4cfb47..6e7ec82 100644
 +			release();
  		}
 -		OSSafeReleaseNULL(bl);
-+		IOLog("LAUREL BACKLIGHT: on: DCS max %u (%s: INTF1 hsync %#x), level %u, %u nits (estimate), fade %u ms, %s\n",
-+		    fBlMax, fPanel != NULL ? fPanel->name : "unknown panel, Samsung range", hsync, fBlLevel, fBlNits,
++		IOLog("LAUREL BACKLIGHT: on: DCS max %u (%s: INTF1 hsync %#x), %s, level %u, %u nits (estimate), fade %u ms, "
++		    "%s; no ambient light sensor for iOS (auto-brightness off)\n",
++		    fBlMax, fPanel != NULL ? fPanel->name : "unknown panel, Samsung range", hsync, fDsiHow, fBlLevel, fBlNits,
 +		    fFadeMs, waiting ? "AppleARMBacklight waits for RedwoodGPU" : blOn ? "AppleARMBacklight: no thread" :
 +		    "sweetbl=0: no AppleARMBacklight");
 +	} else {
@@ -173,17 +213,42 @@ index a4cfb47..6e7ec82 100644
  	}
  	uint32_t accelOn = 1;
  	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
-@@ -1154,7 +1243,8 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
- 		hs = 0;
+@@ -1213,16 +1341,29 @@
+ 	 * Low-power mode (COMMAND_MODE_DMA_CTRL bit 26), as Linux sends commands
+ 	 * for panels with MIPI_DSI_MODE_LPM: in high speed the topaz panel took
+ 	 * none of them (no brightness, no display off). sweetdsi_hs=1: old way.
++	 * laurel 2201 fix: the mode of each command set comes from the panel's DT (fDsiHsNow, set by the caller
++	 * under fBlLock): the Samsung s6e8fco sends brightness, on and off in HS. sweetdsi_hs=0/1 still forces one.
+ 	 */
+-	static int hs = -1;
+-	if (hs < 0) {
+-		hs = 0;
++	static int hs = -2;
++	if (hs == -2) {
++		hs = -1;
  		(void)PE_parse_boot_argn("sweetdsi_hs", &hs, sizeof(hs));
  	}
 -	dsi_wr(fDsi, 0x03c, hs ? (dma & ~(1u << 26)) : (dma | (1u << 26)));
++	bool useHs = hs >= 0 ? hs != 0 : fDsiHsNow;
 +	/* laurel 2201: bit 28 = embedded mode (header in the buffer), set on every send as Linux does */
-+	dsi_wr(fDsi, 0x03c, (hs ? (dma & ~(1u << 26)) : (dma | (1u << 26))) | (1u << 28));
++	dsi_wr(fDsi, 0x03c, (useHs ? (dma & ~(1u << 26)) : (dma | (1u << 26))) | (1u << 28));
++	/*
++	 * laurel 2201 fix: video mode on DSI 2.3 (trinket): Linux schedules every command DMA at the first line of
++	 * the vertical front porch (dsi_ctrl_hw_22_schedule_dma_cmd: DSI_DMA_SCHEDULE_CTRL 0x100 = BIT(28) | line),
++	 * so the packet goes out in the blanking and not into the active video. The DONE then comes up to one
++	 * frame (16.7 ms) later: wait up to 50 ms.
++	 */
++	if (fDsiSchedLine != 0) {
++		dsi_wr(fDsi, 0x100, (dsi_rd(fDsi, 0x100) & ~0xffffu) | (1u << 28) | (fDsiSchedLine & 0xffffu));
++	}
  	dsi_wr(fDsi, 0x090, 1);                          /* SW trigger */
  	bool done = false;
- 	for (int i = 0; i < 100 && !done; i++) {
-@@ -1186,33 +1276,58 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+-	for (int i = 0; i < 100 && !done; i++) {
++	for (int i = 0; i < 250 && !done; i++) {
+ 		done = (dsi_rd(fDsi, 0x110) & 1) != 0;
+ 		if (!done) {
+ 			IODelay(200);
+@@ -1251,39 +1392,133 @@
   * last frame); on = 0x11 sleep out, 120 ms, 0x29 display on (the caller
   * then sends the brightness).
   */
@@ -222,11 +287,13 @@ index a4cfb47..6e7ec82 100644
 -		setPanelLevel(0);
 -	}
  	IOLockLock(fBlLock);
++	fDsiHsNow = on ? fOnHs : fOffHs;        /* laurel 2201 fix: on-/off-command-state of the panel */
  	done &= dsiSend(first, NULL, 0);
  	IOLockUnlock(fBlLock);
 -	IOSleep(on ? 120 : 20);
 +	IOSleep(on ? 120 : off1);
  	IOLockLock(fBlLock);
++	fDsiHsNow = on ? fOnHs : fOffHs;
  	done &= dsiSend(second, NULL, 0);
 -	IOLockUnlock(fBlLock);
 -	if (!on) {
@@ -249,12 +316,23 @@ index a4cfb47..6e7ec82 100644
 +	level = level > fBlMax ? fBlMax : level;
 +	uint8_t cmd[3] = { 0x51, (uint8_t)((level >> 8) & 0xf), (uint8_t)level };   /* MSB first (F9S) */
  	IOLockLock(fBlLock);
++	fDsiHsNow = fBlHs;                      /* laurel 2201 fix: qcom,mdss-dsi-brightness-command-state */
  	bool done = dsiDcsLong(cmd, sizeof(cmd));
++	fBlWrites++;
++	fBlFails += done ? 0 : 1;
++	uint32_t fails = fBlFails;
  	IOLockUnlock(fBlLock);
-@@ -1220,6 +1335,47 @@ AppleCLCD::setPanelLevel(uint32_t level)
- 	if (logs++ < 8 || !done) {
- 		IOLog("SWEET FB: panel level %#x: %s\n", level, done ? "done" : "NO DONE");
- 	}
+-	static uint32_t logs;
+-	if (logs++ < 8 || !done) {
+-		IOLog("SWEET FB: panel level %#x: %s\n", level, done ? "done" : "NO DONE");
++	/*
++	 * laurel 2201 fix: the first 8 writes of the boot were logged and then nothing: the slider looked as if it
++	 * sent no write after a fade had used up the 8. Now: failures only (first 8, then every 100th); the settled
++	 * value has its own line (blLog).
++	 */
++	if (!done && (fails <= 8 || fails % 100 == 0)) {
++		IOLog("SWEET FB: panel level %#x: NO DONE (%u failed writes)\n", level, fails);
++	}
 +	return done;
 +}
 +
@@ -279,27 +357,44 @@ index a4cfb47..6e7ec82 100644
 +	return (uint32_t)v;
 +}
 +
-+/* laurel 2201: a new level (DBV) for the panel, faded over `ms`; at least LAUREL_BL_MIN while the display is on */
++/*
++ * laurel 2201: a new level (DBV) for the panel, faded over `ms`; at least LAUREL_BL_MIN while the display is on.
++ * value: the request's 0..255 for the settled-value line (~0u: an internal change, no line).
++ * fBlLast keeps the last level the user chose: a request for 0 (backboardd's dim before display off) is not one,
++ * so a wake comes back to the slider's level and not to the minimum (2201 kept 4 there).
++ */
 +static void
-+laurel_bl_set(AppleCLCD *fb, uint32_t level, uint32_t ms)
++laurel_bl_set(AppleCLCD *fb, uint32_t level, uint32_t ms, uint32_t value)
 +{
++	char name[20] = "";
++	if (value != ~0u) {
++		proc_selfname(name, sizeof(name));
++	}
 +	IOLockLock(fb->fLock);
++	if (level >= LAUREL_BL_MIN) {
++		fb->fBlLast = level;
++	}
 +	if (!fb->fPowerOff && level < LAUREL_BL_MIN) {
 +		level = LAUREL_BL_MIN;  /* never dark while the display is on: dark is the power-off path */
 +	}
 +	fb->fBlLevel = level;
-+	if (level != 0) {
-+		fb->fBlLast = level;
-+	}
 +	fb->fBlFadeMs = ms > 5000 ? 5000 : ms;
++	if (value != ~0u) {
++		fb->fBlValue = value;
++		strlcpy(fb->fBlFrom, name, sizeof(fb->fBlFrom));
++	}
 +	IOLockUnlock(fb->fLock);
 +	if (fb->fBlCall != NULL) {
-+		thread_call_enter(fb->fBlCall);
++		thread_call_enter(fb->fBlCall);         /* ONCE: runs again after a running walk, with the latest level */
 +	}
++	if (value != ~0u && fb->fBlLogCall != NULL) {
++		uint64_t deadline;
++		clock_interval_to_deadline(LAUREL_BL_LOG_MS, kMillisecondScale, &deadline);
++		thread_call_enter_delayed(fb->fBlLogCall, deadline);    /* re-armed by every request: fires once settled */
+ 	}
  }
  
- /*
-@@ -1233,44 +1389,71 @@ AppleCLCD::setProperties(OSObject *properties)
+@@ -1298,45 +1533,134 @@
  	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
  	sweet_bl_log("iomfb", d);
  	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("IOMFBBrightnessLevel")) : NULL;
@@ -313,21 +408,23 @@ index a4cfb47..6e7ec82 100644
 -	uint64_t level = (v * 0x7ffull) / ((uint64_t)SWEET_FB_MAX_NITS << 16);
 -	if (level > 0x7ff) {
 -		level = 0x7ff;
+-	}
+-	if (level < 1) {
+-		level = 1;
+-	}
+-	IOLockLock(fLock);
+-	fBlLevel = (uint32_t)level;
+-	IOLockUnlock(fLock);
 +	if (!fBlIomfbSeen) {
 +		char name[32];
 +		fBlIomfbSeen = true;
 +		proc_selfname(name, sizeof(name));
 +		IOLog("LAUREL BACKLIGHT: first IOMFBBrightnessLevel from %s: %llu.%03llu nits%s\n", name, v >> 16,
 +		    ((v & 0xffff) * 1000) >> 16, fBlSlider ? " (ignored: AppleARMBacklight brightness is in use)" : "");
- 	}
--	if (level < 1) {
--		level = 1;
++	}
 +	if (fBlSlider && fBacklight != NULL) {
 +		return kIOReturnSuccess;        /* laurel 2201: one source of truth, the AppleARMBacklight slider */
- 	}
--	IOLockLock(fLock);
--	fBlLevel = (uint32_t)level;
--	IOLockUnlock(fLock);
++	}
 +	/* laurel 2201: 0..fBlNits nits (16.16) -> DBV 4..fBlMax (linear: the AMOLED DBV follows luminance) */
 +	uint64_t level = (v * fBlMax) / ((uint64_t)fBlNits << 16);
 +	level = level > fBlMax ? fBlMax : level < LAUREL_BL_MIN ? LAUREL_BL_MIN : level;
@@ -338,7 +435,7 @@ index a4cfb47..6e7ec82 100644
  	 */
 -	if (fBlCall != NULL) {
 -		thread_call_enter(fBlCall);
-+	laurel_bl_set(this, (uint32_t)level, 0);
++	laurel_bl_set(this, (uint32_t)level, 0, laurel_value_for((uint32_t)level, fBlMax));
 +	if (fBacklight != NULL) {
 +		fBacklight->publish(laurel_value_for((uint32_t)level, fBlMax), (uint32_t)(v >> 16));
  	}
@@ -353,14 +450,7 @@ index a4cfb47..6e7ec82 100644
  AppleCLCD::blWork(thread_call_param_t p0, __unused thread_call_param_t p1)
  {
  	AppleCLCD *fb = (AppleCLCD *)p0;
--	IOLockLock(fb->fLock);
--	uint32_t level = fb->fBlLevel;
--	bool off = fb->fPowerOff;
--	IOLockUnlock(fb->fLock);
--	if (!off && level != fb->fBlSent) {
--		fb->fBlSent = level;
--		fb->setPanelLevel(level);
-+	uint32_t step = 0;
++	uint32_t step = 0, walking = ~0u;
 +	for (unsigned guard = 0; guard < 4096; guard++) {
 +		IOLockLock(fb->fLock);
 +		uint32_t target = fb->fBlLevel;
@@ -376,7 +466,10 @@ index a4cfb47..6e7ec82 100644
 +			uint32_t diff = cur > target ? cur - target : target - cur;
 +			step = (uint32_t)((uint64_t)diff * LAUREL_FADE_STEP_MS / ms);
 +			step = step < 1 ? 1 : step;
++		} else if (target != walking) {
++			step = 0;       /* laurel 2201 fix: a new value without a fade goes there at once (2201 kept the old step) */
 +		}
++		walking = target;
 +		uint32_t next = step == 0 ? target :
 +		    cur < target ? (target - cur > step ? cur + step : target) :
 +		    (cur - target > step ? cur - step : target);
@@ -387,10 +480,74 @@ index a4cfb47..6e7ec82 100644
 +		if (next != target) {
 +			IOSleep(LAUREL_FADE_STEP_MS);
 +		}
++	}
++}
++
++/*
++ * laurel 2201 fix: the start self-check. The default level goes out as the Linux driver sends it (the panel's
++ * mode, DMA at the front-porch line). No DONE: once more without the DMA line, then once more the old 2201 way
++ * (LP, no line). The first way that completes is kept for the boot; none = the feature is off.
++ */
++bool
++AppleCLCD::dsiSelfCheck(uint32_t level)
++{
++	static char how[64];
++	uint32_t line = fDsiSchedLine;
++	bool hs = fBlHs;
++	if (setPanelLevel(level)) {
++		snprintf(how, sizeof(how), "DCS %s, DMA at line %u", fBlHs ? "HS" : "LP", line);
++	} else if ((fDsiSchedLine = 0, dsi_wr(fDsi, 0x100, dsi_rd(fDsi, 0x100) & ~(1u << 28)), setPanelLevel(level))) {
++		snprintf(how, sizeof(how), "DCS %s, DMA unscheduled (line %u: no DONE)", fBlHs ? "HS" : "LP", line);
++	} else if ((fBlHs = fOnHs = fOffHs = false, setPanelLevel(level))) {
++		snprintf(how, sizeof(how), "DCS LP, DMA unscheduled (%s + line %u: no DONE)", hs ? "HS" : "LP", line);
++	} else {
++		snprintf(how, sizeof(how), "no DONE in HS/LP, with and without a DMA line");
++		fDsiHow = how;
++		return false;
++	}
++	fDsiHow = how;
++	fBlWrites = fBlFails = 0;
++	return true;
++}
++
++/*
++ * laurel 2201 fix: one line per settled value (LAUREL_BL_LOG_MS after the last request; at most
++ * LAUREL_BL_LOG_MAX per boot, then every 50th): what was asked, the DBV, and how many panel writes since.
++ */
++void
++AppleCLCD::blLog(thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	AppleCLCD *fb = (AppleCLCD *)p0;
++	char from[20];
+ 	IOLockLock(fb->fLock);
+-	uint32_t level = fb->fBlLevel;
++	uint32_t value = fb->fBlValue, target = fb->fBlLevel, sent = fb->fBlSent;
+ 	bool off = fb->fPowerOff;
++	fb->fBlValue = ~0u;
++	strlcpy(from, fb->fBlFrom, sizeof(from));
+ 	IOLockUnlock(fb->fLock);
+-	if (!off && level != fb->fBlSent) {
+-		fb->fBlSent = level;
+-		fb->setPanelLevel(level);
++	if (value == ~0u) {
++		return;
  	}
++	IOLockLock(fb->fBlLock);
++	uint32_t writes = fb->fBlWrites, fails = fb->fBlFails;
++	fb->fBlWrites = fb->fBlFails = 0;
++	IOLockUnlock(fb->fBlLock);
++	uint32_t n = ++fb->fBlLines;
++	if (n > LAUREL_BL_LOG_MAX && n % 50 != 0) {
++		return;
++	}
++	IOLog("LAUREL BACKLIGHT: brightness %u of 255 from %s -> DBV %u (%u nits): %s, %u panel writes, %u failed\n",
++	    value, from[0] ? from : "?", target, target * fb->fBlNits / (fb->fBlMax ? fb->fBlMax : 1),
++	    off ? "display off: kept for the wake" : sent == target ? "panel at it" : "panel still on its way",
++	    writes, fails);
  }
  
-@@ -1294,11 +1477,62 @@ sweet_bl_log(const char *who, OSDictionary *d)
+ static void
+@@ -1359,11 +1683,63 @@
  	OSSafeReleaseNULL(it);
  }
  
@@ -440,20 +597,21 @@ index a4cfb47..6e7ec82 100644
 +			IOLog("LAUREL BACKLIGHT: first AppleARMBacklight brightness from %s: %u of 255%s\n", name, value,
 +			    fFB->fBlIomfbSeen ? "; IOMFBBrightnessLevel is ignored from now on" : "");
 +		}
-+		if (fLogged < 30) {
++		/* laurel 2201 fix: no line per step (30 per boot, then silence); blLog writes one per settled value */
++		if (fLogged < 3) {
 +			char name[32];
 +			fLogged++;
 +			proc_selfname(name, sizeof(name));
 +			IOLog("SWEET BL: %s sets brightness %u (fade %u ms) -> DBV %u\n", name, value, ms, level);
 +		}
-+		laurel_bl_set(fFB, level, ms);
++		laurel_bl_set(fFB, level, ms, value);
 +		publish(value, level * fFB->fBlNits / fFB->fBlMax);
 +		return kIOReturnSuccess;
 +	}
  	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("brightness-nits")) : NULL;
  	if (n != NULL && fFB != NULL) {
  		OSDictionary *m = OSDictionary::withCapacity(1);
-@@ -1317,6 +1551,49 @@ AppleARMBacklight::setProperties(OSObject *properties)
+@@ -1382,6 +1758,50 @@
  	return kIOReturnSuccess;
  }
  
@@ -495,7 +653,8 @@ index a4cfb47..6e7ec82 100644
 +		}
 +	}
 +	OSSafeReleaseNULL(bl);
-+	IOLog("LAUREL BACKLIGHT: on: DCS max %u (%s), AppleARMBacklight %s (RedwoodGPU up: GPU renderer)\n",
++	IOLog("LAUREL BACKLIGHT: on: DCS max %u (%s), AppleARMBacklight %s (RedwoodGPU up: GPU renderer); slider 0..255 -> "
++	    "DBV max * (v/255)^2, one line per settled value; auto-brightness off: no ambient light sensor for iOS\n",
 +	    fb->fBlMax, panel, published ? "published" : "failed");
 +	fb->release();
 +}
@@ -503,7 +662,7 @@ index a4cfb47..6e7ec82 100644
  /* panic: show the console frame (MMIO only, no locks) */
  static void
  sweet_cons_show(void)
-@@ -1738,23 +2015,54 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -1835,23 +2255,54 @@
  				IOLog("SWEET FB: display off ignored (sweetfb_stayon)\n");
  				break;
  			}
@@ -522,7 +681,7 @@ index a4cfb47..6e7ec82 100644
 +			if (dcs) {
 +				fFB->fBlHold = true;
 +			}
-+			uint32_t level = fFB->fBlLevel >= LAUREL_BL_MIN ? fFB->fBlLevel : fFB->fBlLast;
++			uint32_t level = fFB->fBlLast;  /* laurel 2201 fix: the user's level, not backboardd's dim to 0 */
 +			IOLockUnlock(fFB->fLock);
 +			if (dcs && off) {
 +				fFB->fadeOut();
@@ -549,15 +708,15 @@ index a4cfb47..6e7ec82 100644
 +					woke = false;
 +					fFB->fDcsOk = false;
 +					IOLog("LAUREL BACKLIGHT: off: wake 0x11/0x29 not done twice; display off shows a black frame only\n");
- 				}
++				}
 +				IOLockLock(fFB->fLock);
 +				fFB->fBlHold = false;
 +				if (!off) {
 +					fFB->fBlSent = 0;
-+				}
+ 				}
 +				IOLockUnlock(fFB->fLock);
 +				if (!off && woke) {
-+					laurel_bl_set(fFB, level, fFB->fFadeMs);
++					laurel_bl_set(fFB, level, fFB->fFadeMs, ~0u);
 +				}
 +			}
 +			if (fFB->fPwrLock != NULL) {
