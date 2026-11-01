@@ -1296,7 +1296,7 @@ diff -ruN a/bsd/dev/laurel_bt_fat.c b/bsd/dev/laurel_bt_fat.c
 diff -ruN a/bsd/dev/laurel_bt_fw.c b/bsd/dev/laurel_bt_fw.c
 --- a/bsd/dev/laurel_bt_fw.c	1970-01-01 05:30:00.000000000 +0530
 +++ b/bsd/dev/laurel_bt_fw.c	2026-11-01 05:15:56.551294408 +0530
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,200 @@
 +/*
 + * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 3b: rampatch + NVM download (Linux btqca.c
 + * qca_uart_setup / qca_download_firmware / qca_tlv_check_data for the WCN3990).
@@ -1451,7 +1451,14 @@ diff -ruN a/bsd/dev/laurel_bt_fw.c b/bsd/dev/laurel_bt_fw.c
 +lbt_fw_download(const struct lbt_qca_version *v, uint8_t baud_idx, uint8_t nvm_addr[6], bool *have_addr,
 +    char *names, size_t names_len, const char **why)
 +{
-+	unsigned rom = ((v->rom & 0x0f00u) >> 4) | (v->rom & 0x000fu);
++	/*
++	 * Linux btqca qca_uart_setup: the file number comes from the SoC version, not the ROM field:
++	 * ((soc & 0xf00) >> 4) | (soc & 0xf). WCN3990/3991/3998 use crbtfw/crnv, WCN3988 uses apbtfw/apnv.
++	 * Mi A3 seen 2026-11-01: soc 0x40070120, rom 0x0102 -> 10; the partition has apbtfw10.tlv + apnv10.bin
++	 * (WCN3988) and no crbtfw10. Linux picks the prefix from the DT compatible; here the file that exists
++	 * decides (cr first), and patch_check still checks the rampatch against the chip.
++	 */
++	unsigned rom = ((v->soc & 0x0f00u) >> 4) | (v->soc & 0x000fu);
 +	bool wcn3991 = v->soc == WCN3991_SOC, every = true;
 +	char tlv[24], nvm[24], part[16];
 +	uint8_t *d = NULL;
@@ -1460,10 +1467,15 @@ diff -ruN a/bsd/dev/laurel_bt_fw.c b/bsd/dev/laurel_bt_fw.c
 +
 +	snprintf(tlv, sizeof(tlv), "crbtfw%02x.tlv", rom);
 +	snprintf(nvm, sizeof(nvm), wcn3991 ? "crnv%02xu.bin" : "crnv%02x.bin", rom);
-+	snprintf(names, names_len, "%s + %s", tlv, nvm);
-+	if ((e = load(tlv, &d, &n, part, why)) != 0) {
-+		return e;
++	if ((e = lbt_fat_load(tlv, &d, &n, part, why)) != 0) {
++		snprintf(tlv, sizeof(tlv), "apbtfw%02x.tlv", rom);
++		snprintf(nvm, sizeof(nvm), "apnv%02x.bin", rom);
++		if ((e = load(tlv, &d, &n, part, why)) != 0) {
++			snprintf(names, names_len, "crbtfw%02x.tlv / %s", rom, tlv);
++			return e;
++		}
 +	}
++	snprintf(names, names_len, "%s + %s", tlv, nvm);
 +	if ((e = patch_check(d, n, v, &every, why)) == 0) {
 +		LBT_SAY("fw: %s %u bytes from %s, mode %u\n", tlv, n, part, d[14]);
 +		e = send_file(d, n, every, why);

@@ -199,3 +199,14 @@ and the boot are not touched.
   Bluetooth audio it may have to stay (negroni: `BTAUDIO=1`). Merge note: both root.sh hooks go after the
   boldtext line.
 - Polled RX: FIFO mode: bounded by the RX FIFO per poll; SE DMA mode: 2 KiB per poll (RFR holds the chip; no loss).
+
+## Chip and firmware names (phone, 2026-11-01 06:36)
+
+- [V log] SE DMA works: `LAUREL BT: chip: product 0x000f patch 0x0001 rom 0x0102 soc 0x40070120`, then
+  `fw: crbtfw12.tlv: file not in the partition`. The driver took the number from the ROM field.
+- [V BTFM.bin of V12.0.26.0.RFQMIXM, mdir] /image has apbtfw10/11.tlv, apnv10/11.bin, crbtfw11/20/21.tlv, crnv11/20/21.bin,
+  cmbtfw10-12.tlv, cmnv10-12.bin.
+- [V Linux btqca qca_uart_setup] the number is ((soc & 0xf00) >> 4) | (soc & 0xf) = 0x10 for soc 0x40070120; the `ap` prefix
+  is WCN3988. So the Mi A3 chip is a WCN3988 [I from the files present], not a WCN3990.
+- Fix (2600, laurel_bt_fw.c): number from the SoC version; crbtfw%02x first, then apbtfw%02x + apnv%02x. patch_check still
+  checks the rampatch against the chip.
