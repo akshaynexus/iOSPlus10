@@ -72,6 +72,10 @@ The two tracks are joined: `ios26-userland.md` sections 7.1-7.4 (state per item,
 | dyld flags, commpage | `LAUREL DYLD`, `LAUREL CPUID` |
 | User clients | IOSurface, IOMFB of 23F84: ios26-userland.md 8.2. **This kernel no longer answers an iOS 16 userland on these clients: the doc's section 8 line "the kernel reaches launchd of iOS 16" stops at the first surface** |
 
+## 4.1 Debug without a picture
+
+Patch `2951-laurel-boot-state.patch` (both kernels): USB commands `state`, `ps`, `logall`; lines `LAUREL STATE`, `LAUREL SSH`. `ios26-first-boot.md`, `usb-debug.md`. Host test of its table: `scripts/laurel/state-test.sh`.
+
 ## 5. Donor: N104AP (owner decision 2026-11-02)
 
 Values read from `DeviceTree.n104ap.im4p` of the 23F84 IPSW (`scripts/bg.sh ios26-donor scripts/laurel/ios26-donor.sh`; sha256 of `n104ap.adt`
@@ -118,7 +122,7 @@ In boot order:
 4. **Timer and GIC** (`sleh_irq`, `pe_fiq.c`): same code as iOS 16, new `ml_interrupt_masked_debug` calls.
 5. **IOKit start**: `SweetPlatformExpert`, `SweetCPU`, `AppleCLCD`. API changes that `-w` hid.
 6. **Root mount**: hfs-715 on the new VFS; `rd=ufsroot0`.
-7. **launchd and later**: the root exists (`ios26-root.md`), never run. Then dyld on a lowered cache, 83 subcaches, the first `LAUREL EMU` words, and the user-client ABIs, read from the frameworks (ios26-userland.md 8.2) but never run. Sandbox: not traced.
+7. **launchd and later**: the root exists (`ios26-root.md`), never run. What to read at each stage: `ios26-first-boot.md`. Then dyld on a lowered cache, 83 subcaches, the first `LAUREL EMU` words, and the user-client ABIs, read from the frameworks (ios26-userland.md 8.2) but never run. Sandbox: not traced.
 
 ## 8. T1 test plan (only when the owner asks for a flash; not now)
 

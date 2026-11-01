@@ -1,0 +1,450 @@
+laurel 2951: boot state for a phone with no picture and no SSH: USB commands state, ps, logall; LAUREL STATE and LAUREL SSH lines.
+Both kernels (iOS 16 and iOS 26). docs/laurel_sprout/ios26-first-boot.md. Kill switch laurelstate=0.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 7fd2094..2d25823 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -127,6 +127,7 @@ bsd/dev/laurel_rtc.c			standard
+ bsd/dev/laurel_build.c			standard
+ bsd/dev/laurel_wired.c			standard
+ bsd/dev/laurel_stats.c			standard
++bsd/dev/laurel_state.c			standard
+ bsd/dev/laurel_cell.c			standard
+ bsd/dev/laurel_cell_data.c			standard
+ bsd/dev/laurel_pdp.c			standard
+diff --git a/bsd/dev/laurel_state.c b/bsd/dev/laurel_state.c
+new file mode 100644
+index 0000000..f7d55b5
+--- /dev/null
++++ b/bsd/dev/laurel_state.c
+@@ -0,0 +1,155 @@
++/*
++ * laurel 2951: the boot state for the USB command server (bsd/dev/sweet_usb.c): `state` and `ps`, for a phone with no picture and no SSH. docs/laurel_sprout/ios26-first-boot.md.
++ * Lines: LAUREL STATE: on: ... at the exec of launchd; LAUREL SSH: on: dropbear pid P, T s after launchd; or LAUREL SSH: off: ... when launchd has not started it in LAUREL_SSH_WAIT_S.
++ * A failure turns off this table only. Kill switch: laurelstate=0. It reads and it sends nothing by itself.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/mount.h>
++#include <sys/proc_internal.h>
++#include <sys/vnode.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread_call.h>
++#include <pexpert/pexpert.h>
++#include "laurel_state_core.h"
++#if __has_include("laurel_build_stamp.h")
++#include "laurel_build_stamp.h"
++#else
++#define LAUREL_BUILD_STAMP "unstamped"
++#endif
++
++#define LAUREL_SSH_WAIT_S       300u    /* iOS 16 root, boot 2026-11-01 22:35: 4 s from exec launchd to exec dropbearmulti [V usblog]. A first boot on a new root does more work */
++
++extern vnode_t rootvnode;
++void laurel_state_exec(const char *name, int pid);
++void laurel_state_exit(const char *name, int pid, int rv);
++unsigned laurel_state_text(char *out, unsigned cap);
++unsigned laurel_state_ps(char *out, unsigned cap);
++
++static TUNABLE(uint32_t, laurel_state_on, "laurelstate", 1);
++static LCK_GRP_DECLARE(lst_grp, "laurel_state");
++static LCK_SPIN_DECLARE(lst_lock, &lst_grp);
++static struct lst_table lst;
++static unsigned long long lst_launchd_ms;
++static bool lst_ssh_seen;
++static thread_call_t lst_ssh_call;
++
++static unsigned long long
++lst_now_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static void
++lst_ssh_timeout(__unused thread_call_param_t a, __unused thread_call_param_t b)
++{
++	lck_spin_lock(&lst_lock);
++	bool seen = lst_ssh_seen;
++	unsigned long long ex = lst.n_exec, bad = lst.n_bad;
++	lck_spin_unlock(&lst_lock);
++	if (!seen) {
++		printf("LAUREL SSH: off: launchd did not start dropbear in %u s (%llu execs, %llu bad exits): op10tool ctl state\n", LAUREL_SSH_WAIT_S, ex, bad);
++	}
++}
++
++void
++laurel_state_exec(const char *name, int pid)
++{
++	if (!laurel_state_on) {
++		return;
++	}
++	unsigned long long ms = lst_now_ms();
++	bool launchd = false, ssh = false;
++	unsigned long long after = 0;
++
++	lck_spin_lock(&lst_lock);
++	lst_exec(&lst, name, pid, ms);
++	if (pid == 1 && lst_launchd_ms == 0) {
++		lst_launchd_ms = ms ? ms : 1;
++		launchd = true;
++	}
++	if (!lst_ssh_seen && (strcmp(name, "dropbear") == 0 || strcmp(name, "dropbearmulti") == 0)) {
++		lst_ssh_seen = true;
++		ssh = true;
++		after = ms - lst_launchd_ms;
++	}
++	lck_spin_unlock(&lst_lock);
++	if (ssh) {
++		printf("LAUREL SSH: on: dropbear pid %d, %llu.%u s after launchd, on the USB address only\n", pid, LST_S(after));
++	}
++	if (launchd) {
++		printf("LAUREL STATE: on: ctl state and ps answer, %u names watched, launchd is pid 1\n", (unsigned)LST_WATCH_N);
++		lst_ssh_call = thread_call_allocate(lst_ssh_timeout, NULL);
++		if (lst_ssh_call != NULL) {
++			uint64_t dl;
++			clock_interval_to_deadline(LAUREL_SSH_WAIT_S, NSEC_PER_SEC, &dl);
++			thread_call_enter_delayed(lst_ssh_call, dl);
++		}
++	}
++}
++
++void
++laurel_state_exit(const char *name, int pid, int rv)
++{
++	if (!laurel_state_on) {
++		return;
++	}
++	unsigned long long ms = lst_now_ms();
++
++	lck_spin_lock(&lst_lock);
++	lst_exit(&lst, name, pid, rv, ms);
++	lck_spin_unlock(&lst_lock);
++}
++
++/* From ud_thread. Never blocks on a lock another thread can hold for long. */
++unsigned
++laurel_state_text(char *out, unsigned cap)
++{
++	static struct lst_table copy;   /* ud_thread only: the table is too big for its stack */
++	char head[320];
++	unsigned long long launchd_ms;
++	bool ssh;
++
++	if (!laurel_state_on) {
++		return (unsigned)snprintf(out, cap, "state off: laurelstate=0\nend\n");
++	}
++	lck_spin_lock(&lst_lock);
++	copy = lst;
++	launchd_ms = lst_launchd_ms;
++	ssh = lst_ssh_seen;
++	lck_spin_unlock(&lst_lock);
++	mount_t mp = rootvnode != NULL ? vnode_mount(rootvnode) : NULL;
++	snprintf(head, sizeof(head), "build %s\nroot %s %s\nlaunchd=%s ssh=%s\n", LAUREL_BUILD_STAMP,
++	    mp != NULL ? vfs_statfs(mp)->f_mntfromname : "none", mp == NULL ? "-" : (vfs_flags(mp) & MNT_RDONLY) ? "ro" : "rw",
++	    launchd_ms != 0 ? "up" : "no", ssh ? "started" : "no");
++	return lst_text(&copy, lst_now_ms(), head, out, cap);
++}
++
++/* All processes, one line each. The list lock is a try: a hung holder must not stop the command server. */
++unsigned
++laurel_state_ps(char *out, unsigned cap)
++{
++	unsigned n = 0;
++	proc_t p;
++
++	if (!lck_mtx_try_lock(&proc_list_mlock)) {
++		return (unsigned)snprintf(out, cap, "ps busy: try again\nend\n");
++	}
++	ALLPROC_FOREACH(p) {
++		char line[64];
++		int l = snprintf(line, sizeof(line), "%d %d %s\n", proc_getpid(p), p->p_ppid, p->p_comm);
++		if (l <= 0 || n + (unsigned)l + 10 >= cap) {
++			memcpy(out + n, "more\n", 5);
++			n += 5;
++			break;
++		}
++		memcpy(out + n, line, (unsigned)l);
++		n += (unsigned)l;
++	}
++	lck_mtx_unlock(&proc_list_mlock);
++	memcpy(out + n, "end\n", 4);
++	return n + 4;
++}
+diff --git a/bsd/dev/laurel_state_core.h b/bsd/dev/laurel_state_core.h
+new file mode 100644
+index 0000000..20b2995
+--- /dev/null
++++ b/bsd/dev/laurel_state_core.h
+@@ -0,0 +1,157 @@
++/*
++ * laurel 2951: what user processes did since boot, kept by the kernel, for `op10tool ctl state`. iOS 26 has no GL path: a compositor that fails shows no picture, and SSH can fail too.
++ * This table needs only the USB command server, so it answers when launchd refused every job. C without kernel calls: scripts/laurel/state-test.sh compiles this same text.
++ *
++ * Input: lst_exec(), lst_exit(), from the exec line and from proc_prepareexit. Output: lst_text(), lines of text; docs/laurel_sprout/ios26-first-boot.md reads them.
++ *   run NAME pid=P n=STARTS x=EXITS rv=LAST_STATUS t=FIRST_START_S    one line per watched name that has started
++ *   exec T NAME[PID]    the last LST_EXECS execs, any name        bad T NAME[PID] rv=0xS    the last LST_BADS exits with a status other than 0, any name
++ */
++#ifndef LAUREL_STATE_CORE_H
++#define LAUREL_STATE_CORE_H
++
++#define LST_NAME        17u     /* MAXCOMLEN + 1: exec has p_name, exit has p_comm: 16 characters are what both have */
++#define LST_EXECS       8u
++#define LST_BADS        12u
++
++/* In boot order: boot tasks of launchd 23F84 (embedded plist, key Boot), the SSH path, then the compositor. A task with RequireSuccess that fails ends the boot before any daemon. */
++static const char lst_names[][LST_NAME] = {
++	"launchd", "fsck", "mount", "init_data_protec", "launchd_cache_lo", "cc_fips_test", "keybagd", "dirs_cleaner",
++	"configd", "logd", "cfprefsd", "dropbear", "dropbearmulti", "laurelnet", "lockdownd", "mobileactivation", "wifid",
++	"runningboardd", "backboardd", "SpringBoard", "PosterBoard", "mediaserverd", "audiomxd",
++};
++#define LST_WATCH_N     (sizeof(lst_names) / sizeof(lst_names[0]))
++
++struct lst_watch {
++	int pid, last_rv;
++	unsigned starts, exits;
++	unsigned long long first_ms, start_ms, exit_ms;
++};
++
++struct lst_event {
++	char name[LST_NAME];
++	int pid, rv;
++	unsigned long long ms;
++};
++
++struct lst_table {
++	unsigned long long n_exec, n_exit, n_bad, n_sig;
++	struct lst_watch w[LST_WATCH_N];
++	struct lst_event execs[LST_EXECS], bads[LST_BADS];
++};
++
++static inline int
++lst_find(const char *name)
++{
++	for (unsigned i = 0; i < LST_WATCH_N; i++) {
++		if (strncmp(name, lst_names[i], LST_NAME - 1) == 0) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++static inline void
++lst_event_put(struct lst_event *e, const char *name, int pid, int rv, unsigned long long ms)
++{
++	strlcpy(e->name, name, LST_NAME);
++	e->pid = pid;
++	e->rv = rv;
++	e->ms = ms;
++}
++
++static inline void
++lst_exec(struct lst_table *t, const char *name, int pid, unsigned long long ms)
++{
++	lst_event_put(&t->execs[t->n_exec % LST_EXECS], name, pid, 0, ms);
++	t->n_exec++;
++	int i = lst_find(name);
++	if (i >= 0) {
++		struct lst_watch *w = &t->w[i];
++		if (w->starts == 0) {
++			w->first_ms = ms;
++		}
++		w->starts++;
++		w->pid = pid;
++		w->start_ms = ms;
++	}
++}
++
++static inline void
++lst_exit(struct lst_table *t, const char *name, int pid, int rv, unsigned long long ms)
++{
++	t->n_exit++;
++	if (rv != 0) {
++		lst_event_put(&t->bads[t->n_bad % LST_BADS], name, pid, rv, ms);
++		t->n_bad++;
++		if ((rv & 0x7f) != 0) {
++			t->n_sig++;
++		}
++	}
++	int i = lst_find(name);
++	if (i >= 0) {
++		struct lst_watch *w = &t->w[i];
++		w->exits++;
++		w->last_rv = rv;
++		w->exit_ms = ms;
++		if (w->pid == pid) {
++			w->pid = 0;     /* not running now */
++		}
++	}
++}
++
++/* The one line of a time in seconds with a tenth: no floating point in the kernel. */
++#define LST_S(ms)       (unsigned long long)((ms) / 1000), (unsigned)(((ms) % 1000) / 100)
++
++/* Appends to out[cap]; the last line stays whole; returns the bytes in out. A table that does not fit ends with "more". */
++static inline unsigned
++lst_text(const struct lst_table *t, unsigned long long now_ms, const char *head, char *out, unsigned cap)
++{
++	unsigned n = 0;
++	char line[160];
++	int l;
++	/* snprintf returns the length it wanted: a line that was cut counts as what line[] holds */
++#define LST_ADD()       do { if (l >= (int)sizeof(line)) { l = (int)sizeof(line) - 1; } if (l > 0 && n + (unsigned)l + 10 < cap) { memcpy(out + n, line, (unsigned)l); n += (unsigned)l; } else if (l > 0) { goto full; } } while (0)
++
++	l = snprintf(line, sizeof(line), "state 1 up=%llu.%u\n", LST_S(now_ms));
++	LST_ADD();
++	{
++		size_t h = strlen(head);
++		if (n + h + 10 >= cap) {
++			goto full;
++		}
++		memcpy(out + n, head, h);
++		n += (unsigned)h;
++	}
++	l = snprintf(line, sizeof(line), "count exec=%llu exit=%llu bad=%llu sig=%llu\n", t->n_exec, t->n_exit, t->n_bad, t->n_sig);
++	LST_ADD();
++	for (unsigned i = 0; i < LST_WATCH_N; i++) {
++		const struct lst_watch *w = &t->w[i];
++		if (w->starts == 0) {
++			continue;
++		}
++		l = snprintf(line, sizeof(line), "run %s pid=%d n=%u x=%u rv=0x%x t=%llu.%u\n", lst_names[i], w->pid, w->starts, w->exits, w->last_rv, LST_S(w->first_ms));
++		LST_ADD();
++	}
++	{
++		unsigned long long c = t->n_exec > LST_EXECS ? t->n_exec - LST_EXECS : 0;
++		for (; c < t->n_exec; c++) {
++			const struct lst_event *e = &t->execs[c % LST_EXECS];
++			l = snprintf(line, sizeof(line), "exec %llu.%u %s[%d]\n", LST_S(e->ms), e->name, e->pid);
++			LST_ADD();
++		}
++		c = t->n_bad > LST_BADS ? t->n_bad - LST_BADS : 0;
++		for (; c < t->n_bad; c++) {
++			const struct lst_event *e = &t->bads[c % LST_BADS];
++			l = snprintf(line, sizeof(line), "bad %llu.%u %s[%d] rv=0x%x\n", LST_S(e->ms), e->name, e->pid, e->rv);
++			LST_ADD();
++		}
++	}
++	memcpy(out + n, "end\n", 4);
++	return n + 4;
++full:
++	memcpy(out + n, "more\nend\n", 9);
++	return n + 9;
++#undef LST_ADD
++}
++
++#endif
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 0dff108..24d9774 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -121,6 +121,7 @@ static volatile uint64_t ud_tc_ticks;
+ static uint64_t ud_tc_period;
+ #define ud_nolock() (ud_in_panic || ud_in_tc)
+ static volatile bool ud_log_rewind;     /* "log" command: ud_log_thread sends the last 64 KiB again */
++static volatile bool ud_log_rewind_all; /* laurel 2951 "logall" command: all of the console ring again */
+ static volatile uint64_t ud_log_sent;   /* console ring position that ud_log_thread has sent up to */
+ 
+ static int ud_panic_log(const char *fmt, ...) __printflike(1, 2);
+@@ -999,6 +1000,9 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+  * as "LAUREL CTL:":
+  *   ping        reply "pong"
+  *   log         the live log sends the last 64 KiB of the console again
++ *   logall      the live log sends all of the console ring again (laurel 2951)
++ *   state       what the user processes did since boot, several datagrams, last line "end" (laurel 2951)
++ *   ps          all processes, several datagrams, last line "end" (laurel 2951)
+  *   reboot      IMEM reason normal, PSCI SYSTEM_RESET (laurel_reboot.c)
+  *   bootloader  IMEM reason bootloader (ABL fastboot), then the reset
+  *   recovery    IMEM reason recovery, then the reset
+@@ -1238,6 +1242,23 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+ 		ud_ctl_reply(f, "ok log");
+ 		return true;
+ 	}
++	if (strcmp(cmd, "logall") == 0) {       /* laurel 2951 */
++		ud_log_rewind_all = true;
++		ud_ctl_reply(f, "ok logall");
++		return true;
++	}
++	if (strcmp(cmd, "state") == 0 || strcmp(cmd, "ps") == 0) {      /* laurel 2951 */
++		extern unsigned laurel_state_text(char *, unsigned);
++		extern unsigned laurel_state_ps(char *, unsigned);
++		static char sreply[32768];      /* ud_thread only */
++		unsigned sn = cmd[0] == 's' ? laurel_state_text(sreply, sizeof(sreply)) : laurel_state_ps(sreply, sizeof(sreply));
++		for (unsigned so = 0; so < sn;) {
++			unsigned chunk = MIN(sn - so, 1400u);
++			ud_ctl_reply_n(f, sreply + so, chunk);
++			so += chunk;
++		}
++		return true;
++	}
+ 	{
+ 		/* laurel 2720: calendar commands (no reset: also while one is pending) */
+ 		char treply[128];
+@@ -1418,6 +1439,13 @@ ud_panic_rx(const uint8_t *f, uint32_t len)
+ 		ud_panic_pos = end > 65536 ? end - 65536 : 0;
+ 		snprintf(text, sizeof(text), "ok log%s", sfx);
+ 		reply = text;
++	} else if (strcmp(cmd, "logall") == 0) {        /* laurel 2951: sweet_log_copy starts at the oldest byte the ring has */
++		ud_panic_pos = 0;
++		snprintf(text, sizeof(text), "ok logall%s", sfx);
++		reply = text;
++	} else if (strcmp(cmd, "state") == 0 || strcmp(cmd, "ps") == 0) {       /* laurel 2951 */
++		snprintf(text, sizeof(text), "state %s\nend\n", ud_in_panic ? "panic: send logall" : "early: no ue0 yet");
++		reply = text;
+ 	} else if (strcmp(cmd, "reboot") == 0 || strcmp(cmd, "recovery") == 0 ||
+ 	    strcmp(cmd, "bootloader") == 0 || strcmp(cmd, "poweroff") == 0) {
+ 		if (busy) {
+@@ -2167,11 +2195,16 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			uint64_t end = sweet_log_position();
+ 			pos = end > 65536 ? end - 65536 : 0;
+ 		}
++		if (ud_log_rewind_all) {        /* laurel 2951: sweet_log_copy starts at the oldest byte the ring has */
++			ud_log_rewind_all = false;
++			pos = 0;
++		}
+ 		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+ 			so = NULL;
+ 			continue;
+ 		}
+ 		uint32_t n;
++		uint64_t before = pos;          /* laurel 2951: a send that fails keeps its bytes: a whole ring is more than the send queue */
+ 		while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
+ 			struct iovec iov = { .iov_base = chunk, .iov_len = n };
+ 			struct msghdr msg = {
+@@ -2180,8 +2213,10 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			};
+ 			size_t sent = 0;
+ 			if (sock_send(so, &msg, 0, &sent) != 0) {
++				pos = before;   /* laurel 2951 */
+ 				break;          /* no route/ARP yet: retry later */
+ 			}
++			before = pos;
+ 			ud_log_sent = pos;      /* the panic flush starts here */
+ 		}
+ 	}
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 625a74f..89e1786 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8830,6 +8830,8 @@ process_signature(proc_t p, struct image_params *imgp)
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+ 			printf("exec %s\n", p->p_name);
++			extern void laurel_state_exec(const char *, int);       /* laurel 2951 */
++			laurel_state_exec(p->p_name, proc_getpid(p));
+ 			/* topaz: does the window server get our library (GPU's OpenGL ES)? */
+ 			if (strcmp(p->p_name, "backboardd") == 0 && imgp->ip_endargv != NULL && imgp->ip_endenvv != NULL) {
+ 				const char *e = imgp->ip_endargv, *end = imgp->ip_endenvv;
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2028,4 +2028,6 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ 	exception_type_t etype;
+ 
++	extern void laurel_state_exit(const char *, int, int);  /* laurel 2951 */
++	laurel_state_exit(p->p_comm, proc_getpid(p), rv);
+ 	struct uthread *ut;
+ 	thread_t self = current_thread();

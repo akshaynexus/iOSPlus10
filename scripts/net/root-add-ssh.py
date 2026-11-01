@@ -31,7 +31,8 @@ Reads the iOS binaries from out/ssh/ios (userland/ssh/build.sh). Steps (all idem
 import os, plistlib, pwd, shutil, subprocess, sys, tempfile
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-OUT = os.path.join(REPO, 'out', 'ssh')
+# SSH_OUT: another out/ssh (a root stage for iOS 26: scripts/laurel/root-debug-ios26.sh; the self-test uses a scratch one with its own keys)
+OUT = os.environ.get('SSH_OUT') or os.path.join(REPO, 'out', 'ssh')
 IOS = os.path.join(OUT, 'ios')
 HOSTKEYS = os.path.join(OUT, 'hostkeys')
 KNOWN_HOSTS = os.path.join(OUT, 'known_hosts')
@@ -45,6 +46,10 @@ USB_INTERNET = os.environ.get('USBNET_INTERNET') == '1'
 PATH = '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
 IS_ROOT = os.geteuid() == 0
 TOOLS = ('dropbearmulti', 'dash', 'toybox', 'usbnetcfg', 'laurelnet', 'usbreboot', 'oslogstream')
+# SSH_IOS26=1 (scripts/laurel/root-debug-ios26.sh; default off, so the iOS 16 root stays as it was):
+#   the jobs of launchd 23F84 have no log file: launchd opens the path at each spawn, and a job must not depend on /private/var. stderr goes to /dev/console = the USB log.
+#   POSIXSpawnType Interactive, as com.apple.configd; MinimalBootProfile: the job stays in launchd's small boot mode; EnablePressuredExit off: launchd must not end it when idle.
+IOS26 = os.environ.get('SSH_IOS26') == '1'
 
 
 def own(path, uid=0, gid=0, mode=None):
@@ -111,6 +116,20 @@ def save_plist(path, data, fmt=plistlib.FMT_BINARY, mode=0o644, uid=0, gid=0):
     os.replace(tmp, path)
 
 
+def stock_names(root):
+    """Commands the root has. SSH_STOCK_NAMES=FILE: a stage holds no stock commands, so the caller lists them (one per line)."""
+    f = os.environ.get('SSH_STOCK_NAMES')
+    if f:
+        with open(f) as g:
+            return set(g.read().split())
+    stock = set()
+    for d in ('bin', 'sbin', 'usr/bin', 'usr/sbin'):
+        p = os.path.join(root, d)
+        if os.path.isdir(p):
+            stock.update(os.listdir(p))
+    return stock
+
+
 def binaries(root):
     b = mkdirs(root, 'usr/local/bin')
     for n in TOOLS:
@@ -119,11 +138,7 @@ def binaries(root):
         link('dropbearmulti', os.path.join(b, n))
 
     # toybox applets, unless a stock command of that name exists
-    stock = set()
-    for d in ('bin', 'sbin', 'usr/bin', 'usr/sbin'):
-        p = os.path.join(root, d)
-        if os.path.isdir(p):
-            stock.update(os.listdir(p))
+    stock = stock_names(root)
     ours = set(TOOLS) | {'dropbear', 'dropbearkey', 'dbclient', 'scp', 'sh'}
     applets = open(os.path.join(IOS, 'toybox.applets')).read().split()
     n = 0
@@ -326,16 +341,22 @@ def jobs(root, key_only, have_hostkey):
     if key_only and os.environ.get('SSH_PASSWORD_AUTH') != '1':
         args += ['-s']
     env = {'PATH': PATH, 'HOME': '/var/root'}
+    if IOS26:
+        extra = {'POSIXSpawnType': 'Interactive', 'MinimalBootProfile': True, 'EnablePressuredExit': False, 'EnableTransactions': False}
+        ssh_log = {'StandardErrorPath': '/dev/console'}
+        net_log = {'StandardOutPath': '/dev/console', 'StandardErrorPath': '/dev/console'}
+    else:
+        extra = {}
+        ssh_log = {'StandardErrorPath': '/private/var/log/iosplus10-dropbear.log'}
+        net_log = {'StandardOutPath': '/private/var/log/iosplus10-laurelnet.log',
+                   'StandardErrorPath': '/private/var/log/iosplus10-laurelnet.log'}
     add_job(root, LABEL_SSH, {
         'Label': LABEL_SSH, 'ProgramArguments': args, 'RunAtLoad': True, 'KeepAlive': True,
-        'ThrottleInterval': 10, 'UserName': 'root', 'EnvironmentVariables': env,
-        'StandardErrorPath': '/private/var/log/iosplus10-dropbear.log'})
+        'ThrottleInterval': 10, 'UserName': 'root', 'EnvironmentVariables': env, **ssh_log, **extra})
     add_job(root, LABEL_STATUS, {
         'Label': LABEL_STATUS, 'ProgramArguments': ['/usr/local/bin/laurelnet'], 'RunAtLoad': True,
         'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 60, 'UserName': 'root',
-        'EnvironmentVariables': env,
-        'StandardOutPath': '/private/var/log/iosplus10-laurelnet.log',
-        'StandardErrorPath': '/private/var/log/iosplus10-laurelnet.log'})
+        'EnvironmentVariables': env, **net_log, **extra})
     if USB_INTERNET:
         add_job(root, LABEL_NET, {
             'Label': LABEL_NET, 'ProgramArguments': ['/usr/local/bin/usbnetcfg', 'up'], 'RunAtLoad': True,

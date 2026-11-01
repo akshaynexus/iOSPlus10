@@ -5,6 +5,7 @@
 Each hit: address of the adrp, enclosing function start (LC_FUNCTION_STARTS), ObjC method name when the metadata gives one.
 Python here because this is a small reading aid, not a product. Works on macOS and Linux."""
 import bisect
+import hashlib
 import os
 import pickle
 import re
@@ -14,6 +15,15 @@ import sys
 
 LC_SEGMENT_64 = 0x19
 LC_FUNCTION_STARTS = 0x26
+
+
+def work_file(m):
+    """The disassembly and its index: Apple text, out/ only. XREF_DIS, else out/macho-xref/. Never beside the input: a file there goes into the next root build (lowered tree, 2026-11-02)."""
+    if os.environ.get('XREF_DIS'):
+        return os.environ['XREF_DIS']
+    d = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'out', 'macho-xref')
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, '%s-%s.s' % (os.path.basename(m.path), hashlib.sha1(os.path.abspath(m.path).encode()).hexdigest()[:8]))
 
 
 class Macho:
@@ -220,7 +230,7 @@ def main():
         sys.exit(__doc__)
     m = Macho(sys.argv[1])
     # the slow part once per file: strings, methods, stubs (a work file beside the disassembly, Apple text: out/ only)
-    pkl = (os.environ.get('XREF_DIS') or m.path + '.s') + '.pkl'
+    pkl = work_file(m) + '.pkl'
     if os.path.exists(pkl):
         with open(pkl, 'rb') as f:
             st, meth, stubs = pickle.load(f)
@@ -242,7 +252,7 @@ def main():
         return
     if sys.argv[2] in ('--sel', '--calls'):      # who sends this selector, or who calls this address
         want = {t for t, n in stubs.items() if n in sys.argv[3:]} if sys.argv[2] == '--sel' else {int(a, 16) for a in sys.argv[3:]}
-        for line in open(os.environ.get('XREF_DIS') or m.path + '.s', errors='replace'):
+        for line in open(work_file(m), errors='replace'):
             mm = re.match(r'([0-9a-f]{9,}):\tb(l?)\t0x([0-9a-f]+)', line)
             if mm and int(mm.group(3), 16) in want:
                 pc = int(mm.group(1), 16)
@@ -251,7 +261,7 @@ def main():
     if sys.argv[2] == '--dis':
         a = int(sys.argv[3], 16)
         n = int(sys.argv[4]) if len(sys.argv) > 4 else 80
-        cache = os.environ.get('XREF_DIS') or m.path + '.s'
+        cache = work_file(m)
         if not os.path.exists(cache):
             with open(cache, 'w') as f:
                 subprocess.run(['llvm-objdump', '--macho', '-d', '--no-show-raw-insn', m.path], stdout=f, check=True)

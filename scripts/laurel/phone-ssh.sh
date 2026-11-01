@@ -13,7 +13,7 @@
 # kernel that attached ue0 ("LAUREL USB: ue0 attached" in the live log). Everything else (keys, known_hosts,
 # PHONE_IP, SSH_KEY, SSH_OPTS, PHONE_PASSWORD) as scripts/net/ssh-phone.sh, which does the work. Login needs no setup: the repo key
 # out/ssh/phone_ed25519 (made at the root build), or on an older root the stock password alpine, without a prompt.
-# Without SSH (kernel only) the command server still answers: out/bin/op10tool ctl ping|log|bootlog|time|reboot ...
+# Without SSH (kernel only) the command server still answers: out/bin/op10tool ctl ping|state|ps|log|logall|time|reboot ... iOS 26 with no picture: scripts/laurel/ios26-diag.py
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 SSHP=$REPO/scripts/net/ssh-phone.sh
