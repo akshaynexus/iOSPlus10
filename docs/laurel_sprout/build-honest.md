@@ -86,7 +86,7 @@ laurel-root: 9 installed, 1 off by their own switch, 1 missing: camera
 | xnutils | `XNUTILS=0` | `out/laurel/xnutils/root` | app, helper (setuid, checked as root), pmregister |
 | ssh | `SSH=0` | `out/ssh/ios` | dropbear, its job |
 
-New rule: **SSH is wanted by default.** Before, a Linux root silently had no SSH, because nothing built `out/ssh/ios` [V: the main checkout had no `out/ssh`]. `build-all.sh` now builds it (`honest-ssh`: passed on this host, 2026-11-01).
+New rule: **SSH is wanted by default.** Before, a Linux root silently had no SSH, because nothing built `out/ssh/ios` [V: the main checkout had no `out/ssh`]. `build-all.sh` now builds it (passed on this host, 2026-11-01).
 
 Exit 1 when a feature is missing: no sparse image, the sidecar says `status failed`. Only the feature's own `NAME=0` leaves it out. A new feature: one `feature` line in `root-features.sh`, one row in `FEATURES` of `root-manifest.py`, one stage line in `build-all.sh` (XNUtils came this way; a failed XNUtils build was a warning before).
 
@@ -124,6 +124,7 @@ Recommendation: add `zet=5000` in the next boot image after one normal boot of t
 
 ## 7. Limits
 
+- Real run, 2026-11-01: `build-all.sh` passed with all stages (commit 66d75a4f47). An earlier run stopped at the Metal stage, with no new boot image, as it should.
 - `sudo root.sh` itself was not run. The dry run covers the same steps on a copy with real stages, except mkiosroot, fsck and img2simg (`scripts/laurel/root-dry-run.sh`; empty folders stand in for the UI sounds, ringtones and tunings).
 - No boot: the 3 boot lines have not been seen on the phone. The kernel compiles and holds the first line; the ADT holds the second.
 - The kernel series does not cover the compiler, the SDK or `kernel-linux.sh` itself.
