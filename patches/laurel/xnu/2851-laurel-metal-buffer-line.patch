@@ -1,0 +1,28 @@
+laurel 2851: the LAUREL METAL line says the real RedwoodMaxBuffer (256 MiB with the stage-1 tables, 2154). It said "buffers < 64 MiB"
+in every boot, also when Turnip's limit (0101, read from the property) was 256 MiB. Only the text changes.
+
+--- a/iokit/Kernel/arm/LaurelMetal.cpp
++++ b/iokit/Kernel/arm/LaurelMetal.cpp
+@@ -127,6 +127,7 @@
+ 	IOService * gpu = NULL;
+ 	char why[160];
+ 	uint64_t chip = 0, gmem = 0, freq = 0;
++	OSNumber * max_buffer;
+ 	int waited_ms = 0;
+ 
+ 	/* 1. the root, then the plug-in in it (cheap, and it needs no GPU) */
+@@ -193,9 +194,12 @@
+ 	accel->setProperty("MetalPluginName", LAUREL_METAL_PLUGIN);
+ 	accel->setProperty("MetalPluginClassName", LAUREL_METAL_CLASS);
+ 	accel->setProperty("IOGLBundleName", LAUREL_METAL_PLUGIN);   /* not read by Metal; flame and negroni set it too */
+-	IOLog("LAUREL METAL: on: Turnip a610 (chip %#llx, GMEM %llu KiB, %llu MHz, buffers < 64 MiB), metal2vulkan plug-in "
++	/* laurel 2851: the limit Turnip 0101 reads: 256 MiB with the stage-1 tables (2154), about 64 MiB in pass-through */
++	max_buffer = OSDynamicCast(OSNumber, gpu->getProperty("RedwoodMaxBuffer"));
++	IOLog("LAUREL METAL: on: Turnip a610 (chip %#llx, GMEM %llu KiB, %llu MHz, buffers up to %llu MiB), metal2vulkan plug-in "
+ 	    LAUREL_METAL_PLUGIN ".bundle class " LAUREL_METAL_CLASS " on IOAcceleratorES, GPU up %d ms after the root\n",
+-	    (unsigned long long)chip, (unsigned long long)gmem >> 10, (unsigned long long)freq / 1000000, waited_ms);
++	    (unsigned long long)chip, (unsigned long long)gmem >> 10, (unsigned long long)freq / 1000000,
++	    max_buffer != NULL ? (max_buffer->unsigned64BitValue() + 0xfffffull) >> 20 : 0ull, waited_ms);
+ out:
+ 	OSSafeReleaseNULL(gpu);
+ 	accel->registerService();                       /* with the names (on) or empty (off), as topaz 0138 did at once */

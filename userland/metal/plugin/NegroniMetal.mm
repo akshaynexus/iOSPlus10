@@ -52,6 +52,7 @@
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <IOSurface/IOSurfaceRef.h>
@@ -363,7 +364,8 @@ static const char *memory_rule(char *why, size_t size)
 	const long min_mb = env_num("NEGRONIMETAL_MIN_LIMIT_MB", 40); /* 40: chronod (inactive 45 MiB) and widgets (64 with our root) keep the device; stock 30 MiB widgets do not */
 	nlog("memory: footprint %ld MiB, jetsam limit %ld MiB (0 = none/unknown), extension point %s, rule %ld MiB",
 	     footprint, limit, *point ? point : "-", min_mb);
-	if (min_mb <= 0)
+	/* a poster's small numbers are soft limits (jetsamproperties com.apple.posterkit.provider: ActiveHard -1), and with no device it aborts */
+	if (min_mb <= 0 || !strcmp(point, "com.apple.posterkit.provider"))
 		return NULL;
 	if (limit > 0 && limit < min_mb) {
 		snprintf(why, size, "jetsam limit %ld MiB is below %ld MiB (NEGRONIMETAL_MIN_LIMIT_MB): no Metal device", limit, min_mb);
@@ -470,20 +472,58 @@ static void crash_arm(void)
 	g_crash_armed = 1;
 }
 
-/* The strike limit: NEGRONIMETAL_STRIKE_LIMIT (else the old NEGRONIMETAL_MAX_STRIKES), default 2. PosterBoard relaunches the
- * poster extensions (names ending in Poster, PosterExtension, PosterProvider) several times at boot: twice the limit (4). */
-static long strike_limit(void)
+/* The wallpaper extensions (names ending in Poster, PosterExtension, PosterProvider) are Metal-only (docs/notes.md 2026-10-25). */
+static bool poster_process(void)
 {
-	long limit = env_num("NEGRONIMETAL_STRIKE_LIMIT", env_num("NEGRONIMETAL_MAX_STRIKES", 2));
 	const char *n = getprogname();
 	size_t len = strlen(n);
 	static const char *const sfx[] = { "Poster", "PosterExtension", "PosterProvider" };
 	for (const char *x : sfx) {
 		size_t xl = strlen(x);
 		if (len >= xl && !strcmp(n + len - xl, x))
-			return limit * 2;
+			return true;
 	}
-	return limit;
+	return false;
+}
+
+/* The strike limit: NEGRONIMETAL_STRIKE_LIMIT (else the old NEGRONIMETAL_MAX_STRIKES), default 2. PosterBoard relaunches the
+ * poster extensions several times at boot: twice the limit (4). */
+static long strike_limit(void)
+{
+	long limit = env_num("NEGRONIMETAL_STRIKE_LIMIT", env_num("NEGRONIMETAL_MAX_STRIKES", 2));
+	return poster_process() ? limit * 2 : limit;
+}
+
+/*
+ * No device for a poster extension: it aborts at once (AegirPoster: -[NUNIAegirRenderer ...]: "object cannot be nil", CRASH sig 6) and
+ * PosterBoard starts it again, every 8 s (boot 2026-11-01 15:31; the gate still testing, or Metal off). The refusals in a row are
+ * counted per process name (a file in the strikes directory, 10 minutes without one starts again): the 2nd waits 2 s, then 4, 8, up
+ * to 60 s, before the nil device. So a loop costs little, and a device that comes a little later (the gate's list) is found by the next
+ * start. Other processes get their nil at once: SpringBoard's main thread must not wait, and they have CPU paths.
+ */
+static void refused_pause(void)
+{
+	char dir[256], path[320], line[64] = "";
+	if (!poster_process() || !strikes_dir(dir, sizeof(dir)))
+		return;
+	snprintf(path, sizeof(path), "%s/%s.refused", dir, getprogname());
+	long count = 0, last = 0, now = (long)time(NULL);
+	if (FILE *f = fopen(path, "r")) {
+		if (fgets(line, sizeof(line), f) && sscanf(line, "%ld %ld", &count, &last) != 2)
+			count = 0;
+		fclose(f);
+	}
+	if (now - last > 600 || now < last)
+		count = 0;
+	if (FILE *f = fopen(path, "w")) {
+		fprintf(f, "%ld %ld\n", count + 1, now);
+		fclose(f);
+	}
+	if (count > 0) {
+		unsigned wait = count >= 6 ? 60 : 1u << count;
+		nlog("refused %ld times in a row: %u s before the nil device (a poster aborts on it)", count + 1, wait);
+		sleep(wait);
+	}
 }
 
 /* Dead-man: true when this process may open the GPU now. Strikes live in <strikes_dir>/<name>. A process that cannot
@@ -1131,6 +1171,12 @@ static void watchdog_start(void)
 				watchdog_start();
 		} /* a clean refusal removed its strike file (deadman_refused); a hang keeps its strike (deadman_mark) */
 	});
+	if (!device) {
+		static dispatch_once_t paused;
+		dispatch_once(&paused, ^{
+			refused_pause();
+		});
+	}
 	if (g_gpu_lost) {
 		nlog("the GPU watchdog marked the GPU lost: no Metal device");
 		return nil;

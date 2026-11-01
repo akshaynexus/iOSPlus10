@@ -37,6 +37,10 @@ Build: kernel 252/252, 0 LSE; userland 0 ARMv8.1+; metal check PASS. Needs: new 
 (libOSMesa, libtopaz-gl, backboardd wrapper, laurel-metal-gate, clients mark). Next: boot, read `LAUREL GL DRAWN: on`,
 `0 pictures copied out` on every frame, the 10 s `redwood-gl: N frames ...` line, `KB out of the cache` near 0, `GPU busy`,
 `core C MHz`, `LAUREL METAL CLIENTS:`. Details: `docs/laurel_sprout/gpu.md` "Zero copy, cache upkeep, GPU time".
+Metal for all of iOS (2026-11-01 17:30, branch t3/laurel-metal-everywhere, built + host-tested, NOT BOOTED; Turnip has never run on the A610): owner "GPU acceleration on wallpaper choice is broken".
+Causes [V boot 15:27 + source]: the gate ran as user mobile (no m2vtest, no list), its lines never reached the USB log, m2vtest needs host pages (no 0x49), 16 KiB rules on a 4 KiB kernel, no CCU invalidate at submit.
+Done: launchd job as root + 3 tries + quick test decides (`* -backboardd` in /var/db and the bundle), kernel 2160 (host pages), 2161 (CCU invalidate), 2851 (real buffer limit in the line), Turnip 0103, poster refusal pause, memory limits, A610 shader profile.
+Build: kernel 262/262, 0 LSE; Metal stack check PASS. Needs: new boot image AND root rebuild. Next: boot, read `LAUREL GPU HOST PAGES: on`, `LAUREL METAL CLIENTS: testing`, then `on:` or `off: <reason>`; GL frames must stay 8-13 ms (2161 is the suspect if not). Details: `docs/laurel_sprout/metal.md` 6.1-6.5, 10.
 Cellular step 2 (2026-11-01, branch t3/laurel-cellular-ipa3, built + host-tested, NOT BOOTED): patch 2775 = one shared
 TrustZone PAS loader (`bsd/dev/topaz_pas.c`; the GPU zap shader is now its caller, same lines); patch 2780 (renumbered from
 2770, which is the camera) = IPA v4.2 AP side: IPA thread at modem READY (RPM clock, SMMU, registers, firmware PAS 15 from

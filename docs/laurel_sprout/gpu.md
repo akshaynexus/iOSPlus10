@@ -1,6 +1,6 @@
 # Mi A3 (laurel_sprout) GPU: Adreno 610 behind CoreAnimation's OpenGL ES renderer
 
-Status 2026-11-01 08:30 (branch t3/laurel-gpu-zero-copy): 2158 zero-copy surfaces + cache push per CPU write, 2159 measured GPU busy/clock, eagl 0002, Metal client gate; built on Linux, **NOT BOOTED** (section "Zero copy, cache upkeep, GPU time").
+Status 2026-11-01 16:30 (t3/laurel-metal-everywhere: 2160, 2161, 2851, section "Kernel changes for Metal clients"); 08:30 (branch t3/laurel-gpu-zero-copy): 2158 zero-copy surfaces + cache push per CPU write, 2159 measured GPU busy/clock, eagl 0002, Metal client gate; built on Linux, **NOT BOOTED** (section "Zero copy, cache upkeep, GPU time").
 Status 2026-11-01 06:45: the 06:12/06:17 "GL stall" is lsd's first LaunchServices seed (ADT without /chosen MACs), not the GPU; mkadt.py fix + 2155 GPU watchdog, built, NOT BOOTED (section "GL stall"). Status 2026-11-01 06:10: first boot with the zap files (05:52) hung in the zap SCM calls; 2153 fixes it (section "Zap hang").
 Status 2026-11-01 05:10: review fixes on top of laurel-int-1 (areas A, C, H); built on Linux (kernel, Mesa, userland,
 firmware extract, UEFI image). **NOT BOOTED.**
@@ -714,7 +714,7 @@ Expected lines (next GL boot):
   ...; P surface pushes, Q passed over (no CPU write since the last, or write-combined); GPU busy B %, core C MHz while busy,
   W MHz over the window`. K should be near 0 while nothing CPU-draws; C should read about 300.
 - no `LAUREL GPU SMMU: fault` line unless a real fault.
-- Metal gate (metal.md section 6): `LAUREL METAL CLIENTS: on: ...` or `off: <reason>` (syslog, /var/tmp/laurel-metal-gate.log).
+- Metal gate (metal.md 6.1; launchd job as root since 2026-11-01 16:30, the wrapper no longer starts it): `LAUREL METAL CLIENTS: on: ...` or `off: <reason>` (console = USB log, syslog, /var/tmp/laurel-metal-gate.log).
 If `RedwoodGPU: N submissions` shows `(some submissions not timed)` and `the GPU worked 0 us`: RB_DONE_TS does not write the
 counter on the A610 [U]; the rest of 2158/2159 is not affected.
 
@@ -730,6 +730,14 @@ were CPU/copy bound (above), not GPU bound. Next step: boot 2158 + 2159, read `G
 above ~60 % during scrolling, add GPU DCVS 300/600 MHz (600 = GPLL0 / 1, no PLL) behind a self-check: RPM link up, CX vote
 LOW_L1 (192) acked, measured clock within 10 % after the switch, TSENS sensor 15 (LAUREL THERMAL `gpu`) below 85 C, back to
 300 at 95 C. Kill switch `gpudcvs=0`.
+
+## Kernel changes for Metal clients (2026-11-01 16:30; built, NOT BOOTED; metal.md 6.1-6.2)
+
+- 2160: request 0x49, the caller's pages as a GPU buffer, stage 1 only. Line `LAUREL GPU HOST PAGES: on|off`; kill switch `gpu_hostimport=0`. No change for GL (it never asks).
+- 2161: `redwood_gpu_submit` starts each submission with PC_CCU_INVALIDATE_DEPTH + COLOR (Linux `a6xx_submit`; Turnip assumes it). 4 more ring dwords; also for GL. If GL frames get slower or
+  wrong after this boot, this is the first suspect [I]: the GL numbers of the 15:27 boot are the reference (frames 8-13 ms).
+- 2851: `LAUREL METAL` line prints the real RedwoodMaxBuffer. 2154 already set 256 MiB with the tables; Turnip 0101 reads it [V source].
+- 2155's watchdog (3 s with work pending and no fence move) now also sees Metal work while GL runs: one Metal submission above 3 s on this 300 MHz GPU turns the GPU off for the boot (GL -> software renderer, Metal -> nil) [I, by design; not seen].
 
 ## Recovery (no UI after the GPU root)
 

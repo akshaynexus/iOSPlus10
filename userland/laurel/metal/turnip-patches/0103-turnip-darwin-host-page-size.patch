@@ -1,0 +1,47 @@
+laurel (Mi A3): VK_EXT_external_memory_host took 16 KiB pages for granted. The laurel kernel runs 4 KiB pages (PAGES=4k): mmap and
+malloc memory are aligned to 4 KiB only, so Turnip refused 3 of 4 host pointers with VK_ERROR_INVALID_EXTERNAL_HANDLE (m2vtest's import
+step, newBufferWithBytesNoCopy:). The alignment is now the page size of the process (16 KiB on negroni: unchanged). The stand-in's
+NGL_PAGE follows (userland/negronigl/drm/negroni_drm.c). Applied after 0102 by scripts/gpu/turnip-build.sh (TU_EXTRA_PATCHES).
+
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -9,6 +9,10 @@
+ 
+ #include "tu_device.h"
+ 
++#ifdef __APPLE__
++#include <unistd.h>
++#endif
++
+ #include "drm-uapi/drm_fourcc.h"
+ #include "fdl/freedreno_layout.h"
+ #include <fcntl.h>
+@@ -1259,8 +1263,8 @@
+    os_get_page_size(&os_page_size);
+    props->minPlacedMemoryMapAlignment = os_page_size;
+ 
+-   /* VK_EXT_external_memory_host: the kernel imports whole 16 KiB pages (iOS user pages, docs/gpu-abi.md). */
+-   props->minImportedHostPointerAlignment = 16384;
++   /* VK_EXT_external_memory_host: the kernel imports whole pages of the caller (16 KiB on negroni, 4 KiB on the laurel 4K kernel). */
++   props->minImportedHostPointerAlignment = os_page_size;
+ 
+    /* VK_EXT_multi_draw */
+    props->maxMultiDrawCount = 2048;
+@@ -3142,7 +3146,7 @@
+       if (host_info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
+           !device->physical_device->has_host_import ||
+           !(tu_host_import_type_bits(device->physical_device) & (1u << pAllocateInfo->memoryTypeIndex)) ||
+-          (((uintptr_t) host_info->pHostPointer | pAllocateInfo->allocationSize) & 16383)) {
++          (((uintptr_t) host_info->pHostPointer | pAllocateInfo->allocationSize) & (getpagesize() - 1))) {
+          result = vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+       } else {
+          result = tu_bo_init_host(device, &mem->bo, host_info->pHostPointer,
+@@ -3267,7 +3271,7 @@
+    VK_FROM_HANDLE(tu_device, device, _device);
+    const struct tu_physical_device *pdev = device->physical_device;
+    if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
+-       !pdev->has_host_import || ((uintptr_t) pHostPointer & 16383))
++       !pdev->has_host_import || ((uintptr_t) pHostPointer & (getpagesize() - 1)))
+       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+    pMemoryHostPointerProperties->memoryTypeBits = tu_host_import_type_bits(pdev);
+    return VK_SUCCESS;

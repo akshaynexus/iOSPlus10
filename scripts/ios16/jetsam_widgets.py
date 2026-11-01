@@ -3,6 +3,7 @@
 
     jetsam_widgets.py [--mb N] PLIST...                 patch com.apple.jetsamproperties.<model>.plist files in place
     jetsam_widgets.py --daemon NAME [--mb N] PLIST...   raise one daemon's limits (Version4 > Daemon > Override > NAME)
+    jetsam_widgets.py --extensions N [--posters M] PLIST...   a floor of N MiB for every extension point, M for posters
 
 Daemons (2026-10-27, t26): com.apple.lsd has ActiveSoftMemoryLimit 16 / InactiveHardMemoryLimit 12 (D22). On the
 first boot of a fresh root lsd rebuilds the LaunchServices database, crosses 16 MiB and is jetsam-killed (reason
@@ -53,6 +54,32 @@ def patch_daemon(path, name, mb):
     return f'{os.path.basename(path)}: {name} {old} -> {mb} MiB' if changed else f'{os.path.basename(path)}: {name} already >= {mb} MiB'
 
 
+def patch_extensions(path, floor, poster_mb):
+    """Metal in every extension (docs/laurel_sprout/metal.md 6.3): raise each *MemoryLimit of Version4 > Extension > Override below
+    FLOOR MiB to FLOOR, those of com.apple.posterkit.provider to POSTER_MB. -1 (no limit) stays; never lowers. The device costs
+    15-20 MiB; a poster that has none aborts (AegirPoster), and its 15 MiB inactive hard limit kills one that has it."""
+    st = os.stat(path)
+    with open(path, 'rb') as fh:
+        data = plistlib.load(fh)
+    over = data.get('Version4', {}).get('Extension', {}).get('Override', {})
+    raised = 0
+    for point, ent in over.items():
+        want = poster_mb if point == 'com.apple.posterkit.provider' else floor
+        for k, v in list(ent.items()):
+            if k.endswith('MemoryLimit') and isinstance(v, int) and 0 <= v < want:
+                ent[k] = want
+                raised += 1
+    if raised:
+        with open(path, 'wb') as fh:
+            plistlib.dump(data, fh, fmt=plistlib.FMT_BINARY)
+        try:
+            os.chown(path, st.st_uid, st.st_gid)
+        except PermissionError:
+            pass
+        os.chmod(path, st.st_mode & 0o7777)
+    return f'{os.path.basename(path)}: {raised} extension limits raised (floor {floor} MiB, posters {poster_mb} MiB)'
+
+
 def patch(path, mb):
     """Patch one plist in place. Returns a short report line."""
     st = os.stat(path)
@@ -84,12 +111,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--mb', type=int, default=64)
     ap.add_argument('--daemon', default='')
+    ap.add_argument('--extensions', type=int, default=0, help='floor in MiB for every extension point')
+    ap.add_argument('--posters', type=int, default=128, help='with --extensions: MiB for com.apple.posterkit.provider')
     ap.add_argument('plist', nargs='+')
     a = ap.parse_args()
     if a.mb <= 0:
         sys.exit('jetsam_widgets: --mb must be > 0')
     for p in a.plist:
-        print(patch_daemon(p, a.daemon, a.mb) if a.daemon else patch(p, a.mb))
+        if a.extensions:
+            print(patch_extensions(p, a.extensions, a.posters))
+        else:
+            print(patch_daemon(p, a.daemon, a.mb) if a.daemon else patch(p, a.mb))
 
 
 if __name__ == '__main__':

@@ -24,6 +24,7 @@ CORPUS=$MOUT/corpus
 LIBS=$CORPUS/20H392
 RUNS=$CORPUS/runs
 SET=${SET:-ui}
+SET_NAME=$( [ -f "$SET" ] && basename "$SET" .txt || echo "$SET")   # (SET may be a path: run directories and baselines use the name)
 PROFILE=${PROFILE:-$MOUT/profiles/a730-turnip-est.json}
 LIB_TIMEOUT=${LIB_TIMEOUT:-1800}
 BASE=$REPO/userland/metal/tests/shader-corpus-$( [ -f "$SET" ] && basename "$SET" .txt || echo "$SET").tsv
@@ -128,7 +129,7 @@ run() {
 	[ -f "$PROFILE" ] || { echo "no profile $PROFILE (scripts/metal/a730-profile.py)" >&2; exit 1; }
 	local bin r t0 n=0
 	bin=$(cli)
-	r=$RUNS/$(date +%Y%m%d-%H%M%S)-$SET
+	r=$RUNS/$(date +%Y%m%d-%H%M%S)-$SET_NAME
 	mkdir -p "$r"
 	printf 'set\t%s\nprofile\t%s\ncli\t%s\nm2v\t%s\n' "$SET" "$PROFILE" "$bin" "$(git -C "$M2V_SUB" rev-parse --short HEAD 2>/dev/null || echo "$M2V_COMMIT")" > "$r/meta.tsv"
 	: > "$r/summary.tsv"
@@ -141,7 +142,8 @@ run() {
 			continue
 		fi
 		t0=$(date +%s)
-		count_kinds "$lib" | while read -r kind total; do
+		# (a file the reader does not take, an empty or an Apple-only library: counted as 0 functions, the run goes on)
+		{ count_kinds "$lib" || echo "run: $k: metallib-info failed" >> "$r/errors.txt"; } | while read -r kind total; do
 			case $kind in kernel|vertex|fragment) ;; *) printf '%s\t%s\t%s\t0\tnot compiled (linked at run time)\n' "$k" "$kind" "$total" >> "$r/summary.tsv" ;; esac
 		done
 		local out=$r/libs
@@ -156,6 +158,12 @@ run() {
 		done
 		# keep results and failure texts, not the SPIR-V
 		find "$out/$k" -name '*.spv' -delete 2>/dev/null || true
+		rm -rf "${out:?}/${k:?}/repros"
+		# (the disk is shared: stop before it is full)
+		if [ "$(df -Pk "$r" | awk 'NR==2 {print int($4 / 1048576)}')" -lt "${MIN_FREE_GB:-50}" ]; then
+			echo "run: stopped after $k: less than ${MIN_FREE_GB:-50} GiB free" | tee -a "$r/errors.txt"
+			break
+		fi
 		echo "run: [$n] $k done in $(( $(date +%s) - t0 )) s"
 	done < <(list)
 	report "$r" | tee "$r/summary.txt"
@@ -177,7 +185,7 @@ report() { # RUN: Chlorophyll-style table + Chlorophyll's iOS 18 / A630 numbers 
 		sort | uniq -c | sort -rn | head -20
 }
 
-latest() { ls -1d "$RUNS"/*-"$SET" 2>/dev/null | tail -1; }
+latest() { ls -1d "$RUNS"/*-"$SET_NAME" 2>/dev/null | tail -1; }
 
 compare() {
 	local r=${1:-$(latest)}

@@ -4454,3 +4454,19 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - Gotcha: the macOS SDK's CVImageBuffer.h pulls the ApplicationServices umbrella, whose Security headers fail on an iOS target: `userland/laurel/camera/sdk-stub`.
 - Build [V]: 259/259 patches, 0 LSE, kernel sha256 04a59dd993aa...; NegroniCamera 74f5043092c3...; cam-test OK (cam3 2543 checks); camera-cache-check PASS (57 OK, 126 imports).
 - Next: owner boot: root + boot image; lines in camera.md section 9.
+
+## Mi A3: Metal for all of iOS: the gate never ran as root; 0x49, 4 KiB pages, CCU; disk accident (2026-11-01 16:30-17:30, branch t3/laurel-metal-everywhere)
+
+- [V] Owner: wallpaper choice broken. Log usblog-20261101-001446, boot 15:27: `exec laurel-metal-gate` at 15:27:18, no `exec m2vtest`, 16 `NMTL ... not listed`, AegirPoster sig 6 x9, PosterBoard x1.
+- [V] Cause 1: `com.apple.backboardd` has `UserName mobile` (launchd cache of the 15:16 root): the wrapper's gate was mobile, `/var/db/negronimetal` root's 755. posix_spawn with the log there failed, no list written. Fix: launchd job `com.laurel.metal-gate` (root).
+- [V] The USB log carries the console only: syslog lines (`LAUREL METAL CLIENTS`, `LAUREL BBD`) never reach it. Write `/dev/console` too.
+- [V] Cause 2: m2vtest step 0x6505 needs host pages: laurel had no request 0x49, so the gate could never pass even as root. Patch 2160, stage 1 only.
+- [V source] Cause 3: Turnip and negroni_drm.c assume 16 KiB host pages; this kernel is 4 KiB. Turnip 0103, NGL_PAGE = getpagesize() (negroni unchanged).
+- [V source] Cause 4: the ring had no PC_CCU_INVALIDATE at submit (Linux a6xx_submit; ios-redfin METAL-NEXT section 4). GL never needed it. Patch 2161. First suspect if GL changes in the next boot.
+- [V source] `buffers < 64 MiB` in the LAUREL METAL line was only text: 2154 sets RedwoodMaxBuffer 256 MiB with the tables before 2850 looks; 0101 reads it. Patch 2851 prints the value.
+- [V] "24 of 141 QuartzCore functions failed" was the vk12-floor profile, not the A610: 20 FramebufferFetch (the floor has no rasterization-order access; Turnip has it for every part, tu_device.cc:360,755) + 4 storage-texture stand-ins. With `scripts/laurel/a610-profile.py` (FD610 features + Turnip's real clip/descriptor limits): QuartzCore 139/141; the 2 left are `inplace_copy_lpf/lph` (raster order groups, Apple tile paths).
+- [V] A610 lacks storage_16bit, storage_8bit, sampler min/max: the UI corpus still translates (metal2vulkan lowers; spirv-val passes). [U] What ir3 does with it, reg_size_vec4 48, 16 VS inputs: only the phone can say.
+- [V] assetsd sig 6 x7 and syncdefaultsd x9 never load Metal (no NMTL line); uncaught exceptions on dispatch queues, no text. assetsd dies right after `SWEET AKS: assetsd sel 7`; negroni had it too ("pre-existing", notes). Not this work.
+- [V] jetsam 20H392: `com.apple.posterkit.provider` ActiveSoft 15, InactiveHard 15, Rendering Nominal 30 MiB. Raised by root-add-metal.sh (floor 64, posters 128).
+- Lesson [V]: `metal2vulkan` writes a repro bundle (a copy of the input) for EVERY failed try, to `METAL2VULKAN_REPRO_DIR` or else `$TMPDIR`. host-translate's retry loop made 273 GiB (MPS 146, AvatarKit 127) and took the shared disk to 33 MB free, then 16 GiB of tmpfs /tmp when the variable was unset. Now: off by a path that cannot be made (`KEEP_REPROS=1` to keep); `scripts/laurel/metal-corpus.sh` refuses to start and stops the run under 50 GiB free or above 10 GiB of output, and keeps only TSV + summary. The CLI has no off switch.
+- Details: docs/laurel_sprout/metal.md 6.1-6.5 and section 10.
