@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """UniXNU payload volume (FAT) for the Mi A3 (laurel_sprout) XNU kernel, booted by DarwinBoot.
 
-usage: mkdarwinboot.py KERNEL ADT OUT.img --cmdline "..." [--size-mib 48] [--timeout 3]
+usage: mkdarwinboot.py KERNEL ADT OUT.img --cmdline "..." [--size-mib 48] [--timeout 3] [--entry-title TEXT] [--android-entry]
 
 Port of external/slop/negroni-ios/tools/mkdarwinboot.py to the topaz tool chain (external/ios-topaz/tools/mkpayload.py
 gives parse_macho/apply_chained_fixups). DarwinBoot copies the kernel's segments as they are in the file, so the
@@ -32,11 +32,21 @@ title = "laurel-ios"
 
 [[entry]]
 id = "ios16"
-title = "iOS 16 (laurel XNU, TOPAZ_4K)"
+title = "{title}"
 type = "xnu"
 # UEFI FAT paths: backslashes (DarwinBoot passes the path through unchanged)
 path = '\\Payloads\\kernel.macho'
 args = "{cmdline}"
+'''
+
+# docs/laurel_sprout/boot-menu.md: writes the slot flags of boot_b in the GPT, then a reset; ABL does the slot change.
+ANDROID_ENTRY = '''
+[[entry]]
+id = "android"
+title = "Android (LineageOS)"
+type = "action"
+action = "laurel-android"
+confirm = "Restart into Android?"
 '''
 
 
@@ -50,6 +60,10 @@ def main():
     cmdline = opt('--cmdline', '')
     size = int(opt('--size-mib', '48'))
     timeout = int(opt('--timeout', '3'))
+    title = opt('--entry-title', 'iOS 16 (laurel XNU, TOPAZ_4K)')
+    android = '--android-entry' in a
+    if android:
+        a.remove('--android-entry')
     if len(a) != 3:
         sys.exit(__doc__)
     kernel, adt, out = a
@@ -66,7 +80,7 @@ def main():
         os.makedirs(f'{d}/EFI/UniXNU'); os.makedirs(f'{d}/Payloads')
         open(f'{d}/Payloads/kernel.macho', 'wb').write(buf)
         shutil.copy(adt, f'{d}/Payloads/kernel.macho.adt')
-        open(f'{d}/EFI/UniXNU/unixnu.toml', 'w').write(TOML.format(timeout=timeout, cmdline=cmdline.replace('"', '\\"')))
+        open(f'{d}/EFI/UniXNU/unixnu.toml', 'w').write(TOML.format(timeout=timeout, title=title, cmdline=cmdline.replace('"', '\\"')) + (ANDROID_ENTRY if android else ''))
         if os.path.exists(out):
             os.remove(out)
         with open(out, 'wb') as f:

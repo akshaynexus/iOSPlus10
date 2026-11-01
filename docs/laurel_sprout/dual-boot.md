@@ -2,6 +2,8 @@
 
 Owner goal (2026-11-02): LineageOS 24 and iOS on one phone, Android keeps working. iOS 16 root first, because it exists, then iOS 26. **Nothing here has run on the phone.** Not one write step was run. Marks: [V] measured or read in source, [I] inference, [U] unknown.
 
+**Choosing on the phone (menu in Mu, one-tap app in Android): `boot-menu.md`.** It answers D3 and replaces the fastboot steps for daily use.
+
 ## 1. Recommendation
 
 | Part | Choice |

@@ -138,6 +138,12 @@ laurel-a80211-test:
 laurel-ios26-image:
 	$(BG) ios26-image scripts/laurel/ios26-image.sh
 # boot image out/laurel/uefi/laurel-uefi-boot.img (XNU payload); MU_ONLY=1: Mu UEFI alone (its boot menu)
+laurel-menu-test:
+	$(BG) menu-test scripts/laurel/boot-menu-test.sh
+laurel-menu-qemu:
+	$(BG) menu-qemu scripts/laurel/boot-menu-qemu.sh
+laurel-switcher:
+	$(BG) switcher scripts/laurel/switcher-build.sh
 laurel-uefi-image:
 	MU_ONLY=$(MU_ONLY) scripts/laurel/uefi-image.sh
 # flash it to boot_b (owner-approved target) and reset; restore: BOOTIMG=~/laurel-backup/stock/images/boot.img

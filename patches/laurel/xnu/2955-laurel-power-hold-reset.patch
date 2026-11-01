@@ -1,0 +1,67 @@
+laurel 2955: hold Power = hard reset in the PMIC (KPDPWR S2): from a hung iOS kernel to the boot menu with no computer. One line LAUREL POWERKEY: on|off. A setting already on stays. Kill switch laurelpowerhold=0. docs/laurel_sprout/boot-menu.md.
+
+--- a/bsd/dev/laurel_reboot.c
++++ b/bsd/dev/laurel_reboot.c
+@@ -46,6 +46,54 @@
+ #define LR_PON_SPARE     0x88fu
+ static int lr_pon_shift = -1;             /* -1: PON not reachable (self-check) */
+ 
++/*
++ * laurel 2955: hold Power = reset, in the PMIC, with no CPU: the way from a hung iOS kernel to the boot menu with no computer (docs/laurel_sprout/boot-menu.md; no driver
++ * for the APSS watchdog exists, build-honest.md). Registers: qpnp-power-on.c KPDPWR_S1_TIMER 0x40, S2_TIMER 0x41, S2_CNTL 0x42 (type, 7 hard), S2_CNTL2 0x43 (bit 7 enable), same
++ * write order. A setting the firmware or Android left on stays: read first. Not on: S1 6720 ms + S2 2000 ms (the 8.7 s of most phones, far above a normal press).
++ * laurelpowerhold=0 turns it off. The setting stays in the PMIC until the next power-up, so it can also be active in Android after an iOS boot.
++ */
++#define LR_PON_S1_TIMER  0x840u
++#define LR_PON_S2_TIMER  0x841u
++#define LR_PON_S2_CNTL   0x842u
++#define LR_PON_S2_CNTL2  0x843u
++#define LR_S1_6720MS     0x0eu
++#define LR_S2_2000MS     0x07u
++#define LR_S2_HARD       0x07u
++extern void delay(int usec);
++
++static void
++lr_power_hold(void)
++{
++	uint32_t on = 1;
++	uint8_t s1 = 0, s2 = 0, type = 0, en = 0;
++	PE_parse_boot_argn("laurelpowerhold", &on, sizeof(on));
++	if (on == 0) {
++		printf("LAUREL POWERKEY: off: laurelpowerhold=0\n");
++		return;
++	}
++	if (sweet_spmi_pon_read(LR_PON_S1_TIMER, &s1) != 0 || sweet_spmi_pon_read(LR_PON_S2_TIMER, &s2) != 0 ||
++	    sweet_spmi_pon_read(LR_PON_S2_CNTL, &type) != 0 || sweet_spmi_pon_read(LR_PON_S2_CNTL2, &en) != 0) {
++		printf("LAUREL POWERKEY: off: SPMI read of the PON failed\n");
++		return;
++	}
++	if (en & 0x80u) {
++		printf("LAUREL POWERKEY: on: hold Power resets, setting found: S1 code %u, S2 code %u, type %u\n", s1 & 0xfu, s2 & 0x7u, type & 0xfu);
++		return;
++	}
++	/* S2 is off here (read above). The PMIC needs some cycles of its 32 kHz clock between an enable change and the next write */
++	int w = sweet_spmi_pon_write(LR_PON_S1_TIMER, (uint8_t)((s1 & ~0x0fu) | LR_S1_6720MS));
++	w |= sweet_spmi_pon_write(LR_PON_S2_TIMER, (uint8_t)((s2 & ~0x07u) | LR_S2_2000MS));
++	w |= sweet_spmi_pon_write(LR_PON_S2_CNTL, (uint8_t)((type & ~0x0fu) | LR_S2_HARD));
++	delay(200);
++	w |= sweet_spmi_pon_write(LR_PON_S2_CNTL2, (uint8_t)(en | 0x80u));
++	delay(200);
++	if (w != 0 || sweet_spmi_pon_read(LR_PON_S2_CNTL2, &en) != 0 || (en & 0x80u) == 0) {
++		printf("LAUREL POWERKEY: off: PMIC write refused (status %d, enable 0x%02x); Power + Vol Down is the way, release Vol Down when the panel goes dark\n", w, en);
++		return;
++	}
++	printf("LAUREL POWERKEY: on: hold Power 9 s = hard reset, then the boot menu\n");
++}
++
+ static const struct { const char *name; uint32_t imem; uint8_t pon; } lr_modes[] = {  /* pon: laurel 2018 ABL reason */
+ 	{ "normal",     0x77665501, 0 },
+ 	{ "bootloader", 0x77665500, 2 },
+@@ -115,6 +163,7 @@
+ 			lr_pon_shift = sub >= 4 ? 1 : 2;      /* PON_GEN2_PRIMARY 4 / SECONDARY 5 */
+ 			printf("LAUREL REBOOT: PON reason on: subtype 0x%02x (shift %d) SOFT_RB_SPARE 0x%02x PS_HOLD_RST_CTL 0x%02x\n",
+ 			    sub, lr_pon_shift, spare, ctl);
++			lr_power_hold();   /* laurel 2955 */
+ 		} else {
+ 			printf("LAUREL REBOOT: PON reason off: SPMI read of the PON failed\n");
+ 		}

@@ -46,18 +46,18 @@ fi
 # 3. Our laurel changes: reset every file they touch (before the DarwinBoot submodule update: a pin change cannot
 # check out over a patched file), then apply them in order (re-runnable; a later patch may change a file an
 # earlier one changed, e.g. mu 0101 after 0001). A patch whose paths start with DarwinBootPkg/ (mu 0102) goes to
-# UniXNU's DarwinBoot submodule, the others to the Mu tree. MU_RAM_LAYOUT=late: late/*.patch replace 0101, last.
+# UniXNU's DarwinBoot submodule, one with package/ (mu 0201) to UniXNU, the others to the Mu tree. MU_RAM_LAYOUT=late: late/*.patch replace 0101, last.
 DB=$UNIXNU/drivers/DarwinBoot
 LAYOUT=${MU_RAM_LAYOUT:-static}
 case "$LAYOUT" in static|late) ;; *) echo "mu-build: MU_RAM_LAYOUT must be static or late" >&2; exit 1 ;; esac
-target() { if grep -q '^+++ b/DarwinBootPkg/' "$1"; then echo "$DB"; else echo "$MU"; fi; }
+target() { if grep -q '^+++ b/DarwinBootPkg/' "$1"; then echo "$DB"; elif grep -q '^+++ b/package/' "$1"; then echo "$UNIXNU"; else echo "$MU"; fi; }
 for pt in "$REPO"/patches/laurel/mu/*.patch "$REPO"/patches/laurel/mu/late/*.patch; do
   [ -f "$pt" ] || continue
   t=$(target "$pt")
   [ -e "$t/.git" ] || continue
   grep -E '^\+\+\+ b/' "$pt" | sed 's|^+++ b/||' | while read -r f; do git -C "$t" checkout -q -- "$f" 2>/dev/null || true; done
 done
-git -C "$UNIXNU" submodule update -q --init --depth 1 drivers/DarwinBoot
+[ "${SETUP:-1}" != 1 ] || git -C "$UNIXNU" submodule update -q --init --depth 1 drivers/DarwinBoot   # SETUP=0: tree already prepared (scripts/laurel/mu-private-tree.sh)
 say "DarwinBoot $(git -C "$UNIXNU/drivers/DarwinBoot" rev-parse --short HEAD), UniXNU $(git -C "$UNIXNU" rev-parse --short HEAD), Mu fork $(git -C "$MU" rev-parse --short HEAD), RAM layout $LAYOUT"
 if [ "$LAYOUT" = late ]; then
   PATCHES=$(ls "$REPO"/patches/laurel/mu/*.patch | grep -v '/0101-'; ls "$REPO"/patches/laurel/mu/late/*.patch)
@@ -67,8 +67,10 @@ fi
 for pt in $PATCHES; do
   t=$(target "$pt")
   git -C "$t" apply "$pt"
-  say "applied $(basename "$pt") to $([ "$t" = "$DB" ] && echo DarwinBoot || echo Mu)"
+  say "applied $(basename "$pt") to $(case "$t" in "$DB") echo DarwinBoot ;; "$UNIXNU") echo UniXNU ;; *) echo Mu ;; esac)"
 done
+# the boot menu's slot core: one source, also built by the host test (scripts/laurel/boot-menu-test.sh). mu 0201 lists these in UniXNULib.inf.
+cp "$REPO/tools/laurel-slot/laurel_slot.c" "$REPO/tools/laurel-slot/laurel_slot.h" "$REPO/tools/laurel-slot/uefi/LaurelSlot.c" "$UNIXNU/package/UniXNUPkg/Library/UniXNULib/"
 miss=0
 for f in $(grep -rhoE 'Binaries/laurel_sprout/[^ |}]+' "$MU/Platforms/Xiaomi/laurel_sproutPkg" | sort -u); do
   [ -e "$MU/$f" ] || { echo "MISSING $f"; miss=1; }

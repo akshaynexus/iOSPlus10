@@ -10,6 +10,8 @@
 #     Mu 0101 ("Kernel RAM" 0xE1000000 + 0xDF000000) or the late layout (MU_RAM_LAYOUT=late) gives 3264 MiB at
 #     0xE1004000 (kernel patch 2100); an older FD (Kernel RAM 0x81000000 + 0x3F000000) 768 MiB at 0x81004000
 #   CPUS=N (XNU cpus= boot-arg, default 8)   SIZE_MIB=48 (payload FAT)
+#   BOOT_MENU=1 (default): UniXNU menu with iOS + Android, 5 s to iOS, panic reset after 30 s, boot_b marked for the Android app; BOOT_MENU=0: as before (docs/laurel_sprout/boot-menu.md)
+#   ENTRY_TITLE=text: title of the iOS entry. STOCK_DTBO=path: the dtbo_b that the mark names (default ~/laurel-backup/stock/images/dtbo.img)
 # Output: out/laurel/uefi/laurel-uefi-boot.img (+ laurel.adt, payload.img, kernel.gz, cmdline.txt); MU_ONLY=1: laurel-mu-only-boot.img
 # Flash: scripts/bg.sh laurel-flash sh -c 'BOOT=reboot scripts/laurel/flash-boot.sh out/laurel/uefi/laurel-uefi-boot.img'
 #
@@ -44,6 +46,11 @@ CMDLINE=${1:-"debug=0xc serial=3 cpus=$CPUS keepsyms=1 -noprogress rd=ufsroot0 u
 [ "${LAUNCHD_TIMEOUTS:-0}" != 1 ] || CMDLINE=${CMDLINE/ launchd_disable_all_timeouts=1/}
 # EXTRA_ARGS: added to the boot-args, e.g. a kill switch for one test (EXTRA_ARGS=gpu_smmu=0)
 [ -z "${EXTRA_ARGS:-}" ] || CMDLINE="$CMDLINE $EXTRA_ARGS"
+BOOT_MENU=${BOOT_MENU:-1}
+ENTRY_TITLE=${ENTRY_TITLE:-iOS 16 (laurel XNU, TOPAZ_4K)}
+STOCK_DTBO=${STOCK_DTBO:-$HOME/laurel-backup/stock/images/dtbo.img}
+# a panic resets after 30 s, so the menu comes back with no computer (without it the panic hold stays until `op10tool ctl bootloader`); docs/laurel_sprout/usb-debug.md
+[ "$BOOT_MENU" != 1 ] || CMDLINE="$CMDLINE laurelpanic=30"
 
 for f in "$FD" "$SHIM" "$STOCK"; do [ -e "$f" ] || { echo "uefi-image: missing $f (scripts/laurel/mu-build.sh)" >&2; exit 1; }; done
 for t in mkbootimg unpack_bootimg gzip python3 uv; do command -v $t >/dev/null || { echo "uefi-image: missing $t" >&2; exit 1; }; done
@@ -87,7 +94,7 @@ else
   fi
   python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot gold --dram "$DRAM" --mu-fd "$FD" --darwinboot --build-stamp "$STAMP_LINE" ${ADT_TABLE:+--dualboot-table "$ADT_TABLE"} ${MKADT_EXTRA:-}   # laurel 2016: Gold 0x100 is the boot CPU after the PSCI hand-off
   "$OUT/venv/bin/python3" "$REPO/scripts/laurel/mkdarwinboot.py" "$KERNEL" "$W/laurel.adt" "$W/payload.img" \
-    --cmdline "$CMDLINE" --size-mib "$SIZE_MIB" --timeout 3
+    --cmdline "$CMDLINE" --size-mib "$SIZE_MIB" --timeout "$([ "$BOOT_MENU" = 1 ] && echo 5 || echo 3)" --entry-title "$ENTRY_TITLE" $([ "$BOOT_MENU" = 1 ] && echo --android-entry)
   printf '%s\n' "$CMDLINE" > "$W/cmdline.txt"
   rd=$W/payload.img
   IMG=$W/laurel-uefi-boot.img
@@ -97,10 +104,24 @@ fi
 rm -rf "$W/stockboot"
 unpack_bootimg --boot_img "$STOCK" --out "$W/stockboot" > "$W/stockboot.txt"
 [ -s "$W/stockboot/dtb" ] || { echo "uefi-image: no DTB in $STOCK" >&2; exit 1; }
-mkbootimg --header_version 2 --kernel "$W/kernel.gz" --ramdisk "$rd" --dtb "$W/stockboot/dtb" \
+mk() { mkbootimg --header_version 2 --kernel "$W/kernel.gz" --ramdisk "$rd" --dtb "$W/stockboot/dtb" \
   --pagesize 4096 --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 --tags_offset 0x100 \
-  --dtb_offset 0x1f00000 --os_version 11.0.0 --os_patch_level 2022-08 --cmdline "console=null" \
-  -o "$IMG"
+  --dtb_offset 0x1f00000 --os_version 11.0.0 --os_patch_level 2022-08 --cmdline "$1" \
+  -o "$IMG"; }
+mk "console=null"
+# what the Android app checks before it switches (tools/laurel-switcher/assets/to-ios.sh): this image is whole and ours, and which dtbo_b it needs. Neither ABL nor Mu reads these
+# words. The hash covers everything after the header page, which does not depend on the command line. [V] 16384 pages = boot_b.
+if [ "${MU_ONLY:-0}" != 1 ] && [ "$BOOT_MENU" = 1 ]; then
+  pages=$(( ($(wc -c < "$IMG") - 4096) / 4096 ))
+  [ "$pages" -lt 16384 ] || { echo "uefi-image: FAILED: image is $pages pages + header; boot_b holds 16384 pages in all" >&2; exit 1; }
+  img_sha=$(tail -c +4097 "$IMG" | { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; } | cut -d' ' -f1)
+  if [ -f "$STOCK_DTBO" ]; then
+    mk "console=null laurel_ios_image=$pages:$img_sha laurel_ios_dtbo=$(wc -c < "$STOCK_DTBO" | tr -d ' '):$(file_sha "$STOCK_DTBO")"
+  else
+    echo "uefi-image: note: no $STOCK_DTBO: the Android app refuses this image"
+    mk "console=null laurel_ios_image=$pages:$img_sha"
+  fi
+fi
 ls -l "$IMG" "$W/kernel.gz" "$rd"
 if [ "${MU_ONLY:-0}" != 1 ]; then
   python3 -I "$BS" image-seal "$IMG" "$STAMP_LINE" "$KERNEL" "$FD" "$CMDLINE"

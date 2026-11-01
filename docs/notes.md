@@ -4997,3 +4997,18 @@ Full text: `docs/laurel_sprout/ios26-airdrop.md`.
 - [V] Owner decisions: updater off (`pm disable-user --user 0 org.lineageos.updater`; `pm enable` reverses it; a manual sideload still writes slot b), iOS area 32 GiB (30 % of userdata).
 - [V] `scripts/backup/laurel-backup.sh all`: 86 partitions + GPT heads, each compared with a hash made on the phone; /data 9172 entries, 1.4 GB. Output ~/laurel-backup/android-20261102-0137, 5.0 GB, mode 700, out of git. First backup of modemst1/2, fsg, fsc, persist, devinfo. /data is a file copy for salvage, not a block image: FBE keys stay in keymaster. Run `data` again right before the first phone write. No restore was tried.
 - `.gitignore` `backup/` hid `scripts/backup/`: fixed with an exception.
+
+## Mi A3: boot menu, dual boot chosen on the phone (2026-11-02, branch t3/laurel-boot-menu; host and QEMU only, nothing flashed, phone read only)
+Full text: `docs/laurel_sprout/boot-menu.md`.
+- [V source + strings in the phone's ABL] ABL refuses a slot whose boot and abl type GUIDs are equal (`ValidateSlotGuids`) or that does not match the UFS boot LUN. The HAL swaps the type GUID of all A/B partitions and moves the LUN. So **flags alone cannot select a slot**, and a Mu that wrote boot_a's active bit would leave the phone in fastboot.
+- Way that works: Mu writes boot_b retries = 0, successful = 0. ABL's `HandleActiveSlotUnbootable` does the whole change and resets: same state as 7 failed boots, a path this phone has shown. One byte + 2 CRCs per copy. After it boot_a 0x7F, boot_b 0x82; HAL's 0x3F clears it.
+- Retries: never set successful (a broken Mu would then never fall back). Refill to 7 at <= 3, only right before DarwinBoot, with screen and >= 2 input devices (the serial driver counts as 1).
+- [V dump] Every LUN reserves 16 KiB of entries (first usable LBA 6) though sde uses 8 KiB (64 entries) and the others 4 KiB: the backup entries lie at last LBA - 4, not last LBA - used blocks. Writes keep the run as ABL does.
+- [V phone] `hal_bootctl_client` = su system_server update_engine update_verifier vold snapshotctl: no app, also no priv-app, can call the HAL. No su binary on this build. `ro.debuggable=0` with `ro.build.type=userdebug`; root only through adbd + `adbroot_service`. Recovery menu has no slot item.
+- One-tap: normal app + on-device adb client to 127.0.0.1:5555 (`persist.adb.tcp.port`, [V strings adbd]), key in Keystore. Mark in boot_b's command line lets the phone verify image and dtbo with no host.
+- A held Power at the reset gives Enter in the menu: 1.5 s guard in UniXNU's Menu.c.
+- Panic: `laurelpanic=30` now in the default boot-args (it held for ever). Hang: new kernel patch 2955 sets PMIC S2 for Power alone, kept if something else has set it.
+- `scripts/lib/env.sh` exports `BACKUP` (= ~/op10-backup): a script's own `BACKUP=${BACKUP:-...}` gets the wrong folder. Name it otherwise.
+- UniXNU has its own QEMU harness: real menu, real `BlockIo` at 4096-byte blocks from the phone's dump, USB keyboard over QMP. `scripts/laurel/boot-menu-qemu.py`. AAVMF's PartitionDxe restored a primary with a bad CRC before the menu.
+- Mu builds without touching the shared tree: `scripts/laurel/mu-private-tree.sh` (btrfs reflink, own git dirs), then `MU_TREE= UNIXNU_TREE= SETUP=0 scripts/laurel/mu-build.sh`.
+Next: owner decisions O1-O5; the first phone test is section 9 (keys in the menu come first).
