@@ -4761,3 +4761,10 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - Worktree build: symlink external/{ios-topaz,ios-sweet-linux,hackios-scion,laurel-kernel-*}, reflink out/laurel-kernel/{deps,theos,cache,dl} + out/laurel/gpu/deps/sdks; `AUDIT=1` gives the tree at out/laurel-kernel/xnu-src/xnu-8796.141.3. Patch: out/celln-dev/{a,b}, scripts/laurel/cell-patch.sh.
 - Built [V]: 296/296 patches, 0 LSE, kernel.development.sweet.4k sha256 84d8f917f109bba4...; liblaurel-cellbar (sha256 in out/laurel/cell/root.SHA256SUMS); test-cell 15/15; test-ipa PASS; build-honest-test 60/60; xnutils-test PASS. No root image: sudo needs a password here.
 - Next: section 10 step A, then step B. If ONLINE asserts in enl2_dl with the handshake passed, data pipes (9.4) come before ONLINE.
+
+## Mi A3: kernel panic log_encode.c:121 from one printf with 48 values (2026-11-01 22:22, 22:26)
+- [V log] Two panics, one at the first `LAUREL WIFI: link` line of a session; the text is glued to the end of that line:
+  `log_encode.c:121 Assertion failed: log_fits_cmd(ctx, cmd_sz)`. The owner's Control Center press was only coincidence [I].
+- [V code] os_log's kernel buffer is 256 bytes (OS_LOG_BUFFER_MAX_SIZE); each value costs 2 + 8 bytes, so about 24 values fit. 2885 made the
+  line 48 values. Patch 2887 splits it (`link`, `traffic`, `path cost`). `scripts/laurel/printf-arg-check.py` (limit 22) runs in every kernel build.
+- Panic text can sit glued at the end of a normal log line: search for `Assertion failed`, not only `panic(`.
