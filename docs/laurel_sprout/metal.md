@@ -321,3 +321,33 @@ Measured 2026-11-01 06:30 (gpu-upstream-opt: metal2vulkan 219f013, Turnip 0101+0
 | m2vtest | 22 467 280 bytes | 21 498 656 bytes | |
 | metal2vulkan A/B, QuartzCore default.metallib (141 functions, vk12-floor profile, `scripts/metal/m2v-ab.sh`) | f6a96b7d: 117 translated (kernel 3/7, vertex 39/39, fragment 75/95), SPIR-V 1 906 384 bytes, 4.4 s | 219f013: 117 translated (same split), SPIR-V **788 556 bytes (-58.6 %)**, 4.2 s | same coverage, far less code for ir3 to compile and run [I: per-pixel cost follows the instruction count] |
 | check | PASS | PASS: 0102 in the tree; 8 Mach-O, minos 16.0, 0 instructions newer than ARMv8.0; import check vs 20H392 PASS (0 missing) | |
+
+## 10. Metal for all of iOS: who gets it, what was checked (2026-11-01 17:30)
+
+**Nothing below ran through Turnip on the phone.** Log = boot 15:27, before the fix. "Host" = AIR -> SPIR-V + spirv-val with `scripts/laurel/a610-profile.py` (an estimate from `tu_device.cc`, no capture); it does not cover Turnip's ir3, the GPU, or the picture. Every "expected" is [I] until the gate passes.
+
+| User | Log at 15:27 [V] | Host shaders [V host] | Expected after the gate passes [I] |
+|---|---|---|---|
+| backboardd (CoreAnimation window server) | GL path, frames 8-13 ms, Metal refused on purpose (`not listed`) | QuartzCore 139/141 | stays on GL (`-backboardd`, 6.5) |
+| QuartzCore in a process: CAMetalLayer, CARenderer, CAWindowServer offscreen | no device | QuartzCore 139/141; the 2 left are `inplace_copy_*` (raster order groups, no Turnip feature) | Metal in the process; pictures reach backboardd as IOSurfaces (eagl: seed, else the memory's sum each frame) |
+| SpringBoard | `not listed` at 15:29:30 | RenderBox 47/47, CoreUI, QuartzCore | device from the boot after the first pass (it starts before the first test ends); cold device open on its main thread, a slow first start is the risk |
+| PosterBoard | `not listed` x2, sig 6 x1 | as QuartzCore | device, no abort |
+| AegirPoster | `not listed` x10, sig 6 x9 | NanoUniverse 27/27, ClockKitUI 3/4 (the 4th is a host list artefact) | device, no abort. [U] XR10: it needs `supportsExtendedXR10Formats` YES and draws BGR10_XR; whether GL CoreAnimation in backboardd can show such a surface is not known: wallpaper may be wrong or black |
+| PridePosterExtension | `not listed` x1 | PridePoster 8/8 | device. Same XR10 question: no (only Aegir is known to set it) [I] |
+| Collections, Gradient, Unity, Emoji, Photos, Extragalactic posters | started, no NMTL line, so no device asked before the end of the log (CollectionsPoster sig 9 once: check-in timeout) | no own metallib seen except via frameworks | device on demand; limit raised to 128 MiB (6.3) |
+| UIKit | no own use seen | ColorPicker 2/2 | device where it asks |
+| CoreImage | no NMTL line | default 58/59; `ci_*` stitchable libraries are linked at run time, counted, not compiled | Metal CIContext where it asks; userland/cifix CPU path stays when no device |
+| Photos / assetsd | assetsd sig 6 x7, **no NMTL: not Metal** (after `SWEET AKS: assetsd sel 7`; negroni had it too) | PhotosUICore 4/4, MediaAnalysis 2/3, Vision 17/18 | PhotosUICore fine; the assetsd crash stays, not this work; host pages (2160) needed by no-copy paths |
+| Maps (MapKit, VectorKit) | not started | VectorKit 309/309, AlloyCommon 13/13 | device; heavy on this GPU |
+| WebKit GPU process (WebGL, canvas) | not started | ANGLE compiles MSL at run time: not in the corpus | device, with negroni's flame/0014 + 0015. Footprint on negroni 396 MiB against 300 MiB fatal limit: watch for jetsam |
+| Camera | not started | CameraUI 2/2, CameraEffectsKit 6/6, CameraColorProcessing 12/13 | camera has its own open work (no iOS frames yet) |
+| Widgets (chronod, WidgetKit extensions) | chronod `not listed`; 5 widgets sig 9: check-in timeout, they never loaded Metal | RenderBox 47/47, VFX 257/257 | device; check-in timeouts remain at boot load |
+| Third-party Metal apps and games | none in this boot | SceneKit 329/341, SpriteKit 19/19, MetalFX 31/31 | device; 300 MHz low-end GPU, simple games only; no tessellation function pipelines in metal2vulkan yet (`NotImplemented`) |
+| OpenGL ES apps (non-backboardd) | none | - | **no GL**: the GL loader goes only into backboardd (bbd_wrap). `EAGLContext` gets nil there. Not in this round; negroni's NegroniGL "apps" gate is the design |
+| Simple daemons (syncdefaultsd sig 6 x9) | no NMTL: not Metal (no network) | - | no change |
+
+Host numbers, all 142 system metallibs (`scripts/laurel/metal-corpus.sh all`, `userland/metal/tests/shader-corpus-a610-all.tsv`): 8130 of 9455 translated in that run; AvatarKit was 124/910 there because of floor limits in the profile, and is **910/910** with Turnip's real tessellation and interface limits [V rerun], so about **8916 of 9455** (the TSV has the old AvatarKit rows). UI set of 30 (`shader-corpus-a610-ui.tsv`): **2900 of 2927**. Largest real gaps: MPSNeuralNetwork 625/869 (`Lowering(Sampler) NotImplemented` in metal2vulkan: CNN kernels; Vision and Photos analysis lose those pipelines [I]), MTLReplayer (developer tool), tessellation vertex functions (`NotImplemented`). Host-side gaps, not client gaps [I]: MPSNDArray 60/149 (`LinkedFunction` inputs the host loop cannot supply), PencilKit 6 (stand-in for function constants). The `0/1` rows (`ci_stdlib` etc.) are libraries with no compiled entry, plus one empty list row per library (host artefact).
+
+"24 of 141 QuartzCore failed" (A/B, section 9) was metal2vulkan's vk12-floor profile, not the A610: 20 FramebufferFetch (no rasterization-order access in the floor; Turnip answers it for every part) + 4 storage-texture stand-ins [V rerun].
+
+A610 gaps against what clients ask [V source]: no storage_16bit, storage_8bit, sampler min/max (translation passes without them), no HW multiview (0102 reports the extension; a real multiview client does not exist in iOS UI [I]), 16 vertex inputs (Metal allows 31; UI shaders pass [V host]), reg_size_vec4 48 [U: only ir3 on the phone can say], GPU VA 2 GiB for scattered buffers of ALL clients (`0x01000000-0x80000000`; 15-20 MiB + work per process: no problem until about 40 busy clients [I]), 512 MiB pool then scattered pages, one ring: a Metal submission above 3 s stops the GPU (2155).

@@ -22,7 +22,8 @@ DROP_FEATURES = {"VkPhysicalDeviceVulkan11Features": {"storageBuffer16BitAccess"
 
 
 # tu_device.cc tu_get_properties: the floor's 0 clip distances and 4 storage images fail shaders that Turnip runs
-LIMITS = {"maxClipDistances": 8, "maxCullDistances": 8, "maxCombinedClipAndCullDistances": 8,
+LIMITS = {"maxTessellationGenerationLevel": 64, "maxTessellationPatchSize": 32, "maxVertexOutputComponents": 128, "maxFragmentInputComponents": 124, "maxTessellationEvaluationOutputComponents": 128,
+          "maxTessellationEvaluationInputComponents": 128, "maxClipDistances": 8, "maxCullDistances": 8, "maxCombinedClipAndCullDistances": 8,
           "maxPerStageDescriptorStorageImages": 1024, "maxPerStageDescriptorStorageBuffers": 1024,
           "maxPerStageDescriptorSampledImages": 1024, "maxPerStageDescriptorSamplers": 1024,
           "maxPerStageDescriptorUniformBuffers": 1024, "maxPerStageResources": 1024}
