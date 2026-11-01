@@ -17,6 +17,11 @@ KEY = 'BKEnableALS'
 USERS = (('private/var/mobile', 501), ('private/var/root', 0))
 
 
+def own(path, uid):
+    if os.geteuid() == 0:
+        os.chown(path, uid, uid)
+
+
 def set_key(path, uid, value):
     data = {}
     if os.path.exists(path):
@@ -30,10 +35,10 @@ def set_key(path, uid, value):
         d = os.path.dirname(d)
     for d in reversed(missing):         # new directories belong to the user, as iOS makes them
         os.mkdir(d, 0o755)
-        os.chown(d, uid, uid)
+        own(d, uid)
     with open(path, 'wb') as fh:
         plistlib.dump(data, fh, fmt=plistlib.FMT_BINARY)
-    os.chown(path, uid, uid)
+    own(path, uid)
     os.chmod(path, 0o600)
     return old
 

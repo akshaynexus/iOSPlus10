@@ -3,12 +3,12 @@
 
     scripts/laurel/metal-a610.py MESA_TREE CHIP_ID       (scripts/laurel/metal-build.sh check)
 
-CHIP_ID = what the kernel answers for MSM_PARAM_CHIP_ID (topaz TopazAdreno.cpp: 0x06010001).
+CHIP_ID = what the kernel answers for MSM_PARAM_CHIP_ID (boot 20:02: 0x06010000, the table entry takes 0x060100ff).
 Checks (each prints one line, exit 1 if one fails):
   1. Mesa's device table (src/freedreno/common/freedreno_devices.py) has an entry whose chip id matches CHIP_ID with
      the rule of freedreno_dev_info.c (exact, or patch id 0xff = wildcard) and prints its A6xx properties;
   2. Turnip's msm KMD (tu_knl_drm_msm.cc) falls back to kernel-chosen GPU addresses when the kernel has no
-     MSM_PARAM_VA_START (topaz RedwoodGPU: the SMMU is pass-through, GPU VA = PA);
+     MSM_PARAM_VA_START (RedwoodGPU has no VA range to give: stage 1 SMMU with GPU VA = PA, laurel 2154);
   3. Turnip has an A6xx (gen 6) path (tu_device.cc "case 6").
 Only reads files; no build.
 """

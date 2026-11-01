@@ -7,6 +7,8 @@
 # and bt-launchd.py on it in the order of root.sh (chown off: the user cannot make 0 or 501 files), then checks the result:
 # the job list against the expected list in docs/laurel_sprout/system-features.md, 32 apps moved, no staged app left, the
 # aggregated job and its limit. Exit 0 = PASS. It does not build a root: that is `sudo scripts/laurel/root.sh`.
+# Then the feature step on that copy, with the real stages (FEATURES=0 skips): root-manifest.py preflight + root-features.sh, the same table
+# root.sh prints; a missing feature = exit 1. Folders the features only look for are empty copies: a real root has their files.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 APPLE=${APPLE:-$HOME/op10-apple}
@@ -34,6 +36,11 @@ done
 # the 141 stock app folders by name only (the copy needs the count, not their files)
 mkdir -p "$R/Applications" "$R/private/var/containers"
 for a in "$SRC"/Applications/*.app; do mkdir -p "$R/Applications/$(basename "$a")"; done
+for d in System/Library/VideoDecoders System/Library/Extensions System/Library/Audio/UISounds System/Library/Audio/Plug-Ins/HAL Library/Audio/Tunings/D22 \
+         Library/Ringtones Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin; do
+  if [ -d "$SRC/$d" ]; then mkdir -p "$R/$d"; else echo "root-dry-run: note: no /$d in the OS image"; fi
+done
+mkdir -p "$R/usr/libexec"; cp "$SRC/usr/libexec/backboardd" "$R/usr/libexec/backboardd"
 chmod -R u+w "$R"
 stock_apps=$(ls "$R/Applications" | wc -l)
 
@@ -76,3 +83,10 @@ for a in ('MobileCal', 'MobileMail', 'MobileNotes', 'MobileTimer', 'Weather', 'M
 print('root-dry-run:', 'PASS' if not fail else 'FAIL: ' + '; '.join(fail))
 sys.exit(1 if fail else 0)
 EOF
+
+if [ "${FEATURES:-1}" != 0 ]; then
+  python3 -I "$REPO/scripts/laurel/root-manifest.py" preflight --inputs "$W/inputs"
+  bash "$REPO/scripts/laurel/root-features.sh" "$R" --inputs "$W/inputs" --sidecar "$W/root.manifest"
+  python3 -I "$REPO/scripts/laurel/root-manifest.py" inputs-check "$W/inputs"
+  echo "root-dry-run: feature step PASS: first line of the manifest: $(head -1 "$R/usr/share/laurel/root-manifest")"
+fi

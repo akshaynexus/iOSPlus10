@@ -3,6 +3,9 @@
 #   scripts/bg.sh laurel-root sudo scripts/laurel/root.sh       (needs root: loop mounts, apfs-fuse, rsync -aH)
 # Input: $APPLE/20H392/*.dmg (scripts/ios16/fetch-dmgs.sh, op10tool ipsw-get; default APPLE=~/op10-apple).
 # SSH=1 (default, when out/ssh/ios exists): dropbear + tools (scripts/net/root-add-ssh.sh); SSH=0: none.
+# Honest build (docs/laurel_sprout/build-honest.md): preflight first (every stage of a wanted feature exists and is fresh, or no start; prints the inputs),
+# one feature table at the end and in the root (/usr/share/laurel/root-manifest), exit 1 unless each absent feature has its own =0 switch, and exit 1 when
+# an input changed during the run. Then no sparse image is made; $APPLE/laurel-ios16-root.manifest says why and root-flash-test.sh will not flash.
 # Steps: 1. external/ios-topaz/tools/mkiosroot.sh (case-sensitive journaled HFS+, OS + SystemOS/AppOS cryptexes,
 #        dyld cache link, plain system keybag); 2. topaz sweet-root-tweaks.py (build 20H392 fixes, launchd,
 #        CommCenter drop, Setup, migration) + negroni root-tweaks-extra.py (vmd etc. dropped), root-tweaks-perf.py (restart-loop jobs),
@@ -17,6 +20,8 @@
 # Flash (erases Android user data; owner confirms first): fastboot reboot bootloader, then
 #   fastboot -S 512M flash userdata $APPLE/laurel-ios16-root.simg
 set -euo pipefail
+# Everything is in main(): bash reads a function whole, so an edit of this file during the run cannot change what runs.
+main() {
 [ "$(id -u)" = 0 ] || { echo "laurel-root: run with sudo" >&2; exit 1; }
 U=${SUDO_USER:-$USER}
 H=$(getent passwd "$U" | cut -d: -f6)
@@ -24,47 +29,36 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd)
 APPLE=${APPLE:-$H/op10-apple}
 D=$APPLE/20H392
 IMG=$APPLE/laurel-ios16-root.img
+SIDECAR=${IMG%.img}.manifest
 TOPAZ=$REPO/external/ios-topaz/tools
+M=$REPO/scripts/laurel/root-manifest.py
 for t in apfs-fuse mkfs.hfsplus fsck.hfsplus rsync python3; do
   command -v "$t" >/dev/null || { echo "laurel-root: missing $t (paru -S hfsprogs apfs-fuse-git)" >&2; exit 1; }
 done
 for f in 087-86698-044.dmg 087-86593-047.dmg 087-86715-047.dmg; do
   [ -s "$D/$f" ] || { echo "laurel-root: missing $D/$f (scripts/ios16/fetch-dmgs.sh)" >&2; exit 1; }
 done
-modprobe hfsplus
 ts() { date +%H:%M:%S; }
+mnt=$(mktemp -d)
+INPUTS=$(mktemp)
+trap 'umount "$mnt" 2>/dev/null || true; rmdir "$mnt" 2>/dev/null || true; rm -f "$INPUTS"; chown "$U": "$SIDECAR" 2>/dev/null || true' EXIT
+# before anything slow: every stage of a wanted feature, the kernel stamp; the inputs of this run
+python3 -I "$M" preflight --inputs "$INPUTS" || exit 1
+# from here the old image is not the current one: the sidecar says so until the end
+python3 -I "$M" begin "$SIDECAR"
+modprobe hfsplus
 
 echo "$(ts) laurel-root: 1/4 mkiosroot -> $IMG (${SIZE:-16G})"
 rm -f "$IMG"
 # mkiosroot ends with one fsck repair and a read-only verify; after the big copy the verify can still ask
-# for a "minor repair" of the volume header (2026-11-01). Repair again (max 3) until the verify is clean.
+# for a "minor repair" of the volume header (2026-11-01): scripts/laurel/root-fsck.sh repairs (max 3) until clean.
 if ! bash "$TOPAZ/mkiosroot.sh" "$D/087-86698-044.dmg" "$D/087-86593-047.dmg" "$D/087-86715-047.dmg" "$IMG" "${SIZE:-16G}"; then
-  [ -s "$IMG" ] || { echo "laurel-root: mkiosroot failed before the image existed" >&2; exit 1; }
-  ok=0
-  for i in 1 2 3; do
-    echo "$(ts) laurel-root: verify failed: fsck repair pass $i"
-    fsck.hfsplus -f -y "$IMG" | grep -v 'Illegal name' || true
-    if fsck.hfsplus -f -n "$IMG" >/dev/null 2>&1; then ok=1; break; fi
-  done
-  if [ $ok = 0 ]; then
-    # Linux fsck_hfs 540.1 repairs the volume header and reports "Volume header needs minor repair (1, 0)"
-    # again on the next verify-only pass (seen 2026-11-01 after 3 repairs; catalog, extents, bitmap and
-    # attributes all pass). Accept exactly that one finding; any other problem stops the build.
-    v=$(fsck.hfsplus -f -n "$IMG" 2>&1 || true)
-    others=$(printf '%s\n' "$v" | grep -E 'needs|invalid|Invalid|incorrect|Incorrect|error|Error|missing|Missing|overlap' | grep -v 'Volume header needs minor repair' | grep -v 'needs to be repaired' || true)
-    if printf '%s\n' "$v" | grep -q 'Volume header needs minor repair' && [ -z "$others" ]; then
-      echo "$(ts) laurel-root: note: only 'Volume header needs minor repair' remains (Linux fsck_hfs); accepted"
-      ok=1
-    else
-      echo "laurel-root: volume still not clean after 3 repairs" >&2; printf '%s\n' "$v" | tail -8; exit 1
-    fi
-  fi
+  [ -s "$IMG" ] || { python3 -I "$M" fail "$SIDECAR" "mkiosroot failed"; echo "laurel-root: FAILED: mkiosroot failed before the image existed" >&2; exit 1; }
+  bash "$REPO/scripts/laurel/root-fsck.sh" "$IMG" || { python3 -I "$M" fail "$SIDECAR" "fsck after mkiosroot"; exit 1; }
   echo "$(ts) laurel-root: volume checked"
 fi
 
 echo "$(ts) laurel-root: 2/4 root tweaks (topaz sweet-root-tweaks.py)"
-mnt=$(mktemp -d)
-trap 'umount "$mnt" 2>/dev/null || true; rmdir "$mnt" 2>/dev/null || true' EXIT
 mount -t hfsplus -o loop,force,rw "$IMG" "$mnt"
 python3 -I "$TOPAZ/sweet-root-tweaks.py" "$mnt"
 # negroni's tweaks on top (docs/laurel_sprout/negroni-ports.md "Userland / root image"): launchd drop list
@@ -79,47 +73,35 @@ python3 -I "$REPO/scripts/laurel/root-tweaks-perf.py" "$mnt"
 # system apps and jobs back (docs/laurel_sprout/system-features.md): the 32 staged Apple apps to /Applications, aggregated (power log for
 # Settings > Battery) back with a 32 MiB limit. STAGED_APPS=0, RESTORE_JOBS= and AGGREGATED_JETSAM_MB= turn parts off.
 python3 -I "$REPO/scripts/laurel/root-system-features.py" "$mnt"
-# GPU user space (docs/laurel_sprout/gpu.md): Mesa + EAGL GL + backboardd loader + the phone's own GPU firmware, from
-# out/laurel/gpu/root (scripts/laurel/gpu-firmware.sh + gpu-userland.sh as the user first); skipped with a note when absent
-bash "$REPO/scripts/laurel/root-add-gpu.sh" "$mnt"
-# Metal path (docs/laurel_sprout/metal.md): NegroniMetal.bundle (Turnip a610 + metal2vulkan) + probes, when
-# scripts/laurel/metal-build.sh has staged them; METAL=0 skips. Without the stage it logs "metal: off" and goes on.
-# (AREA B's scripts/laurel/root-add-gpu.sh, GPU firmware + GL, goes before this line: Metal checks for B's backboardd wrapper)
-METAL=${METAL:-1} sh "$REPO/scripts/laurel/root-add-metal.sh" "$mnt"
-# HEVC/HEIC: software decoder in VideoToolbox's empty HEVCH8 slot (docs/laurel_sprout/hevc.md); HEVC=0 skips: Apple's VCPHEVC alone
-HEVC=${HEVC:-1} bash "$REPO/scripts/laurel/root-hevc.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-hevc.sh failed; root built without our HEVC decoder" >&2
-# speaker audio (kernel patch 2500): RedwoodAudio.driver HAL plug-in, VirtualAudio back, BTAudio off
-AUDIO=${AUDIO:-1} bash "$REPO/scripts/laurel/root-audio.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-audio.sh failed; root built without audio" >&2
-# Bluetooth (kernel patch 2600): bluetoothd job back + the BlueTool stand-in; BT=0 skips
-BT=${BT:-1} bash "$REPO/scripts/laurel/root-bt.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-bt.sh failed; root built without Bluetooth" >&2
-# rear camera (kernel patches 2771, 2772): the phone's stock sensor libraries (tables read by the kernel) + the mediaserverd plug-in; CAMERA=0 skips
-CAMERA=${CAMERA:-1} bash "$REPO/scripts/laurel/root-camera.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-camera.sh failed; root built without camera tables" >&2
-# status bar at the native 720x1560 @2x screen (2103): UIKit's own provider override = _FixedSplit, else the red
-# rdar:45025538 bar; plus the waterdrop as SpringBoard's notch rect (liblaurel-notch.dylib + laurel-springboard from
-# out/laurel/notch, scripts/laurel/notch-build.sh; absent -> a note, Apple's D22Zoomed notch spacing). STATUSBAR=0 skips both,
-# NOTCH=0 only the dylib (docs/laurel_sprout/rtc-statusbar.md B, C)
-STATUSBAR=${STATUSBAR:-1} NOTCH=${NOTCH:-1} python3 -I "$REPO/scripts/laurel/root-statusbar.py" "$mnt"
-# flashlight (kernel patches 2781, 2783): one owner: NegroniCamera.driver when root-camera.sh put it in, else LaurelFlashlight.driver; TORCH=0 = no button
-TORCH=${TORCH:-1} bash "$REPO/scripts/laurel/root-flashlight.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-flashlight.sh failed; root built without the flashlight" >&2
-# auto-brightness off: no ambient light sensor for iOS (kernel 2201; docs/laurel_sprout/brightness.md); BRIGHTNESS=0 skips
-BRIGHTNESS=${BRIGHTNESS:-1} python3 -I "$REPO/scripts/laurel/root-brightness.py" "$mnt"
-# SSH (dropbear on 192.168.7.2:22, dash, toybox, usbreboot, oslogstream; docs/usb-network.md) when the iOS
-# builds exist (userland/ssh/build.sh, Linux or macOS). SSH=0: none. Host key and known_hosts as root-add-ssh.py.
-if [ "${SSH:-1}" = 1 ] && [ -x "$REPO/out/ssh/ios/dropbearmulti" ]; then
-  SSH=1 sh "$REPO/scripts/net/root-add-ssh.sh" "$mnt"
-elif [ "${SSH:-1}" = 1 ]; then
-  echo "$(ts) laurel-root: SSH skipped: no out/ssh/ios (userland/ssh/fetch.sh, fetch-sdk.sh, build.sh)"
-fi
+# every feature, each with its row in the one table (scripts/laurel/root-features.sh; switches listed there)
+missing=0
+bash "$REPO/scripts/laurel/root-features.sh" "$mnt" --inputs "$INPUTS" --sidecar "$SIDECAR" || missing=1
 sync
 umount "$mnt"
+if [ "$missing" != 0 ]; then
+  python3 -I "$M" fail "$SIDECAR" "a feature is missing"
+  echo "$(ts) laurel-root: FAILED: a feature is missing (table above): no sparse image. $IMG stays for a look" >&2
+  exit 1
+fi
 
 echo "$(ts) laurel-root: 3/4 fsck"
-fsck.hfsplus -fy "$IMG" | grep -v 'Illegal name' | tail -3 || true
+bash "$REPO/scripts/laurel/root-fsck.sh" "$IMG" || { python3 -I "$M" fail "$SIDECAR" "fsck"; exit 1; }
+
+# a script or stage that changed during the run: the image is not what the inputs say (the race of 2026-11-01)
+if ! python3 -I "$M" inputs-check "$INPUTS"; then
+  python3 -I "$M" fail "$SIDECAR" "an input changed during the run"
+  echo "$(ts) laurel-root: FAILED: an input changed during the run: no sparse image; run root.sh again" >&2
+  exit 1
+fi
 
 echo "$(ts) laurel-root: 4/4 sparse image (op10tool img2simg)"
 OP=$REPO/out/bin/op10tool
 [ -x "$OP" ] || sudo -u "$U" "$REPO/scripts/setup/build-op10tool.sh"
 "$OP" img2simg "$IMG" "$IMG.simg.partial" && mv "$IMG.simg.partial" "${IMG%.img}.simg"
 chown "$U": "$IMG" "${IMG%.img}.simg"
+python3 -I "$M" seal "$SIDECAR" "${IMG%.img}.simg"
 ls -l "$IMG" "${IMG%.img}.simg"
 echo "$(ts) laurel-root: done"
+}
+main "$@"
+exit 0

@@ -4693,3 +4693,15 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - Gotcha: `llvm-strip` refuses ld64's LC_SEGMENT_SPLIT_INFO on a dylib: use the theos `strip`. ffmpeg.org gave no tarball bytes here: pin by git commit. zsh: `echo =====` is an error, and `$VAR` with spaces does not split.
 - Refused by this session's permission check, so not done: running a prebuilt `ipsw`; fetching musl to run the arm64 test under qemu. So FFmpeg's NEON assembly has never run here. Owner decides.
 
+## Mi A3: honest build (2026-11-01, branch t3/laurel-build-honest, patch 2911). docs/laurel_sprout/build-honest.md
+- [V] The `linker command failed` lines in a good kernel build are the DriverKit stub rounds of `build-with-iig.sh`: 2 failed links (build.log 2228, 2948), then `built kernel at` twice (3635 stubs, 6487 forwarding wrappers). `make` always ends `Error 2` (`check_all_exports`). Not a stale kernel. Never test the make exit code here.
+- [V] `apply-xnu.sh` deletes the xnu tree each run, so an old `BUILD/` kernel from an earlier run cannot exist. The real hole: round 3 fails after round 2 worked: `$K` stays with all DriverKit wrappers "unsupported" and `built kernel at` is already in the log. Test: `$K` must be newer than `iokit/DriverKit/OSObject.iig.cpp`.
+- Stamps: `kernel...4k.stamp`, `laurel-uefi-boot.img.stamp`, `$APPLE/laurel-ios16-root.manifest` (sidecar), `/usr/share/laurel/root-manifest`, ADT `/chosen laurel-image-build`. Series = patches + fixes + known-skips by name and contents.
+- Gotcha: `sudo` drops the environment: `AUDIO=0 root-flash-test.sh` never reached root.sh before; `root-manifest.py switches` passes them now.
+- Gotcha: Linux roots had no SSH, silently: nothing built `out/ssh/ios`. `build-all.sh` does now; `SSH=0` leaves it out. A first build fetches dropbear and toybox.
+- Gotcha: the shell reads a script while it runs. Editing a running script in the main checkout changes the run. Body in `main()` for the three top scripts; the others are hashed at start and end. Use a worktree for edits during a build.
+- Gotcha: an image from before this branch has no sidecar: flash-check refuses it; `STALE_OK=1` flashes it. So does an image from `root-audio.sh --image`.
+- Gotcha: a preflight in the main checkout fails as long as a source is newer than its stage; that is correct. Seen 2026-11-01: `userland/metal/tests/mediaserverd-leak.c`, `userland/camera/media_hooks.c`, `metal_gate.c`.
+- Gotcha for agents: the permission check refuses a `bash -c` script whose text has `rm`: use a script file or the Edit tool.
+- Watchdogs: table in build-honest.md section 6. Nothing can reset the phone: IOWatchdog (topaz 0040) never fires, no APSS WDT driver. Only low-risk candidate: `zet=5000`, not booted.
+

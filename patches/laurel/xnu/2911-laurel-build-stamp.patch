@@ -1,0 +1,188 @@
+laurel 2911: the boot log proves which build runs (new bsd/dev/laurel_build.c). Lines: `LAUREL BUILD: <commit> <n> patches, series <hash>, <pages>` (generated header from kernel-linux.sh, which looks for this exact line in the linked kernel), `LAUREL BUILD: image ...` (/chosen laurel-image-build, uefi-image.sh), `LAUREL BUILD: root ...` (first line of /usr/share/laurel/root-manifest, root-manifest.py); each says whether its kernel series matches this kernel. Printed in bsd_init, at the root mount and again 30 s later, because a USB capture can start late. Owner request 2026-11-01: a build must never look good when a part is missing. Reads only. Kill switch laurelbuild=0.
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -125,6 +125,7 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/laurel_reboot.c			standard
+ bsd/dev/laurel_rtc.c			standard
++bsd/dev/laurel_build.c			standard
+ bsd/dev/laurel_wired.c			standard
+ bsd/dev/laurel_cell.c			standard
+ bsd/dev/laurel_ext4.c			standard
+diff -ruN a/bsd/dev/laurel_build.c b/bsd/dev/laurel_build.c
+--- a/bsd/dev/laurel_build.c
++++ b/bsd/dev/laurel_build.c
+@@ -0,0 +1,146 @@
++/*
++ * laurel 2911: which build runs. A phone log must prove it. docs/laurel_sprout/build-honest.md.
++ *
++ *   LAUREL BUILD: <commit> <n> patches, series <16 hex>, <pages>
++ *   LAUREL BUILD: image <commit> <time> kernel-series <16 hex> fd <8 hex>: kernel series matches
++ *   LAUREL BUILD: root <commit> <time> kernel-series <16 hex> features <n> installed <n> off <n> missing <n>: kernel series matches
++ *
++ * Line 1 is text in the kernel: scripts/laurel/kernel-linux.sh writes bsd/dev/laurel_build_stamp.h after the patches and looks for this
++ * exact line in the linked file, so an old kernel cannot pass as new. Line 2 is /chosen laurel-image-build in the ADT
++ * (scripts/laurel/uefi-image.sh, mkadt.py --build-stamp). Line 3 is the first line of /usr/share/laurel/root-manifest
++ * (scripts/laurel/root-manifest.py); the rest of that file is the feature table. "KERNEL SERIES DIFFERS" = the boot image or the
++ * root was built for another kernel. An absent stamp is one line, and nothing else changes.
++ *
++ * The first line prints in bsd_init (console ring: a panic dump has it). A USB capture can start late [V boot 20:02: its first
++ * lines are from after the root mount], so all three print at the root mount and again 30 s later.
++ * Reads only: the ADT and one file. Kill switch: laurelbuild=0.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/vnode.h>
++#include <sys/vnode_if.h>
++#include <sys/kauth.h>
++#include <kern/clock.h>
++#include <kern/thread_call.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++#if __has_include("laurel_build_stamp.h")
++#include "laurel_build_stamp.h"
++#else
++#define LAUREL_BUILD_STAMP  "unstamped: not from scripts/laurel/kernel-linux.sh"
++#define LAUREL_BUILD_SERIES ""
++#endif
++
++#define LB_ROOT_FILE "/usr/share/laurel/root-manifest"
++#define LB_AGAIN_S   30u
++
++static const char lb_line[] = "LAUREL BUILD: " LAUREL_BUILD_STAMP "\n";
++static char lb_image[160];
++static char lb_root[200];
++static bool lb_off;
++
++/* printable ASCII up to the first line end: the text comes from a file and is only printed */
++static void
++lb_copy_line(char *dst, size_t dstlen, const char *src, size_t srclen)
++{
++	size_t i = 0;
++
++	while (i + 1 < dstlen && i < srclen && src[i] != 0 && src[i] != '\n') {
++		dst[i] = (src[i] >= 0x20 && src[i] < 0x7f) ? src[i] : '?';
++		i++;
++	}
++	dst[i] = 0;
++}
++
++static const char *
++lb_series_note(const char *text)
++{
++	const char *p = strnstr(text, "kernel-series ", strlen(text));
++
++	if (p == NULL) {
++		return "";
++	}
++	p += strlen("kernel-series ");
++	if (strlen(LAUREL_BUILD_SERIES) != 0 && strncmp(p, LAUREL_BUILD_SERIES, strlen(LAUREL_BUILD_SERIES)) == 0) {
++		return ": kernel series matches";
++	}
++	return ": KERNEL SERIES DIFFERS";
++}
++
++static void
++lb_print_all(void)
++{
++	printf("%s", lb_line);
++	printf("LAUREL BUILD: image %s%s\n", lb_image, lb_series_note(lb_image));
++	printf("LAUREL BUILD: root %s%s\n", lb_root, lb_series_note(lb_root));
++}
++
++static void
++lb_again(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	lb_print_all();
++}
++
++void
++laurel_build_early(void)
++{
++	int on = 1;
++
++	if (PE_parse_boot_argn("laurelbuild", &on, sizeof(on)) && on == 0) {
++		lb_off = true;
++		printf("LAUREL BUILD: off: laurelbuild=0\n");
++		return;
++	}
++	printf("%s", lb_line);
++}
++
++void
++laurel_build_root(void)
++{
++	DTEntry chosen;
++	void const *prop = NULL;
++	unsigned int len = 0;
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	char buf[sizeof(lb_root)];
++	int resid = sizeof(buf), error;
++
++	if (lb_off) {
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++	    SecureDTGetProperty(chosen, "laurel-image-build", &prop, &len) == kSuccess && len != 0) {
++		lb_copy_line(lb_image, sizeof(lb_image), prop, len);
++	} else {
++		strlcpy(lb_image, "no stamp: no /chosen laurel-image-build", sizeof(lb_image));
++	}
++
++	error = vnode_open(LB_ROOT_FILE, FREAD, 0, 0, &vp, ctx);
++	if (error == 0) {
++		error = vn_rdwr(UIO_READ, vp, buf, sizeof(buf), 0, UIO_SYSSPACE, IO_NODELOCKED,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		(void)vnode_close(vp, FREAD, ctx);
++	}
++	if (error == 0) {
++		lb_copy_line(lb_root, sizeof(lb_root), buf, sizeof(buf) - (size_t)resid);
++	} else {
++		snprintf(lb_root, sizeof(lb_root), "no stamp: %s: error %d", LB_ROOT_FILE, error);
++	}
++	lb_print_all();
++
++	thread_call_t call = thread_call_allocate(lb_again, NULL);
++	if (call != NULL) {
++		uint64_t deadline;
++
++		clock_interval_to_deadline(LB_AGAIN_S, NSEC_PER_SEC, &deadline);
++		thread_call_enter_delayed(call, deadline);
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -508,6 +508,11 @@
+ 	throttle_init();
+ 
+ 	printf(copyright);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* laurel 2911: which build runs (bsd/dev/laurel_build.c): early, for a panic dump before the root. */
++	extern void laurel_build_early(void);
++	laurel_build_early();
++#endif
+ 
+ #if CONFIG_DEV_KMEM
+ 	bsd_init_kprintf("calling dev_kmem_init\n");
+@@ -1054,6 +1059,9 @@
+ 	/* laurel 2720: the saved RTC offset is on the root volume: apply it before launchd (bsd/dev/laurel_rtc.c). */
+ 	extern void laurel_rtc_load_saved(void);
+ 	laurel_rtc_load_saved();
++	/* laurel 2911: the boot image and root stamps; again 30 s later, when the host USB log is attached. */
++	extern void laurel_build_root(void);
++	laurel_build_root();
+ #endif
+ 
+ 	/* Initialize signal state for process 0. */

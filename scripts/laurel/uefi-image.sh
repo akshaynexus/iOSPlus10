@@ -4,6 +4,8 @@
 #   scripts/laurel/uefi-image.sh [CMDLINE]
 #   MU_ONLY=1   boot image with Mu UEFI alone (empty ramdisk): Mu's boot menu/front page, no XNU (step 1 of the plan)
 #   KERNEL=path (default out/laurel-kernel/out/kernel.development.sweet.4k)   FD=path (default out/laurel/mu/SILICIUM_UEFI-DEBUG.fd)
+#     The default kernel must have its stamp and match the patches in the repo (build-stamp.py kernel-check), else no image. A KERNEL= by hand
+#     needs only its own stamp to be right: an older kernel on purpose (docs/laurel_sprout/build-honest.md).
 #   DRAM=BASE:SIZE or auto (default): the DarwinBoot window from the FD's Mu memory map (mkadt.py --dram auto):
 #     Mu 0101 ("Kernel RAM" 0xE1000000 + 0xDF000000) or the late layout (MU_RAM_LAYOUT=late) gives 3264 MiB at
 #     0xE1004000 (kernel patch 2100); an older FD (Kernel RAM 0x81000000 + 0x3F000000) 768 MiB at 0x81004000
@@ -23,7 +25,9 @@ STOCK=${STOCK_BOOT:-$HOME/laurel-backup/stock/images/boot.img}
 MU=$OUT/laurel/mu
 FD=${FD:-$MU/SILICIUM_UEFI-DEBUG.fd}
 SHIM=${SHIM:-$MU/BootShim.bin}
+KERNEL_BY_HAND=${KERNEL:-}
 KERNEL=${KERNEL:-$OUT/laurel-kernel/out/kernel.development.sweet.4k}
+BS=$REPO/scripts/laurel/build-stamp.py
 DRAM=${DRAM:-auto}
 CPUS=${CPUS:-8}
 SIZE_MIB=${SIZE_MIB:-48}
@@ -64,7 +68,10 @@ if [ "${MU_ONLY:-0}" = 1 ]; then
   IMG=$W/laurel-mu-only-boot.img
 else
   [ -f "$KERNEL" ] || { echo "uefi-image: missing kernel $KERNEL (scripts/laurel/kernel-linux.sh)" >&2; exit 1; }
-  python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot gold --dram "$DRAM" --mu-fd "$FD" --darwinboot   # laurel 2016: Gold 0x100 is the boot CPU after the PSCI hand-off
+  # no boot image from a kernel that is not proven: kernel-linux.sh stamps only what passed its checks
+  python3 -I "$BS" kernel-check "$KERNEL" ${KERNEL_BY_HAND:+--no-repo} || { echo "uefi-image: FAILED: kernel not good: no boot image" >&2; rm -f "$W/laurel-uefi-boot.img.stamp"; exit 1; }
+  STAMP_LINE=$(python3 -I "$BS" image-line "$KERNEL" "$FD")
+  python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot gold --dram "$DRAM" --mu-fd "$FD" --darwinboot --build-stamp "$STAMP_LINE"   # laurel 2016: Gold 0x100 is the boot CPU after the PSCI hand-off
   "$OUT/venv/bin/python3" "$REPO/scripts/laurel/mkdarwinboot.py" "$KERNEL" "$W/laurel.adt" "$W/payload.img" \
     --cmdline "$CMDLINE" --size-mib "$SIZE_MIB" --timeout 3
   printf '%s\n' "$CMDLINE" > "$W/cmdline.txt"
@@ -81,4 +88,8 @@ mkbootimg --header_version 2 --kernel "$W/kernel.gz" --ramdisk "$rd" --dtb "$W/s
   --dtb_offset 0x1f00000 --os_version 11.0.0 --os_patch_level 2022-08 --cmdline "console=null" \
   -o "$IMG"
 ls -l "$IMG" "$W/kernel.gz" "$rd"
+if [ "${MU_ONLY:-0}" != 1 ]; then
+  python3 -I "$BS" image-seal "$IMG" "$STAMP_LINE" "$KERNEL" "$FD" "$CMDLINE"
+  echo "uefi-image: boot line: LAUREL BUILD: image $STAMP_LINE"
+fi
 echo "uefi-image: $IMG (FD $fdlen bytes$([ "${MU_ONLY:-0}" = 1 ] && echo ', Mu alone' || echo ", kernel $(basename "$KERNEL"), cpus=$CPUS, dram $DRAM, boot CPU Gold 0x100 after the PSCI hand-off (patch 2016)"))"

@@ -9,7 +9,7 @@
 #   TORCH=0: neither is used for the torch: writes the mark HAL/laurel-flashlight-off, the kernel then publishes no button.
 # The kernel publishes the Control Center button (IODeviceTree:/product/camera flash) only with one of the two in the root.
 # Works on macOS and Linux. Needs out/laurel/flashlight/LaurelFlashlight.driver for the second case (built here if missing;
-# a plug-in that cannot be built (no theos toolchain / SDK) is a warning: the root goes on without it).
+# a plug-in that cannot be built (no theos toolchain / SDK): exit 1; root.sh's table says `flashlight missing`).
 # Undo on the phone: /var/db/laurel/flashlight-off stops LaurelFlashlight; the boot-arg torch=0 stops the kernel side.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -33,8 +33,8 @@ fi
 if [ ! -f "$SRC/LaurelFlashlight" ]; then
   if [ -n "${SUDO_USER:-}" ]; then b() { sudo -u "$SUDO_USER" "$REPO/userland/laurel/flashlight/build.sh"; }; else b() { "$REPO/userland/laurel/flashlight/build.sh"; }; fi
   if ! b || [ ! -f "$SRC/LaurelFlashlight" ]; then
-    echo "root-flashlight: WARNING: LaurelFlashlight.driver could not be built (theos toolchain/SDK: run scripts/laurel/kernel-linux.sh once); flashlight skipped, root unchanged" >&2
-    exit 0
+    echo "root-flashlight: FAILED: LaurelFlashlight.driver could not be built (theos toolchain/SDK: run scripts/laurel/kernel-linux.sh once); root unchanged" >&2
+    exit 1
   fi
 fi
 rm -rf "${HAL:?}/LaurelFlashlight.driver"

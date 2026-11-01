@@ -311,6 +311,7 @@ if __name__ == '__main__':
     ap.add_argument('--dram', default='0x80000000:0x40000000', help='BASE:SIZE, or auto (needs --mu-fd)')
     ap.add_argument('--mu-fd', help='Mu FD for --dram auto (its "Kernel RAM" entry decides the window size)')
     ap.add_argument('--darwinboot', action='store_true')
+    ap.add_argument('--build-stamp', help='/chosen laurel-image-build: the boot log line of kernel patch 2911 (scripts/laurel/build-stamp.py image-line)')
     ap.add_argument('--dump', action='store_true')
     a = ap.parse_args()
     if a.dram == 'auto':
@@ -322,6 +323,8 @@ if __name__ == '__main__':
         b, s = (int(x, 0) for x in a.dram.split(':'))
     root = build(a.cores, (b, s), boot=a.boot, darwinboot=a.darwinboot)
     check(root, a.cores, a.boot, a.darwinboot)
+    if a.build_stamp:
+        setprop(find(root, 'chosen'), 'laurel-image-build', cstr(a.build_stamp))
     blob = adt.serialize(root)
     adt.parse(blob)   # round trip
     with open(a.out, 'wb') as f:

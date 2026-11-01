@@ -63,6 +63,10 @@ echo "kernel-linux: topaz $(git -C "$TOPAZ" rev-parse --short HEAD), $(ls "$W"/p
 
 export TOP=$W PATCHES_DIR=$W/patches THEOS=$W/theos MACHINE_CONFIG=SWEET KERNEL_CONFIG=DEVELOPMENT JOBS=$NPROC
 PAGES=${PAGES:-4k}
+# laurel 2911: what this run builds, from the copies above: the boot line, and the check at the end (docs/laurel_sprout/build-honest.md)
+BS=$REPO/scripts/laurel/build-stamp.py
+STAMP=$(python3 -I "$BS" kernel-stamp "$W" "$PAGES")
+echo "kernel-linux: this build: LAUREL BUILD: $STAMP"
 case "$PAGES" in
 4k)  export TOPAZ_4K=1 ;;   # makedefs/MakeInc.def (0140) adds -DTOPAZ_4K=1 for SWEET
 16k) unset TOPAZ_4K ;;
@@ -138,6 +142,9 @@ apply_and_deps() {
   return $rc
 }
 step patch+deps apply_and_deps || exit 1
+# the stamp header of patch 2911 (bsd/dev/laurel_build.c); apply-xnu made a new tree, so no old BUILD/ directory is left
+XNU_TREE=$W/xnu-src/$XNU_TAG
+python3 -I "$BS" kernel-header "$STAMP" > "$XNU_TREE/bsd/dev/laurel_build_stamp.h"
 
 # compiler cache: a second build with the same sources only links. ccache is optional.
 if command -v ccache >/dev/null; then
@@ -158,16 +165,21 @@ fi
 step firehose tolog "$LOGD/stage2.log" bash linux/setup-deps.sh --stage2 || { tail -20 "$LOGD/stage2.log"; exit 1; }
 touch "$fh.a53"
 rm -f "$W/build.log"
-step kernel tolog "$LOGD/kernel-make.log" bash linux/build-with-iig.sh || true
+# make always ends with an error here (the export check after the link cannot pass; external/ios-sweet-linux/linux/build.sh), and the first
+# two links fail by design (DriverKit stub rounds). build-with-iig.sh judges by the file and "built kernel at": its status counts.
+build_rc=0
+step kernel tolog "$LOGD/kernel-make.log" bash linux/build-with-iig.sh || build_rc=$?
 command -v ccache >/dev/null && ccache -s | grep -iE "hits|misses" | head -3
 echo "kernel-linux: total $(( $(date +%s) - T0 )) s"
 
-K=$W/xnu-src/xnu-8796.141.3/BUILD/obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet
-if [ ! -s "$K" ]; then
-  echo "kernel-linux: no kernel; first errors:" >&2
+K=$XNU_TREE/BUILD/obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet
+if [ "$build_rc" != 0 ] || [ ! -s "$K" ]; then
+  echo "kernel-linux: FAILED: build-with-iig.sh exit $build_rc, kernel file $([ -s "$K" ] && echo present || echo absent); first errors:" >&2
   grep -n -m 40 -E "error:|Undefined symbols|symbol\(s\) not found" "$W/build.log" >&2 || true
   exit 1
 fi
+# the kernel must be this run's: time stamps, last link round, embedded stamp, patches unchanged. Nothing is copied to out/ otherwise.
+python3 -I "$BS" kernel-verify --kernel "$K" --work "$W" --stamp "$STAMP" --t0 "$T0" --xnu "$XNU_TREE" || exit 1
 # the variant must be the one asked for: 0142 (sweet_early_map_final, sweet_early_fb_mapped) exists only with TOPAZ_4K
 has4k=0
 # (no grep -q: with pipefail its early exit SIGPIPEs llvm-nm and the test fails)
@@ -177,6 +189,7 @@ if { [ "$PAGES" = 4k ] && [ $has4k = 0 ]; } || { [ "$PAGES" = 16k ] && [ $has4k 
 fi
 mkdir -p "$W/out"
 O=$W/out/kernel.development.sweet.$PAGES
+rm -f "$O.stamp"
 cp "$K" "$O"
 [ -s "$K.unstripped" ] && cp "$K.unstripped" "$O.unstripped"
 ln -sfn "$(basename "$O")" "$W/out/kernel.development.sweet"
@@ -191,10 +204,14 @@ if command -v llvm-objdump >/dev/null; then
     llvm-objdump -d --mattr=+v8.5a "$O.unstripped" |
       grep -P "^[0-9a-f]+ <|$pat" | grep -B1 -P "$pat" | grep -P '^[0-9a-f]+ <' | sort -u >&2 || true
     echo "kernel-linux: kernel has ARMv8.1+ instructions (functions above); not usable on the Mi A3" >&2
-    mv "$O" "$O.has-lse"; rm -f "$W/out/kernel.development.sweet"
+    mv "$O" "$O.has-lse"; rm -f "$W/out/kernel.development.sweet" "$O.stamp"
     exit 1
   fi
 else
   echo "kernel-linux: llvm-objdump missing: cannot check for LSE instructions" >&2; exit 1
 fi
+# only a kernel that passed every check gets a stamp; uefi-image.sh takes no other
+python3 -I "$BS" kernel-seal "$K" "$O" "$STAMP"
+python3 -I "$BS" kernel-check "$O"
+echo "kernel-linux: boot line: LAUREL BUILD: $STAMP"
 echo "kernel-linux: $O"

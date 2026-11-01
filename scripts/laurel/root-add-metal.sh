@@ -5,7 +5,7 @@
 #   /private/var/db/negronimetal/{clients,env,cache/,strikes/,metal.log}
 # Input: out/metal/stage from scripts/laurel/metal-build.sh (Turnip for the A610 + metal2vulkan bridge + plug-in).
 # The kernel (patch 2850) names the bundle on IOAcceleratorES only when these files are in the root and the A610 runs;
-# without them it logs "LAUREL METAL: off: ... missing" and CoreAnimation keeps its current renderer.
+# without them it logs "LAUREL METAL: off: ... missing" and CoreAnimation keeps its current renderer. No stage: exit 1, root.sh's table says `metal missing`.
 #   sudo METAL=1 scripts/laurel/root-add-metal.sh MOUNTED_ROOT
 #   METAL_CLIENTS="..."   the processes that get a Metal device (/var/db/negronimetal/clients). Default: the probes only
 #                         ("metalprobe m2vtest carenderprobe layerprobe"), marked as the gate's list: at boot
@@ -29,7 +29,7 @@ if [ "${METAL:-1}" = 0 ]; then
 fi
 for f in "$B/NegroniMetal" "$B/libvulkan_freedreno.dylib" "$B/Info.plist"; do
   if [ ! -f "$f" ]; then
-    echo "laurel-root: metal: off: no ${f#$REPO/} (scripts/laurel/metal-build.sh)"; exit 0
+    echo "laurel-root: metal: off: no ${f#$REPO/} (scripts/laurel/metal-build.sh)"; exit 1
   fi
 done
 D=$R/private/var/db/negronimetal

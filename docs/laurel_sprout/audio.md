@@ -76,7 +76,7 @@ XNU now runs at 0xE1004000-0x1AD004000, mostly above 4 GiB, so nothing the ADSP 
 - Shared TopazModem.cpp fixes (scm() lock + busy retry, smmu_identity() lock, pool-vs-XNU-window check) are area E's
   patch 2404 (in this branch now).
 - root-audio.sh: `--image` checks the fsck verify result before the sparse step (only the known Linux "Volume header
-  needs minor repair" is accepted, as in root.sh); no toolchain -> warning, audio skipped, exit 0 (root.sh also goes on
+  needs minor repair" is accepted, as in root.sh); no toolchain -> exit 1, table row `audio missing` (root.sh goes on to the other features, then exit 1
   if the script fails); `--image` is Linux only (stated in the script).
 - Open question from the review: VirtualAudio back on. RedwoodAudio always publishes "Speaker" + "Hawking" (also when
   `/dev/redwood-audio` does not open), which removes topaz's crash cause; count `CRASH mediaserverd` over several boots

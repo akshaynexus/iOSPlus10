@@ -1,8 +1,8 @@
 #!/bin/bash
 # Install the Mi A3 GPU user space into a mounted, writable iOS 16 root (scripts/laurel/root.sh calls it; idempotent).
 #   sudo scripts/laurel/root-add-gpu.sh MOUNTED_ROOT
-# Input: out/laurel/gpu/root/ from scripts/laurel/gpu-userland.sh (+ gpu-firmware.sh for the firmware). Without it: a note, exit 0
-# (the root still boots; the kernel logs 'LAUREL GPU: off: zap shader failed: no zap shader ...').
+# Input: out/laurel/gpu/root/ from scripts/laurel/gpu-userland.sh (+ gpu-firmware.sh for the firmware). GPU=0: skipped, nothing changes.
+# Without the stage or with a wrapper that fails its check: Apple's backboardd stays and the exit is 1: root.sh's table says `gpu missing`.
 # What it does:
 #   /topaz/lib/{libOSMesa.8.dylib,libtopaz-gl.dylib,libtopaz-inject.dylib}   (root:wheel 755)
 #   /usr/share/firmware/laurel/{a610_zap.mdt,a610_zap.bNN,a630_sqe.fw}     (root:wheel 644; the kernel reads them)
@@ -18,12 +18,13 @@ set -euo pipefail
 R=${1:?usage: $0 MOUNTED_ROOT}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 S=$REPO/out/laurel/gpu/root
+if [ "${GPU:-1}" = 0 ]; then echo "root-add-gpu: off: GPU=0"; exit 0; fi
 R=$(cd "$R" && pwd -P)
 [ "$R" != / ] || { echo "root-add-gpu: refusing to install into /" >&2; exit 1; }
 [ -d "$R/System/Library/xpc" ] && [ -x "$R/usr/libexec/backboardd" ] || { echo "root-add-gpu: $R is not an iOS root" >&2; exit 1; }
 if [ ! -s "$S/topaz/lib/libtopaz-gl.dylib" ]; then
-  echo "root-add-gpu: skipped: no $S (scripts/laurel/gpu-firmware.sh + gpu-userland.sh); the root has no GPU user space"
-  exit 0
+  echo "root-add-gpu: FAILED: no $S (scripts/laurel/gpu-firmware.sh + gpu-userland.sh); the root has no GPU user space"
+  exit 1
 fi
 own() { [ "$(id -u)" != 0 ] || chown -R 0:0 "$@"; }
 
@@ -60,8 +61,8 @@ assert b'/usr/libexec/real/backboardd' in d, 'does not exec /usr/libexec/real/ba
 PY
 then
   echo "root-add-gpu: the backboardd wrapper $W failed its check: Apple's backboardd stays (no GL in the window server)" >&2
-  echo "root-add-gpu: /topaz/lib + firmware installed; backboardd unchanged"
-  exit 0
+  echo "root-add-gpu: FAILED: /topaz/lib + firmware installed; backboardd unchanged"
+  exit 1
 fi
 # backboardd: Apple's binary moves once; a Mach-O that is our wrapper is never moved over the real one
 real=$R/usr/libexec/real/backboardd

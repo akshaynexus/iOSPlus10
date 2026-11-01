@@ -6,6 +6,7 @@
 # Ad hoc signed, no entitlements: the kernel's AMFI stand-in treats a signed file on the root as platform code [V NegroniCamera.driver in
 # mediaserverd]. Every HEIC stays as Apple ships it. Details: docs/laurel_sprout/hevc.md.
 # One line at the end: "laurel-root: hevc: on: ..." or "laurel-root: hevc: off: <reason>". Off = Apple's VCPHEVC.videocodec alone. Idempotent.
+# Only HEVC=0 is a wanted off: the other reasons exit 1 and root.sh's table says `hevc missing`.
 set -euo pipefail
 R=${1:?usage: $0 MOUNTED_ROOT}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -16,7 +17,7 @@ if [ "${HEVC:-1}" = 0 ]; then
   echo "laurel-root: hevc: off: HEVC=0: Apple's VCPHEVC.videocodec alone"
   exit 0
 fi
-[ -d "$R/System/Library/VideoDecoders" ] || { echo "laurel-root: hevc: off: $R has no System/Library/VideoDecoders"; exit 0; }
+[ -d "$R/System/Library/VideoDecoders" ] || { echo "laurel-root: hevc: off: $R has no System/Library/VideoDecoders"; exit 1; }
 if [ ! -s "$S" ]; then
   if [ -n "${SUDO_USER:-}" ]; then
     sudo -u "$SUDO_USER" "$REPO/scripts/laurel/hevc-build.sh" || true
@@ -27,14 +28,14 @@ fi
 if [ ! -s "$S" ]; then
   rm -f "$F"
   echo "laurel-root: hevc: off: no $S (scripts/laurel/hevc-build.sh failed): Apple's VCPHEVC.videocodec alone"
-  exit 0
+  exit 1
 fi
 want=$(sed -n 's/ .*HEVCH8.videodecoder$//p' "$(dirname "$S")/SHA256SUMS" 2>/dev/null || true)
 have=$(sha256sum "$S" 2>/dev/null | cut -d' ' -f1 || shasum -a 256 "$S" | cut -d' ' -f1)
 if [ -z "$want" ] || [ "$want" != "$have" ]; then
   rm -f "$F"
   echo "laurel-root: hevc: off: $S does not match its SHA256SUMS: Apple's VCPHEVC.videocodec alone"
-  exit 0
+  exit 1
 fi
 install -m 755 "$S" "$F"
 [ "$(id -u)" != 0 ] || chown 0:0 "$F"
