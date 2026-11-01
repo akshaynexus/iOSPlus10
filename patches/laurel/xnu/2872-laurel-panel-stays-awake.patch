@@ -1,0 +1,305 @@
+laurel 2872: display off keeps the panel awake; the wake shows a frame and checks the panel. Boot 19:34 (2871): the owner locked the phone and the screen never came back: iOS and the kernel alive, swaps and touches go on, every 0x11/0x29 done, panel holds DBV 2047, display on bit set. 2871's self-check found that only the TPG FIFO answers and chose it for writes too, so boot 19:34 is the first boot where 0x28/0x10 reached the panel: the memory DMA answered no read and left 0x54 at 0x28 after 53 20, all earlier boots had no effect from any DCS write and always woke. First real sleep at 19:42:55 changed the panel's power mode from 0x9f to 0x9d for good. 0x11 + 0x29 with the video stream running is a sequence Linux never sends: the DT has lp11-init, a reset sequence and a full on-command set with vendor registers, sent before the video starts. Fix: display off = fade to DBV 0 + black kernel frame, no 0x28/0x10 (the same dark as before, the power of all earlier boots). The wake sends nothing unless a check finds the panel off: one DCS 0x0A after each display on, light still out (bits 7, 4, 3, 2 = 0x9c), mismatch = 0x11, 120 ms, 0x29, 0x53 0x20 once, one more read, one line. Reads after the start: only this one; the settled-value read-back and the way moves are gone (the start self-check keeps the transport and the way). Reads cannot be proven safe in video mode from a log; a wake check runs with the light out. laurelbl_read=0 now means no reads at all, FIFO for writes. Display on with no new iOS frame: fPending is not the last frame on the direct path (stale record, or black until iOS draws): the first tick shows the last direct frame again when the panel still has the black one and nothing waits (its surface is still held by fShowHold). Lines: `LAUREL PANEL: on: ...` after USB is up, `LAUREL PANEL: wake N: panel power 0x.. (start 0x..)` (first 8, then on a change), `LAUREL PANEL: display on, no new iOS frame yet: the last one again (N)` (first 8). The lines `SWEET FB: panel display off, sleep in` and `panel sleep out, display on` are gone. Kill switches: laurelbl_read=0, sweetfb_stayon=1 (existing).
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -316,11 +316,11 @@
+ 	bool          fDsiBtaDone;
+ 	bool          fDsiReadHs;     /* the mode of a read */
+ 	bool          fRdOn;          /* the panel answers reads */
+-	bool          fRd52;          /* 0x52 followed a written level at start: it can judge a settled value */
++	bool          fRd52;          /* 0x52 followed a written level at start */
+ 	uint32_t      fRdFails;       /* reads without an answer in a row */
+ 	uint32_t      fDsiLine;       /* the DMA line of the panel */
+ 	bool          fDsiDtHs, fDsiDtOnHs, fDsiDtOffHs;      /* the panel's DT modes */
+-	uint32_t      fDsiWay, fDsiWayMoves;
++	uint32_t      fDsiWay;
+ 	uint32_t      dsiDcsRead(uint8_t cmd, uint8_t *out, uint32_t n);
+ 	bool          panelDbv(uint32_t *dbv);
+ 	bool          setPanelBctrl(void);
+@@ -339,7 +339,15 @@
+ 	static void   blLog(thread_call_param_t p0, thread_call_param_t p1);
+ 	bool          dsiDcsLong(const uint8_t *payload, uint32_t len);
+ 	bool          dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len);
+-	bool          setPanelOn(bool on);
++	/* laurel 2872: the panel stays awake at display off; the wake checks it and shows a frame */
++	bool          panelWakeSeq(void);
++	void          panelWakeCheck(void);
++	uint8_t       fPanelPower0, fPanelPowerLast;  /* DCS 0x0A at start, at the last wake check */
++	uint32_t      fWakeChecks, fWakeShows;
++	bool          fWakeShow;      /* display on: the next tick shows the last iOS frame if the panel still has the black one */
++	bool          fLastDirect;    /* the last iOS frame went by the direct path: fPending is not that frame */
++	uint64_t      fLastDirectPhys;
++	uint32_t      fLastDirectStride;
+ 	bool          setPanelLevel(uint32_t level);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+@@ -391,6 +399,7 @@
+ 	{ "GVO r692a9", 1360, 136, 4095, 50, 20, false, false, true, 28, 4 },
+ };
+ #define LAUREL_PANEL_LINES      1560u
++#define LAUREL_POWER_ON         0x9cu   /* DCS 0x0A: booster, sleep out, normal, display on */
+ #define LAUREL_BL_LOG_MS        700u    /* a value is "settled" when no request came for this long */
+ #define LAUREL_BL_LOG_MAX       200u    /* settled-value lines per boot, then every 50th */
+ #define LAUREL_BL_MIN           4u
+@@ -1008,6 +1017,19 @@
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
++	/*
++	 * laurel 2872: display on and no iOS frame came since the black frame: show the last frame again (fShowHold still holds
++	 * its surface: nothing reused it). Before, the panel stayed black until iOS sent a new frame: fPending is not the last
++	 * frame on the direct path, so the old redraw at wake presented a stale record.
++	 */
++	if (fb->fWakeShow) {
++		fb->fWakeShow = false;
++		if (fb->fScanHolds == LAUREL_SCAN_BLACK && !fb->fDirty && fb->fLastDirectPhys != 0 &&
++		    fb->scanFrom(fb->fLastDirectPhys, fb->fLastDirectStride, LAUREL_SCAN_IOS, "the last iOS frame again (display on)") &&
++		    ++fb->fWakeShows <= 8) {
++			IOLog("LAUREL PANEL: display on, no new iOS frame yet: the last one again (%u)\n", fb->fWakeShows);
++		}
++	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
+ 	SweetSurface *taken[4] = {};
+@@ -1373,6 +1395,11 @@
+ 		memcpy(retired, fRetireHold, sizeof(retired));
+ 		memcpy(fShowHold, held, sizeof(held));
+ 		bzero(fRetireHold, sizeof(fRetireHold));
++		if (fScanHolds == LAUREL_SCAN_IOS) {            /* laurel 2872: what a wake can show again */
++			fLastDirect = true;
++			fLastDirectPhys = fScanPhys;
++			fLastDirectStride = fScanStride;
++		}
+ 		IOLockUnlock(fLock);
+ 		sweet_hold_set(shown, false);
+ 		sweet_hold_set(retired, false);
+@@ -1390,6 +1417,7 @@
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	fLastDirect = false;                            /* laurel 2872 */
+ 	SweetSurface *dropped[4];
+ 	memcpy(dropped, fPendHold, sizeof(dropped));      /* replaced before shown */
+ 	memcpy(fPendHold, held, sizeof(held));
+@@ -1612,9 +1640,11 @@
+  */
+ /*
+  * laurel 2201 (topaz 0106/0143, apollo 0151): the light fades out to DBV 0 while the panel still shows
+- * frames (fadeOut, before fPowerOff), then off = 0x28, off1 ms, 0x10, off2 ms (per panel; unknown: 50/120);
+- * on = 0x11, 120 ms (both panels need <= 100), 0x29, 0x53 0x20 (brightness control on), one frame
+- * (bl-update-flag delay_until_first_frame); the caller fades the level in. false: a command did not complete.
++ * frames (fadeOut, before fPowerOff).
++ * laurel 2872: then the black kernel frame; the panel stays awake: no 0x28/0x10. Boot 19:34 is the first boot where these
++ * commands reached the panel (the FIFO transport of 2871); the panel never showed a picture again: 0x11 + 0x29 with the video
++ * stream running do not bring it back. Linux never does that: it resets the panel, then sends the whole on-command set with the
++ * link in LP-11 and only then starts the video (qcom,mdss-dsi-lp11-init, on-command, reset-sequence in the DT).
+  */
+ void
+ AppleCLCD::fadeOut(void)
+@@ -1633,32 +1663,68 @@
+ 	IOLockUnlock(fLock);
+ }
+ 
++/*
++ * laurel 2872: the sleep-out sequence, only for a panel that a check finds off. fPwrLock serializes it; 0x11 needs 120 ms
++ * before 0x29 however fast the requests come (both panels need <= 100 ms).
++ */
+ bool
+-AppleCLCD::setPanelOn(bool on)
++AppleCLCD::panelWakeSeq(void)
+ {
+-	uint8_t first[4] = { (uint8_t)(on ? 0x11 : 0x28), 0, 0x05, 0x80 };
+-	uint8_t second[4] = { (uint8_t)(on ? 0x29 : 0x10), 0, 0x05, 0x80 };
++	uint8_t first[4] = { 0x11, 0, 0x05, 0x80 };
++	uint8_t second[4] = { 0x29, 0, 0x05, 0x80 };
+ 	uint8_t bctrl[4] = { 0x53, 0x20, 0x15, 0x80 };          /* DCS short write, 1 parameter */
+-	uint32_t off1 = fPanel != NULL ? fPanel->off1_ms : 50, off2 = fPanel != NULL ? fPanel->off2_ms : 120;
+ 	bool done = true;
+ 	IOLockLock(fBlLock);
+-	fDsiHsNow = on ? fOnHs : fOffHs;        /* laurel 2201 fix: on-/off-command-state of the panel */
++	fDsiHsNow = fOnHs;
+ 	done &= dsiSend(first, NULL, 0);
+ 	IOLockUnlock(fBlLock);
+-	IOSleep(on ? 120 : off1);
++	IOSleep(120);
+ 	IOLockLock(fBlLock);
+-	fDsiHsNow = on ? fOnHs : fOffHs;
++	fDsiHsNow = fOnHs;
+ 	done &= dsiSend(second, NULL, 0);
+-	if (on) {
+-		done &= dsiSend(bctrl, NULL, 0);
+-	}
++	done &= dsiSend(bctrl, NULL, 0);
+ 	IOLockUnlock(fBlLock);
+-	IOSleep(on ? 17 : off2);
+-	IOLog("SWEET FB: panel %s: %s\n", on ? "sleep out, display on" : "display off, sleep in",
+-	    done ? "done" : "NO DONE");
++	IOSleep(17);
+ 	return done;
+ }
+ 
++/*
++ * laurel 2872: the wake's self-check: one DCS 0x0A with the light still out (a disturbed frame cannot be seen). Bits 7, 4, 3, 2
++ * (booster, sleep out, normal, display on) must be set; bits 1, 0 are reserved in DCS and vendor-defined here (boot 19:34: 0x9f
++ * before the first real sleep, 0x9d after it). A panel found off gets the sleep-out sequence once and one more read.
++ * No answer 3 times: no more reads. Nothing here turns off the display path. Called with fPwrLock held, fBlHold set.
++ */
++void
++AppleCLCD::panelWakeCheck(void)
++{
++	uint8_t power = 0;
++	if (!fRdOn) {
++		return;
++	}
++	if (dsiDcsRead(0x0a, &power, 1) != 1) {
++		if (++fRdFails >= 3) {
++			fRdOn = false;
++			IOLog("LAUREL PANEL: wake check off: 3 reads without an answer (the display path goes on)\n");
++		}
++		return;
++	}
++	fRdFails = 0;
++	uint32_t n = ++fWakeChecks;
++	if ((power & LAUREL_POWER_ON) == LAUREL_POWER_ON) {
++		if (n <= 8 || power != fPanelPowerLast) {
++			IOLog("LAUREL PANEL: wake %u: panel power %#x (start %#x)\n", n, power, fPanelPower0);
++		}
++		fPanelPowerLast = power;
++		return;
++	}
++	bool done = panelWakeSeq();
++	uint8_t after = 0;
++	bool read = dsiDcsRead(0x0a, &after, 1) == 1;
++	fPanelPowerLast = after;
++	IOLog("LAUREL PANEL: wake %u: panel power %#x (start %#x): the panel is off: sleep out + display on once: %s, power now %#x%s\n",
++	    n, power, fPanelPower0, done ? "done" : "NO DONE", after, read ? "" : " (no answer)");
++}
++
+ bool
+ AppleCLCD::setPanelLevel(uint32_t level)
+ {
+@@ -1954,7 +2020,11 @@
+ 	(void)setPanelBctrl();                                  /* the wake sends it too; the boot chain may not have */
+ 	(void)PE_parse_boot_argn("laurelbl_read", &on, sizeof(on));
+ 	if (on == 0) {
+-		snprintf(how, size, "%s, no panel reads (laurelbl_read=0)", start);
++		/* laurel 2872: the transport that reached the panel at boot 19:34; the memory DMA did not answer and 0x53 stayed 0x28 */
++		fDsiFifo = true;
++		(void)setPanelBctrl();
++		(void)setPanelLevel(level);
++		snprintf(how, size, "%s, FIFO, no panel reads (laurelbl_read=0)", start);
+ 		return;
+ 	}
+ 	const char *path = NULL;
+@@ -1972,6 +2042,7 @@
+ 		return;
+ 	}
+ 	fRdOn = true;
++	fPanelPower0 = fPanelPowerLast = power;
+ 	(void)dsiDcsRead(0x54, &control, 1);
+ 	for (uint32_t i = 0; i < 4 && !fRd52; i++) {
+ 		uint32_t way = (way0 + i) & 3, a = 0, b = 0;
+@@ -2020,42 +2091,10 @@
+ 	if (n > LAUREL_BL_LOG_MAX && n % 50 != 0) {
+ 		return;
+ 	}
+-	/*
+-	 * laurel 2871: what the panel holds now, in the same line (fPwrLock: no power change during the read). When 0x52 followed the
+-	 * writes at start and does not now, the next way gets the level (at most 4 moves per boot; one more line says it).
+-	 */
+-	char held[120] = "";
+-	if (!off && sent == target && fb->fRdOn && fb->fPwrLock != NULL && IOLockTryLock(fb->fPwrLock)) {
+-		IOLockLock(fb->fLock);
+-		bool away = fb->fPowerOff || fb->fBlHold;
+-		IOLockUnlock(fb->fLock);
+-		uint32_t dbv = 0;
+-		uint8_t power = 0;
+-		if (!away && fb->panelDbv(&dbv) && fb->dsiDcsRead(0x0a, &power, 1) == 1) {
+-			fb->fRdFails = 0;
+-			snprintf(held, sizeof(held), "; panel holds DBV %u, power %#x%s", dbv, power, dbv == target ? "" : " (NOT the asked DBV)");
+-			IOLockLock(fb->fLock);
+-			bool same = fb->fBlLevel == target && fb->fBlSent == target;
+-			IOLockUnlock(fb->fLock);
+-			if (dbv != target && same && fb->fRd52 && fb->fDsiWayMoves < 4) {
+-				fb->fDsiWayMoves++;
+-				fb->dsiWay(fb->fDsiWay + 1);
+-				(void)fb->setPanelBctrl();
+-				bool sentAgain = fb->setPanelLevel(target);
+-				bool read = fb->panelDbv(&dbv);
+-				IOLog("LAUREL BACKLIGHT: the panel lost the level: next way %s: %s, reads %u\n", fb->dsiWayName(fb->fDsiWay),
+-				    sentAgain ? "sent" : "NO DONE", read ? dbv : 0);
+-			}
+-		} else if (!away && ++fb->fRdFails >= 3) {
+-			fb->fRdOn = false;
+-			IOLog("LAUREL BACKLIGHT: panel reads off: 3 without an answer in a row (writes go on)\n");
+-		}
+-		IOLockUnlock(fb->fPwrLock);
+-	}
+-	IOLog("LAUREL BACKLIGHT: brightness %u of 255 from %s -> DBV %u (%u nits): %s, %u panel writes, %u failed%s\n",
++	IOLog("LAUREL BACKLIGHT: brightness %u of 255 from %s -> DBV %u (%u nits): %s, %u panel writes, %u failed\n",
+ 	    value, from[0] ? from : "?", target, target * fb->fBlNits / (fb->fBlMax ? fb->fBlMax : 1),
+ 	    off ? "display off: kept for the wake" : sent == target ? "panel at it" : "panel still on its way",
+-	    writes, fails, held);
++	    writes, fails);
+ }
+ 
+ static void
+@@ -2195,6 +2234,8 @@
+ 	IOLog("LAUREL BACKLIGHT: on: DCS max %u (%s), %s; AppleARMBacklight %s (RedwoodGPU up: GPU renderer); slider 0..255 -> "
+ 	    "DBV max * (v/255)^2, one line per settled value; auto-brightness off: no ambient light sensor for iOS\n",
+ 	    fb->fBlMax, panel, fb->fDsiHow, published ? "published" : "failed");
++	IOLog("LAUREL PANEL: on: display off = light out + black frame, the panel stays awake (no 0x28/0x10); %s\n",
++	    fb->fRdOn ? "wake check: one DCS 0x0A after each display on; no other reads after the start" : "no wake check: no panel reads");
+ 	fb->release();
+ }
+ 
+@@ -2814,9 +2855,10 @@
+ 			}
+ 			/*
+ 			 * laurel 2201: one power change at a time (fPwrLock). Off: fade the light out while frames are
+-			 * still shown, then fPowerOff (black kernel frame), 0x28/0x10. On: fPowerOff clear (the latest
+-			 * frame is drawn), 0x11/0x29 (one retry), then the fade in to the last level. fBlHold keeps
+-			 * blWork away from the panel level until the change is done.
++			 * still shown, then fPowerOff (black kernel frame). On: fPowerOff clear (a waiting frame is drawn,
++			 * else the last one again), then the fade in to the last level. fBlHold keeps blWork away from the
++			 * panel level until the change is done. laurel 2872: no 0x28/0x10 (see fadeOut); the wake checks the
++			 * panel power mode once, with the light still out.
+ 			 */
+ 			if (fFB->fPwrLock != NULL) {
+ 				IOLockLock(fFB->fPwrLock);
+@@ -2836,17 +2878,17 @@
+ 			if (changed) {
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+-				fFB->fDirty = true;     /* on: redraw the latest frame */
++				if (!off) {
++					fFB->fWakeShow = true;
++					/* laurel 2872: fPending is the latest frame only on the copy path; the direct path: fWakeShow */
++					fFB->fDirty = fFB->fDirty || !fFB->fLastDirect;
++				}
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+-			bool woke = true;
+ 			if (dcs) {
+-				if (off) {
+-					(void)fFB->setPanelOn(false);
+-				} else if (!fFB->setPanelOn(true) && !fFB->setPanelOn(true)) {
+-					woke = false;
+-					fFB->fDcsOk = false;
+-					IOLog("LAUREL BACKLIGHT: off: wake 0x11/0x29 not done twice; display off shows a black frame only\n");
++				if (!off) {
++					IOSleep(17);    /* one frame: the frame above is latched */
++					fFB->panelWakeCheck();
+ 				}
+ 				IOLockLock(fFB->fLock);
+ 				fFB->fBlHold = false;
+@@ -2854,7 +2896,7 @@
+ 					fFB->fBlSent = 0;
+ 				}
+ 				IOLockUnlock(fFB->fLock);
+-				if (!off && woke) {
++				if (!off) {
+ 					laurel_bl_set(fFB, level, fFB->fFadeMs, ~0u);
+ 				}
+ 			}

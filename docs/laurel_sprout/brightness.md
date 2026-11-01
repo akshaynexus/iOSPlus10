@@ -1,7 +1,67 @@
-# Mi A3 brightness: the slider moves, the panel stays (2026-11-01, patches 2201, 2871)
+# Mi A3 brightness and panel power (2026-11-01, patches 2201, 2871, 2872)
 
-Status: 2201 fix BOOTED at 18:40: the panel still does not follow. 2871 built, NOT BOOTED. Marks: [V] seen in a source or log,
+Status: 2871 BOOTED at 19:34: the panel holds each level, and the screen stays black after the first lock. 2872 built, NOT BOOTED. Marks: [V] seen in a source or log,
 [I] inference, [U] unknown.
+
+## Boot 19:34: the screen stays black after the first lock; 2872 (2026-11-01; built, NOT BOOTED)
+
+Owner: "I turned off the phone and it won't turn on, the screen is just blank." Log: usblog-20261101-165828.txt, lines 36822..48604.
+
+Most probable cause [I, strong; not proven until the phone runs 2872]: 2871 made 0x28/0x10 reach the panel for the first time, and
+0x11 + 0x29 with the video stream running do not bring the picture back.
+- [V log] Start line: `FIFO, reads in LP; panel power 0x9f, control 0x28`. The memory DMA answered no read in LP or HS; only the FIFO answered. 2871 keeps
+  that transport for writes too.
+- [V code + log] `53 20` went out by the memory DMA before the reads; the first FIFO read of 0x54 still gave 0x28. [I] The memory DMA does not reach the panel.
+  This also explains the dead slider of boots 07:20 and 18:40 and the old topaz comment "the DCS commands do not reach the panel yet".
+- [V log] Boot 18:40 (memory DMA): 3 wakes from 18:44:46 to 18:46:16; the owner reported no black screen and touched the screen to 18:46:32. [I] Those commands had no effect: display off was only the black frame.
+- [V log] Boot 19:34: first display off of the boot at 19:42:55. Power reads: 0x9f at 19:35:01 and 19:42:21; 0x9d at all 7 reads after 19:42:55. So the sleep-in changed the panel, for good.
+- [V DT] Linux never sends this sequence: `qcom,mdss-dsi-lp11-init`, `reset-sequence` <1 12>, <0 2>, <1 10>, and an on-command set with vendor registers (FC, B0, ED, F0, E1, F4)
+  around 0x11 and 0x29, sent before the video starts. Which of these the panel needs: [U].
+
+Suspects tested:
+
+| Suspect | Result |
+|---|---|
+| (a) reads | Not the cause [I]: reads at start and at 19:35:01, 19:42:21; the owner kept using the screen (touches to 19:42:52). Only 2 reads in use: safety in video mode is NOT proven |
+| (a) FIFO, DMA line, watermarks | They are what made the commands arrive. All writes worked before the lock (116 writes, 0 failed, DBV read back) |
+| (b) wake too fast | Refuted [V code]: fPwrLock is held through 0x28, 20 ms, 0x10, 120 ms, then 0x11, 120 ms, 0x29. "Same second" fits: 277 ms is the minimum |
+| (c) no iOS frame | Not the cause [V log]: 4000 swaps at 19:43:21, 5000 at 19:43:42, redwood-gl frame 3960 at 19:43:46, no `LAUREL FB OWNER: refused`. `SWEET FPS` stops because a gap > 500 ms restarts its 10 s window [V code]; the last display off is 19:43:48 and no key came after it. A real hole was found here all the same: see below |
+| (d) 0x9d vs 0x9f | DCS 0x0A: bit 7 booster, 4 sleep out, 3 normal, 2 display on: all set in both. Bits 1, 0 are reserved in DCS [I, from the DCS definition]; meaning here [U]. Bit 1 is the only difference, and it follows the first sleep |
+| (e) fade stuck at DBV 4 | Refuted [V log]: `panel holds DBV 2047` after each wake |
+
+A hole found in (c) [V code], not the cause here: fPending is not the last frame on the direct path, so a wake with no new iOS frame presented an old record or stayed black.
+
+### 2872
+
+- Display off: fade to DBV 0, black kernel frame; **no 0x28/0x10**. The panel stays awake. Same dark, same power as all boots before 19:34 [I]: the DSI and the MDP already ran on.
+- Wake: nothing is sent unless the check finds the panel off. One DCS 0x0A, 17 ms after display on, with the light still out. Bits 0x9c not all set: 0x11, 120 ms, 0x29, `53 20` once, one more read, one line. 3 reads without an answer: no more checks.
+- Display on with the black frame still on the panel and nothing waiting: the first tick shows the last direct iOS frame again (fShowHold still holds its surface).
+- Reads: start self-check + the one wake check. The read-back in each settled-value line and the way moves are gone. Reason: 2 reads in use prove nothing about a disturbed frame in video mode, and the start self-check already proves the transport and the way.
+- `laurelbl_read=0`: no reads at all, writes by the FIFO (before: memory DMA, a dead slider [I]). `sweetfb_stayon=1` stays.
+- Real panel sleep is off, with no boot-arg. To add it later: stop the video, reset the panel, send the whole on-command set in LP-11, start the video, as Linux does. Not done: it needs its own test.
+
+Unproven until the phone runs it: the cause; that the screen comes back; that the slider now changes the light (the owner did not say; the log shows only that the panel holds each level). If the panel stays black with 2872, the cause is wrong: send the log.
+
+Expected lines:
+
+```
+LAUREL BACKLIGHT: on: DCS max 2047 (Samsung s6e8fco), DCS HS, DMA at line 1568, FIFO, reads in LP; panel power 0x9f, control 0x28, DBV follows the writes (DT mode, DMA line); AppleARMBacklight published ...
+LAUREL PANEL: on: display off = light out + black frame, the panel stays awake (no 0x28/0x10); wake check: one DCS 0x0A after each display on; no other reads after the start
+SWEET FB: display off
+LAUREL PANEL: wake 1: panel power 0x9f (start 0x9f)
+SWEET FB: display on
+LAUREL BACKLIGHT: brightness 128 of 255 from backboardd -> DBV 515 (108 nits): panel at it, 22 panel writes, 0 failed
+```
+Only sometimes: `LAUREL PANEL: display on, no new iOS frame yet: the last one again (1)`. Must be absent: `SWEET FB: panel display off, sleep in`, `SWEET FB: panel sleep out, display on`, `the panel is off: sleep out`.
+
+| Next log says | Meaning |
+|---|---|
+| picture comes back, power stays 0x9f | cause confirmed; bit 1 follows the real sleep |
+| picture comes back, power 0x9d | bit 1 does not mean what we think; picture is what counts |
+| black, power 0x9f, swaps go on | the cause is wrong: look at the frame path (`fScanPhys`, DBV) |
+| `the panel is off` line | the panel left the on state without our commands: look at what sent it |
+
+Test: (1) lock, wait 5 s, unlock, 5 times. (2) Press power fast 6 times. (3) Lock for 2 min, then unlock. (4) Slider low, high, low, with stops of 2 s: say if the light changes. (5) Black frame check: in a dark room, is the locked panel dark? Each time the picture must return within 1 s.
 
 ## Boot 18:40 (logs/laurel-boot-1840.txt, kernel with the 2201 fix): the owner says the slider does nothing
 

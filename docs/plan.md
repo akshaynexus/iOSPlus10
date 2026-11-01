@@ -910,3 +910,8 @@ Causes [V log + code]: every lost frame (13715) = the one 128-frame Tx queue ful
 Done: en0 output queue with flow control (kill switch wifi_txq=0), Rx 1 copy, Tx 2 copies, batches, 128 Tx slots, ring 512, Rx/Tx turns, no scan in the first 30 s or under any traffic, smoothed signal (beacons first), event 39 + RSSI_BOUNDS, drops by reason, thread cost, request log per link.
 Build: 280/280 patches (79 laurel), 0 LSE, kernel.development.sweet.4k sha256 f6d6b604dfe6cb05b9eaa4052b45854765b6b39e606add3101509d386cf2ebd6; wifi-phy-test.sh passes.
 Next: boot with this kernel; docs/laurel_sprout/wifi.md "Test": read `link` + `path` during fast.com; compare wifi_txq=0.
+
+## Mi A3: black screen after the lock, boot 19:34; display off keeps the panel awake (2026-11-01, branch t3/laurel-wake-blank, patch 2872; build only, NOT BOOTED)
+Owner: phone locked, screen never came back; iOS and the kernel alive. [I, strong] 2871's FIFO made 0x28/0x10 reach the panel for the first time; 0x11 + 0x29 with video running do not bring the picture back (power mode 0x9f -> 0x9d at the first sleep [V]). Suspects timing, frames, DBV: refuted by code and log; table in docs/laurel_sprout/brightness.md.
+Change: display off = fade to DBV 0 + black frame, no 0x28/0x10. Wake: one 0x0A with the light out, sleep-out sequence once only if the panel is off. Last direct iOS frame shown again if none is new. No reads after the start except that check.
+Build: 276/276 patches (75 laurel), 0 LSE, kernel sha256 9e57a0b5f9e35f81.... Next: boot image (`scripts/laurel/uefi-image.sh`) with this kernel, owner approves the flash, test in brightness.md. Open: real panel sleep (video stop, reset, whole on-command set, video start) if the battery needs it.

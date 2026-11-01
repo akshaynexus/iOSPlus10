@@ -4585,3 +4585,14 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - Gotcha: `git rebase --autosquash` in the stage tree stopped on conflict and `mkpatch` still ran on the old branch: check `git status` before making patches.
 - Build [V]: kernel-linux.sh 280/280 patches (79 laurel), 0 LSE, no warnings in the changed files, kernel sha256 f6d6b604dfe6cb05b9eaa4052b45854765b6b39e606add3101509d386cf2ebd6; wifi-phy-test.sh all checks passed (ASan + UBSan); bars checked against iOS's formula from -100 to -20 dBm.
 - Next: owner test, wifi.md "Test". Then decide from `wait` and `path`: A-MPDU, CPU, or DNS.
+## Mi A3: boot 19:34 black screen after the first lock = first real sleep-in; 2872 keeps the panel awake (2026-11-01, branch t3/laurel-wake-blank; built, NOT BOOTED)
+- Details, suspect table, expected lines, test: docs/laurel_sprout/brightness.md, first section. Log: usblog-20261101-165828.txt from line 36822.
+- [I, strong] 2871 chose the TPG FIFO because only the FIFO answers reads, and kept it for writes. So 0x28/0x10 reached the panel for the first time at 19:42:55, and 0x11 + 0x29 with video running did not bring the picture back. Not proven until the phone runs 2872.
+- [V log] `53 20` by the memory DMA, then FIFO read of 0x54 = 0x28. Power mode 0x9f (2 reads) before the first sleep, 0x9d (7 reads) after it. Swaps and GL frames go on; DBV reads back 2047; all DONE.
+- Lesson: when a fix makes a path work for the first time, every command on that path becomes real, also ones never tested. "It always worked" meant "it never arrived". Check what else a new transport turns on.
+- Lesson: DONE and a good power-mode byte do not prove a picture: 0x9d has display on and sleep out set while the panel was black [V owner + log].
+- [V code] `SWEET FB: display off` and `on` in the same second is normal: fPwrLock holds the whole sequence with its sleeps. `SWEET FPS` stopping proves nothing: a gap > 500 ms restarts its 10 s window. Use `N swaps` and `redwood-gl: frame`.
+- [V DT] The Samsung on-command set is not only 0x11 + 0x29: `FC`, `51 00 00`, `53 20`, `11`, 50 ms, `29`, then `B0`/`ED`/`F0`/`FC`/`E1`/`F4` vendor writes; lp11-init; reset 12/2/10 ms. A real panel sleep needs video stop + reset + this set + video start: not done.
+- [V code] Fixed hole: on the direct path fPending is not the last frame; a wake with no new iOS frame presented an old record or stayed black. Now the last direct frame is shown again.
+- Reads: start self-check + one per wake, with the light out. Settled-line read-back removed: 2 reads in use do not prove video-mode safety. `laurelbl_read=0` = no reads, FIFO writes.
+- Build [V]: kernel-linux.sh 276/276 patches, 0 failed, 0 LSE, no warnings in SweetFramebuffer.cpp, kernel.development.sweet.4k sha256 9e57a0b5f9e35f8127dca3f50ef196fb92eb3d669f0493bb488f0bf128c6bfa4.
