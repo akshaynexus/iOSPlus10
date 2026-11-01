@@ -754,3 +754,23 @@ Observed [V, usblog 07:20:52 boot, laurel-int-1 at e2c29b4 + EXTRA_ARGS=gpu_smmu
 Open: 2154 SMMU stage-1 faults on the CP ring and turns the GPU off (fix agent t3/laurel-smmu-pool-bt), so tests use
 gpu_smmu=0 until then; BT rampatch check rejects apbtfw10.tlv (same agent); RTC/status bar (2720 + root-statusbar.py, merged,
 needs a root rebuild); cellular step 1 (2760) merged, step 2 IPA in progress.
+
+## Mi A3: brightness slider fix (2201) + flashlight (2770 + LaurelFlashlight.driver) built (2026-11-01 08:10, branch t3/laurel-brightness-torch; build only, NOT BOOTED)
+
+Brightness [V log 07:27, V DT, V Linux source; cause I]: the slider values were sent (the missing `panel level` lines are
+the 8-line log cap) but in LP mode with no DMA line; the Samsung s6e8fco DT sends brightness/on/off in HS and Linux
+schedules each command DMA at the front-porch line (DSI_DMA_SCHEDULE_CTRL 0x100). 2201 now does both per panel, with a
+start self-check fallback (unscheduled, then LP). Also: one blWork at a time (THREAD_CALL_OPTIONS_ONCE), no stale fade
+step, wake at the user's level, one line per settled value. No ambient light sensor for iOS (stk3x3x on the ADSP hub):
+`root-brightness.py` sets BKEnableALS false. Details: docs/laurel_sprout/brightness.md.
+Flashlight: 2770 PMI632 flash LED torch (SID 3 0xD300, LED1, 12.5..150 mA, auto-off 600 s, off at OTST/fault, quiesce at
+halt/panic, `torch=0`), `/dev/laureltorch`, `/product/camera flash` (Control Center button) only with the plug-in;
+`userland/laurel/flashlight` (mediaserverd: FigFlashlight vendor hook + FigFlashlight server). Details:
+docs/laurel_sprout/torch.md.
+Also: 2760's bsd/conf/files hunk refreshed (it did not apply after 2720 on laurel-int-1).
+Build [V]: kernel-linux.sh 249/249 patches, 0 LSE, no warnings in the changed files, kernel.development.sweet.4k sha256
+f5e631b49c0833ff62bfc51582a698a51841c370f7819895a29e80f4aeed29aa. LaurelFlashlight.driver built (userland/laurel/flashlight/build.sh).
+Next: boot image with this kernel + root rebuild (root.sh: root-flashlight.sh + root-brightness.py; owner approves the
+userdata flash). Check `LAUREL BACKLIGHT: on: ... DCS HS, DMA at line 1567`, move the slider (panel must follow, one
+`brightness N of 255 ... -> DBV` line per stop), `LAUREL TORCH: on:`, `LAUREL TORCH UI: on:`, `LAUREL FLASHLIGHT: on:`,
+Control Center flashlight tap. If the panel still does not follow: DCS read 0x52 (negroni 0293 port).

@@ -30,7 +30,7 @@ mechanically: each port is re-written on the topaz files as `patches/laurel/xnu/
 
 Also ADAPT later: 0220 (AKS selectors topaz lacks), 0210/0360 USB command server, 0367 UFS boot log,
 0398 framebuffer blend/scale, 0399 wired-memory guard, 0288 PSCI cpuidle (trinket idle states), 0382 adaptive polls,
-0297 mmio-try, 0387 torch (PMI632 flash), 0253 refresh step, 0363/0378 (only if laurel moves to Mu + UniXNU).
+0297 mmio-try, 0387 torch (**done as laurel 2770**: PMI632 flash LED, `torch.md`), 0253 refresh step, 0363/0378 (only if laurel moves to Mu + UniXNU).
 
 ## Skip [V]
 
@@ -47,7 +47,7 @@ Charger 0270 (SPMI v7), 0273/0274/0368-0374/0385 (ADSP charger PD, VOOC). 0201/0
 PORT: `scripts/ios16/root-tweaks-extra.py` drop list (fairplayd.H2, vmd, ReportCrash, spindump, tailspind, aggregated,
 activityawardsd), ExtensionKit cache signing off, `FBLaunchWatchdogScale` 3, lsd jetsam 64 MiB; `root-tweaks-boldtext.py`;
 `userland/bluetooth` + `scripts/bt/*` + ADT bluetooth node; `userland/ssh` + `scripts/net/*`; `userland/screenshot`,
-`userland/uiopen`. ADAPT: `userland/rebootapp` (after 0211), `userland/location`, `userland/flashlight`.
+`userland/uiopen`. ADAPT: `userland/rebootapp` (after 0211), `userland/location`, `userland/flashlight` (**done**: `userland/laurel/flashlight`).
 SKIP: `userland/audio` (topaz `audio_plugin.c` has the same devices), camera/fp/metal/negronigl/turnip/gpu-policy.
 
 ## Risks

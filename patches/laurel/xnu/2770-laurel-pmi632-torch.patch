@@ -1,0 +1,818 @@
+laurel 2770: rear flashlight (torch) on the Mi A3. PMI632 flash LED module (qcom,qpnp-flash-led-v2, SPMI SID 3 0xD300, pmi632.dtsi:519; laurel uses torch_0 = LED1 only, ires 12.5 mA, DT max 950 mA) through the one SPMI core (user SWEET_SPMI_TORCH, sweet_spmi.c 2710 rule). Sequence as leds-qpnp-flash-v2.c qpnp_flash_led_switch_set: IRES 0x47, STROBE_CTRL 0x49 bit 2 = 0 (SW), TGR_CURRENT 0x43, SAFETY_TMR 0x40 = 0x13 (off: torch), MOD_CTRL 0x46 bit 7, then the PMI632 charger flash boost VREG_OK (SID 2 0xA607 bit 4, 5 ms x 60; 0xA608 & 7 = 7 = error), then EN_LED_CTRL 0x4C bit 0; off = EN_LED 0, MOD_CTRL off, TGR 0, timer 0x13. Every write read back; a failure = off for the boot (the off sequence still runs). Policy: 1..100 % = 12.5..150 mA (cap 150 mA, static assert <= DT max), auto-off 600 s, no light at an OTST level (LED_STATUS2 0x09 bits 0-2), lit: an OTST level, the led-fault bit (INT_RT bit 0; STATUS1 short/open and VPH droop named in the line) or a charger flash error turn it off (watch 100 ms); 3 faults = off. Halt/restart/panic: laurel_torch_quiesce (emergency SPMI writes, SweetPlatformExpert). iOS: /dev/laureltorch root:mobile 0660 (write "0".."100", read the state), LaurelTorch IOService (IOResources match) starts it; after the root mount IODeviceTree:/product/camera "flash" (MobileGestalt camera-flash = the Control Center button) only when the root has LaurelFlashlight.driver (userland/laurel/flashlight: mediaserverd plug-in that gives FigFlashlight a device whose TorchLevel lands here and starts the FigFlashlight server). Lines: `LAUREL TORCH: on: PMI632 flash LED SID3 0xd300 (...)` or `LAUREL TORCH: off: <why>`, `LAUREL TORCH UI: on|off: <why>`, `LAUREL TORCH: lit: P % = M mA (code C) by PROC`, `LAUREL TORCH: dark: <why> (lit N ms)`. Kill switch torch=0. Details: docs/laurel_sprout/torch.md.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e55b7f7..d8e9a65 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,7 @@ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/topaz_fw.c			standard
+ bsd/dev/topaz_redwood_audio.c		standard
+ bsd/dev/laurel_haptic.c			standard
++bsd/dev/laurel_torch.c			standard
+ bsd/kern/topaz_sandbox_container.c		standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+diff --git a/bsd/dev/laurel_torch.c b/bsd/dev/laurel_torch.c
+new file mode 100644
+index 0000000..5951c65
+--- /dev/null
++++ b/bsd/dev/laurel_torch.c
+@@ -0,0 +1,613 @@
++/*
++ * laurel_sprout (Xiaomi Mi A3, SM6125): the rear flashlight (torch) on the PMI632 flash LED (laurel 2770).
++ *
++ * Hardware [V external/laurel-kernel-los]:
++ *   pmi632.dtsi:519   qcom,leds@d300 "qcom,qpnp-flash-led-v2", SPMI SID 3, base 0xD300; interrupts led-fault (0xd3, 0),
++ *                     all-ramp-down (3), all-ramp-up (4); short/open-circuit and VPH droop detection; thermal derate.
++ *   laurel_sprout-trinket-camera.dtsi: the camera flash uses torch-source = torch_0 and switch_0 only: one LED on
++ *                     channel LED1 (id 0). torch_0: qcom,ires-ua 12500 (12.5 mA steps), laurel max-current 950 mA
++ *                     (laurel_sprout-trinket-power.dtsi), current-ma 900. switch_0 led-mask 3.
++ *   drivers/leds/leds-qpnp-flash-v2.c (offsets from the base):
++ *     0x08 LED_STATUS1  short/open per LED (fault IRQ prints it)
++ *     0x09 LED_STATUS2  bits 0-2 thermal OTST levels (derate table index), bit 4 VPH droop fault
++ *     0x10 INT_RT_STS   bit 0 led-fault
++ *     0x40+n SAFETY_TMR 0x13 = off (torch: no hardware timer; flash: 1280 ms)
++ *     0x43+n TGR_CURRENT bits 6:0, code = round(mA * 1000 / ires_uA) - 1
++ *     0x46 MOD_CTRL     bit 7 module enable
++ *     0x47 IRES         2 bits per LED: 0 = 12.5 mA (the DT's ires-ua)
++ *     0x49+n STROBE_CTRL bit 2 = HW strobe select (0 = SW strobe, ours)
++ *     0x4C EN_LED_CTRL  bit per LED (switch_0 mask 3)
++ *   qpnp_flash_led_switch_set (on): IRES, STROBE_CTRL, TGR_CURRENT, SAFETY_TMR, MOD_CTRL bit 7, then on PMI632
++ *     qpnp_flash_poll_vreg_ok: the charger's flash boost (schgm-flash.c, SID 2 0xA600) STATUS_2 0xA607 bit 4 VREG_OK,
++ *     every 5 ms up to 300 ms; STATUS_3 0xA608 bits 2:0 = 7 = flash error; no VREG_OK = module off again.
++ *     Last EN_LED_CTRL. Off (qpnp_flash_led_switch_disable): EN_LED_CTRL 0, MOD_CTRL bit 7 off, TGR_CURRENT 0,
++ *     SAFETY_TMR 0x13.
++ *   Android also sets the charger's FLASH_ACTIVE (qpnp-smb5.c: with USB present it holds VBUS at 5 V, no HVDCP); our
++ *   charger (laurel 2301) does no HVDCP, so there is nothing to hold [I].
++ *
++ * Policy (on by default; kill switch torch=0):
++ *   current     at most LT_CAP_MA = 150 mA (the DT allows 950 mA torch; 150 mA is our choice, a flashlight that does
++ *               not heat the camera module). Level 1..100 % -> 12.5..150 mA in 12.5 mA codes (code 0..11).
++ *   auto-off    LT_AUTO_OFF_S = 600 s after the light came on (a new level does not restart it; a new "on" does).
++ *   thermal     no light while LED_STATUS2 shows an OTST level; lit: any OTST level, the led-fault bit (STATUS1
++ *               short/open and VPH droop named) or a charger flash error turns it off. Watch every 100 ms while lit.
++ *   failures    a failed SPMI write or read-back: off for this boot (the off sequence still runs). 3 faults: off.
++ *   halt, restart, panic: laurel_torch_quiesce() (SweetPlatformExpert) writes EN_LED_CTRL 0 and MOD_CTRL off as
++ *               emergency SPMI writes (they run when the lock is busy for 5 ms).
++ * SPMI: laurel 2710 rule: only through the one core in sweet_spmi.c (user SWEET_SPMI_TORCH).
++ *
++ * iOS: /dev/laureltorch (root:mobile 0660). write ASCII "0".."100" (percent, newline allowed; 0 = off); read
++ *   "level=P ma=M code=C lit=0|1 cap_ma=150 auto_off_s=600 faults=N state=on|off reason=...". The mediaserverd plug-in
++ *   userland/laurel/flashlight (LaurelFlashlight.driver) gives FigFlashlight (Control Center, AVFlashlight) a
++ *   device whose TorchLevel 0..1 lands here. LaurelTorch.cpp publishes IODeviceTree:/product/camera "flash"
++ *   (MobileGestalt camera-flash: the Control Center button) after the root mount, only when this driver is on and
++ *   the root has the plug-in.
++ * Log: "LAUREL TORCH: on: ..." / "LAUREL TORCH: off: <why>" once at start; "LAUREL TORCH: lit ..." and
++ *   "LAUREL TORCH: dark: <why>" for the first LT_LOG changes, every fault and every auto-off.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/uio.h>
++#include <sys/proc.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern kern_return_t thread_terminate(thread_t);
++extern void proc_selfname(char *buf, int size);
++
++int laurel_torch_start(void);                   /* LaurelTorch::start (IOKit matching thread) */
++void laurel_torch_quiesce(void);                /* SweetPlatformExpert: halt, restart, panic */
++int laurel_torch_publish_flash(void);           /* LaurelTorch.cpp: IODeviceTree:/product/camera flash */
++void laurel_torch_state(uint32_t *percent, uint32_t *ma, bool *lit, bool *on);
++
++#define LT_SID          3u
++#define LT_BASE         0xd300u
++#define LT_PPID         ((LT_SID << 8) | (LT_BASE >> 8))        /* 0x3d3 */
++#define LT_CHG_SID      2u
++#define LT_CHG_BASE     0xa600u                                 /* SCHGM_FLASH (charger flash boost) */
++#define LT_NO_APID      0xffffu
++
++/* flash module registers (offsets in the peripheral); LED1 = id 0 */
++#define LT_REG_REV2     0x01u
++#define LT_REG_TYPE     0x04u
++#define LT_REG_STATUS1  0x08u
++#define LT_REG_STATUS2  0x09u
++#define LT_OTST_MASK    0x07u
++#define LT_VPH_DROOP    0x10u
++#define LT_REG_INT_RT   0x10u
++#define LT_FAULT_BIT    0x01u
++#define LT_REG_SAFETY   0x40u
++#define LT_SAFETY_OFF   0x13u
++#define LT_REG_TGR      0x43u
++#define LT_CODE_MASK    0x7fu
++#define LT_REG_MOD_CTRL 0x46u
++#define LT_MOD_EN       0x80u
++#define LT_REG_IRES     0x47u
++#define LT_IRES_MASK    0x03u           /* LED1's 2 bits; 0 = 12.5 mA */
++#define LT_REG_STROBE   0x49u
++#define LT_HW_STROBE    0x04u
++#define LT_REG_EN_LED   0x4cu
++#define LT_EN_MASK      0x03u           /* switch_0 led-mask */
++#define LT_EN_LED1      0x01u
++/* charger flash boost (schgm-flash.h) */
++#define LT_CHG_STATUS2  0x07u
++#define LT_VREG_OK      0x10u
++#define LT_CHG_STATUS3  0x08u
++#define LT_CHG_ERROR    0x07u
++
++/* policy */
++#define LT_IRES_UA      12500u          /* qcom,ires-ua of torch_0 */
++#define LT_DT_MAX_MA    950u            /* laurel qcom,max-current of torch_0 */
++#define LT_CAP_MA       150u
++#define LT_AUTO_OFF_S   600u
++#define LT_WATCH_MS     100u
++#define LT_VREG_TRIES   60u             /* x 5 ms, qpnp_flash_poll_vreg_ok */
++#define LT_FAULT_MAX    3u
++#define LT_LOG          24u
++_Static_assert(LT_CAP_MA <= LT_DT_MAX_MA, "torch cap above the DT max-current");
++_Static_assert((LT_CAP_MA * 1000u + LT_IRES_UA / 2u) / LT_IRES_UA - 1u <= LT_CODE_MASK, "torch code above 7 bits");
++
++static LCK_GRP_DECLARE(lt_grp, "laurel_torch");
++static LCK_MTX_DECLARE(lt_lock, &lt_grp);       /* every SPMI sequence and the state below */
++
++static uint16_t lt_apid = LT_NO_APID, lt_chg_apid = LT_NO_APID;
++static bool lt_ready;                           /* self-check passed */
++static volatile bool lt_dead;                   /* off for this boot */
++static volatile bool lt_ever_lit;               /* quiesce has something to do */
++static bool lt_lit;
++static uint32_t lt_percent, lt_ma, lt_code;
++static uint64_t lt_lit_since;
++static uint32_t lt_faults, lt_said;
++static uint8_t lt_mod_base;                     /* MOD_CTRL without bit 7, as found */
++static char lt_reason[96] = "never lit";
++static int lt_event;
++
++static uint64_t
++lt_abs(uint64_t ms)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime(ms * NSEC_PER_MSEC, &t);
++	return t;
++}
++
++static uint64_t
++lt_ms(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++/* ---- SPMI (the one core, sweet_spmi.c) ---------------------------------------------------------------- */
++
++static int
++lt_read(unsigned off, uint8_t *v)
++{
++	return lt_apid != LT_NO_APID && sweet_spmi_ext_read(SWEET_SPMI_TORCH, lt_apid, off, v, 1, NULL) == 0 ? 0 : -1;
++}
++
++static int
++lt_chg_read(unsigned off, uint8_t *v)
++{
++	return lt_chg_apid != LT_NO_APID && sweet_spmi_ext_read(SWEET_SPMI_TORCH, lt_chg_apid, off, v, 1, NULL) == 0 ? 0 : -1;
++}
++
++/* one byte, read back (a register that does not read back what was written: the feature stops) */
++static int
++lt_write(unsigned off, uint8_t v, uint8_t check_mask)
++{
++	uint8_t back = 0;
++	if (lt_apid == LT_NO_APID || sweet_spmi_ext_write(SWEET_SPMI_TORCH, lt_apid, off, &v, 1, false) != 0) {
++		return -1;
++	}
++	if (check_mask != 0 && (lt_read(off, &back) != 0 || (back & check_mask) != (v & check_mask))) {
++		return -1;
++	}
++	return 0;
++}
++
++static int
++lt_masked(unsigned off, uint8_t mask, uint8_t v)
++{
++	uint8_t cur = 0;
++	if (lt_read(off, &cur) != 0) {
++		return -1;
++	}
++	return lt_write(off, (uint8_t)((cur & ~mask) | (v & mask)), mask);
++}
++
++/* ---- the light ------------------------------------------------------------------------------------------ */
++
++static uint32_t
++lt_code_for(uint32_t percent, uint32_t *ma)
++{
++	uint32_t want = (LT_CAP_MA * percent + 50u) / 100u;             /* mA */
++	uint32_t code = (want * 1000u + LT_IRES_UA / 2u) / LT_IRES_UA;   /* round(mA / 12.5) */
++	code = code == 0 ? 0 : code - 1;
++	uint32_t max = (LT_CAP_MA * 1000u + LT_IRES_UA / 2u) / LT_IRES_UA - 1u;
++	code = code > max ? max : code;
++	*ma = (code + 1u) * LT_IRES_UA / 1000u;
++	return code;
++}
++
++/* LED off, module off, current 0, timer off (switch_disable); every write tried even when one fails */
++static int
++lt_off_locked(void)
++{
++	int rc = 0;
++	rc |= lt_masked(LT_REG_EN_LED, LT_EN_MASK, 0);
++	rc |= lt_write(LT_REG_MOD_CTRL, lt_mod_base, LT_MOD_EN);
++	rc |= lt_masked(LT_REG_TGR, LT_CODE_MASK, 0);
++	rc |= lt_write(LT_REG_SAFETY, LT_SAFETY_OFF, 0);
++	lt_lit = false;
++	return rc;
++}
++
++static void
++lt_dark_locked(const char *why, bool always_log)
++{
++	bool was = lt_lit;
++	int rc = lt_off_locked();
++	uint64_t on_ms = was ? lt_ms(mach_absolute_time() - lt_lit_since) : 0;
++	snprintf(lt_reason, sizeof(lt_reason), "%s", why);
++	if (rc != 0) {
++		lt_dead = true;
++		printf("LAUREL TORCH: off: the off sequence failed after \"%s\" (SPMI); torch off for this boot\n", why);
++		return;
++	}
++	if (was && (always_log || lt_said < LT_LOG)) {
++		lt_said++;
++		printf("LAUREL TORCH: dark: %s (lit %llu ms)\n", why, on_ms);
++	}
++}
++
++static void
++lt_fault_locked(const char *what, uint8_t st1, uint8_t st2, uint8_t rt)
++{
++	char why[96];
++	lt_faults++;
++	snprintf(why, sizeof(why), "%s (STATUS1 %#x STATUS2 %#x INT_RT %#x), fault %u of %u", what, st1, st2, rt,
++	    lt_faults, LT_FAULT_MAX);
++	lt_dark_locked(why, true);
++	if (lt_faults >= LT_FAULT_MAX && !lt_dead) {
++		lt_dead = true;
++		printf("LAUREL TORCH: off: %u faults; torch off for this boot\n", lt_faults);
++	}
++}
++
++/* status before and while lit: 0 = fine; else the fault was handled (light off) */
++static int
++lt_check_locked(bool before)
++{
++	uint8_t st1 = 0, st2 = 0, rt = 0, cs3 = 0;
++	if (lt_read(LT_REG_STATUS1, &st1) != 0 || lt_read(LT_REG_STATUS2, &st2) != 0 || lt_read(LT_REG_INT_RT, &rt) != 0) {
++		lt_dark_locked("status read failed (SPMI)", true);
++		lt_dead = true;
++		printf("LAUREL TORCH: off: status read failed; torch off for this boot\n");
++		return -1;
++	}
++	if (st2 & LT_OTST_MASK) {
++		lt_fault_locked(before ? "over-temperature (OTST), not lit" : "over-temperature (OTST)", st1, st2, rt);
++		return -1;
++	}
++	/* as the Linux fault IRQ: STATUS1 (short/open) and the VPH droop bit are read when the led-fault bit is set */
++	if (!before && (rt & LT_FAULT_BIT)) {
++		lt_fault_locked(st1 ? "led-fault: LED short/open" : (st2 & LT_VPH_DROOP) ? "led-fault: VPH droop" : "led-fault",
++		    st1, st2, rt);
++		return -1;
++	}
++	if (!before && lt_chg_read(LT_CHG_STATUS3, &cs3) == 0 && (cs3 & LT_CHG_ERROR) == LT_CHG_ERROR) {
++		lt_fault_locked("charger flash boost error", st1, st2, rt);
++		return -1;
++	}
++	return 0;
++}
++
++/* qpnp_flash_led_switch_set for LED1 in torch mode, or a new current while lit */
++static int
++lt_set_locked(uint32_t percent)
++{
++	uint32_t ma = 0, code;
++	if (lt_dead || !lt_ready) {
++		return EIO;
++	}
++	if (percent == 0) {
++		lt_percent = 0;
++		lt_dark_locked("off (request)", false);
++		return lt_dead ? EIO : 0;
++	}
++	if (lt_faults >= LT_FAULT_MAX) {
++		return EBUSY;
++	}
++	percent = percent > 100 ? 100 : percent;
++	code = lt_code_for(percent, &ma);
++	if (lt_check_locked(true) != 0) {
++		return EBUSY;
++	}
++	if (lt_lit) {
++		if (lt_masked(LT_REG_TGR, LT_CODE_MASK, (uint8_t)code) != 0) {
++			lt_dark_locked("current write failed (SPMI)", true);
++			lt_dead = true;
++			return EIO;
++		}
++	} else {
++		if (lt_masked(LT_REG_IRES, LT_IRES_MASK, 0) != 0 || lt_masked(LT_REG_STROBE, LT_HW_STROBE, 0) != 0 ||
++		    lt_masked(LT_REG_TGR, LT_CODE_MASK, (uint8_t)code) != 0 || lt_write(LT_REG_SAFETY, LT_SAFETY_OFF, 0x80) != 0 ||
++		    lt_write(LT_REG_MOD_CTRL, (uint8_t)(lt_mod_base | LT_MOD_EN), LT_MOD_EN) != 0) {
++			lt_dark_locked("setup write failed (SPMI)", true);
++			lt_dead = true;
++			printf("LAUREL TORCH: off: a setup write did not read back; torch off for this boot\n");
++			return EIO;
++		}
++		lt_ever_lit = true;
++		uint8_t vreg = 0, cs3 = 0;
++		unsigned tries;
++		for (tries = 0; tries < LT_VREG_TRIES; tries++) {
++			delay_for_interval(5, NSEC_PER_MSEC);
++			if (lt_chg_read(LT_CHG_STATUS2, &vreg) != 0) {
++				break;
++			}
++			if (vreg & LT_VREG_OK) {
++				break;
++			}
++			if (lt_chg_read(LT_CHG_STATUS3, &cs3) == 0 && (cs3 & LT_CHG_ERROR) == LT_CHG_ERROR) {
++				break;
++			}
++		}
++		if (!(vreg & LT_VREG_OK)) {
++			char why[96];
++			snprintf(why, sizeof(why), "flash boost VREG_OK not set in %u ms (charger 0xA607 %#x, 0xA608 %#x)",
++			    (tries + 1) * 5u, vreg, cs3);
++			lt_lit = true;          /* so the off sequence logs the reason */
++			lt_fault_locked(why, 0, 0, 0);
++			return EIO;
++		}
++		if (lt_masked(LT_REG_EN_LED, LT_EN_MASK, LT_EN_LED1) != 0) {
++			lt_lit = true;
++			lt_dark_locked("LED enable write failed (SPMI)", true);
++			lt_dead = true;
++			return EIO;
++		}
++		lt_lit = true;
++		lt_lit_since = mach_absolute_time();
++		thread_wakeup((event_t)&lt_event);
++	}
++	if (lt_said < LT_LOG) {
++		char name[24];
++		proc_selfname(name, sizeof(name));
++		lt_said++;
++		printf("LAUREL TORCH: lit: %u %% = %u mA (code %u) by %s\n", percent, ma, code, name);
++	}
++	lt_percent = percent;
++	lt_ma = ma;
++	lt_code = code;
++	snprintf(lt_reason, sizeof(lt_reason), "lit");
++	return 0;
++}
++
++/* watch while lit: faults, thermal, auto-off */
++static void
++lt_watch(__unused void *arg, __unused wait_result_t wr)
++{
++	lck_mtx_lock(&lt_lock);
++	for (;;) {
++		if (lt_lit && !lt_dead) {
++			if (lt_check_locked(false) == 0 &&
++			    lt_ms(mach_absolute_time() - lt_lit_since) >= (uint64_t)LT_AUTO_OFF_S * 1000u) {
++				char why[48];
++				snprintf(why, sizeof(why), "auto-off after %u s", LT_AUTO_OFF_S);
++				lt_percent = 0;
++				lt_dark_locked(why, true);
++			}
++		}
++		if (lt_lit && !lt_dead) {
++			(void)lck_mtx_sleep_deadline(&lt_lock, LCK_SLEEP_DEFAULT, (event_t)&lt_event, THREAD_UNINT,
++			    mach_absolute_time() + lt_abs(LT_WATCH_MS));
++		} else {
++			(void)lck_mtx_sleep(&lt_lock, LCK_SLEEP_DEFAULT, (event_t)&lt_event, THREAD_UNINT);
++		}
++	}
++}
++
++/* ---- /dev/laureltorch ----------------------------------------------------------------------------------- */
++
++static int
++lt_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	char text[16];
++	user_ssize_t n = uio_resid(uio);
++	if (n <= 0 || n >= (user_ssize_t)sizeof(text)) {
++		return EINVAL;
++	}
++	int error = uiomove(text, (int)n, uio);
++	if (error != 0) {
++		return error;
++	}
++	text[n] = 0;
++	uint32_t percent = 0;
++	unsigned i = 0, digits = 0;
++	for (; text[i] >= '0' && text[i] <= '9' && digits < 4; i++, digits++) {
++		percent = percent * 10u + (uint32_t)(text[i] - '0');
++	}
++	if (digits == 0 || (text[i] != 0 && text[i] != '\n')) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&lt_lock);
++	error = lt_set_locked(percent);
++	lck_mtx_unlock(&lt_lock);
++	return error;
++}
++
++static int
++lt_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	char text[200];
++	lck_mtx_lock(&lt_lock);
++	int len = snprintf(text, sizeof(text), "level=%u ma=%u code=%u lit=%d cap_ma=%u auto_off_s=%u faults=%u state=%s reason=%s\n",
++	    lt_lit ? lt_percent : 0, lt_lit ? lt_ma : 0, lt_lit ? lt_code : 0, lt_lit ? 1 : 0, LT_CAP_MA, LT_AUTO_OFF_S,
++	    lt_faults, lt_ready && !lt_dead ? "on" : "off", lt_reason);
++	lck_mtx_unlock(&lt_lock);
++	if (len < 0) {
++		return EIO;
++	}
++	len = len >= (int)sizeof(text) ? (int)sizeof(text) - 1 : len;
++	off_t off = uio_offset(uio);
++	if (off >= len) {
++		return 0;
++	}
++	return uiomove(text + off, len - (int)off, uio);
++}
++
++static int
++lt_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static const struct cdevsw lt_cdevsw = {
++	.d_open = lt_dev_open,
++	.d_close = lt_dev_open,
++	.d_read = lt_dev_read,
++	.d_write = lt_dev_write,
++	.d_ioctl = eno_ioctl,
++	.d_stop = eno_stop,
++	.d_reset = eno_reset,
++	.d_ttys = NULL,
++	.d_select = eno_select,
++	.d_mmap = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type = 0,
++};
++
++static bool
++lt_exists(const char *path)
++{
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, 0, &vp, vfs_context_kernel()) != 0) {
++		return false;
++	}
++	vnode_put(vp);
++	return true;
++}
++
++#define LT_PLUGIN       "/System/Library/Audio/Plug-Ins/HAL/LaurelFlashlight.driver/LaurelFlashlight"
++#define LT_GID_MOBILE   501
++
++/* after the root mount (devfs is up then): the node, then the Control Center button (MobileGestalt camera-flash) */
++static void
++lt_root_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	unsigned waited = 0;
++	while (rootvnode == NULLVP && waited < 600u * 1000u) {
++		delay_for_interval(20, NSEC_PER_MSEC);
++		waited += 20;
++	}
++	int major = cdevsw_add(-1, &lt_cdevsw);
++	void *node = major < 0 ? NULL :
++	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, LT_GID_MOBILE, 0660, "laureltorch");
++	if (rootvnode == NULLVP) {
++		printf("LAUREL TORCH UI: off: no root file system after %u s\n", waited / 1000u);
++	} else if (node == NULL) {
++		printf("LAUREL TORCH UI: off: /dev/laureltorch not made (devfs)\n");
++	} else if (!lt_exists(LT_PLUGIN)) {
++		printf("LAUREL TORCH UI: off: no %s in the root (scripts/laurel/root-flashlight.sh): no Control Center button\n",
++		    LT_PLUGIN);
++	} else if (laurel_torch_publish_flash() != 0) {
++		printf("LAUREL TORCH UI: off: IODeviceTree:/product/camera flash not published\n");
++	} else {
++		printf("LAUREL TORCH UI: on: /dev/laureltorch, IODeviceTree:/product/camera flash (Control Center button; "
++		    "mediaserverd LaurelFlashlight.driver -> FigFlashlight TorchLevel)\n");
++	}
++	(void)thread_terminate(current_thread());
++}
++
++/* ---- start, state, quiesce ------------------------------------------------------------------------------ */
++
++int
++laurel_torch_start(void)
++{
++	static bool tried;
++	uint32_t on = 1;
++	thread_t th;
++
++	if (tried) {
++		return lt_ready ? 0 : -1;
++	}
++	tried = true;
++	(void)PE_parse_boot_argn("torch", &on, sizeof(on));
++	if (on == 0) {
++		printf("LAUREL TORCH: off: torch=0\n");
++		return -1;
++	}
++	if (sweet_spmi_register(SWEET_SPMI_TORCH) != 0) {
++		printf("LAUREL TORCH: off: SPMI arbiter not ready (LAUREL SPMI line)\n");
++		return -1;
++	}
++	int owner = 8, chg_owner = 8;
++	int apid = sweet_spmi_apid(LT_SID, LT_BASE >> 8, &owner);
++	int chg = sweet_spmi_apid(LT_CHG_SID, LT_CHG_BASE >> 8, &chg_owner);
++	if (apid < 0) {
++		printf("LAUREL TORCH: off: no SPMI APID for PMI632 SID3 0xd300 (PPID 0x%03x)\n", LT_PPID);
++		return -1;
++	}
++	if (owner != 0) {
++		printf("LAUREL TORCH: off: APID %d (SID3 0xd300) is owned by EE %d, not the apps EE 0\n", apid, owner);
++		return -1;
++	}
++	if (chg < 0) {
++		printf("LAUREL TORCH: off: no SPMI APID for the charger flash boost SID2 0xa600 (VREG_OK cannot be read)\n");
++		return -1;
++	}
++	if (sweet_spmi_rw_map((unsigned)apid) != 0) {
++		printf("LAUREL TORCH: off: rw channel of APID %d not mapped\n", apid);
++		return -1;
++	}
++	lck_mtx_lock(&lt_lock);
++	lt_apid = (uint16_t)apid;
++	lt_chg_apid = (uint16_t)chg;
++	uint8_t type = 0, sub = 0, rev = 0, mod = 0, en = 0, st2 = 0, vreg = 0, tgr = 0, back = 0xff;
++	if (lt_read(LT_REG_TYPE, &type) != 0 || lt_read(LT_REG_TYPE + 1, &sub) != 0 || lt_read(LT_REG_REV2, &rev) != 0 ||
++	    lt_read(LT_REG_MOD_CTRL, &mod) != 0 || lt_read(LT_REG_EN_LED, &en) != 0 || lt_read(LT_REG_STATUS2, &st2) != 0 ||
++	    lt_read(LT_REG_TGR, &tgr) != 0 || lt_chg_read(LT_CHG_STATUS2, &vreg) != 0) {
++		lck_mtx_unlock(&lt_lock);
++		printf("LAUREL TORCH: off: SPMI read of SID3 0xd300 / SID2 0xa600 failed (APID %d / %d)\n", apid, chg);
++		return -1;
++	}
++	if (type == 0xffu || (type == 0 && sub == 0)) {
++		lck_mtx_unlock(&lt_lock);
++		printf("LAUREL TORCH: off: SID3 0xd300 type 0x%02x subtype 0x%02x: no flash module\n", type, sub);
++		return -1;
++	}
++	lt_mod_base = (uint8_t)(mod & ~LT_MOD_EN);
++	/* the boot chain left it on: off first. Then the handshake: TGR_CURRENT 1 and back to 0 (module off: no light) */
++	if (((en & LT_EN_MASK) || (mod & LT_MOD_EN)) && lt_off_locked() != 0) {
++		lck_mtx_unlock(&lt_lock);
++		printf("LAUREL TORCH: off: the boot chain left the flash module on (EN_LED %#x MOD_CTRL %#x) and the off failed\n",
++		    en, mod);
++		return -1;
++	}
++	if (lt_masked(LT_REG_EN_LED, LT_EN_MASK, 0) != 0 || lt_masked(LT_REG_TGR, LT_CODE_MASK, 1) != 0 ||
++	    lt_masked(LT_REG_TGR, LT_CODE_MASK, 0) != 0 || lt_read(LT_REG_TGR, &back) != 0 || (back & LT_CODE_MASK) != 0) {
++		lck_mtx_unlock(&lt_lock);
++		printf("LAUREL TORCH: off: TGR_CURRENT write did not read back (was %#x, now %#x)\n", tgr, back);
++		return -1;
++	}
++	lt_lit = false;
++	lck_mtx_unlock(&lt_lock);
++	if (kernel_thread_start(lt_watch, NULL, &th) != KERN_SUCCESS) {
++		printf("LAUREL TORCH: off: no watch thread\n");
++		return -1;
++	}
++	thread_deallocate(th);
++	lt_ready = true;
++	uint32_t ma_max = 0;
++	(void)lt_code_for(100, &ma_max);
++	printf("LAUREL TORCH: on: PMI632 flash LED SID3 0xd300 (APID %d, type 0x%02x/0x%02x rev 0x%02x, EN_LED %#x MOD_CTRL %#x, "
++	    "STATUS2 %#x, boost VREG %#x), LED1 torch 12.5 mA steps, 1..100 %% = 12..%u mA (DT max %u mA), auto-off %u s, "
++	    "off at over-temperature or a fault; /dev/laureltorch after the root mount\n",
++	    apid, type, sub, rev, en, mod, st2, vreg, ma_max, LT_DT_MAX_MA, LT_AUTO_OFF_S);
++	if (kernel_thread_start(lt_root_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		printf("LAUREL TORCH UI: off: no root-wait thread (no /dev/laureltorch)\n");
++	}
++	return 0;
++}
++
++void
++laurel_torch_state(uint32_t *percent, uint32_t *ma, bool *lit, bool *on)
++{
++	*percent = lt_lit ? lt_percent : 0;
++	*ma = lt_lit ? lt_ma : 0;
++	*lit = lt_lit;
++	*on = lt_ready && !lt_dead;
++}
++
++/* halt, restart, panic: LED and module off without the driver lock (emergency SPMI writes, bounded) */
++void
++laurel_torch_quiesce(void)
++{
++	if (!lt_ever_lit || lt_apid == LT_NO_APID) {
++		return;
++	}
++	lt_ready = false;               /* no write lights it after this */
++	uint8_t zero = 0, mod = lt_mod_base;
++	(void)sweet_spmi_ext_write(SWEET_SPMI_TORCH, lt_apid, LT_REG_EN_LED, &zero, 1, true);
++	(void)sweet_spmi_ext_write(SWEET_SPMI_TORCH, lt_apid, LT_REG_MOD_CTRL, &mod, 1, true);
++	lt_lit = false;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 27b38d0..a46eb2c 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -69,7 +69,7 @@ static volatile uint32_t sp_xfer_word;
+ 
+ /* users and error counts (sweet_spmi_errors) */
+ static const char *const sp_user_name[SWEET_SPMI_USERS] = {
+-	"pon", "keys", "battery", "haptic", "rtc",
++	"pon", "keys", "battery", "haptic", "rtc", "torch",
+ };
+ static volatile uint32_t sp_registered;          /* bit per user */
+ static volatile uint32_t sp_errs[SWEET_SPMI_USERS];
+@@ -340,9 +340,9 @@ sweet_spmi_errors(char *buf, size_t len)
+ 	if (!buf || !len) {
+ 		return;
+ 	}
+-	(void)snprintf(buf, len, "spmi errors pon %u keys %u battery %u haptic %u rtc %u, forced %u",
++	(void)snprintf(buf, len, "spmi errors pon %u keys %u battery %u haptic %u rtc %u torch %u, forced %u",
+ 	    sp_errs[SWEET_SPMI_PON], sp_errs[SWEET_SPMI_KEYS], sp_errs[SWEET_SPMI_BATTERY],
+-	    sp_errs[SWEET_SPMI_HAPTIC], sp_errs[SWEET_SPMI_RTC], sp_forced);
++	    sp_errs[SWEET_SPMI_HAPTIC], sp_errs[SWEET_SPMI_RTC], sp_errs[SWEET_SPMI_TORCH], sp_forced);
+ }
+ 
+ int
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 4fb99fa..6b46b13 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -36,6 +36,7 @@ enum {
+ 	SWEET_SPMI_BATTERY,     /* laurel_pmi632.c, SweetBattery.cpp, laurel_thermal.c (sweet_spmi_read/_write) */
+ 	SWEET_SPMI_HAPTIC,      /* laurel_haptic.c */
+ 	SWEET_SPMI_RTC,         /* laurel_rtc.c (laurel 2720: PM6125 RTC_RW 0x6000, reads only) */
++	SWEET_SPMI_TORCH,       /* laurel_torch.c (laurel 2770: PMI632 flash LED SID 3 0xd300, charger flash SID 2 0xa600 reads) */
+ 	SWEET_SPMI_USERS
+ };
+ int sweet_spmi_register(int user);
+diff --git a/iokit/Kernel/arm/LaurelTorch.cpp b/iokit/Kernel/arm/LaurelTorch.cpp
+new file mode 100644
+index 0000000..c543fb0
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelTorch.cpp
+@@ -0,0 +1,84 @@
++/*
++ * laurel_sprout (Mi A3): the flashlight service (laurel 2770). The hardware driver is bsd/dev/laurel_torch.c
++ * (PMI632 flash LED, /dev/laureltorch); this class starts it from IOKit matching (IOResources, as LaurelVibrator)
++ * and gives iOS the one thing it reads in the device tree:
++ *
++ * laurel_torch_publish_flash(): IODeviceTree:/product/camera "flash" (any value). [V negroni userland/flashlight
++ * README, 20H392 disassembly]: +[AVFlashlight hasFlashlight] = MGGetBoolAnswer("camera-flash"); libMobileGestalt
++ * answers true when IODeviceTree:/product/camera has a property "flash" (presence only). Without it Control Center
++ * has no flashlight button. Called by laurel_torch.c after the root mount, only when the torch self-check passed and
++ * the root has the mediaserverd plug-in LaurelFlashlight.driver (userland/laurel/flashlight): with the button and
++ * no plug-in, Control Center would talk to a FigFlashlight server that is never started
++ * (com.apple.coremedia.flashlight is a MachService of mediaserverd [V root plist]; the root has
++ * StartRecorderServer false, so mediaserverd starts no capture server itself).
++ * Not in scripts/laurel/mkadt.py on purpose (as /product/haptics in LaurelVibrator.cpp).
++ * [I] /product/camera may also make MobileGestalt answer other camera keys; this port has no camera driver.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IORegistryEntry.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++
++extern "C" int laurel_torch_start(void);
++extern "C" int laurel_torch_publish_flash(void);
++
++class LaurelTorch : public IOService {
++	OSDeclareDefaultStructors(LaurelTorch);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(LaurelTorch, IOService);
++
++bool
++LaurelTorch::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	bool on = laurel_torch_start() == 0;     /* one "LAUREL TORCH: on|off: ..." line */
++	setProperty("laurel-torch", on ? "on" : "off");
++	setProperty("torch-device", "/dev/laureltorch");
++	setProperty("torch-cap-ma", 150ULL, 32);
++	setProperty("torch-auto-off-s", 600ULL, 32);
++	registerService();
++	return true;
++}
++
++extern "C" int
++laurel_torch_publish_flash(void)
++{
++	IORegistryEntry *product = IORegistryEntry::fromPath("/product", gIODTPlane);
++	if (product == NULL) {
++		IOLog("LAUREL TORCH UI: no IODeviceTree:/product (ADT built without d22ap.adt)\n");
++		return -1;
++	}
++	static const uint32_t one = 1;
++	OSData *flash = OSData::withBytes(&one, sizeof(one));
++	IORegistryEntry *camera = product->childFromPath("camera", gIODTPlane);
++	bool ok = flash != NULL;
++	if (ok && camera != NULL) {
++		ok = camera->setProperty("flash", flash);       /* a /product/camera from the ADT: add the property */
++		camera->release();
++	} else if (ok) {
++		static const char name[] = "camera";
++		IORegistryEntry *node = new IORegistryEntry;
++		OSData *n = OSData::withBytes(name, sizeof(name));
++		ok = node != NULL && n != NULL && node->init(NULL);
++		if (ok) {
++			node->setName(name);
++			ok = node->setProperty("name", n) && node->setProperty("flash", flash) &&
++			    node->attachToParent(product, gIODTPlane);
++		}
++		OSSafeReleaseNULL(n);
++		OSSafeReleaseNULL(node);        /* the parent link keeps it */
++	}
++	OSSafeReleaseNULL(flash);
++	product->release();
++	return ok ? 0 : -1;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 77f54be..29f8188 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -19,11 +19,25 @@ void laurel_usb_panic_hold(void);     /* laurel 2005: bsd/dev/sweet_usb.c; retur
+ /* laurel 2720: calendar from the PM6125 RTC + saved offset (bsd/dev/laurel_rtc.c) */
+ void laurel_rtc_get(clock_sec_t *secs, clock_nsec_t *nsecs);
+ void laurel_rtc_set(clock_sec_t secs, clock_nsec_t nsecs);
++/* laurel 2770: torch LED off before halt, restart and the panic hold (bsd/dev/laurel_torch.c) */
++void laurel_torch_quiesce(void);
+ }
+ 
+ static int
+ laurel_halt_restart(unsigned int type)
+ {
++	switch (type) {
++	case kPEHaltCPU:
++	case kPERestartCPU:
++	case kPEPanicBegin:
++	case kPEPanicDiagnosticsDone:
++	case kPEPanicRestartCPU:
++	case kPEPanicRestartCPUNoCallouts:
++		laurel_torch_quiesce();         /* laurel 2770: no lit LED in a halt, a restart or a panic hold */
++		break;
++	default:
++		break;
++	}
+ 	switch (type) {
+ 	case kPEHaltCPU:
+ 		laurel_power_off();
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 2797311..6662f18 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -87,6 +87,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = LaurelVibrator;"
+     "   },"
++    "   {"
++    "     'IOClass'         = LaurelTorch;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = LaurelTorch;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index cb428c5..b50fcf8 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -29,6 +29,7 @@ iokit/Kernel/arm/TopazAdrenoFw.cpp                               optional iokitc
+ iokit/Kernel/arm/RedwoodGPU.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/LaurelVibrator.cpp                              optional iokitcpp
++iokit/Kernel/arm/LaurelTorch.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
