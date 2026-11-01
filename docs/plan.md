@@ -618,12 +618,12 @@ exception, or ask for a macOS path (Xcode clang/ld/codesign in gpu-env.sh).
 
 - Done [V build]: upstream check (docs/laurel_sprout/upstream-2026-11-01.md, `scripts/setup/upstream-check.sh`);
   metal2vulkan f6a96b7d -> 219f013 (rollback sets kept); Turnip 0102 (the A610 reported **Vulkan 1.0**, metal2vulkan needs
-  1.2: Metal had no device); kernel **2153** stage-1 SMMU tables on by default with self-check and fallback (lifts the
+  1.2: Metal had no device); kernel **2154** stage-1 SMMU tables on by default with self-check and fallback (lifts the
   backboardd-only rule, scattered buffers/surfaces, 256 MiB buffers); compiled target `-mcpu=cortex-a53` (measured with
   llvm-mca against `-mtune=cortex-a73`) + A53 erratum fix + ThinLTO (Turnip, Rust) + dSYMs; full ARMv8.0 check
   (`scripts/laurel/armv80-check.py`); metal2vulkan cache caps 32 MiB / 1 GiB; eagl still surfaces every 8th frame.
   Kernel 242 patches, 0 LSE; GL, Turnip, bridge, plug-in: check PASS, import check PASS.
-- Next (coordinator, phone): kernel with 2153 + root with GPU + Metal stage; read `LAUREL GPU:`, `LAUREL GPU SMMU:`,
+- Next (coordinator, phone): kernel with 2154 + root with GPU + Metal stage; read `LAUREL GPU:`, `LAUREL GPU SMMU:`,
   `LAUREL METAL:`; then `vkprobe` (expect `TU DARWIN API: on` and apiVersion 1.3), `m2vtest`, `metalprobe`; then
   METAL_CLIENTS steps (metal.md section 8). If `LAUREL GPU SMMU: off`, send the reason line: stage 1 then needs work on
   the register access or the >4 GiB reach.

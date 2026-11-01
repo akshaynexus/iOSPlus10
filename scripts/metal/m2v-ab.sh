@@ -30,7 +30,7 @@ if [ -z "${SYSROOT:-}" ]; then
   trap umnt EXIT
   SYSROOT=$MNT/root
 fi
-mkdir -p "$AB/libs"
+rm -rf "$AB/libs"; mkdir -p "$AB/libs"
 for l in $LIBS; do
   n=$(basename "$(dirname "$l")" .framework)_$(basename "$l" .metallib)
   cp "$SYSROOT$l" "$AB/libs/$n.metallib"      # Apple content: out/ only, never in git
@@ -75,9 +75,9 @@ for pin in "$PIN_A" "$PIN_B"; do
     M2V_CLI=$bin OUTNAME=$n TRANSLATE_DIR=$AB/${pin:0:12} "$REPO/scripts/metal/host-translate.sh" "$m" "$prof" > "$AB/${pin:0:12}-$n.log" 2>&1 || true
     t1=$(date +%s.%N)
     d=$AB/${pin:0:12}/$n
-    total=$(wc -l < "$d/functions.txt" | tr -d ' ')
+    total=$( { wc -l < "$d/functions.txt" 2>/dev/null || echo 0; } | tr -d ' ')
     ok=$(awk -F'\t' '$3 ~ /^PASS/' "$d/results.tsv" 2>/dev/null | wc -l | tr -d ' ')
-    bytes=$(cat "$d"/*.spv 2>/dev/null | wc -c | tr -d ' ')
+    bytes=$( { cat "$d"/*.spv 2>/dev/null || true; } | wc -c | tr -d ' ')
     printf '%s\t%s\t%s\t%s\t%s\t%.1f\n' "${pin:0:9}" "$n" "$total" "$ok" "$bytes" "$(awk -v a="$t0" -v b="$t1" 'BEGIN{print b-a}')" | tee -a "$AB/summary.tsv"
   done
 done

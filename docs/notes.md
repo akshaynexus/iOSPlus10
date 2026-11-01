@@ -4044,7 +4044,7 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - Line to check on the next boot: `LAUREL BT: on: WCN3990 product 0x000a rom 0x0201, crbtfw21.tlv + crnv21.bin, 3000000 baud,
   BD_ADDR ..` or `LAUREL BT: off: <why>` (+ `LAUREL BT: clk:/geni:/power:/chip:/fw:` step lines).
 
-## Mi A3: GPU upstream sync, SMMU stage 1 (2153), Vulkan 1.3 for the A610, compiled target (2026-11-01 06:45, gpu-upstream-opt agent, branch t3/laurel-gpu-upstream-opt; build only, NOT BOOTED)
+## Mi A3: GPU upstream sync, SMMU stage 1 (2154), Vulkan 1.3 for the A610, compiled target (2026-11-01 06:45, gpu-upstream-opt agent, branch t3/laurel-gpu-upstream-opt; build only, NOT BOOTED)
 - Upstream table: docs/laurel_sprout/upstream-2026-11-01.md (tool `scripts/setup/upstream-check.sh`).
   [V] HakiOS moved its user space into `oosexgang/hakios-xnu-kernel` (renamed; `hakios-os` returns not found). Its main
   (a48d2b2) has **no merge base** with our reference d82c64a, and lacks d82c64a/b4c5513 work (gpu_recover, ir3-shift-split,
@@ -4059,7 +4059,7 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - metal2vulkan f6a96b7d -> 219f013 (native-arithmetic round: emulations deleted; m2v/0003 dropped; flame/0017 API fix;
   rollback sets kept, `fetch-sources.sh` picks by pin; flame patches `*-m2v-<c>` only when the pin contains <c>).
   [I] fewer ALU ops per pixel; upstream measured +8-16 % encode CPU per draw (44d97aa, no switch): measure backboardd CPU.
-- Kernel 2153 (docs/laurel_sprout/gpu.md "SMMU stage 1"): pass-through bring-up first (topaz's proven path), then a live
+- Kernel 2154 (docs/laurel_sprout/gpu.md "SMMU stage 1"): pass-through bring-up first (topaz's proven path), then a live
   switch of CB0 to the stage-1 tables with the CP idle (CP buffers at VA = PA, so CP_RB_BASE etc. stay valid), self-check
   (read-back, fence at VA = PA, fence into a kernel page above 4 GiB at VA != PA, FSR 0), fallback to pass-through. With
   it on, RedwoodGPU accepts every process, GEM from the pool first then scattered pages (256 MiB max), every surface gets

@@ -1,4 +1,4 @@
-laurel 2153: stage-1 SMMU tables for the Adreno 610, on by default (kill switch gpu_smmu=0); fallback = pass-through.
+laurel 2154: stage-1 SMMU tables for the Adreno 610, on by default (kill switch gpu_smmu=0); fallback = pass-through.
 The GPU comes up in pass-through as in 2150 (the path topaz proved). Then, with the CP idle, context bank 0 switches to the
 kernel's tables (one GPU address space for all clients; 32-bit GPU VA, 4 KiB pages, LPAE, Normal non-cacheable, HUPCF, no
 fault interrupt) and checks itself: register read-back (SCTLR.M, TTBR0, CBAR0 type, S2CR0, SMR0), one CP fence through
@@ -22,7 +22,7 @@ diff -ruN a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
  /* bsd/dev/redwood_adreno.c ("the GPU kept on"; declared in bsd/sys/redwood_input.h, which is not seen from here) */
  bool redwood_gpu_ready(void);
  bool redwood_gpu_identity(void);
-+bool topaz_gpu_stage1(void);                    /* laurel 2153 (TopazAdreno.cpp): stage-1 tables in use */
++bool topaz_gpu_stage1(void);                    /* laurel 2154 (TopazAdreno.cpp): stage-1 tables in use */
  uint64_t topaz_gpu_pool_alloc(uint64_t size, void ** va);
  IOMemoryDescriptor * topaz_gpu_pool_md(uint64_t pa, uint64_t size);
  bool topaz_gpu_midmem(void);
@@ -31,7 +31,7 @@ diff -ruN a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
  	setProperty(kIOUserClientClassKey, "RedwoodGPUUserClient");
  	setName("RedwoodGPU");
 +	/*
-+	 * laurel 2153: the largest GEM_NEW (Turnip's maxMemoryAllocationSize, laurel 0101): one pool chunk in pass-through
++	 * laurel 2154: the largest GEM_NEW (Turnip's maxMemoryAllocationSize, laurel 0101): one pool chunk in pass-through
 +	 * (contiguous), GPU_BUFFER_MAX with the stage-1 tables (scattered pages). LaurelGPUSMMU: which one runs.
 +	 */
 +	setProperty("RedwoodMaxBuffer", redwood_gpu_identity() ? 0x4000000ull - 0x10000ull : (uint64_t) GPU_BUFFER_MAX, 64);
@@ -53,7 +53,7 @@ diff -ruN a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
  	 * laurel 2150: with the SMMU in pass-through (gpu_identity, the default) a GPU address is a physical
  	 * address: a command stream of any client could write kernel memory or a TrustZone carve-out (an access
  	 * fault resets the SoC). Until the stage-1 tables are in use, only the window server may open the GPU.
-+	 * laurel 2153: the stage-1 tables are on by default (TopazAdreno.cpp smmu_stage1); this rule is then off.
++	 * laurel 2154: the stage-1 tables are on by default (TopazAdreno.cpp smmu_stage1); this rule is then off.
  	 */
  	if (redwood_gpu_identity() && strcmp(name, "backboardd") != 0) {
  		static uint32_t refused;
@@ -61,7 +61,7 @@ diff -ruN a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
  }
  
  /*
-+ * laurel 2153: with the stage-1 tables, contiguous memory below 4 GiB (the GPU pool, the CP's buffers) is entered at
++ * laurel 2154: with the stage-1 tables, contiguous memory below 4 GiB (the GPU pool, the CP's buffers) is entered at
 + * GPU VA = PA (TopazAdreno.cpp IDENT window 0x80000000-0xffffffff); the allocator's addresses are below it. So the
 + * pool's bookkeeping (address = physical) stays as in pass-through.
 + */
@@ -95,7 +95,7 @@ diff -ruN a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
  		b->address = phys;
  		mapped = true;
 +	} else if (b != NULL && samePlace && sameAddress(memory, from, size, &b->address)) {
-+		/* laurel 2153: contiguous memory below 4 GiB (the GPU pool): VA = PA, entered into the tables below */
++		/* laurel 2154: contiguous memory below 4 GiB (the GPU pool): VA = PA, entered into the tables below */
  	} else if (b == NULL || (b->address = redwood_gpu_address(size)) == 0) {
  		IOLog("RedwoodGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
  		return NULL;
@@ -116,7 +116,7 @@ diff -ruN a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
  	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
 -	if (redwood_gpu_identity()) {
 +	/*
-+	 * laurel 2153: with the stage-1 tables too, the GPU pool first: write-combined memory nobody else maps (no cache
++	 * laurel 2154: with the stage-1 tables too, the GPU pool first: write-combined memory nobody else maps (no cache
 +	 * upkeep per submission, no cacheable alias), entered at VA = PA. Pool full or a buffer larger than a pool chunk:
 +	 * ordinary pages, scattered (the tables map them), cached with the upkeep below.
 +	 */
@@ -143,7 +143,7 @@ diff -ruN a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
  			return kIOReturnNoMemory;
  		}
 +		if (pa == 0) {
-+			goto scattered;                 /* laurel 2153 */
++			goto scattered;                 /* laurel 2154 */
 +		}
  		bzero(va, (size_t) size);
  		IOMemoryDescriptor * pm = topaz_gpu_pool_md(pa, size);
@@ -167,7 +167,7 @@ diff -ruN a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
  		/* topaz: pool memory is not the kernel's: mapped write-combined, not as a device */
 -		*options = (redwood_gpu_identity() && OSDynamicCast(IOBufferMemoryDescriptor, b->memory) == NULL) ?
 -		    kIOMapWriteCombineCache : 0;
-+		/* laurel 2153: with the stage-1 tables too: the pool's own buffers and pool surfaces (kernel RAM keeps its cache mode) */
++		/* laurel 2154: with the stage-1 tables too: the pool's own buffers and pool surfaces (kernel RAM keeps its cache mode) */
 +		*options = (OSDynamicCast(IOBufferMemoryDescriptor, b->memory) == NULL && (redwood_gpu_identity() ||
 +		    b->surface == NULL || b->surface->gpuPool)) ? kIOMapWriteCombineCache : 0;
  		ret = kIOReturnSuccess;
@@ -180,7 +180,7 @@ diff -ruN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cp
   * from wired pages (LAUREL SURF), contiguous below 4 GiB only as the fallback while the GPU is wanted.
   */
  extern "C" bool topaz_gpu_wanted(void);
-+extern "C" bool topaz_gpu_stage1(void);         /* laurel 2153 (TopazAdreno.cpp): the GPU translates through its tables */
++extern "C" bool topaz_gpu_stage1(void);         /* laurel 2154 (TopazAdreno.cpp): the GPU translates through its tables */
  extern "C" bool topaz_gpu_gl_active(void);
  #define LAUREL_GPU_MASK         0x00000000FFFFC000ull   /* the GPU reaches DRAM below 4 GiB only; 16 KiB aligned */
  #define LAUREL_SCREEN_SIZED(s)  ((s)->width >= 700 && (s)->height >= 1500)     /* Mi A3 720x1560 (topaz: 1000x2000) */
@@ -190,7 +190,7 @@ diff -ruN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cp
  			 */
 -			uint64_t take = gpu_low ? sweet_round_upage(s->allocSize + 64ull * s->bytesPerRow) : s->allocSize;
 +			/*
-+			 * laurel 2153: with the stage-1 tables every process may draw with the GPU (Metal), and RedwoodGPU maps
++			 * laurel 2154: with the stage-1 tables every process may draw with the GPU (Metal), and RedwoodGPU maps
 +			 * scattered pages: every surface gets the 64 guard rows, and none needs contiguous memory.
 +			 */
 +			bool stage1 = topaz_gpu_stage1();
@@ -214,7 +214,7 @@ diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  void topaz_adreno_init(void);
  bool topaz_gpu_wanted(void);
  bool topaz_gpu_ready(void);
-+bool topaz_gpu_stage1(void);                    /* laurel 2153 */
++bool topaz_gpu_stage1(void);                    /* laurel 2154 */
  bool topaz_gpu_gl_active(void);
  void topaz_gpu_gl_opened(void);
  extern unsigned long gPhysBase, gPhysSize;
@@ -231,7 +231,7 @@ diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  /* boot-arg gpu_identity (default 1): the SMMU passes addresses through (TopazGpuW G1), GPU VA = PA */
  static uint32_t gpu_identity = 1;
 +/*
-+ * laurel 2153: stage-1 SMMU tables for the Adreno, on by default (kill switch gpu_smmu=0). The GPU comes up in
++ * laurel 2154: stage-1 SMMU tables for the Adreno, on by default (kill switch gpu_smmu=0). The GPU comes up in
 + * pass-through as before (the path topaz proved), then, with the CP idle, context bank 0 switches to the kernel's
 + * tables (one GPU address space for every client, kernel-managed addresses) and checks itself; any failure
 + * switches back to pass-through. GPU VA layout (32-bit input addresses, 4 KiB pages):
@@ -253,7 +253,7 @@ diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  	}
 -	b->iova = kernel_va_next;
 -	kernel_va_next += b->size + 4096;               /* guard page */
-+	/* laurel 2153: kernel buffers are contiguous below 4 GiB: VA = PA (the IDENT window) */
++	/* laurel 2154: kernel buffers are contiguous below 4 GiB: VA = PA (the IDENT window) */
 +	b->iova = b->pa;
 +	if (b->pa < IDENT_BASE || b->pa + b->size > IDENT_END) {
 +		return false;
@@ -280,7 +280,7 @@ diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  }
  
 +/*
-+ * laurel 2153: one CP fence write of `magic` to GPU address `gpu_va`, read back through `cpu` (cache line cleaned and
++ * laurel 2154: one CP fence write of `magic` to GPU address `gpu_va`, read back through `cpu` (cache line cleaned and
 + * invalidated around it: the page may be cached kernel memory). With hw_lock held and the ring idle.
 + */
 +static bool
@@ -316,7 +316,7 @@ diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
 +	return false;
 +}
 +
-+/* laurel 2153: from pass-through to stage-1 tables, with the CP up and idle; false: smmu_note says why */
++/* laurel 2154: from pass-through to stage-1 tables, with the CP up and idle; false: smmu_note says why */
 +static bool
 +smmu_stage1(void)
 +{
@@ -458,7 +458,7 @@ diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
 +	if (!cp_start()) {
 +		return false;
 +	}
-+	/* laurel 2153: stage-1 tables; failed: pass-through as before, checked again with one fence */
++	/* laurel 2154: stage-1 tables; failed: pass-through as before, checked again with one fence */
 +	if (!smmu_stage1()) {
 +		uint64_t us = 0;
 +		stage = "pass-through after the stage-1 check";
@@ -477,7 +477,7 @@ diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  redwood_gpu_mapped(void)
  {
 +	/*
-+	 * laurel 2153: entries are only ever written over invalid ones (an unmap invalidates the TLB at once), and an
++	 * laurel 2154: entries are only ever written over invalid ones (an unmap invalidates the TLB at once), and an
 +	 * SMMU caches no invalid entry: only a barrier, so that the table writes are in memory before the next submit
 +	 * (HakiOS hakios.adreno.c: no TLBI on map). Saves a TLBIALL + sync + poll per buffer made.
 +	 */
@@ -492,7 +492,7 @@ diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  	*microseconds = 0;
  	*submissions = 0;
  	bzero(by, 7 * sizeof(uint32_t));
-+	/* laurel 2153: a GPU access the tables refused (terminated, no stall): told, then cleared (FSR is write-1-to-clear) */
++	/* laurel 2154: a GPU access the tables refused (terminated, no stall): told, then cleared (FSR is write-1-to-clear) */
 +	uint32_t fsr = (!gpu_identity && smmu != NULL) ? rd(smmu, SMMU_CB0 + 0x58) : 0;
 +	if (fsr != 0) {
 +		static uint32_t told;
@@ -521,7 +521,7 @@ diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  	return !killed && !failed;
  }
  
-+/* laurel 2153: the GPU translates through the stage-1 tables (scattered pages and pages above 4 GiB are fine) */
++/* laurel 2154: the GPU translates through the stage-1 tables (scattered pages and pages above 4 GiB are fine) */
 +bool
 +topaz_gpu_stage1(void)
 +{
@@ -536,7 +536,7 @@ diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  		return;
  	}
 -	(void)PE_parse_boot_argn("gpu_identity", &gpu_identity, sizeof(gpu_identity));
-+	(void)PE_parse_boot_argn("gpu_smmu", &gpu_smmu, sizeof(gpu_smmu));        /* laurel 2153: kill switch gpu_smmu=0 */
++	(void)PE_parse_boot_argn("gpu_smmu", &gpu_smmu, sizeof(gpu_smmu));        /* laurel 2154: kill switch gpu_smmu=0 */
  	(void)PE_parse_boot_argn("gpu_midmem", &gpu_midmem, sizeof(gpu_midmem));
  	if (!gpu_midmem && !gpu_pool_place()) {
  		gpu_midmem = 1;                         /* no pool in the ADT: kernel memory below 4 GiB */

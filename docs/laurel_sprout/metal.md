@@ -66,7 +66,7 @@ Turnip as it is**, if it keeps this table:
 | 0x46 GEM_SUBMIT: CMD_BUF cmds, bo list, SYNCOBJ flags ignored | 1..128 cmds, <= 8192 bos | OK; the stand-in answers 0-cmd submits and the syncobjs itself [V negroni_drm.c:717-756] |
 | 0x4a SUBMITQUEUE_NEW, 0x4c QUERY (FAULTS) | yes | OK |
 | 0x7e IOSurface import by ID (CA's render targets) | yes, physically contiguous surfaces only (identity mode) | OK for topaz 0937-0940 surfaces (BGRA, 64-byte rows, <= 16 MB) |
-| 0x49 host-page import (`VK_EXT_external_memory_host` of plain memory, `newBufferWithBytesNoCopy:`) | no | **not done**. With 2153's stage-1 tables scattered pages can be mapped (the kernel half is negroni 0232's design over `redwood_gpu_map`); open. The stand-in sees no `NegroniGPUABI` "userptr" and imports only noted IOSurfaces (logs it once) |
+| 0x49 host-page import (`VK_EXT_external_memory_host` of plain memory, `newBufferWithBytesNoCopy:`) | no | **not done**. With 2154's stage-1 tables scattered pages can be mapped (the kernel half is negroni 0232's design over `redwood_gpu_map`); open. The stand-in sees no `NegroniGPUABI` "userptr" and imports only noted IOSurfaces (logs it once) |
 | **IOAcceleratorES with `MetalPluginName` / `MetalPluginClassName`** | topaz 0138: empty service | **laurel 2850** (below) |
 
 ### Patch 2850 `laurel-metal-registration` (range 2850-2899)
@@ -194,7 +194,7 @@ with HW multiview are unchanged. Kill switch `TU_DARWIN_API=0`; line `TU DARWIN 
 1. [U] Nothing ran on the A610 yet. First failure points: Turnip device creation (chip, GMEM 132 KiB), first submit
    (topaz's ring framing for Turnip's IBs: Turnip expects the kernel's `a6xx_submit` wrapper, CCU invalidate at the start,
    CACHE_FLUSH_TS fence; flame's first submits failed without it, docs/metal-design.md 4.3 item 4).
-2. (Lifted by 2153 when `LAUREL GPU SMMU: on`: GEM_NEW up to 256 MiB from scattered pages, surfaces from wired pages,
+2. (Lifted by 2154 when `LAUREL GPU SMMU: on`: GEM_NEW up to 256 MiB from scattered pages, surfaces from wired pages,
    `RedwoodMaxBuffer` 256 MiB. The text below is the pass-through fallback.)
    Contiguous memory: every GEM_NEW and every imported surface must be physically contiguous (pass-through SMMU); one
    buffer < 64 MiB (pool chunk). Turnip 0101 reports that limit (`maxMemoryAllocationSize`, `maxBufferSize` =
