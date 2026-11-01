@@ -1,0 +1,871 @@
+laurel 2911: kern.laurel_stats, the data of the XNUtils app (docs/laurel_sprout/xnutils.md).
+
+A read-only string sysctl for every user. It parses the console ring that sweet_ufs.c keeps anyway, only when somebody reads it and
+in the log thread that wakes every 10 s anyway (bsd/dev/laurel_stats_core.h, host test scripts/laurel/xnutils-test.sh): last state
+line per feature, last line per driver + count, crashes by process, processes with a Metal or GPU device. Runs of 14+ digits become
+'#'. Live values from variables the drivers keep: laurel_thermal_stats, laurel_gpu_dcvs_stats, laurel_wifi_stats. No hook in the print
+path, no new poll, no register read. Kill switch laurelstats=0. Line: LAUREL STATS: on|off.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 428ecd1..8231cd0 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -126,6 +126,7 @@ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/laurel_reboot.c			standard
+ bsd/dev/laurel_rtc.c			standard
+ bsd/dev/laurel_wired.c			standard
++bsd/dev/laurel_stats.c			standard
+ bsd/dev/laurel_cell.c			standard
+ bsd/dev/laurel_ext4.c			standard
+ bsd/dev/laurel_ext4_dir.c		standard
+diff --git a/bsd/dev/laurel_stats.c b/bsd/dev/laurel_stats.c
+new file mode 100644
+index 0000000..923986f
+--- /dev/null
++++ b/bsd/dev/laurel_stats.c
+@@ -0,0 +1,156 @@
++/*
++ * laurel 2911: kern.laurel_stats, the data of the XNUtils app (docs/laurel_sprout/xnutils.md). Read-only, for every user.
++ *
++ * Nearly every value of this port exists only as a console line. All console text is already in the 4 MiB ring of
++ * sweet_ufs.c, so this file has no hook in the print path: it takes the new bytes of the ring when somebody reads the sysctl,
++ * and in the log thread that wakes every 10 s anyway (else boot lines leave the ring before the first read). The lines go into
++ * the table of laurel_stats_core.h. A few values that change between lines come from the drivers' own variables
++ * (laurel_thermal_stats, laurel_gpu_dcvs_stats, laurel_wifi_stats). No driver gets new work; no register is read here.
++ *
++ * Text: "v=1", key=value lines, then the records of ls_print. Nothing is read when nothing asks: the app stops when it is hidden.
++ * Off: boot-arg laurelstats=0 (kill switch), or no memory for one read: then the sysctl gives "off: <reason>" and the system goes on.
++ * Line: "LAUREL STATS: on: ..." once, at the first scan.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++#include "laurel_stats_core.h"
++
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern uint64_t sweet_log_position(void);
++extern int laurel_thermal_stats(char *s, size_t n);
++extern int laurel_gpu_dcvs_stats(char *s, size_t n);
++extern int laurel_wifi_stats(char *s, size_t n);
++
++void laurel_stats_scan(void);
++
++#define LS_SIZE_RING    (4ull << 20)    /* SWEET_LOG_SIZE: what a first read can still find */
++
++static LCK_GRP_DECLARE(ls_grp, "laurel_stats");
++static LCK_MTX_DECLARE(ls_lock, &ls_grp);
++static struct ls_table ls_t;
++static uint64_t ls_pos, ls_lost;
++static uint32_t ls_thread_scans;
++static int ls_mode = -1;                /* -1 not read, 0 off, 1 on */
++
++static uint64_t
++ls_now_ms(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++/* ls_lock held. Only the bytes since the last scan: little after the first time. */
++static void
++ls_scan_locked(void)
++{
++	char buf[1024];
++	uint64_t now = ls_now_ms(), end = sweet_log_position();
++
++	if (end - ls_pos > LS_SIZE_RING) {
++		ls_lost += end - ls_pos - LS_SIZE_RING;
++	}
++	for (;;) {
++		uint32_t n = sweet_log_copy(&ls_pos, buf, sizeof(buf));
++
++		if (n == 0) {
++			break;
++		}
++		ls_feed(&ls_t, buf, n, now);
++	}
++}
++
++static int
++ls_enabled(void)
++{
++	if (ls_mode < 0) {
++		uint32_t on = 1;
++
++		(void)PE_parse_boot_argn("laurelstats", &on, sizeof(on));
++		ls_mode = on != 0;
++		if (ls_mode) {
++			printf("LAUREL STATS: on: kern.laurel_stats reads the console ring (%u state + %u line slots), no work in the drivers\n",
++			    LS_STATE_N, LS_RECENT_N);
++		} else {
++			printf("LAUREL STATS: off: boot-arg laurelstats=0\n");
++		}
++	}
++	return ls_mode;
++}
++
++/* The log thread (sweet_ufs.c), every 10 s; a cheap pass when nothing new came. */
++void
++laurel_stats_scan(void)
++{
++	if (!ls_enabled()) {
++		return;
++	}
++	lck_mtx_lock(&ls_lock);
++	ls_thread_scans++;
++	ls_scan_locked();
++	lck_mtx_unlock(&ls_lock);
++}
++
++static int
++laurel_stats_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	if (req->newptr != USER_ADDR_NULL) {
++		return EPERM;
++	}
++	if (!ls_enabled()) {
++		static const char why[] = "off: boot-arg laurelstats=0";
++
++		return SYSCTL_OUT(req, why, sizeof(why));
++	}
++	char *out = kalloc_data(LS_OUT_MAX, Z_WAITOK);
++
++	if (out == NULL) {
++		static const char why[] = "off: no memory for this read";
++
++		return SYSCTL_OUT(req, why, sizeof(why));
++	}
++	struct ls_out o = { out, 0, LS_OUT_MAX };
++	uint64_t now = ls_now_ms();
++
++	out[0] = 0;
++	ls_s(&o, "v=1\nup_ms=");
++	ls_u(&o, now);
++	lck_mtx_lock(&ls_lock);
++	ls_scan_locked();
++	ls_s(&o, "\nlog.bytes=");
++	ls_u(&o, ls_pos);
++	ls_s(&o, "\nlog.lost=");
++	ls_u(&o, ls_lost);
++	ls_s(&o, "\nlog.lines=");
++	ls_u(&o, ls_t.lines);
++	ls_s(&o, "\nlog.full=");
++	ls_u(&o, ls_t.full);
++	ls_s(&o, "\nlog.thread_scans=");
++	ls_u(&o, ls_thread_scans);
++	ls_s(&o, "\n");
++	lck_mtx_unlock(&ls_lock);
++	o.at += (uint32_t)laurel_thermal_stats(out + o.at, o.cap - o.at);
++	o.at += (uint32_t)laurel_gpu_dcvs_stats(out + o.at, o.cap - o.at);
++	o.at += (uint32_t)laurel_wifi_stats(out + o.at, o.cap - o.at);
++	lck_mtx_lock(&ls_lock);
++	ls_print(&ls_t, &o, now);
++	lck_mtx_unlock(&ls_lock);
++	int error = SYSCTL_OUT(req, out, o.at + 1);
++
++	kfree_data(out, LS_OUT_MAX);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, laurel_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, laurel_stats_sysctl, "A",
++    "laurel 2911: the drivers' last console lines and live values, for XNUtils");
++#else
++void laurel_stats_scan(void);
++void laurel_stats_scan(void) {}
++#endif
+diff --git a/bsd/dev/laurel_stats_core.h b/bsd/dev/laurel_stats_core.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/laurel_stats_core.h
+@@ -0,0 +1,299 @@
++/*
++ * laurel 2911: the line table behind kern.laurel_stats (bsd/dev/laurel_stats.c). C without kernel calls: the host test
++ * (scripts/laurel/xnutils-test.sh) compiles this same text and feeds it a real boot log.
++ *
++ * Input: bytes of the console ring (sweet_log_copy), in any cut. Output: for each driver, its last lines.
++ *   S  state lines: "LAUREL X[: sub]: on|off[: text]", one slot per feature, the last line wins, never pushed out
++ *   R  other lines by tag + the first three words without a digit, the last line + how many were seen, oldest pushed out
++ *   C  crashes: "CRASH name[pid] sig N" + "CRASH name reason ...", one slot per process
++ *   D  devices: "NMTL[pid name]: device ..." (M, Metal) + "RedwoodGPU: client name (open N)" (G, GPU)
++ * A run of 14 or more digits becomes '#': an ICCID, an IMSI or an IMEI never leaves this table.
++ */
++#ifndef LAUREL_STATS_CORE_H
++#define LAUREL_STATS_CORE_H
++
++#define LS_LINE_MAX     448u
++#define LS_STATE_N      112u
++#define LS_RECENT_N     128u
++#define LS_CRASH_N      32u
++#define LS_DEVICE_N     40u
++#define LS_NAME         24u
++#define LS_KEY          64u
++#define LS_STATE_TEXT   224u
++#define LS_RECENT_TEXT  LS_LINE_MAX
++#define LS_NOTE         136u
++#define LS_DIGITS_MASK  14u
++/* every slot full, every field at its size, the live values: laurel_stats.c allocates this for one read */
++#define LS_OUT_MAX      (LS_STATE_N * (LS_KEY + LS_STATE_TEXT + 32u) + LS_RECENT_N * (LS_KEY + LS_RECENT_TEXT + 32u) + \
++	                 LS_CRASH_N * (LS_NAME + LS_NOTE + 40u) + LS_DEVICE_N * (LS_NAME + LS_NOTE + 40u) + 2048u)
++
++struct ls_state {
++	char key[LS_KEY], text[LS_STATE_TEXT];
++	uint32_t n;
++	uint8_t on;
++	uint64_t ms;
++};
++
++struct ls_recent {
++	char key[LS_KEY], text[LS_RECENT_TEXT];
++	uint32_t n;
++	uint64_t ms;
++};
++
++struct ls_crash {
++	char name[LS_NAME], reason[LS_NOTE];
++	uint32_t n;
++	int sig;
++	uint64_t ms;
++};
++
++struct ls_device {
++	char name[LS_NAME], note[LS_NOTE];
++	char kind;
++	uint32_t n;
++	uint64_t ms;
++};
++
++struct ls_table {
++	struct ls_state state[LS_STATE_N];
++	struct ls_recent recent[LS_RECENT_N];
++	struct ls_crash crash[LS_CRASH_N];
++	struct ls_device device[LS_DEVICE_N];
++	char line[LS_LINE_MAX];
++	uint32_t len;
++	uint64_t lines, full;
++};
++
++static inline uint32_t
++ls_len(const char *s)
++{
++	uint32_t n = 0;
++
++	while (s[n] != 0) {
++		n++;
++	}
++	return n;
++}
++
++/* the string with a limit: always ends in 0 */
++static inline void
++ls_copy(char *to, const char *from, uint32_t n, uint32_t cap)
++{
++	uint32_t i = 0;
++
++	for (; i < n && i + 1 < cap && from[i] != 0; i++) {
++		to[i] = from[i];
++	}
++	to[i] = 0;
++}
++
++static inline int
++ls_same(const char *a, const char *b)
++{
++	while (*a != 0 && *a == *b) {
++		a++;
++		b++;
++	}
++	return *a == *b;
++}
++
++static inline int
++ls_starts(const char *s, const char *p)
++{
++	while (*p != 0) {
++		if (*s++ != *p++) {
++			return 0;
++		}
++	}
++	return 1;
++}
++
++static inline const char *
++ls_find(const char *s, const char *p)
++{
++	for (; *s != 0; s++) {
++		if (ls_starts(s, p)) {
++			return s;
++		}
++	}
++	return (const char *)0;
++}
++
++static inline int
++ls_digit(char c)
++{
++	return c >= '0' && c <= '9';
++}
++
++/* printable ASCII only; the digit runs of an ICCID, an IMSI, an IMEI become '#' */
++static inline void
++ls_clean(char *s)
++{
++	uint32_t run = 0, i = 0;
++
++	for (; s[i] != 0; i++) {
++		char c = s[i];
++
++		if (c == '\t') {
++			s[i] = ' ';
++		} else if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7e) {
++			s[i] = '?';
++		}
++		if (ls_digit(c)) {
++			run++;
++			continue;
++		}
++		if (run >= LS_DIGITS_MASK) {
++			for (uint32_t j = i - run; j < i; j++) {
++				s[j] = '#';
++			}
++		}
++		run = 0;
++	}
++	if (run >= LS_DIGITS_MASK) {
++		for (uint32_t j = i - run; j < i; j++) {
++			s[j] = '#';
++		}
++	}
++}
++
++/* a word of the body counts for the slot key when it has no digit: "wake 3: panel" and "wake 4: panel" share a slot */
++static inline const char *
++ls_word(const char *s, char *out, uint32_t cap)
++{
++	for (;;) {
++		while (*s == ' ') {
++			s++;
++		}
++		if (*s == 0) {
++			out[0] = 0;
++			return s;
++		}
++		uint32_t n = 0;
++		int digit = 0;
++
++		while (s[n] != 0 && s[n] != ' ') {
++			digit |= ls_digit(s[n]);
++			n++;
++		}
++		if (!digit) {
++			ls_copy(out, s, n, cap);
++			return s + n;
++		}
++		s += n;
++	}
++}
++
++static inline void
++ls_recent_put(struct ls_table *t, const char *tag, const char *body, const char *text, uint64_t now)
++{
++	char key[LS_KEY], w[3][14];
++	uint32_t at = 0;
++	const char *p = body;
++
++	for (int i = 0; i < 3; i++) {
++		p = ls_word(p, w[i], sizeof(w[i]));
++	}
++	uint32_t n = ls_len(tag);
++
++	ls_copy(key, tag, n, sizeof(key));
++	n = ls_len(key);
++	if (n + 2 < sizeof(key)) {
++		key[n++] = ':';
++		key[n] = 0;
++	}
++	for (int i = 0; i < 3; i++) {
++		if (w[i][0] != 0 && n + 2 < sizeof(key)) {
++			key[n++] = ' ';
++			ls_copy(key + n, w[i], ls_len(w[i]), (uint32_t)sizeof(key) - n);
++			n = ls_len(key);
++		}
++	}
++	for (uint32_t i = 0; i < LS_RECENT_N; i++) {
++		if (t->recent[i].n == 0) {
++			at = i;
++			break;
++		}
++		if (ls_same(t->recent[i].key, key)) {
++			at = i;
++			break;
++		}
++		if (t->recent[i].ms < t->recent[at].ms) {
++			at = i;
++		}
++	}
++	struct ls_recent *r = &t->recent[at];
++
++	if (r->n == 0 || !ls_same(r->key, key)) {
++		ls_copy(r->key, key, LS_KEY, LS_KEY);
++		r->n = 0;
++	}
++	ls_copy(r->text, text, LS_RECENT_TEXT, LS_RECENT_TEXT);
++	r->n++;
++	r->ms = now;
++}
++
++struct ls_out {
++	char *p;
++	uint32_t at, cap;
++};
++
++static inline void
++ls_s(struct ls_out *o, const char *s)
++{
++	while (*s != 0 && o->at + 1 < o->cap) {
++		o->p[o->at++] = *s++;
++	}
++	o->p[o->at] = 0;
++}
++
++static inline void
++ls_u(struct ls_out *o, uint64_t v)
++{
++	char b[24];
++	uint32_t n = sizeof(b) - 1;
++
++	b[n] = 0;
++	do {
++		b[--n] = (char)('0' + v % 10);
++		v /= 10;
++	} while (v != 0);
++	ls_s(o, b + n);
++}
++
++/* one record per line, fields separated by a tab, the text last: S age n key on text | R age n key text | C age n name sig reason | D age n kind name note */
++static inline void
++ls_print(const struct ls_table *t, struct ls_out *o, uint64_t now)
++{
++	for (uint32_t i = 0; i < LS_STATE_N && t->state[i].n != 0; i++) {
++		const struct ls_state *s = &t->state[i];
++
++		ls_s(o, "S\t"); ls_u(o, (now - s->ms) / 1000); ls_s(o, "\t"); ls_u(o, s->n); ls_s(o, "\t");
++		ls_s(o, s->key); ls_s(o, s->on ? "\ton\t" : "\toff\t"); ls_s(o, s->text); ls_s(o, "\n");
++	}
++	for (uint32_t i = 0; i < LS_RECENT_N && t->recent[i].n != 0; i++) {
++		const struct ls_recent *r = &t->recent[i];
++
++		ls_s(o, "R\t"); ls_u(o, (now - r->ms) / 1000); ls_s(o, "\t"); ls_u(o, r->n); ls_s(o, "\t");
++		ls_s(o, r->key); ls_s(o, "\t"); ls_s(o, r->text); ls_s(o, "\n");
++	}
++	for (uint32_t i = 0; i < LS_CRASH_N && t->crash[i].n != 0; i++) {
++		const struct ls_crash *c = &t->crash[i];
++
++		ls_s(o, "C\t"); ls_u(o, (now - c->ms) / 1000); ls_s(o, "\t"); ls_u(o, c->n); ls_s(o, "\t");
++		ls_s(o, c->name); ls_s(o, "\t"); ls_u(o, (uint64_t)(unsigned)c->sig); ls_s(o, "\t"); ls_s(o, c->reason); ls_s(o, "\n");
++	}
++	for (uint32_t i = 0; i < LS_DEVICE_N && t->device[i].name[0] != 0; i++) {
++		const struct ls_device *d = &t->device[i];
++		char kind[2] = { d->kind, 0 };
++
++		if (d->n == 0) {
++			continue;
++		}
++		ls_s(o, "D\t"); ls_u(o, (now - d->ms) / 1000); ls_s(o, "\t"); ls_u(o, d->n); ls_s(o, "\t");
++		ls_s(o, kind); ls_s(o, "\t"); ls_s(o, d->name); ls_s(o, "\t"); ls_s(o, d->note); ls_s(o, "\n");
++	}
++}
++
++#include "laurel_stats_lines.h"
++#endif /* LAUREL_STATS_CORE_H */
+diff --git a/bsd/dev/laurel_stats_lines.h b/bsd/dev/laurel_stats_lines.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/laurel_stats_lines.h
+@@ -0,0 +1,272 @@
++/* laurel 2911: the second half of laurel_stats_core.h: state lines, crashes, devices, one console line. */
++
++/*
++ * The state word of a body: "on:" / "off:" as a whole word in its first 40 characters, or a body that is "on" / "off", or
++ * "on without ...", "off for ...". Returns its place, or NULL. "bring-up on:" after a long text does not count.
++ */
++static inline const char *
++ls_state_word(const char *body, int *on, const char **rest)
++{
++	for (uint32_t i = 0; body[i] != 0 && i < 40; i++) {
++		if (i != 0 && body[i - 1] != ' ') {
++			continue;
++		}
++		const char *s = body + i;
++		int word = ls_starts(s, "on") ? 2 : ls_starts(s, "off") ? 3 : 0;
++
++		if (word == 0) {
++			continue;
++		}
++		const char *e = s + word;
++
++		if (*e == ':') {
++			*on = word == 2;
++			*rest = e + 1;
++			return s;
++		}
++		if (*e == 0 || (word == 2 && ls_starts(e, " without")) || (word == 3 && ls_starts(e, " for"))) {
++			*on = word == 2;
++			*rest = e;
++			return s;
++		}
++	}
++	return (const char *)0;
++}
++
++static inline void
++ls_state_put(struct ls_table *t, const char *tag, const char *body, uint64_t now)
++{
++	int on = 0;
++	const char *rest = (const char *)0, *w = ls_state_word(body, &on, &rest);
++
++	if (w == (const char *)0) {
++		return;
++	}
++	char key[LS_KEY];
++	uint32_t n = ls_len(tag);
++
++	ls_copy(key, tag, n, sizeof(key));
++	n = ls_len(key);
++	/* the feature's part: "tx queue" of "tx queue: on: ..." */
++	uint32_t sub = (uint32_t)(w - body);
++
++	while (sub != 0 && (body[sub - 1] == ' ' || body[sub - 1] == ':')) {
++		sub--;
++	}
++	if (sub != 0 && n + 2 < sizeof(key)) {
++		key[n++] = '/';
++		ls_copy(key + n, body, sub, (uint32_t)sizeof(key) - n);
++	}
++	struct ls_state *s = (struct ls_state *)0;
++
++	for (uint32_t i = 0; i < LS_STATE_N; i++) {
++		if (t->state[i].n == 0 || ls_same(t->state[i].key, key)) {
++			s = &t->state[i];
++			break;
++		}
++	}
++	if (s == (struct ls_state *)0) {
++		t->full++;
++		return;
++	}
++	while (*rest == ' ') {
++		rest++;
++	}
++	ls_copy(s->key, key, LS_KEY, LS_KEY);
++	ls_copy(s->text, rest, LS_STATE_TEXT, LS_STATE_TEXT);
++	s->on = (uint8_t)on;
++	s->n++;
++	s->ms = now;
++}
++
++/* "CRASH name[pid] sig 9 ...": a new crash. "CRASH name reason ns 1 code 0x7: (none)": its reason. The rest: nothing. */
++static inline void
++ls_crash_put(struct ls_table *t, const char *s, uint64_t now)
++{
++	char name[LS_NAME];
++	uint32_t n = 0;
++
++	while (s[n] != 0 && s[n] != ' ' && s[n] != '[') {
++		n++;
++	}
++	ls_copy(name, s, n, sizeof(name));
++	const char *e = s + n;
++	struct ls_crash *c = (struct ls_crash *)0;
++
++	if (*e == '[') {
++		const char *sig = ls_find(e, "] sig ");
++
++		if (sig == (const char *)0) {
++			return;
++		}
++		for (uint32_t i = 0; i < LS_CRASH_N; i++) {
++			if (t->crash[i].n == 0 || ls_same(t->crash[i].name, name)) {
++				c = &t->crash[i];
++				break;
++			}
++		}
++		if (c == (struct ls_crash *)0) {
++			t->full++;
++			return;
++		}
++		ls_copy(c->name, name, LS_NAME, LS_NAME);
++		c->n++;
++		c->ms = now;
++		c->sig = 0;
++		c->reason[0] = 0;
++		for (const char *d = sig + 6; ls_digit(*d); d++) {
++			c->sig = c->sig * 10 + (*d - '0');
++		}
++	} else if (ls_starts(e, " reason ")) {
++		for (uint32_t i = 0; i < LS_CRASH_N; i++) {
++			if (t->crash[i].n != 0 && ls_same(t->crash[i].name, name)) {
++				ls_copy(t->crash[i].reason, e + 8, LS_NOTE, LS_NOTE);
++				break;
++			}
++		}
++	}
++}
++
++static inline struct ls_device *
++ls_device_get(struct ls_table *t, char kind, const char *name, uint32_t len)
++{
++	char key[LS_NAME];
++
++	ls_copy(key, name, len, sizeof(key));
++	for (uint32_t i = 0; i < LS_DEVICE_N; i++) {
++		struct ls_device *d = &t->device[i];
++
++		if (d->n == 0) {
++			ls_copy(d->name, key, LS_NAME, LS_NAME);
++			d->kind = kind;
++			return d;
++		}
++		if (d->kind == kind && ls_same(d->name, key)) {
++			return d;
++		}
++	}
++	t->full++;
++	return (struct ls_device *)0;
++}
++
++/* "NMTL[26 SpringBoard]: device Turnip ..." and "NMTL[26 SpringBoard]: pipelines 6 compiled in ..." */
++static inline void
++ls_metal_put(struct ls_table *t, const char *s, uint64_t now)
++{
++	const char *sp = ls_find(s, " "), *end = ls_find(s, "]: ");
++
++	if (sp == (const char *)0 || end == (const char *)0 || sp > end) {
++		return;
++	}
++	const char *body = end + 3;
++	int device = ls_starts(body, "device "), pipes = ls_starts(body, "pipelines ");
++
++	if (!device && !pipes) {
++		return;
++	}
++	struct ls_device *d = ls_device_get(t, 'M', sp + 1, (uint32_t)(end - sp - 1));
++
++	if (d == (struct ls_device *)0) {
++		return;
++	}
++	if (device || d->n == 0) {      /* (a pipelines line whose device line left the ring: a device all the same) */
++		d->n++;
++		d->ms = now;
++	}
++	if (pipes) {
++		ls_copy(d->note, body, LS_NOTE, LS_NOTE);
++	}
++}
++
++static inline void
++ls_line_end(struct ls_table *t, char *line, uint64_t now)
++{
++	static const char *const others[] = { "SWEET FPS:", "SWEET BATTERY:", "SWEET BL:", "RedwoodGPU:", "TopazGPU:", "TopazAudio:",
++		                              "redwood-gl:", "LaurelCell:", "topaz wifi:" };
++	const char *s = line;
++
++	t->lines++;
++	ls_clean(line);
++	if (s[0] == '|') {                      /* "|backboardd| redwood-gl: ...", a process's console line */
++		const char *e = ls_find(s + 1, "| ");
++
++		if (e != (const char *)0) {
++			s = e + 2;
++		}
++	}
++	if (ls_starts(s, "CRASH ")) {
++		ls_crash_put(t, s + 6, now);
++		return;
++	}
++	if (ls_starts(s, "NMTL[")) {
++		ls_metal_put(t, s + 5, now);
++		return;
++	}
++	const char *l = ls_find(s, "LAUREL ");  /* the console mixes writers: a tag may start in the middle of a line */
++
++	if (l != (const char *)0) {
++		s = l;
++	} else {
++		int known = 0;
++
++		for (uint32_t i = 0; i < sizeof(others) / sizeof(others[0]) && !known; i++) {
++			known = ls_starts(s, others[i]);
++		}
++		if (!known) {
++			return;
++		}
++		if (ls_starts(s, "RedwoodGPU: client ")) {
++			const char *name = s + 19, *e = ls_find(name, " ");
++
++			if (e != (const char *)0 && ls_starts(e, " (open ")) {
++				struct ls_device *d = ls_device_get(t, 'G', name, (uint32_t)(e - name));
++
++				if (d != (struct ls_device *)0) {
++					d->n++;
++					d->ms = now;
++				}
++			}
++			return;
++		}
++		if (ls_starts(s, "RedwoodGPU: submission ") || (ls_starts(s, "TopazAudio:") && ls_find(s, " status: ") == (const char *)0) ||
++		    (ls_starts(s, "redwood-gl:") && !ls_starts(s, "redwood-gl: frame "))) {
++			return;                 /* boot and per-submission noise: it would push out the lines people read */
++		}
++	}
++	const char *colon = ls_find(s, ":");
++
++	if (colon == (const char *)0 || colon - s >= (long)LS_NAME + 8) {
++		return;
++	}
++	char tag[LS_NAME + 8];
++
++	ls_copy(tag, s, (uint32_t)(colon - s), sizeof(tag));
++	const char *body = colon + 1;
++
++	while (*body == ' ') {
++		body++;
++	}
++	if (l != (const char *)0) {
++		ls_state_put(t, tag, body, now);
++	}
++	ls_recent_put(t, tag, body, s, now);
++}
++
++/* Console bytes in any cut. A line longer than the buffer loses its end. */
++static inline void
++ls_feed(struct ls_table *t, const char *buf, uint32_t n, uint64_t now)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		char c = buf[i];
++
++		if (c == '\n' || c == '\r') {
++			if (t->len != 0) {
++				t->line[t->len] = 0;
++				ls_line_end(t, t->line, now);
++				t->len = 0;
++			}
++		} else if (c != 0 && t->len + 1 < LS_LINE_MAX) {
++			t->line[t->len++] = c;
++		}
++	}
++}
+diff --git a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
+index 201c8d9..31f49f1 100644
+--- a/bsd/dev/laurel_thermal.c
++++ b/bsd/dev/laurel_thermal.c
+@@ -228,6 +228,24 @@ laurel_cpufreq_gold_mhz(void)
+ 	return cl_base[CL_GOLD] ? cl_khz[CL_GOLD][cl_row[CL_GOLD]] / 1000 : 0;
+ }
+ 
++/* laurel 2911: kern.laurel_stats reads what the governor and the thermal loop keep. Temperatures in 0.1 C. */
++int laurel_thermal_stats(char *s, size_t n);
++int
++laurel_thermal_stats(char *s, size_t n)
++{
++	if (cl_base[CL_SILVER] == 0 || cl_base[CL_GOLD] == 0) {
++		return 0;
++	}
++	uint64_t now = mach_absolute_time();
++
++	return scnprintf(s, n, "cpu.silver_mhz=%u\ncpu.silver_busy=%u\ncpu.silver_cap_mhz=%u\ncpu.gold_mhz=%u\ncpu.gold_busy=%u\n"
++	           "cpu.gold_cap_mhz=%u\ncpu.hold=%s\ntemp.cpu_dC=%d\ntemp.gpu_dC=%d\ntemp.on=%d\n",
++	           cl_khz[CL_SILVER][cl_row[CL_SILVER]] / 1000, cl_busy[CL_SILVER], cl_khz[CL_SILVER][cl_cap[CL_SILVER]] / 1000,
++	           cl_khz[CL_GOLD][cl_row[CL_GOLD]] / 1000, cl_busy[CL_GOLD], cl_khz[CL_GOLD][cl_cap[CL_GOLD]] / 1000,
++	           within_ms(laurel_touch_at, now, TOUCH_HOLD_MS) ? "touch" : within_ms(laurel_gpu_last_work, now, GPU_HOLD_MS) ? "gpu" : "none",
++	           th_cpu, th_gpu, th_on ? 1 : 0);
++}
++
+ int
+ laurel_cpufreq_start(void)
+ {
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index d59100a..352a860 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -998,6 +998,8 @@ struct sweet_log_header {
+ 	uint64_t total, seq;
+ };
+ 
++extern void laurel_stats_scan(void);    /* laurel 2911: bsd/dev/laurel_stats.c */
++
+ static void
+ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -1009,6 +1011,7 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
+ 	for (;;) {
+ 		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
++		laurel_stats_scan();            /* laurel 2911: the driver lines stay readable after the ring wraps */
+ 		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
+ 		if (total == flushed) {
+ 			continue;
+diff --git a/iokit/Kernel/arm/LaurelGpuDcvs.cpp b/iokit/Kernel/arm/LaurelGpuDcvs.cpp
+index d17cfc2..39bfc58 100644
+--- a/iokit/Kernel/arm/LaurelGpuDcvs.cpp
++++ b/iokit/Kernel/arm/LaurelGpuDcvs.cpp
+@@ -255,7 +255,16 @@ laurel_gpu_dcvs_start(void)
+ 	}
+ 	thread_deallocate(thread);
+ }
++
++/* laurel 2911: kern.laurel_stats: the level this file set (the measured clock is in RedwoodGPU's 5 s line) */
++extern "C" int laurel_gpu_dcvs_stats(char *s, size_t n);
++int
++laurel_gpu_dcvs_stats(char *s, size_t n)
++{
++	return scnprintf(s, n, "gpu.level_mhz=%u\nddr.boot_mhz=%u\nddr.vote_mhz=%u\n", level ? 600 : 300, ddr_boot, ddr_vote);
++}
+ #else
++extern "C" int laurel_gpu_dcvs_stats(char *s, size_t n) { (void)s; (void)n; return 0; }
+ extern "C" void laurel_gpu_dcvs_start(void) {}
+ extern "C" bool laurel_gpu_dcvs_stall(void) { return false; }
+ #endif
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index f7762e0..ca1878c 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -6294,6 +6294,32 @@ topaz_modem_init(void)
+ 	}
+ }
+ 
++
++/*
++ * laurel 2911: kern.laurel_stats: the same values as the "LAUREL WIFI: link" line, which comes every 10-60 s and stops at the
++ * log's line limit. Only reads what the status line reads; the byte counts let the reader make its own rate.
++ */
++extern "C" int laurel_wifi_stats(char *s, size_t n);
++int
++laurel_wifi_stats(char *s, size_t n)
++{
++	static const char *const kinds[3] = { "legacy", "HT", "VHT" };
++	uint64_t d[6];
++	const struct lw_rate *r = &lw_rx_rate;
++	int rssi = lw_rssi_now();
++
++	redwood_net_drops_get(d);
++	return scnprintf(s, n, "wifi.up=%d\nwifi.freq=%u\nwifi.channel=%u\nwifi.width=%u\nwifi.mode=%s\nwifi.qos=%d\nwifi.nss=%u\n"
++	           "wifi.rx_kind=%s\nwifi.rx_mcs=%u\nwifi.rx_width=%u\nwifi.rx_mbps10=%u\nwifi.tx_kbps=%u\nwifi.rssi=%d\nwifi.bars=%u\n"
++	           "wifi.rx_bytes=%llu\nwifi.tx_bytes=%llu\nwifi.rx_frames=%u\nwifi.tx_frames=%u\nwifi.tx_fail=%u\n"
++	           "wifi.drop_full=%llu\nwifi.drop_down=%llu\nwifi.drop_big=%llu\nwifi.drop_nomem=%llu\nwifi.drop_queue=%llu\nwifi.drop_left=%u\n"
++	           "wifi.drop_in=%llu\nwifi.scans=%u\nwifi.scans_deferred=%u\n",
++	           s_state == S_UP ? 1 : 0, s_state == S_UP ? s_freq : 0, s_state != S_UP ? 0 : s_freq >= 4900 ? (s_freq - 5000) / 5 : (s_freq - 2407) / 5,
++	           s_link.width, s_link.vht ? "VHT" : s_link.ht ? "HT" : "legacy", s_link.qos ? 1 : 0, s_link.nss, kinds[r->kind], r->mcs, r->width,
++	           r->mbps10, lw_tx_kbps, rssi, lw_ios_bars(rssi), lw_rx_bytes, lw_tx_bytes, rx_up, tx_sent, tx_fail, d[0], d[1], d[2], d[3], d[4],
++	           lw_drop_left, d[5], lw_scans_real, lw_scans_deferred);
++}
+ #else
+ extern "C" void topaz_modem_init(void) {}
++extern "C" int laurel_wifi_stats(char *s, size_t n) { (void)s; (void)n; return 0; }
+ #endif

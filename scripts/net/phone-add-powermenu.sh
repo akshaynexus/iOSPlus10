@@ -17,7 +17,7 @@
 # Status: written 2026-10-25 (XNUtils rename 2026-10-27), NOT run on the phone yet.
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-S=$REPO/out/powermenu
+S=${POWERMENU_OUT:-$REPO/out/powermenu}   # Mi A3: POWERMENU_OUT=out/laurel/xnutils/flat SSH_PHONE=scripts/laurel/phone-ssh.sh (docs/laurel_sprout/xnutils.md)
 P=${SSH_PHONE:-$REPO/scripts/net/ssh-phone.sh}   # SSH_PHONE=FILE: another ssh-phone.sh (dry runs)
 D=/private/var/tmp/powermenu-push
 mode=${1:-install}

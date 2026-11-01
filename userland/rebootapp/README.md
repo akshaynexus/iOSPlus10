@@ -1,5 +1,8 @@
 # XNUtils.app (formerly PowerMenu.app)
 
+OnePlus 10 Pro (negroni) version: macOS + Xcode, negroni boot-args, Adreno 730 paths. Mi A3 version (Linux build, live stats, other Metal
+and GL files): `userland/laurel/xnutils`, `docs/laurel_sprout/xnutils.md`.
+
 A home screen app: Metal device status, the GPU switches (Metal all / probes / off, GL for backboardd,
 GL for apps, glFinish, Clear Metal strikes, Restart backboardd) and three power buttons (Reboot to
 Bootloader, Restart, Shut Down). iOS 16.7.16 (20H392) on the OnePlus 10 Pro. UI: the owner's `main.m`;

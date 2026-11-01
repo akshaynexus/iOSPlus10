@@ -6,7 +6,7 @@
 # out/laurel-root-dry/root, runs topaz sweet-root-tweaks.py, root-tweaks-extra.py, root-tweaks-perf.py, root-system-features.py
 # and bt-launchd.py on it in the order of root.sh (chown off: the user cannot make 0 or 501 files), then checks the result:
 # the job list against the expected list in docs/laurel_sprout/system-features.md, 32 apps moved, no staged app left, the
-# aggregated job and its limit. Exit 0 = PASS. It does not build a root: that is `sudo scripts/laurel/root.sh`.
+# aggregated job and its limit, then root-xnutils.sh when XNUtils is built. Exit 0 = PASS. It does not build a root: that is `sudo scripts/laurel/root.sh`.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 APPLE=${APPLE:-$HOME/op10-apple}
@@ -73,6 +73,23 @@ if len(apps) - stock_apps != 32 or staged:
 for a in ('MobileCal', 'MobileMail', 'MobileNotes', 'MobileTimer', 'Weather', 'Maps'):
     if not os.path.isfile(f'{r}/Applications/{a}.app/Info.plist'):
         fail.append(f'{a}.app has no Info.plist')
-print('root-dry-run:', 'PASS' if not fail else 'FAIL: ' + '; '.join(fail))
+print('root-dry-run:', 'jobs + apps PASS' if not fail else 'FAIL: ' + '; '.join(fail))
 sys.exit(1 if fail else 0)
 EOF
+# XNUtils (root-xnutils.sh), when it is built. As the user: no owners, no setuid bit (the script says so).
+if [ -x "$REPO/out/laurel/xnutils/root/Applications/XNUtils.app/XNUtils" ]; then
+  bash "$REPO/scripts/laurel/root-xnutils.sh" "$R"
+  python3 -I - "$R" <<'EOF'
+import os, plistlib, stat, sys
+r = sys.argv[1]; a = r + '/Applications/XNUtils.app'
+info = plistlib.load(open(a + '/Info.plist', 'rb'))
+ok = (info['CFBundleIdentifier'] == 'dev.iosplus10.xnutils' and os.access(a + '/XNUtils', os.X_OK) and os.path.isfile(a + '/AppIcon60x60@2x.png')
+      and os.path.isfile(r + '/usr/local/libexec/powermenu-helper') and os.access(r + '/usr/local/bin/pmregister', os.X_OK)
+      and not os.path.exists(a + '.new') and stat.S_IMODE(os.stat(a + '/Info.plist').st_mode) == 0o644)
+print('root-dry-run: XNUtils', 'PASS' if ok else 'FAIL')
+sys.exit(0 if ok else 1)
+EOF
+else
+  echo "root-dry-run: XNUtils: note: not built (scripts/laurel/xnutils-build.sh)"
+fi
+echo "root-dry-run: PASS"
