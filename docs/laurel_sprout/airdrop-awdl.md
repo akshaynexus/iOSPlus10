@@ -157,7 +157,7 @@ Prepare: Build root with this branch (`build-all.sh`, then `root.sh`) and kernel
 
 ## 9. Build
 
-Built [V] on origin/laurel-int-1 3c43cd1: `kernel-linux.sh` 305/305 patches, 0 failed, 0 LSE/RCpc, printf-arg-check OK, sha256 a5cca08c44b8a9c8, armv80-check 21 (same as before). `awdl-build.sh`: 0 instructions newer than ARMv8.0, sha256 72a3bf90a4483c0f, only libSystem. `cargo test`: 13 of 13, one of them two Nodes that meet and pass IPv6 in the kernel's native-wifi form. `wifi-phy-test`, self-tests, `root-dry-run.sh` (FEATURES=0): passed.
-Not run: the phone, the full root (`sudo`), `FEATURES=1` of the dry run (this worktree has no other stages). The host test proves the daemon's use of owly-awdl; it says nothing of the radio.
+Built [V] on merge ce31b60 (origin/laurel-sprout 2bb0c84 + this branch): kernel-linux.sh 308/308 patches, 0 failed, 0 LSE/RCpc, printf-arg-check OK, kernel.development.sweet.4k sha256 6c80416eb01a80e4. laurel-awdld 369 kB sha256 3baf40e673203252, links only libSystem, 0 instructions newer than ARMv8.0; laurel-airplay sha256 1b2ae1cfad5f6f4a. Host tests: `cargo test` 13 of 13, wifi-phy-test passed, build-honest-test 60 of 60, root-dry-run (FEATURES=0) PASS. Not run: the phone; the full root (`sudo`); `FEATURES=1` of the dry run.
+The host test proves the daemon's use of owly-awdl; it says nothing of the radio.
 
-Base: `origin/laurel-sprout` (cad5efb) has neither 2930/2931 nor the USB route fix, so this branch starts at `origin/laurel-int-1` (3c43cd1).
+Base: this branch started at `origin/laurel-int-1` (3c43cd1) because `origin/laurel-sprout` then lacked 2930/2931 and the USB route fix; it is now merged with `origin/laurel-sprout` 2bb0c84, which has both.
