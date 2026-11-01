@@ -1,5 +1,5 @@
 /*
- * The parser of kern.laurel_cell_net (kernel patch 2932, bsd/dev/laurel_pdp_text.h): key=value lines -> struct. Plain C with no iOS header: the host test
+ * The parser of kern.laurel_cell_net (kernel patch 2942, bsd/dev/laurel_pdp_text.h): key=value lines -> struct. Plain C with no iOS header: the host test
  * (scripts/laurel/test-cell.sh) parses the kernel's own text with this file. Used by laurel_celld.c.
  */
 #ifndef CELLD_NET_H

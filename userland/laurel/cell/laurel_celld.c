@@ -1,10 +1,10 @@
 /*
- * laurel-celld: the Mi A3's cellular data session in configd (kernel patch 2932). Reads kern.laurel_cell_net every 2 s; on a change publishes one network
+ * laurel-celld: the Mi A3's cellular data session in configd (kernel patch 2942). Reads kern.laurel_cell_net every 2 s; on a change publishes one network
  * service to configd's dynamic store. IPMonitor then elects the primary service, writes the default route and the DNS configuration: Wi-Fi first while it is up,
  * cellular when it is gone [I: IPMonitor's rules from Apple's configd source, from memory; not in this repo. The phone test says]. Docs: docs/laurel_sprout/cellular.md section 11.
  *
  * On an iPhone CommCenter publishes the same keys: State:/Network/Service/<id>/{IPv4,IPv6,DNS,com.apple.CommCenter} [I]. No address work here: the kernel has
- * set the addresses on pdp_ip0 (bsd/dev/laurel_pdp2.h). A launchd job: starts at boot, exits only when the kernel has no such sysctl (kernel without 2932).
+ * set the addresses on pdp_ip0 (bsd/dev/laurel_pdp2.h). A launchd job: starts at boot, exits only when the kernel has no such sysctl (kernel without 2942).
  * SC functions by dlsym: a missing one = one "off" line, nothing else changes. Every result line goes to the USB log through kern.laurel_cell_ui, as the status bar bridge.
  * Never a SIM or modem identity: the text has none. Kill switches: boot-args cell=0 or cell_data=0: the kernel text stays "off", nothing is published.
  */

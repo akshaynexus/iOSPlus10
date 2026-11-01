@@ -1,5 +1,5 @@
 /*
- * Scenarios of laurel 2932 (test-cell.sh): the data session's QMI steps. Included by cell_test.c. The AP pipes and the interface are stand-ins here
+ * Scenarios of laurel 2942 (test-cell.sh): the data session's QMI steps. Included by cell_test.c. The AP pipes and the interface are stand-ins here
  * (tools/laurel-ipa-test/data_test.c tests the pipes). Layouts of the answers: libqmi, as hakios.mpss.c reads them. This does not prove the firmware's answers.
  */
 static void

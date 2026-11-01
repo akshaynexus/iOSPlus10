@@ -11,7 +11,8 @@
 # Needs: a root image with SSH (scripts/laurel/root.sh installs it when out/ssh/ios exists: userland/ssh/build.sh,
 # Linux or macOS), the host address 192.168.7.1 on the phone's interface (make usblog sets it), and a
 # kernel that attached ue0 ("LAUREL USB: ue0 attached" in the live log). Everything else (keys, known_hosts,
-# PHONE_IP, SSH_KEY, SSH_OPTS) as scripts/net/ssh-phone.sh, which does the work.
+# PHONE_IP, SSH_KEY, SSH_OPTS, PHONE_PASSWORD) as scripts/net/ssh-phone.sh, which does the work. Login needs no setup: the repo key
+# out/ssh/phone_ed25519 (made at the root build), or on an older root the stock password alpine, without a prompt.
 # Without SSH (kernel only) the command server still answers: out/bin/op10tool ctl ping|log|bootlog|time|reboot ...
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)

@@ -1,5 +1,5 @@
 /*
- * Host test of the laurel 2931 AP data path (bsd/dev/laurel_ipa_data.c, taken from the patch) with a simulated GSI + IPA: register values against the sources named in
+ * Host test of the laurel 2941 AP data path (bsd/dev/laurel_ipa_data.c, taken from the patch) with a simulated GSI + IPA: register values against the sources named in
  * that file, RX ring + QMAP frames, TX ring, full ring, errors. No claim about the hardware's answer: only that this code does what the sources say.
  * Run by scripts/laurel/test-ipa.sh. Exit 0 = all pass.
  */

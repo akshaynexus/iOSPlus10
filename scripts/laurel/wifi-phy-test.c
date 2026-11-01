@@ -7,6 +7,7 @@
 #include "LaurelWifiPhy.h"
 #include "LaurelWifiLink.h"
 #include "LaurelWifiPath.h"
+#include "LaurelWifiAwdl.h"
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); fails++; } } while (0)
@@ -125,6 +126,39 @@ path_tests(void)
 	CHECK(lw_slot_get(busy) == -1);
 }
 
+/* laurel 2930: a PSF and a MIF are AWDL; other action frames, a short frame and a beacon are not */
+static void
+awdl_tests(void)
+{
+	uint8_t f[64] = { 0xD0 };
+
+	f[24] = 127;
+	f[25] = 0x00;
+	f[26] = 0x17;
+	f[27] = 0xF2;
+	f[28] = 8;
+	f[29] = 0x10;
+	f[30] = 0;
+	CHECK(lw_awdl_frame(f, 40));
+	CHECK(!lw_awdl_frame(f, 30));
+	f[30] = 3;
+	CHECK(lw_awdl_frame(f, 31));
+	f[30] = 1;
+	CHECK(!lw_awdl_frame(f, 40));
+	f[30] = 0;
+	f[28] = 9;                              /* Apple's other vendor frames */
+	CHECK(!lw_awdl_frame(f, 40));
+	f[28] = 8;
+	f[25] = 0x50;                           /* another OUI */
+	CHECK(!lw_awdl_frame(f, 40));
+	f[25] = 0x00;
+	f[24] = 4;                              /* public action */
+	CHECK(!lw_awdl_frame(f, 40));
+	f[24] = 127;
+	f[0] = 0x80;                            /* beacon */
+	CHECK(!lw_awdl_frame(f, 40));
+}
+
 int
 main(void)
 {
@@ -208,6 +242,7 @@ main(void)
 	lw_rate_decode(0x04u << 24 | 1u << 4, 0, 0, &r);
 	CHECK(r.kind == 0 && r.mbps10 == 110);
 	path_tests();
+	awdl_tests();
 	printf(fails == 0 ? "wifi-phy-test: all checks passed\n" : "wifi-phy-test: %d checks FAILED\n", fails);
 	return fails != 0;
 }

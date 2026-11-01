@@ -55,8 +55,8 @@ static struct {
 	int opmode_reads, opmode_err_left, opmode_later, opmode_after;   /* GET_OPERATING_MODE: errors first; the mode changes after opmode_after reads */
 	int set_refuse_left, bind_err_left[2], rsrp, rssi_only;          /* SET refused; BIND error 3; signal */
 	bool no_signal, mode_sticky;
-	int set_lpm, lpm_refuse, event_reports;                          /* laurel 2930: SET low power; its error; SET_EVENT_REPORT with mode reporting */
-	uint32_t dpm_pipes[2];                                           /* laurel 2932: the data session */
+	int set_lpm, lpm_refuse, event_reports;                          /* laurel 2940: SET low power; its error; SET_EVENT_REPORT with mode reporting */
+	uint32_t dpm_pipes[2];                                           /* laurel 2942: the data session */
 	int wda_sets, wda_err, wds_bind[2], wds_family[2], wds_start[2], start_family[2], start_err[2], wds_mux;
 	bool online_after_format;
 } M;
@@ -242,7 +242,7 @@ topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *dat
 		put_tlv(tl, &tn, 0x14, "airtelgprs.com", 14);
 		answer(src_port, 2, txn, msg, 0, tl, tn);
 		break;
-	case 0x4017:                                        /* laurel 2932: DPM */
+	case 0x4017:                                        /* laurel 2942: DPM */
 		if (d[7] == 0x11 && d[10] == 1) {
 			uint32_t w[4];
 			memcpy(w, d + 11, 16);
@@ -321,7 +321,7 @@ laurel_ipa_state(const char **why)
 	return test_ipa_on;
 }
 
-/* laurel 2932: the AP pipes and the interface are stand-ins here; data_test.c tests the pipes. Default: no pipes, as an image without them */
+/* laurel 2942: the AP pipes and the interface are stand-ins here; data_test.c tests the pipes. Default: no pipes, as an image without them */
 static int test_data_state = -1;
 int
 laurel_ipa_data_state(const char **why)

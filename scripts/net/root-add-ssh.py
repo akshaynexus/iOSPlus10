@@ -5,11 +5,12 @@
 
 Reads the iOS binaries from out/ssh/ios (userland/ssh/build.sh). Steps (all idempotent):
  1. /usr/local/bin: dropbearmulti (+ dropbear, dropbearkey, dbclient, scp links), dash, toybox
-    (+ applet links that do not shadow a stock command), usbnetcfg, usbreboot, oslogstream. /bin/sh = dash
+    (+ applet links that do not shadow a stock command), usbnetcfg, laurelnet, usbreboot, oslogstream. /bin/sh = dash
     (stock iOS has no /bin/sh). /private/etc/shells lists /bin/sh.
- 2. Login: /private/var/root/.ssh/authorized_keys from the host user's public key
-    (SSH_PUBKEY=FILE, else ~/.ssh/id_ed25519.pub, id_ecdsa.pub, id_rsa.pub of SUDO_USER).
-    With a key, dropbear runs with -s (no passwords). Without a key, password logins are on and
+ 2. Login: /private/var/root/.ssh/authorized_keys gets the repo key out/ssh/phone_ed25519 (made once with
+    ssh-keygen, kept across rebuilds; scripts/net/ssh-phone.sh uses it, so SSH works with no setup) and the host
+    user's public key if there is one (SSH_PUBKEY=FILE, else ~/.ssh/id_ed25519.pub, id_ecdsa.pub, id_rsa.pub of SUDO_USER).
+    With a key, dropbear runs with -s (no passwords). No ssh-keygen and no user key: password logins are on and
     root's password is the stock iOS one from /etc/master.passwd ("alpine").
     SSH_PASSWORD_AUTH=1 allows passwords also when a key is installed.
  3. Host key: out/ssh/hostkeys/dropbear_ed25519_host_key (generated once with the host
@@ -18,11 +19,14 @@ Reads the iOS binaries from out/ssh/ios (userland/ssh/build.sh). Steps (all idem
     key on the phone at the first connection.
  4. launchd jobs (plist file + entry in /System/Library/xpc/launchd.plist under the
     /System/Library/LaunchDaemons/ key, the only path launchd reads on these ports):
-    dev.iosplus10.dropbear (192.168.7.2:22, KeepAlive) and dev.iosplus10.usbnetcfg (publishes
-    ue0 to configd once per boot). Logs: /private/var/log/iosplus10-*.log.
- 5. configd preferences: "USB Ethernet" service on ue0, manual 192.168.7.2/24, router
-    192.168.7.1, DNS 1.1.1.1 8.8.8.8 (as in external/slop NOTES.md 2026-10-18), first in the
-    service order; ue0 in NetworkInterfaces.plist (phone MAC 02:00:5e:77:ee:02, patch 0075).
+    dev.iosplus10.dropbear (192.168.7.2:22, KeepAlive) and dev.iosplus10.laurelnet (the LAUREL NET
+    line). dev.iosplus10.usbnetcfg (default route + DNS through the host at each boot) only with
+    USBNET_INTERNET=1: without host NAT it takes names and routes from Wi-Fi (docs/usb-network.md
+    "ue0 and Wi-Fi"); scripts/net/share-internet.sh runs usbnetcfg when the NAT is on.
+    Logs: /private/var/log/iosplus10-*.log.
+ 5. configd preferences: "USB Ethernet" service on ue0, manual 192.168.7.2/24, PrimaryRank Last, last in
+    the service order, no router and no DNS (USBNET_INTERNET=1: router 192.168.7.1, DNS 1.1.1.1 8.8.8.8);
+    ue0 in NetworkInterfaces.plist (phone MAC 02:00:5e:77:ee:02, patch 0075).
 """
 import os, plistlib, pwd, shutil, subprocess, sys, tempfile
 
@@ -35,8 +39,12 @@ PHONE = '192.168.7.2'
 SERVICE = '1F05B0E7-0000-4000-8000-0000000000E0'   # same as usbnetcfg.c DEFAULT_SERVICE
 LABEL_SSH = 'dev.iosplus10.dropbear'
 LABEL_NET = 'dev.iosplus10.usbnetcfg'
+LABEL_STATUS = 'dev.iosplus10.laurelnet'
+REPO_KEY = os.path.join(OUT, 'phone_ed25519')
+USB_INTERNET = os.environ.get('USBNET_INTERNET') == '1'
 PATH = '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
 IS_ROOT = os.geteuid() == 0
+TOOLS = ('dropbearmulti', 'dash', 'toybox', 'usbnetcfg', 'laurelnet', 'usbreboot', 'oslogstream')
 
 
 def own(path, uid=0, gid=0, mode=None):
@@ -105,7 +113,7 @@ def save_plist(path, data, fmt=plistlib.FMT_BINARY, mode=0o644, uid=0, gid=0):
 
 def binaries(root):
     b = mkdirs(root, 'usr/local/bin')
-    for n in ('dropbearmulti', 'dash', 'toybox', 'usbnetcfg', 'usbreboot', 'oslogstream'):
+    for n in TOOLS:
         install(os.path.join(IOS, n), os.path.join(b, n))
     for n in ('dropbear', 'dropbearkey', 'dbclient', 'scp'):
         link('dropbearmulti', os.path.join(b, n))
@@ -116,8 +124,7 @@ def binaries(root):
         p = os.path.join(root, d)
         if os.path.isdir(p):
             stock.update(os.listdir(p))
-    ours = {'dropbearmulti', 'dash', 'toybox', 'usbnetcfg', 'usbreboot', 'oslogstream', 'dropbear', 'dropbearkey',
-            'dbclient', 'scp', 'sh'}
+    ours = set(TOOLS) | {'dropbear', 'dropbearkey', 'dbclient', 'scp', 'sh'}
     applets = open(os.path.join(IOS, 'toybox.applets')).read().split()
     n = 0
     for a in applets:
@@ -135,7 +142,7 @@ def binaries(root):
         shnote = '/bin/sh -> /usr/local/bin/dash'
     else:
         shnote = '/bin/sh exists (kept; dash is /usr/local/bin/dash)'
-    print(f'ssh: /usr/local/bin: dropbear, dash, toybox (+{n} applet links), usbnetcfg, usbreboot, oslogstream; {shnote}')
+    print(f'ssh: /usr/local/bin: dropbear, dash, toybox (+{n} applet links), usbnetcfg, laurelnet, usbreboot, oslogstream; {shnote}')
 
     shells = os.path.join(mkdirs(root, 'private/etc'), 'shells')
     lines = open(shells).read().splitlines() if os.path.exists(shells) else []
@@ -168,9 +175,39 @@ def find_pubkey():
     return None
 
 
+def repo_key():
+    """The key of this repo for the phone: out/ssh/phone_ed25519(.pub), made once. None without ssh-keygen."""
+    pub = REPO_KEY + '.pub'
+    if not os.path.isfile(pub):
+        exe = shutil.which('ssh-keygen')
+        if exe is None:
+            return None
+        os.makedirs(OUT, exist_ok=True)
+        host_owned(OUT)
+        if os.path.exists(REPO_KEY):   # the private key alone: keep it, a phone may have it
+            out = subprocess.run([exe, '-y', '-f', REPO_KEY], check=True, capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout
+            with open(pub, 'w') as f:
+                f.write(out)
+        else:
+            subprocess.run([exe, '-q', '-t', 'ed25519', '-N', '', '-C', 'iosplus10-phone', '-f', REPO_KEY], check=True, stdin=subprocess.DEVNULL)
+            print('ssh: phone key generated:', os.path.relpath(REPO_KEY, REPO))
+    # the host user runs ssh with it, also after a run with sudo
+    host_owned(REPO_KEY)
+    host_owned(pub)
+    os.chmod(REPO_KEY, 0o600)
+    return pub
+
+
+def public_key_line(keyfile):
+    key = open(keyfile).read().strip().splitlines()[0].strip()
+    if not key.startswith(('ssh-', 'ecdsa-')) or 'PRIVATE KEY' in key:
+        sys.exit(f'{keyfile} does not look like a public key')
+    return key
+
+
 def login(root):
     """Returns True for key-only logins."""
-    keyfile = find_pubkey()
+    keyfiles = [k for k in (repo_key(), find_pubkey()) if k is not None]
     d = mkdirs(root, 'private/var/root/.ssh', 0o700)
     own(d, 0, 0, 0o700)
     profile = os.path.join(root, 'private/var/root/.profile')
@@ -179,21 +216,20 @@ def login(root):
             f.write(f'# iOSPlus10 (scripts/net/root-add-ssh.py)\nexport PATH={PATH}\nexport HOME=/var/root\n'
                     'export PS1="$(hostname -s 2>/dev/null || echo iPhone):\\$PWD# "\n')
         own(profile, 0, 0, 0o644)
-    if keyfile is None:
-        print('ssh: no public key found (SSH_PUBKEY or ~/.ssh/id_ed25519.pub): password login, '
-              'root password = stock iOS "alpine"')
+    if not keyfiles:
+        print('ssh: no ssh-keygen and no public key (SSH_PUBKEY or ~/.ssh/id_ed25519.pub): password login, '
+              'root password = stock iOS "alpine" (scripts/net/ssh-phone.sh gives it)')
         return False
-    key = open(keyfile).read().strip().splitlines()[0].strip()
-    if not key.startswith(('ssh-', 'ecdsa-')) or 'PRIVATE KEY' in key:
-        sys.exit(f'{keyfile} does not look like a public key')
     ak = os.path.join(d, 'authorized_keys')
     have = open(ak).read().splitlines() if os.path.exists(ak) else []
-    if key not in have:
-        have.append(key)
+    for keyfile in keyfiles:
+        key = public_key_line(keyfile)
+        if key not in have:
+            have.append(key)
+        print('ssh: authorized_keys <-', keyfile)
     with open(ak, 'w') as f:
         f.write('\n'.join(have) + '\n')
     own(ak, 0, 0, 0o600)
-    print('ssh: authorized_keys <-', keyfile)
     return True
 
 
@@ -266,6 +302,19 @@ def add_job(root, label, job):
     save_plist(lp, data, mode=st.st_mode & 0o7777, uid=st.st_uid, gid=st.st_gid)
 
 
+def drop_job(root, label):
+    """A job of an older run of this script on the same root goes away."""
+    rel = f'System/Library/LaunchDaemons/{label}.plist'
+    p = os.path.join(root, rel)
+    if os.path.exists(p):
+        os.unlink(p)
+    lp = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    st = os.stat(lp)
+    data = load_plist(lp, None)
+    if data.get('LaunchDaemons', {}).pop('/' + rel, None) is not None:
+        save_plist(lp, data, mode=st.st_mode & 0o7777, uid=st.st_uid, gid=st.st_gid)
+
+
 def jobs(root, key_only, have_hostkey):
     mkdirs(root, 'private/var/log')
     args = ['/usr/local/bin/dropbear', '-F', '-E', '-p', f'{PHONE}:22']
@@ -281,29 +330,42 @@ def jobs(root, key_only, have_hostkey):
         'Label': LABEL_SSH, 'ProgramArguments': args, 'RunAtLoad': True, 'KeepAlive': True,
         'ThrottleInterval': 10, 'UserName': 'root', 'EnvironmentVariables': env,
         'StandardErrorPath': '/private/var/log/iosplus10-dropbear.log'})
-    add_job(root, LABEL_NET, {
-        'Label': LABEL_NET, 'ProgramArguments': ['/usr/local/bin/usbnetcfg', 'up'], 'RunAtLoad': True,
-        'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 10, 'UserName': 'root',
+    add_job(root, LABEL_STATUS, {
+        'Label': LABEL_STATUS, 'ProgramArguments': ['/usr/local/bin/laurelnet'], 'RunAtLoad': True,
+        'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 60, 'UserName': 'root',
         'EnvironmentVariables': env,
-        'StandardOutPath': '/private/var/log/iosplus10-usbnetcfg.log',
-        'StandardErrorPath': '/private/var/log/iosplus10-usbnetcfg.log'})
-    print(f'ssh: launchd jobs {LABEL_SSH} ({" ".join(args)}), {LABEL_NET}')
+        'StandardOutPath': '/private/var/log/iosplus10-laurelnet.log',
+        'StandardErrorPath': '/private/var/log/iosplus10-laurelnet.log'})
+    if USB_INTERNET:
+        add_job(root, LABEL_NET, {
+            'Label': LABEL_NET, 'ProgramArguments': ['/usr/local/bin/usbnetcfg', 'up'], 'RunAtLoad': True,
+            'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 10, 'UserName': 'root',
+            'EnvironmentVariables': env,
+            'StandardOutPath': '/private/var/log/iosplus10-usbnetcfg.log',
+            'StandardErrorPath': '/private/var/log/iosplus10-usbnetcfg.log'})
+    else:
+        drop_job(root, LABEL_NET)
+    print(f'ssh: launchd jobs {LABEL_SSH} ({" ".join(args)}), {LABEL_STATUS}' + (f', {LABEL_NET}' if USB_INTERNET else ''))
 
 
 def configd(root):
     base = mkdirs(root, 'private/var/preferences/SystemConfiguration')
     path = os.path.join(base, 'preferences.plist')
     prefs = load_plist(path, {'__VERSION__': 20191120})
-    prefs.setdefault('NetworkServices', {})[SERVICE] = {
+    ipv4 = {'ConfigMethod': 'Manual', 'Addresses': [PHONE], 'SubnetMasks': ['255.255.255.0']}
+    service = {
         'UserDefinedName': 'USB Ethernet',
+        'PrimaryRank': 'Last',
         'Interface': {'DeviceName': 'ue0', 'Hardware': 'Ethernet', 'Type': 'Ethernet',
                       'UserDefinedName': 'USB Ethernet'},
-        'IPv4': {'ConfigMethod': 'Manual', 'Addresses': [PHONE], 'SubnetMasks': ['255.255.255.0'],
-                 'Router': '192.168.7.1'},
+        'IPv4': ipv4,
         'IPv6': {'ConfigMethod': 'Automatic'},
-        'DNS': {'ServerAddresses': ['1.1.1.1', '8.8.8.8']},
         'Proxies': {'ExceptionsList': ['*.local', '169.254/16'], 'FTPPassive': 1},
     }
+    if USB_INTERNET:
+        ipv4['Router'] = '192.168.7.1'
+        service['DNS'] = {'ServerAddresses': ['1.1.1.1', '8.8.8.8']}
+    prefs.setdefault('NetworkServices', {})[SERVICE] = service
     sets = prefs.setdefault('Sets', {})
     cur = prefs.get('CurrentSet', '').rsplit('/', 1)[-1] or next(iter(sets), '1F05B0E7-0000-4000-8000-00000000005E')
     s = sets.setdefault(cur, {'UserDefinedName': 'Automatic', 'Network': {}})
@@ -312,7 +374,7 @@ def configd(root):
     order = net.setdefault('Global', {}).setdefault('IPv4', {}).setdefault('ServiceOrder', [])
     if SERVICE in order:
         order.remove(SERVICE)
-    order.insert(0, SERVICE)
+    order.append(SERVICE)
     net.setdefault('Interface', {})
     prefs['CurrentSet'] = '/Sets/' + cur
     save_plist(path, prefs)
@@ -326,8 +388,8 @@ def configd(root):
                 'SCNetworkInterfaceInfo': {'UserDefinedName': 'USB Ethernet'}})
     ifs['Interfaces'] = lst
     save_plist(path, ifs)
-    print(f'usbnet: configd service {SERVICE} "USB Ethernet": ue0 {PHONE}/24 router 192.168.7.1, '
-          'DNS 1.1.1.1 8.8.8.8')
+    print(f'usbnet: configd service {SERVICE} "USB Ethernet": ue0 {PHONE}/24, last in the order, ' +
+          ('router 192.168.7.1, DNS 1.1.1.1 8.8.8.8' if USB_INTERNET else 'no router and no DNS (default route and names stay with Wi-Fi)'))
 
 
 def main():
@@ -336,8 +398,7 @@ def main():
     root = os.path.abspath(sys.argv[1])
     if not os.path.isfile(os.path.join(root, 'System/Library/xpc/launchd.plist')):
         sys.exit(f'{root} is not an iOS root (no System/Library/xpc/launchd.plist)')
-    need = [os.path.join(IOS, n) for n in ('dropbearmulti', 'dash', 'toybox', 'usbnetcfg', 'usbreboot', 'oslogstream',
-                                           'toybox.applets')]
+    need = [os.path.join(IOS, n) for n in TOOLS + ('toybox.applets',)]
     missing = [os.path.basename(p) for p in need if not os.path.isfile(p)]
     if missing:
         sys.exit('ssh: out/ssh/ios is missing ' + ', '.join(missing) + ' (run userland/ssh/build.sh on a Mac)')

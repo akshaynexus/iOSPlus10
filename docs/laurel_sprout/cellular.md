@@ -4,7 +4,7 @@ Goal (owner): SIM detection for both slots, network registration, mobile data an
 iOS 16.7.16 (20H392, iPhone10,3 userland). Status 2026-11-01: step 1 (kernel QMI client: SIM 1/2 status, provisioning,
 modem facts; radio kept off by its IPA self-check) [V] booted (boot 20:02: the kernel reads SIM state; iOS saw no SIM, half-done-audit.md row 3). The bridge to iOS and the online fix
 (section 9, patch 2786): built + host test, NOT BOOTED. Path decision, data, SMS, voice, Settings, modem restart: section 9. The IPA phone test: section 10.
-Status later on 2026-11-01: IPA handshake [V] passes on the phone (boot 22:50); DMS mode 5 blocked ONLINE. Radio online + data (2930-2932, `laurel-celld`): built + host test, NOT BOOTED, data [I] until a phone ping: **section 11, read it first.**
+Status later on 2026-11-01: IPA handshake [V] passes on the phone (boot 22:50); DMS mode 5 blocked ONLINE. Radio online + data (2940-2942, `laurel-celld`): built + host test, NOT BOOTED, data [I] until a phone ping: **section 11, read it first.**
 
 Labels: [V] read in source, measured on the host, or in the 20H392 root; [I] inference; [U] unknown.
 Kernel patch: `patches/laurel/xnu/2760-laurel-cellular-qmi.patch` (new `bsd/dev/laurel_cell.c` + hooks in TopazModem.cpp).
@@ -388,7 +388,7 @@ Expected on the screen [I]: `No Service`, no bars, no longer `No SIM`. `LAUREL W
 
 | Line | Meaning |
 | --- | --- |
-| `... modem shutting down; ...` as the final line, 60 s after the start | The modem really stays at 5 ([V] boot 22:50). With 2930 only in an `ipa=0` image; else section 11.6 |
+| `... modem shutting down; ...` as the final line, 60 s after the start | The modem really stays at 5 ([V] boot 22:50). With 2940 only in an `ipa=0` image; else section 11.6 |
 | `LaurelCell: nas1: BIND_SUBSCRIPTION error 0x3`, then nothing wrong | Normal now: asked again, 10 s apart |
 | `... SIM2: NAS not bound to this SIM` (only online) | 6 refusals: SIM2 gets no bars, by design |
 | `LAUREL CELLBAR: off: no -[...]` or `no CoreTelephony ...` | The build differs from what section 9 read. Apple's bar stays |
@@ -433,7 +433,7 @@ Fail, first match:
 | `modem crash reason:` within seconds after `online: ok`, e.g. `enl2_dl` | Radio needs AP data pipes (scion's crash, but handshake passed) | Off | Section 9.4 comes before ONLINE: gate ONLINE on it. New fact |
 | `SIM1 searching` or `not registered`, no crash | Radio works, no network yet. No bars, by design | Stays | Antenna, band, `registration denied` text |
 
-## 11. Radio online + data: patches 2930, 2931, 2932 + `laurel-celld` (2026-11-01, build + host test, NOT BOOTED)
+## 11. Radio online + data: patches 2940, 2941, 2942 + `laurel-celld` (2026-11-01, build + host test, NOT BOOTED)
 
 Phone input [V, boot 22:50:54, `logs/laurel-boot-ipa.txt`]: the IPA handshake passes (`modem answered INIT_MODEM_DRIVER: success (21 ms)`, `LAUREL IPA: on`), no modem crash, Wi-Fi on. DMS says 5 for the whole boot, so 2786 never sends ONLINE. **Section 8's claim "5 is only an old value" is wrong.**
 
@@ -454,7 +454,7 @@ Evidence tool: `scripts/debug/modem-re.sh` (stock NON-HLOS to `out/re-modem`, st
 
 Conclusion: **unknown until the next boot** whether ONLINE works at 5. Next-boot lines tell: raw mode, offline reason, hardware restricted, and the answer to each request.
 
-### 11.2 What 2930 does
+### 11.2 What 2940 does
 
 - `radio_step()`: 20 s after DMS came up, 5, 4 or an unknown mode no longer blocks. One round: low power, 2 s, ONLINE, each answer in one line, then a mode read. 6 rounds at most: 10 s after a refusal, 30 s after an `ok` that changes nothing. A refused low power does not stop the round. Mode 1, 6, 7: ONLINE directly.
 - The mode line has the raw value, offline reason (TLV 0x10), hardware restricted (TLV 0x11). `DMS SET_EVENT_REPORT` (TLV 0x14): the modem tells changes, the 10 s read stays.
@@ -467,7 +467,7 @@ Conclusion: **unknown until the next boot** whether ONLINE works at 5. Next-boot
 
 **DSDS.** [V firmware] L+L dual standby, one voice, config in `mcfg_hw/.../7+7_mode/sr_dsds`. NAS client per subscription: built in 2760 + 2786. Both SIMs in `kern.laurel_cell_state`. Dual standby preference: not sent; the modem's stored value applies [I]. `SET_DUAL_STANDBY_PREF` layout is not in this repo, so no blind request.
 
-### 11.3 What 2931 does: the AP data pipes
+### 11.3 What 2941 does: the AP data pipes
 
 `bsd/dev/laurel_ipa_data.c`, thread from `LAUREL IPA: on`, polled, kill switch `cell_data=0`.
 
@@ -479,7 +479,7 @@ Conclusion: **unknown until the next boot** whether ONLINE works at 5. Next-boot
 
 Sources: stock `ipa3_ep_mapping[IPA_4_2]`, `rmnet_ipa.c`, `ipa_dp.c`; mainline `ipa_data-v4.2.c`, `gsi.c`, `ipa_endpoint.c`. Decisions: channel scratch stays 0 (stock: no MCS prefetch on 4.2; scion and mainline write it); no AP command channel (tables are in SRAM; `qcom,modem-cfg-emb-pipe-flt`: the modem fills pipe 1's filter table, stock installs no AP rule there [V]); no checksum offload (4-byte QMAP, the stack computes); no status towards the AP. Memory: modem pool, about 1.4 MB. Poll: 1 ms with traffic, 10 ms after 200 quiet polls, 100 ms with no session: cost on a phone [U].
 
-### 11.4 What 2932 does: the session and `pdp_ip0`
+### 11.4 What 2942 does: the session and `pdp_ip0`
 
 1. `laurel_cell_data.c`: DPM OPEN_PORT (embedded, interface 1, pipes 1 and 9), WDA SET_DATA_FORMAT (raw IP, QMAP, 16 packets or 6144 bytes). **These come before ONLINE**, as netmgrd before the RIL [I], at most 30 s. A WDA refusal: data off, radio goes on.
 2. One WDS client per family (ports 0x4019, 0x401A): BIND_MUX_DATA_PORT mux 1, SET_IP_FAMILY, START_NETWORK when NAS says registered, GET_CURRENT_SETTINGS. Gaps: 10 s, after 6 tries 60 s. Packet service indication: disconnected = this family goes down, START again.

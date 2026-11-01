@@ -34,8 +34,8 @@ for f in laurel_ext4.c laurel_ext4_dir.c laurel_ext4.h laurel_ipa.c laurel_ipa_h
 done
 # 2782 changes these files and adds laurel_ipa_gsi.c + laurel_ipa_link.c (its bsd/conf/files part is not for the test)
 awk '/^diff / {p = index($0, "bsd/dev/") != 0} p' "$P_GSI" | (cd "$D" && patch -s -p3) || { echo "test-ipa: 2782 does not apply" >&2; exit 1; }
-# 2931: the AP data pipes: changes these files, adds laurel_ipa_data.c + laurel_ipa_data2.h
-awk '/^diff / {p = index($0, "bsd/dev/") != 0} p' "$REPO/patches/laurel/xnu/2931-laurel-ipa-data-path.patch" | (cd "$D" && patch -s -p3) || { echo "test-ipa: 2931 does not apply" >&2; exit 1; }
+# 2941: the AP data pipes: changes these files, adds laurel_ipa_data.c + laurel_ipa_data2.h
+awk '/^diff / {p = index($0, "bsd/dev/") != 0} p' "$REPO/patches/laurel/xnu/2941-laurel-ipa-data-path.patch" | (cd "$D" && patch -s -p3) || { echo "test-ipa: 2941 does not apply" >&2; exit 1; }
 for f in topaz_pas.c topaz_pas.h; do extract "$P_PAS" $f; done
 # the ARM barrier of topaz_pas.c on an x86 host: a full compiler + CPU fence (same meaning for the test)
 case "$(uname -m)" in arm64|aarch64) ;; *) sed -i.bak 's/__asm__ volatile ("dsb sy" ::: "memory")/__sync_synchronize()/' "$D/topaz_pas.c" "$D/laurel_ipa_data.c" ;; esac
@@ -61,10 +61,10 @@ $CC $CF -o "$D/data_test" "$T/data_test.c"
 
 # laurel_cell.c as the kernel has it: the new file of 2760, then the hunks of 2780 and 2786
 extract "$REPO/patches/laurel/xnu/2760-laurel-cellular-qmi.patch" laurel_cell.c
-for p in "$P_IPA" "$REPO/patches/laurel/xnu/2786-laurel-cell-radio-state.patch" "$REPO/patches/laurel/xnu/2930-laurel-cell-radio-online.patch" "$REPO/patches/laurel/xnu/2932-laurel-cell-data.patch"; do
+for p in "$P_IPA" "$REPO/patches/laurel/xnu/2786-laurel-cell-radio-state.patch" "$REPO/patches/laurel/xnu/2940-laurel-cell-radio-online.patch" "$REPO/patches/laurel/xnu/2942-laurel-cell-data.patch"; do
   awk '/^diff / {p = ($0 ~ /b\/bsd\/dev\/laurel_cell\.c$/)} p' "$p" | (cd "$D" && patch -s -p0 laurel_cell.c) || { echo "test-ipa: $(basename "$p") does not apply to laurel_cell.c" >&2; exit 1; }
 done
-for f in laurel_cell_data.c laurel_cell_data2.h laurel_cell_data.h; do extract "$REPO/patches/laurel/xnu/2932-laurel-cell-data.patch" $f; done
+for f in laurel_cell_data.c laurel_cell_data2.h laurel_cell_data.h; do extract "$REPO/patches/laurel/xnu/2942-laurel-cell-data.patch" $f; done
 # shellcheck disable=SC2086
 $CC $CF -c -o "$D/laurel_cell.o" "$D/laurel_cell.c"
 # shellcheck disable=SC2086
@@ -80,7 +80,7 @@ echo "== 5. the gate before the handshake"
 "$D/gate_test"
 echo "== 6. IPA and cellular together"
 "$D/ipa_cell_test"
-echo "== 7. AP data pipes (2931)"
+echo "== 7. AP data pipes (2941)"
 "$D/data_test"
 
 IMG=${VENDOR_IMG:-}

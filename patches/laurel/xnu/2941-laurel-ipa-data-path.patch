@@ -1,4 +1,4 @@
-laurel 2931: IPA v4.2 AP data path: event + transfer rings, endpoint config for pipes 1 (WAN_PROD), 9 (WAN_CONS), 8 (LAN_CONS): QMAP, polled, no AP command channel. Runs after "LAUREL IPA: on". Kill switch cell_data=0. Self-check: channel states, GSI ERROR_LOG. Docs: docs/laurel_sprout/cellular.md section 11. Host test: test-ipa.sh data_test. NOT PROVEN on a phone.
+laurel 2941: IPA v4.2 AP data path: event + transfer rings, endpoint config for pipes 1 (WAN_PROD), 9 (WAN_CONS), 8 (LAN_CONS): QMAP, polled, no AP command channel. Runs after "LAUREL IPA: on". Kill switch cell_data=0. Self-check: channel states, GSI ERROR_LOG. Docs: docs/laurel_sprout/cellular.md section 11. Host test: test-ipa.sh data_test. NOT PROVEN on a phone.
 
 diff -ruN a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files	2026-11-01 23:19:26.770343151 +0530
@@ -19,7 +19,7 @@ diff -ruN a/bsd/dev/laurel_ipa.c b/bsd/dev/laurel_ipa.c
  		return;
  	}
 +	if (p == P_ON) {
-+		lipa_data_kick(&mem);           /* laurel 2931: the AP's data pipes, before the radio goes online */
++		lipa_data_kick(&mem);           /* laurel 2941: the AP's data pipes, before the radio goes online */
 +		return;
 +	}
  	if (p != P_QMI) {
@@ -30,7 +30,7 @@ diff -ruN a/bsd/dev/laurel_ipa_data2.h b/bsd/dev/laurel_ipa_data2.h
 +++ b/bsd/dev/laurel_ipa_data2.h	2026-11-01 23:35:23.406634328 +0530
 @@ -0,0 +1,134 @@
 +/*
-+ * laurel 2931: second half of laurel_ipa_data.c: transmit, the polling thread, the state. One file with the first half (included there): the file limit of this repo's rule.
++ * laurel 2941: second half of laurel_ipa_data.c: transmit, the polling thread, the state. One file with the first half (included there): the file limit of this repo's rule.
 + * The thread runs from "LAUREL IPA: on" until the IPA goes off (modem crash): no restart. Poll: 1 ms while packets flow, 10 ms after 200 quiet polls,
 + * 100 ms while no data session is up. Each wake up costs a few register reads; numbers on a phone: [U].
 + */
@@ -168,7 +168,7 @@ diff -ruN a/bsd/dev/laurel_ipa_data.c b/bsd/dev/laurel_ipa_data.c
 +++ b/bsd/dev/laurel_ipa_data.c	2026-11-01 23:27:42.227972280 +0530
 @@ -0,0 +1,313 @@
 +/*
-+ * laurel_sprout (Mi A3, SM6125) IPA v4.2 AP data path (laurel 2931): GSI event + transfer rings and endpoint config for the
++ * laurel_sprout (Mi A3, SM6125) IPA v4.2 AP data path (laurel 2941): GSI event + transfer rings and endpoint config for the
 + * AP's three data pipes. On with the IPA (kill switch ipa=0), and cell_data=0 turns off only this. Sources: stock 4.14
 + * ipa_v3 (ipa_utils.c ipa3_ep_mapping[IPA_4_2], rmnet_ipa.c handle3_ingress_format / handle3_egress_format, ipa_dp.c
 + * ipa3_assign_policy), mainline drivers/net/ipa (data/ipa_data-v4.2.c, reg/gsi_reg-v4.0.c, reg/ipa_reg-v4.2.c, gsi.c,
@@ -487,7 +487,7 @@ diff -ruN a/bsd/dev/laurel_ipa_regs.h b/bsd/dev/laurel_ipa_regs.h
  #define LIPA_GSI_EE0_SIZE       0x00004000u
  /* ---- GSI EE 0 registers, offsets from LIPA_GSI_EE0_PA (gsi_reg_v1.h: the 0x1cxxx / 0x1fxxx offsets, n = 0) */
  #define G_CH_CNTXT_0(k)         (0x80u * (k))   /* [23:20] CHSTATE */
-+#define G_CH_CNTXT(k, n)        (0x80u * (k) + 4u * (n))        /* laurel 2931 (gsi_reg-v4.0.c, n = 0..3) */
++#define G_CH_CNTXT(k, n)        (0x80u * (k) + 4u * (n))        /* laurel 2941 (gsi_reg-v4.0.c, n = 0..3) */
 +#define G_CH_QOS(k)             (0x5Cu + 0x80u * (k))
 +#define G_CH_SCRATCH(k, n)      (0x60u + 0x80u * (k) + 4u * (n))
 +#define G_EV_CNTXT(e, n)        (0x1000u + 0x80u * (e) + 4u * (n))
@@ -502,7 +502,7 @@ diff -ruN a/bsd/dev/laurel_ipa_regs.h b/bsd/dev/laurel_ipa_regs.h
  #define R_DST_RSRC_GRP_01(n)    (0x500u + 0x20u * (n))
  #define R_SRAM_DIRECT           0x7000          /* IPA_SW_AREA_RAM_DIRECT_ACCESS_n, n = byte offset / 4 */
  
-+/* laurel 2931: endpoint registers (reg/ipa_reg-v4.2.c) and the AP data pipes' values (laurel_ipa_data.c) */
++/* laurel 2941: endpoint registers (reg/ipa_reg-v4.2.c) and the AP data pipes' values (laurel_ipa_data.c) */
 +#define R_ENDP_CFG(p)           (0x808u + 0x70u * (p))
 +#define R_ENDP_NAT(p)           (0x80Cu + 0x70u * (p))
 +#define R_ENDP_HDR(p)           (0x810u + 0x70u * (p))
@@ -533,7 +533,7 @@ diff -ruN a/bsd/dev/laurel_ipa_regs.h b/bsd/dev/laurel_ipa_regs.h
  /* laurel_ipa_gsi.c: the GSI channels of all EEs (GSI 2.2: the AP allocates the modem's too) */
  bool lipa_gsi_alloc(uint32_t pipes, char *why, size_t wl);
  
-+/* laurel_ipa_data.c (laurel 2931): the AP's data pipes (WAN_PROD, WAN_CONS, LAN_CONS) */
++/* laurel_ipa_data.c (laurel 2941): the AP's data pipes (WAN_PROD, WAN_CONS, LAN_CONS) */
 +#define LIPA_DATA_CH            3u
 +#define LIPA_MUX_ID             1u              /* QMAP mux of the data session */
 +typedef void (*lipa_rx_fn)(uint8_t mux, const uint8_t *ip, uint32_t len);

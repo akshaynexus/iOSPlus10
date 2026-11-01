@@ -2,7 +2,7 @@
 # Mi A3: build every stage that root.sh needs, in parallel, then the boot image. Logs: logs/stage-*.log.
 #   scripts/bg.sh laurel-full sh -c 'scripts/laurel/build-all.sh && scripts/laurel/root-flash-test.sh'
 # Exit 0 only when each wanted part is built and proven (root-manifest.py preflight; docs/laurel_sprout/build-honest.md). A part stays out only by its own
-# switch: GPU=0 METAL=0 HEVC=0 AUDIO=0 BT=0 CAMERA=0 STATUSBAR=0 NOTCH=0 TORCH=0 BRIGHTNESS=0 XNUTILS=0 SSH=0. No half-built root after a 10 minute flash.
+# switch: GPU=0 METAL=0 HEVC=0 AUDIO=0 BT=0 CAMERA=0 STATUSBAR=0 NOTCH=0 TORCH=0 BRIGHTNESS=0 XNUTILS=0 AIRPLAY=0 SSH=0. No half-built root after a 10 minute flash.
 set -u
 . "$(dirname "$0")/../lib/env.sh"
 # main(): sh reads a function whole, so an edit of this file during the run cannot change what runs
@@ -26,7 +26,7 @@ if [ ! -x out/laurel-kernel/theos/toolchain/linux/iphone/bin/ld ]; then
 else
   "$L/kernel-linux.sh" > logs/stage-kernel.log 2>&1 & k=$!
 fi
-g=; m=; n=; e=; c=; h=; a=; b=; f=; x=; s=
+g=; m=; n=; e=; c=; h=; a=; b=; f=; x=; p=; s=
 if on GPU; then
   { [ -s out/laurel/gpu/firmware/a610_zap.mdt ] || "$L/gpu-firmware.sh"; } > logs/stage-gpufw.log 2>&1 || { echo "build-all: FAILED: gpu-firmware (logs/stage-gpufw.log)" >&2; exit 1; }
   "$L/gpu-userland.sh" > logs/stage-gpu.log 2>&1 & g=$!
@@ -41,11 +41,12 @@ if on BT; then userland/laurel/bt/build.sh > logs/stage-bt.log 2>&1 & b=$!; fi
 # the camera plug-in owns the flashlight; its own plug-in only without the camera
 if on TORCH && ! on CAMERA; then userland/laurel/flashlight/build.sh > logs/stage-torch.log 2>&1 & f=$!; fi
 if on XNUTILS; then "$L/xnutils-build.sh" > logs/stage-xnutils.log 2>&1 & x=$!; fi
+if on AIRPLAY; then "$L/airplay-build.sh" > logs/stage-airplay.log 2>&1 & p=$!; fi
 if on SSH; then
   { userland/ssh/fetch.sh && { [ "$(uname -s)" != Linux ] || userland/ssh/fetch-sdk.sh; } && userland/ssh/build.sh; } > logs/stage-ssh.log 2>&1 & s=$!
 fi
 bad=
-for j in kernel:$k gpu:$g metal:$m notch:$n cell:$e camera:$c hevc:$h audio:$a bt:$b flashlight:$f xnutils:$x ssh:$s; do
+for j in kernel:$k gpu:$g metal:$m notch:$n cell:$e camera:$c hevc:$h audio:$a bt:$b flashlight:$f xnutils:$x airplay:$p ssh:$s; do
   [ -n "${j#*:}" ] || continue
   wait "${j#*:}" || bad="$bad ${j%%:*}"
 done

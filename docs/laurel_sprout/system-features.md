@@ -30,7 +30,7 @@ Actions: **ON** = enabled by this branch. **DRIVER** = needs a driver. **OFF** =
 | HFS on flash | no SSD flag | merged 2902 | **ON** | Lower: no file relocation, no hot-file work |
 | IOSurface wired guard | absent | merged 2906 (negroni freeze of 2026-10-27) | **ON**, 55 % of RAM, backboardd and SpringBoard exempt | one check per surface |
 | USB poll and TX queue (for SSH) | fixed 1 ms poll | merged 2905. Changed here: only a received frame holds the 200 us poll. The original also held it for the live log alone | **ON** | Lower at idle: 4 ms, 20 ms without a host |
-| SSH over USB (dropbear) | not in the root | merged from infra (`root.sh`, `phone-ssh.sh`, Linux build) | **ON** when `out/ssh/ios` exists | [I] none until a session starts |
+| SSH over USB (dropbear) | not in the root | merged from infra (`root.sh`, `phone-ssh.sh`, Linux build). Repo key, no setup (`docs/usb-network.md`). `usbnetcfg` no longer runs at boot: it took the default route from Wi-Fi | **ON** when `out/ssh/ios` exists | [I] none until a session starts |
 
 ### 2.2 Needs a driver or hardware service
 
@@ -44,7 +44,7 @@ Actions: **ON** = enabled by this branch. **DRIVER** = needs a driver. **OFF** =
 | Microphone: Voice Memos, Siri, calls | `audio.md` "Microphone": analog AMIC1 on WCD937x + SoundWire | **DRIVER built, not booted** (patch 2920). Voice Memos: test steps there. Siri: needs network services [U]. Calls: no cell path |
 | Front, depth, ultrawide cameras | `camera.md`: rear IMX586 only | **DRIVER** |
 | Hardware video decode | [V] log: `AppleVXD375/390` -> none | **DRIVER**. Wallpaper HEIC is solved by `root-wallpaper.sh` |
-| AirDrop, AWDL: `wifip2pd` | [V] 76 starts in 15 min, no crash line. `wifi.md` has no AWDL | **DRIVER**. Stays off (`root-tweaks-perf.py`); put back when AWDL comes |
+| AirDrop, AWDL: `wifip2pd` | [V] 76 starts in 15 min, no crash line. No AWDL data path on this firmware (`airplay-airdrop.md`) | **DRIVER, off by the evidence**. `LAUREL AWDL: off: ...`. `wifip2pd` stays out (`root-tweaks-perf.py`). AirDrop on en0 only (`root-airdrop-lan.py`) |
 | Face ID, Touch ID | [V] log: `ApplePearlSEPDriver`, `pearl-sep` -> none. No SEP | **DRIVER**. Passcode only |
 | USB accessories, MagSafe, thermal/`ApplePPM` | [V] log: `IOAccessoryManager`, `AppleHPMDevice`, `ApplePPM` -> 0 | **DRIVER**, no user request |
 
@@ -65,7 +65,7 @@ Actions: **ON** = enabled by this branch. **DRIVER** = needs a driver. **OFF** =
 
 | Item | Evidence | State |
 | --- | --- | --- |
-| `webbookmarksd` | [V] 7 starts, 6 crashes sig 6, 2-3 min apart, uncaught exception in a Mach async reply. Not a tight loop. [V] its container fallback (`sandbox_container_path_for_pid` fails, kernel op 4 = ENOENT) only skips `setenv HOME` | **OPEN**. Stays on: Safari may use it [I]. Read the exception over SSH |
+| `webbookmarksd` | [V] 7 starts, 6 crashes sig 6, 2-3 min apart, uncaught exception in a Mach async reply. Not a tight loop. [V] its container fallback (`sandbox_container_path_for_pid` fails, kernel op 4 = ENOENT) only skips `setenv HOME`. Boot 22:35: 5 crashes in 12 min; not why pages do not load (`wifi.md` "No page loads") | **OPEN**. Stays on: Safari may use it [I]. Read the exception over SSH (login needs no setup now) |
 | `driverkitd` | [V] sig 9, reason namespace 1 (jetsam) code 7 (process limit), in `NSData initWithContentsOfFile`. One start, no restart | **OK** at no cost: no DriverKit driver here |
 | `mediaserverd` | [V] 6 crashes at Camera start: `-[BWMultiFilterThumbnailNode prepareForCurrentConfigurationToBecomeLive]`, far 0x8 | **OPEN**, camera area |
 | `PosterBoard` | [V] 1 sig 10 in `PBFPosterSnapshotter _lock_populateSnapshotsFromAssetCatalogIfPossible` -> `_ERROR_ImageIO_DataBufferIsNotReadable` | **OPEN**, wallpaper area |

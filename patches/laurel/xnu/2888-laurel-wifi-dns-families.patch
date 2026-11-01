@@ -1,0 +1,51 @@
+laurel 2888: path line: DNS frames by family. In the log of 2026-11-01 22:37 "dns asked 24 answers 6" could not say whether a v6 server takes the questions and does not answer.
+
+The line is now: LAUREL WIFI: path | ... | dns asked N (v6 N) answers N (v6 N) | ...
+
+diff --git a/bsd/dev/redwood_net.c b/bsd/dev/redwood_net.c
+--- a/bsd/dev/redwood_net.c
++++ b/bsd/dev/redwood_net.c
+@@ -50,7 +50,7 @@
+ 	/* laurel 2881: why it was dropped; how often the sender waited for the radio */
+ 	uint64_t drop_full, drop_down, drop_big, drop_nomem, tx_waits;
+ 	/* laurel 2882: what the traffic is, for the status line */
+-	uint64_t v4[2], v6[2], dns[2], connects;
++	uint64_t v4[2], v6[2], dns[2], dns_v6[2], connects;
+ } net_count;
+ 
+ static bool net_flow_control;           /* laurel 2881: en0 has an output queue, a full radio makes its sender wait */
+@@ -162,6 +162,9 @@
+ 	}
+ 	if (proto == IPPROTO_UDP && (way != 0 ? l4[2] << 8 | l4[3] : l4[0] << 8 | l4[1]) == 53) {
+ 		net_count.dns[way]++;
++		if (type == ETHERTYPE_IPV6) {
++			net_count.dns_v6[way]++;        /* laurel 2888: a server that only answers on one family shows here */
++		}
+ 	} else if (proto == IPPROTO_TCP && way != 0 && (l4[13] & 0x12) == 0x02) {
+ 		net_count.connects++;
+ 	}
+@@ -363,12 +366,13 @@
+ redwood_net_path_line(void)
+ {
+ 	static uint32_t tcp_sent, tcp_rexmt, tcp_rto, tcp_dup;
+-	static uint64_t v4[2], v6[2], dns[2], connects, waits;
++	static uint64_t v4[2], v6[2], dns[2], dns_v6[2], connects, waits;
+ 	uint32_t s = tcpstat.tcps_sndtotal, r = tcpstat.tcps_sndrexmitpack, t = tcpstat.tcps_rexmttimeo, d = tcpstat.tcps_rcvduppack;
+ 
+-	printf("LAUREL WIFI: path | tcp sent %u retrans %u timeouts %u dup in %u | connects %llu | dns asked %llu answers %llu | "
++	printf("LAUREL WIFI: path | tcp sent %u retrans %u timeouts %u dup in %u | connects %llu | dns asked %llu (v6 %llu) answers %llu (v6 %llu) | "
+ 	    "v4 out %llu in %llu | v6 out %llu in %llu | sender waited %llu times\n", s - tcp_sent, r - tcp_rexmt, t - tcp_rto, d - tcp_dup,
+-	    net_count.connects - connects, net_count.dns[1] - dns[1], net_count.dns[0] - dns[0], net_count.v4[1] - v4[1],
++	    net_count.connects - connects, net_count.dns[1] - dns[1], net_count.dns_v6[1] - dns_v6[1], net_count.dns[0] - dns[0],
++	    net_count.dns_v6[0] - dns_v6[0], net_count.v4[1] - v4[1],
+ 	    net_count.v4[0] - v4[0], net_count.v6[1] - v6[1], net_count.v6[0] - v6[0], net_count.tx_waits - waits);
+ 	tcp_sent = s;
+ 	tcp_rexmt = r;
+@@ -377,6 +381,7 @@
+ 	memcpy(v4, net_count.v4, sizeof(v4));
+ 	memcpy(v6, net_count.v6, sizeof(v6));
+ 	memcpy(dns, net_count.dns, sizeof(dns));
++	memcpy(dns_v6, net_count.dns_v6, sizeof(dns_v6));
+ 	connects = net_count.connects;
+ 	waits = net_count.tx_waits;
+ }

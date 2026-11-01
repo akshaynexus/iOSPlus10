@@ -1,4 +1,4 @@
-laurel 2932: cellular data session: DPM OPEN_PORT, WDA SET_DATA_FORMAT before ONLINE, per family WDS BIND_MUX + SET_IP_FAMILY + START_NETWORK + GET_CURRENT_SETTINGS; interface pdp_ip0 (bsd/dev/laurel_pdp.c) with addresses by kernel ioctl, kern.laurel_cell_net for laurel_celld (configd). Lines LaurelData and LAUREL CELL DATA. Host test: test-cell.sh. NOT PROVEN on a phone: [I] until a ping.
+laurel 2942: cellular data session: DPM OPEN_PORT, WDA SET_DATA_FORMAT before ONLINE, per family WDS BIND_MUX + SET_IP_FAMILY + START_NETWORK + GET_CURRENT_SETTINGS; interface pdp_ip0 (bsd/dev/laurel_pdp.c) with addresses by kernel ioctl, kern.laurel_cell_net for laurel_celld (configd). Lines LaurelData and LAUREL CELL DATA. Host test: test-cell.sh. NOT PROVEN on a phone: [I] until a ping.
 
 diff -ruN a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files	2026-11-01 23:24:17.345368441 +0530
@@ -19,16 +19,16 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  void laurel_cell_poll(bool ready, bool glink);
  void laurel_cell_off(const char *why);
  
-+#include "laurel_cell_data.h"                   /* laurel 2932: the data session */
++#include "laurel_cell_data.h"                   /* laurel 2942: the data session */
 +
  #define SAY(...)            printf("LAUREL CELL: " __VA_ARGS__)
  #define LOG(...)            printf("LaurelCell: " __VA_ARGS__)
  
 @@ -98,6 +100,7 @@
- #define ONLINE_TRIES        6u                  /* laurel 2930: rounds of (low power when needed, then online), 10 s apart, 30 s after an "ok" that changes nothing */
- #define MODE_GRACE_MS       20000u              /* laurel 2930: mode 4, 5 or unknown this long after DMS came up: ask all the same */
+ #define ONLINE_TRIES        6u                  /* laurel 2940: rounds of (low power when needed, then online), 10 s apart, 30 s after an "ok" that changes nothing */
+ #define MODE_GRACE_MS       20000u              /* laurel 2940: mode 4, 5 or unknown this long after DMS came up: ask all the same */
  #define LPM_GAP_MS          2000u               /* low power answered -> online */
-+#define FORMAT_WAIT_MS      30000u              /* laurel 2932: the data format before the radio (as netmgrd before the RIL), at most this long */
++#define FORMAT_WAIT_MS      30000u              /* laurel 2942: the data format before the radio (as netmgrd before the RIL), at most this long */
  #define ONLINE_RECHECK_MS   30000u
  #define BIND_TRIES          6u                  /* NAS BIND_SUBSCRIPTION: UIM still starting answers an error */
  #define SAY_MIN_GAP_MS      10000u
@@ -50,7 +50,7 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  		}
  	}
 -	if (lines++ < 16) {
-+	if (lines++ < 32) {             /* laurel 2932: laurel-celld writes here too */
++	if (lines++ < 32) {             /* laurel 2942: laurel-celld writes here too */
  		printf("LAUREL CELLBAR: %s\n", buf);
  	}
  	return 0;
@@ -127,7 +127,7 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  			qc_simple(C_DMS, DMS_GET_OPMODE);
  		}
  	}
-+	/* laurel 2932: the data session, on the modem's default subscription (primary) */
++	/* laurel 2942: the data session, on the modem's default subscription (primary) */
 +	lcd_poll(now, sub_slot(0) >= 0 && reg[0].valid && reg[0].state == 1 && (!reg[0].bound || reg[0].bind_ok));
  	/* NAS per subscription */
  	for (int sub = 0; sub < 2; sub++) {
@@ -137,7 +137,7 @@ diff -ruN a/bsd/dev/laurel_cell_data2.h b/bsd/dev/laurel_cell_data2.h
 +++ b/bsd/dev/laurel_cell_data2.h	2026-11-01 23:27:42.199054428 +0530
 @@ -0,0 +1,383 @@
 +/*
-+ * laurel 2932: second half of laurel_cell_data.c (included there): the steps of a data session and the hooks for laurel_cell.c.
++ * laurel 2942: second half of laurel_cell_data.c (included there): the steps of a data session and the hooks for laurel_cell.c.
 + */
 +
 +static void
@@ -524,7 +524,7 @@ diff -ruN a/bsd/dev/laurel_cell_data.c b/bsd/dev/laurel_cell_data.c
 +++ b/bsd/dev/laurel_cell_data.c	2026-11-01 23:30:35.438355034 +0530
 @@ -0,0 +1,164 @@
 +/*
-+ * laurel_sprout (Mi A3) cellular data (laurel 2932): the QMI side of a data session. Called from laurel_cell.c in the modem watch thread (one thread).
++ * laurel_sprout (Mi A3) cellular data (laurel 2942): the QMI side of a data session. Called from laurel_cell.c in the modem watch thread (one thread).
 + * Order as Android's netmgrd + ModemManager's "ipa" port: DPM OPEN_PORT (embedded port 1, IPA pipes 1 and 9), WDA SET_DATA_FORMAT (raw IP in QMAP, no
 + * checksum), then per IP family one WDS client: BIND_MUX_DATA_PORT (mux 1), SET_IP_FAMILY, START_NETWORK once NAS says registered, GET_CURRENT_SETTINGS.
 + * Layouts: libqmi qmi-service-{dpm,wda,wds}.json as used by hackios-scion hakios.mpss.c [V]; scion never saw a packet on them [V its docs]: on this phone all
@@ -692,7 +692,7 @@ diff -ruN a/bsd/dev/laurel_cell_data.h b/bsd/dev/laurel_cell_data.h
 +++ b/bsd/dev/laurel_cell_data.h	2026-11-01 23:27:42.160971500 +0530
 @@ -0,0 +1,27 @@
 +/*
-+ * laurel 2932: declarations of the cellular data client (laurel_cell_data.c), the interface (laurel_pdp.c), for laurel_cell.c and the host test.
++ * laurel 2942: declarations of the cellular data client (laurel_cell_data.c), the interface (laurel_pdp.c), for laurel_cell.c and the host test.
 + */
 +#ifndef LAUREL_CELL_DATA_H
 +#define LAUREL_CELL_DATA_H
@@ -723,7 +723,7 @@ diff -ruN a/bsd/dev/laurel_pdp2.h b/bsd/dev/laurel_pdp2.h
 +++ b/bsd/dev/laurel_pdp2.h	2026-11-01 23:33:10.954828771 +0530
 @@ -0,0 +1,166 @@
 +/*
-+ * laurel 2932: second half of laurel_pdp.c (included there): addresses by kernel socket ioctls, and kern.laurel_cell_net for laurel_celld (text: laurel_pdp_text.h).
++ * laurel 2942: second half of laurel_pdp.c (included there): addresses by kernel socket ioctls, and kern.laurel_cell_net for laurel_celld (text: laurel_pdp_text.h).
 + */
 +
 +static errno_t
@@ -893,7 +893,7 @@ diff -ruN a/bsd/dev/laurel_pdp.c b/bsd/dev/laurel_pdp.c
 +++ b/bsd/dev/laurel_pdp.c	2026-11-01 23:33:10.954609841 +0530
 @@ -0,0 +1,242 @@
 +/*
-+ * laurel_sprout (Mi A3) cellular data (laurel 2932): the iOS interface pdp_ip0 (IFT_CELLULAR, raw IP, point to point): the name CommCenter uses on an iPhone.
++ * laurel_sprout (Mi A3) cellular data (laurel 2942): the iOS interface pdp_ip0 (IFT_CELLULAR, raw IP, point to point): the name CommCenter uses on an iPhone.
 + * laurel_cell_data2.h stores the session's settings (watch thread); laurel_pdp_work() applies them in the IPA data thread: interface on first use, addresses
 + * by kernel socket ioctls. No default route here: userland/laurel/cell/laurel_celld.c publishes kern.laurel_cell_net to configd, and IPMonitor picks the
 + * primary service (Wi-Fi first when it is up [I until the phone test]). Plumbing like if_utun.c; the packets go through laurel_ipa_data.c, QMAP mux 1.
@@ -1139,7 +1139,7 @@ diff -ruN a/bsd/dev/laurel_pdp_text.h b/bsd/dev/laurel_pdp_text.h
 +++ b/bsd/dev/laurel_pdp_text.h	2026-11-01 23:33:10.941190557 +0530
 @@ -0,0 +1,49 @@
 +/*
-+ * laurel 2932: the text of kern.laurel_cell_net: pure, so the host test (scripts/laurel/test-cell.sh) feeds the daemon's parser (userland/laurel/cell/celld_net.h) with
++ * laurel 2942: the text of kern.laurel_cell_net: pure, so the host test (scripts/laurel/test-cell.sh) feeds the daemon's parser (userland/laurel/cell/celld_net.h) with
 + * the kernel's own text. Keys: state=on|off, if, mtu, v4, v4.mask, v4.gw, v4.dns (0-2), v6, v6.plen, v6.gw, v6.dns (0-2). Never a SIM or modem identity.
 + */
 +#ifndef LAUREL_PDP_TEXT_H

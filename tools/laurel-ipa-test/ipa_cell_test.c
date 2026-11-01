@@ -12,7 +12,7 @@ extern void laurel_cell_poll(bool ready, bool glink);
 extern void laurel_cell_off(const char *why);
 uint32_t topaz_qrtr_services(void);
 uint32_t topaz_qrtr_services(void) { return 9; }
-/* laurel 2932: the data client is real; no AP pipes in this test */
+/* laurel 2942: the data client is real; no AP pipes in this test */
 int laurel_ipa_data_state(const char **why);
 int laurel_ipa_data_state(const char **why) { if (why != NULL) { *why = "no AP GSI data pipes yet"; } return -1; }
 void laurel_pdp_set4(bool up, uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns1, uint32_t dns2, uint32_t mtu);

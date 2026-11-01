@@ -11,7 +11,7 @@
 #   out/ssh/host then holds Linux builds (dropbearkey for the host key at install time).
 # Output:
 #   out/ssh/ios/   dropbearmulti (dropbear, dropbearkey, dbclient, scp), dash, toybox,
-#                  usbnetcfg, usbreboot, oslogstream: arm64, minos 16.0, signed ad hoc with
+#                  usbnetcfg, laurelnet, usbreboot, oslogstream: arm64, minos 16.0, signed ad hoc with
 #                  entitlements.plist (oslogstream: oslogstream.entitlements);
 #                  toybox.applets (applet list); SHA256SUMS
 #   out/ssh/host/  macOS builds of dropbearmulti and toybox (host keys at install time, tests)
@@ -127,6 +127,8 @@ rc=0; for p in $pids; do wait "$p" || rc=1; done
 # ---- our tools --------------------------------------------------------------------------------
 "$ICC" $IFLAGS -O2 -Wall -Wno-unguarded-availability-new -framework CoreFoundation \
   "$HERE/usbnetcfg.c" -o "$W/ios/usbnetcfg"
+"$ICC" $IFLAGS -O2 -Wall -Wno-unguarded-availability-new -framework CoreFoundation \
+  "$HERE/laurelnet.c" -o "$W/ios/laurelnet"
 "$ICC" $IFLAGS -O2 -Wall -Wno-deprecated-declarations "$HERE/usbreboot.c" -o "$W/ios/usbreboot"
 "$ICC" $IFLAGS -O2 -Wall -fobjc-arc -framework Foundation "$HERE/oslogstream.m" -o "$W/ios/oslogstream"
 
@@ -141,7 +143,7 @@ chmod 755 "$W"/ios/* "$W"/host/*; chmod 644 "$W/ios/toybox.applets"
 
 # ---- checks + signing -------------------------------------------------------------------------
 fail=0
-for f in dropbearmulti dash toybox usbnetcfg usbreboot oslogstream; do
+for f in dropbearmulti dash toybox usbnetcfg laurelnet usbreboot oslogstream; do
   b=$W/ios/$f
   $LIPO -archs "$b" | grep -qx arm64 || { echo "$f: not arm64-only" >&2; fail=1; }
   minos=$($OTOOL -l "$b" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
@@ -154,7 +156,7 @@ for f in dropbearmulti dash toybox usbnetcfg usbreboot oslogstream; do
 done
 # The negroni AMFI stand-in reads the XML entitlements blob (DER-only signatures get none):
 # check that each signature has one (magic 0xfade7171).
-python3 -I - "$W"/ios/dropbearmulti "$W"/ios/dash "$W"/ios/toybox "$W"/ios/usbnetcfg "$W"/ios/usbreboot "$W"/ios/oslogstream <<'EOF' || fail=1
+python3 -I - "$W"/ios/dropbearmulti "$W"/ios/dash "$W"/ios/toybox "$W"/ios/usbnetcfg "$W"/ios/laurelnet "$W"/ios/usbreboot "$W"/ios/oslogstream <<'EOF' || fail=1
 import struct, sys
 bad = 0
 for p in sys.argv[1:]:
@@ -173,7 +175,7 @@ sys.exit(bad)
 EOF
 [ $fail = 0 ] || { echo "checks failed" >&2; exit 1; }
 
-(cd "$W/ios" && sha dropbearmulti dash toybox usbnetcfg usbreboot oslogstream > SHA256SUMS)
+(cd "$W/ios" && sha dropbearmulti dash toybox usbnetcfg laurelnet usbreboot oslogstream > SHA256SUMS)
 echo "iOS builds (arm64, minos $MINOS, ad hoc signed, XML entitlements present):"
 cat "$W/ios/SHA256SUMS"
 echo "toybox applets: $(wc -l < "$W/ios/toybox.applets")"

@@ -1,4 +1,4 @@
-laurel 2930: cellular: the radio goes online although DMS reports mode 5. Boot 22:50: both USIMs ready, Wi-Fi up, DMS 5 for the whole boot: no block on 5 after a 20 s grace time: low power, then online, 6 bounded rounds, each answer one line. Mode line with offline reason + hardware restricted, DMS mode indication, DMS GET_CAPABILITIES (LTE at most, X12), NAS bind ok line, state keys mode, caps, subN.plmn/ps/rsrp/rssi. SMP2P "master-kernel" entry = stock order, value 0. Docs: docs/laurel_sprout/cellular.md section 11.
+laurel 2940: cellular: the radio goes online although DMS reports mode 5. Boot 22:50: both USIMs ready, Wi-Fi up, DMS 5 for the whole boot: no block on 5 after a 20 s grace time: low power, then online, 6 bounded rounds, each answer one line. Mode line with offline reason + hardware restricted, DMS mode indication, DMS GET_CAPABILITIES (LTE at most, X12), NAS bind ok line, state keys mode, caps, subN.plmn/ps/rsrp/rssi. SMP2P "master-kernel" entry = stock order, value 0. Docs: docs/laurel_sprout/cellular.md section 11.
 
 diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
 --- a/bsd/dev/laurel_cell.c	2026-11-01 23:19:26.768343129 +0530
@@ -17,8 +17,8 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  #define OPMODE_PERIOD_MS    10000u              /* DMS mode: read again until the modem is online */
  #define OPMODE_ONLINE_MS    60000u              /* and more slowly after that */
 -#define ONLINE_TRIES        6u                  /* SET_OPERATING_MODE online, each after a read of the mode */
-+#define ONLINE_TRIES        6u                  /* laurel 2930: rounds of (low power when needed, then online), 10 s apart, 30 s after an "ok" that changes nothing */
-+#define MODE_GRACE_MS       20000u              /* laurel 2930: mode 4, 5 or unknown this long after DMS came up: ask all the same */
++#define ONLINE_TRIES        6u                  /* laurel 2940: rounds of (low power when needed, then online), 10 s apart, 30 s after an "ok" that changes nothing */
++#define MODE_GRACE_MS       20000u              /* laurel 2940: mode 4, 5 or unknown this long after DMS came up: ask all the same */
 +#define LPM_GAP_MS          2000u               /* low power answered -> online */
 +#define ONLINE_RECHECK_MS   30000u
  #define BIND_TRIES          6u                  /* NAS BIND_SUBSCRIPTION: UIM still starting answers an error */
@@ -28,7 +28,7 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  static uint64_t opmode_next, online_next;       /* next read of the mode, next ONLINE try */
  static uint8_t online_tries;
  static uint16_t online_err;                     /* last SET_OPERATING_MODE error */
-+/* laurel 2930: the radio's start, one request at a time; every answer is one line */
++/* laurel 2940: the radio's start, one request at a time; every answer is one line */
 +static bool dms_ev_done, caps_done, lpm_done, set_is_lpm;
 +static uint64_t t_dms;
 +static char caps[32];                           /* radio technologies the modem says it has: GSM,UMTS,LTE */
@@ -70,7 +70,7 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  		if (n >= max) {
  			return;
  		}
-+		/* laurel 2930: what the bars come from, and the network: for XNUtils and the later network search UI */
++		/* laurel 2940: what the bars come from, and the network: for XNUtils and the later network search UI */
 +		if (live && r->rsrp != 0) {
 +			n += snprintf(out + n, max - n, "sub%d.rsrp=%d\n", sub, r->rsrp);
 +		}
@@ -99,7 +99,7 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  
  /* ---------------------------------------------------------------- DMS */
  
-+/* laurel 2930: mode + why, one line on a change. TLV 0x10 offline reason bits, TLV 0x11 hardware restricted (RF calibration, thermal) */
++/* laurel 2940: mode + why, one line on a change. TLV 0x10 offline reason bits, TLV 0x11 hardware restricted (RF calibration, thermal) */
 +static void
 +mode_changed(const uint8_t *d, uint32_t len, const uint8_t *v, const char *how)
 +{
@@ -221,7 +221,7 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  }
  
 +/*
-+ * laurel 2930: boot 22:50:54: DMS said 5 for the whole boot with both USIMs ready and Wi-Fi up, so the modem is not going down [V]: 5 is what it reports
++ * laurel 2940: boot 22:50:54: DMS said 5 for the whole boot with both USIMs ready and Wi-Fi up, so the modem is not going down [V]: 5 is what it reports
 + * until somebody asks for a mode [I]. So after a grace time the mode no longer blocks: low power first (the mode Android's RIL starts from), then online.
 + * A modem assert here stops Wi-Fi for the boot: only images without ipa=0 reach this (ipa_up). True = a request went out.
 + */
@@ -279,7 +279,7 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  			nas_rx(i, msg, d, len, true);
 +		} else if (i == C_DMS && msg == DMS_SET_EVENT) {
 +			uint16_t l = 0;
-+			const uint8_t *v = tlv(d, len, 0x14, &l);       /* laurel 2930: the modem tells a mode change */
++			const uint8_t *v = tlv(d, len, 0x14, &l);       /* laurel 2940: the modem tells a mode change */
 +			if (v != NULL && l >= 1) {
 +				mode_changed(d, len, v, ", indication");
 +			}
@@ -334,14 +334,16 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  			opmode_next = now + (opmode == 0 ? OPMODE_ONLINE_MS : OPMODE_PERIOD_MS);
 diff -ruN a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 --- a/iokit/Kernel/arm/TopazModem.cpp	2026-11-01 23:19:26.771343162 +0530
-+++ b/iokit/Kernel/arm/TopazModem.cpp	2026-11-01 23:20:02.396145452 +0530
-@@ -5766,6 +5766,9 @@
++++ b/iokit/Kernel/arm/TopazModem.cpp	2026-11-01 23:35:55.828577652 +0530
+@@ -5766,6 +5766,11 @@
  		laurel_ipa_off("cannot create the SMP2P item for the modem");
  		return;
  	}
-+	/* laurel 2930: stock's first entry (trinket.dtsi modem_smp2p_out: master-kernel, then ipa). Its bit 0 asks a graceful shutdown (modem sys_m: "SMP2P graceful
++	/* laurel 2940: stock's first entry (trinket.dtsi modem_smp2p_out: master-kernel, then ipa). Its bit 0 asks a graceful shutdown (modem sys_m: "SMP2P graceful
 +	 * shutdown request"): value 0 and we never set it. The modem's sys_m opens this name; without it nobody tells the modem the AP is there */
-+	(void)smp2p_add_out(out, "master-kernel", 0);
++	if (laurel_ipa_enabled()) {             /* a normal image (ipa=0) stays as the one that has Wi-Fi today; this modem has not seen the entry yet */
++		(void)smp2p_add_out(out, "master-kernel", 0);
++	}
  	ipa_out = smp2p_add_out(out, "ipa", 0);
  	bool glink = false;
  	for (unsigned ms = 0; seconds == 0 || ms < seconds * 1000; ms++) {
