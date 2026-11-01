@@ -4759,7 +4759,7 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - Gotcha: `grep` in this shell is ugrep and treats a pattern with a leading `-` as an option; `==` in a zsh echo fails. RE helpers are bash scripts: scripts/debug/cell-*.
 - Gotcha: a new feature row needs a fake stage script in build-honest-test.sh too (`cell-build`), or its build-all cases fail.
 - Worktree build: symlink external/{ios-topaz,ios-sweet-linux,hackios-scion,laurel-kernel-*}, reflink out/laurel-kernel/{deps,theos,cache,dl} + out/laurel/gpu/deps/sdks; `AUDIT=1` gives the tree at out/laurel-kernel/xnu-src/xnu-8796.141.3. Patch: out/celln-dev/{a,b}, scripts/laurel/cell-patch.sh.
-- Built [V]: 296/296 patches, 0 LSE, kernel.development.sweet.4k sha256 84d8f917f109bba4...; liblaurel-cellbar (sha256 in out/laurel/cell/root.SHA256SUMS); test-cell 15/15; test-ipa PASS; build-honest-test 60/60; xnutils-test PASS. No root image: sudo needs a password here.
+- Built [V, merged with 80072a9]: 297/297 patches, 0 LSE, printf-arg-check OK, kernel.development.sweet.4k sha256 010bc6a6ebc346dc...; liblaurel-cellbar (sha256 in out/laurel/cell/root.SHA256SUMS); test-cell 15/15; test-ipa PASS; build-honest-test 60/60; xnutils-test PASS. No root image: sudo needs a password here.
 - Next: section 10 step A, then step B. If ONLINE asserts in enl2_dl with the handshake passed, data pipes (9.4) come before ONLINE.
 
 ## Mi A3: kernel panic log_encode.c:121 from one printf with 48 values (2026-11-01 22:22, 22:26)
