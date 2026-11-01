@@ -4952,3 +4952,9 @@ Traps of 12377 that compile fine and fail at run time [V code]:
 Donor [owner, 2026-11-02]: N104AP, iPhone12,1, `artwork-device-subtype` 0x700, scale 2. `mkadt.py --donor`; iOS 16 D22AP unchanged.
 Guess [I]: first failure is the 4K bootstrap in `start.s`/`arm_vm_init`, then kalloc startup with stock clang.
 Negroni series tool after the `--profile` change: same result as before it (`0401-negroni-ram-7g` is an ERROR with both: that patch changes base-owned files and is not listed in `patch-rules.py`; older than this work and not fixed here).
+
+## Mi A3: read with root and backup (2026-11-02, read-only, nothing written except the updater setting)
+- [V phone, adb root after the owner turned on Rooted debugging] `dmctl table userdata`: default-key over 8:15 at start 0, 226307992 sectors = all of userdata (115869691904 bytes). Slots: current and active 0; both bootable and both marked successful. boot_a = boot_b = Lineage boot; first 8 MiB of dtbo_a and dtbo_b = Lineage dtbo; vbmeta_b, modem_b = stock; modem_a = modem_b. system_b and vendor_b hold ext4 (not hashed). SELinux Enforcing.
+- [V] Owner decisions: updater off (`pm disable-user --user 0 org.lineageos.updater`; `pm enable` reverses it; a manual sideload still writes slot b), iOS area 32 GiB (30 % of userdata).
+- [V] `scripts/backup/laurel-backup.sh all`: 86 partitions + GPT heads, each compared with a hash made on the phone; /data 9172 entries, 1.4 GB. Output ~/laurel-backup/android-20261102-0137, 5.0 GB, mode 700, out of git. First backup of modemst1/2, fsg, fsc, persist, devinfo. /data is a file copy for salvage, not a block image: FBE keys stay in keymaster. Run `data` again right before the first phone write. No restore was tried.
+- `.gitignore` `backup/` hid `scripts/backup/`: fixed with an exception.
