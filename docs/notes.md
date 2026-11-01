@@ -4322,3 +4322,27 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - Next: boot (boot_b flash, owner), expect `LAUREL CAMERA: on: rear IMX586 (0x1a id 0x0586), depth ..., front S5KGD1 ...,
   ultrawide S5K4H7 ...`; a NACK on one slot = check that slot's rail/reset pins. Then step 2 (RDI frames), step 3 (/dev node),
   step 4 (iOS plug-in from userland/camera).
+
+## Mi A3: camera step 2 = rear IMX586 RDI raw frames 1280x720, fps line, picture over USB; patch 2771 (2026-11-01, camera agent, branch t3/laurel-camera-rdi; build + host tests only, NOT BOOTED)
+- Details: docs/laurel_sprout/camera.md section 8 (files, table layout, register sequence, lines, test steps).
+- [V] The sensor tables are read by the kernel at run time from the stock library on the root
+  (/usr/share/firmware/laurel-camera/, root step scripts/laurel/root-camera.sh from out/laurel/camera/lib): .data
+  offsets init 0x9f2c, resolution k 0x5c090 + k x 0x5dd0 (3000 entries + 16-byte trailer: size 0 in the file, addr_type 2,
+  data_type 1, delay), out_info 0xae1f0, CSI params 0xae740 (4 lanes, settle 0x13), CID LUT 0xae744 + k x 0x104. Same in the
+  IMX586 qtech/sunny and IMX582 qtech files. The table end is the first addr 0 (the size field is 0 in the file).
+- [V] Correction: IMX586 mode 6 (1280x720) has 94 writes at .data+0x7f370, not 95 at 0x7f368 (the extra entry was the
+  trailer of the table before). Init 531 writes. qtech and sunny tables are identical (init and mode 6).
+- [V] Register facts used (research 2026-11-01): CSIPHY1 clock mux 0x5c00124 (0x5c00120 + 4n, the step 1 doc had only n=0);
+  CSID1 0x5c30400; ISPIF RDI mux 0x5c00028; VFE GDSCs 0x1454004/0x145403c; laurel DT asks 311 MHz for the CSIPHY timer, which
+  the clock table rounds to 268.8 MHz (GPLL4), so Android ran settle 0x13 at 268.8 MHz; mainline would pick 200 MHz.
+- [I] Risks for the first boot: GPLL4/GPLL9 may be unlocked (fallbacks + lines exist); no bus vote for the VFE AXI path (no
+  RPM-SMD bus voter); Bayer order RGGB from the mm-camera enum.
+- [V] USB command server: `camread` replies are binary (16-byte "LCF1" header + 1400 bytes) and are not logged (823 per frame);
+  ud_ctl_reply_n added in sweet_usb.c. The camera commands try the frame lock only (never block ud_thread).
+- [V] The WIP branch t3/laurel-cellular-ipa2 also numbers its IPA patch 2770 (clash with the camera 2770 at merge). Its ext4
+  reader could replace the root step later.
+- Build [V]: kernel-linux.sh 252/252 patches, 0 LSE, no warnings in the changed files, kcheck OK for each file; kernel sha256
+  dcbae3a4c98f532e29017c9a23d8eea7e0c091408f34f6d20e47f4c0c59b1ac6. cam-test 69/69 + 31/31 + C = Python tables for the 3
+  libraries; cam-frame-test (mock phone, 5 % loss, 51 resends): frame byte-equal, PNG written.
+- Next: boot with the new root (tables) + kernel; expect `LAUREL CAMERA: rear stream: 1280x720 RAW10 at ~93 fps, frame ~186`;
+  then `scripts/laurel/cam-frame.sh`. Then step 3 (/dev/negronicam NCFRAME1) and step 4 (iOS plug-in).
