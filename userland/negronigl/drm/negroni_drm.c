@@ -39,6 +39,13 @@
 #include "ngl_abi.h"
 #include "negroni_drm.h"
 
+/*
+ * The page size of this process (ngl_abi.h's NGL_PAGE is negroni's 16 KiB): the laurel kernel runs 4 KiB pages, where mmap and
+ * malloc memory is 4 KiB aligned (Turnip patch 0103 follows). Host imports and sizes round to what the kernel maps.
+ */
+#undef NGL_PAGE
+#define NGL_PAGE ((uint64_t)getpagesize())
+
 /* msm_drm.h of newer Linux; Mesa 25.0.7's header may lack some */
 #ifndef MSM_PARAM_VA_START
 #define MSM_PARAM_VA_START      0x0e

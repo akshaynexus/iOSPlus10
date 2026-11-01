@@ -28,7 +28,10 @@ name=${OUTNAME:-$(basename "$(dirname "$LIB")" .framework)_$(basename "$LIB" .me
 T=${TRANSLATE_DIR:-$MOUT/translate}/$name   # TRANSLATE_DIR: another parent directory (corpus runs)
 rm -rf "$T" && mkdir -p "$T"
 python3 -I "$REPO/scripts/metal/metallib-info.py" "$LIB" | tail -n +2 | awk '{print $1, $2}' > "$T/functions.txt"
-export METAL2VULKAN_REPRO_DIR=$T/repros
+# Repro bundles only when asked: each failed try writes a copy of the input, and 146 + 127 GB of them filled the disk in one corpus run
+# (MPS, AvatarKit; 2026-11-01). KEEP_REPROS=1 keeps them, for one library at a time.
+# Off = a directory that cannot be made: the CLI has no switch, and with no variable it writes to $TMPDIR (16 GiB of /tmp in 3 min).
+if [ "${KEEP_REPROS:-0}" = 1 ]; then export METAL2VULKAN_REPRO_DIR=$T/repros; else export METAL2VULKAN_REPRO_DIR=/dev/null/no-repros; fi
 # CA supplies vertex descriptors, function constants and attachment formats at pipeline creation. On the host the
 # loop below answers each input the compile asks for with a stand-in, and tries again:
 #   - a vertex attribute: a 16-byte slot in buffer 29 (formats tried in order until the attribute's type accepts one)

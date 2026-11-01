@@ -1,0 +1,41 @@
+laurel 2161: every submission starts with PC_CCU_INVALIDATE_DEPTH + COLOR, as Linux's a6xx_submit. Turnip takes that for granted
+(the GL path through Mesa's freedreno never needed it, so the boots so far did not show it); without it the first Turnip render
+reads old CCU lines (ios-flame's first submits failed so, ios-redfin METAL-NEXT.md section 4). 4 more ring dwords a submission.
+Not run on the phone yet [I].
+
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -112,6 +112,8 @@
+ #define CP_ME_INIT          0x48
+ #define CP_SET_SECURE_MODE  0x66
+ #define CACHE_FLUSH_TS      4
++#define PC_CCU_INVALIDATE_DEPTH 0x18            /* laurel 2161 (Mesa adreno_pm4.xml vgt_event_type) */
++#define PC_CCU_INVALIDATE_COLOR 0x19
+ 
+ #define VA_USER_START       0x01000000ull
+ #define VA_KERNEL           0xF0000000ull
+@@ -1845,7 +1847,7 @@
+ uint32_t
+ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+ {
+-	uint32_t need = 4 * count + 5 + 4 + 5;          /* laurel 2159: + the two time stamps */
++	uint32_t need = 4 * count + 5 + 4 + 5 + 4;      /* laurel 2159: + the two time stamps; laurel 2161: + the two CCU events */
+ 
+ 	if (!ready) {
+ 		return 0;
+@@ -1873,6 +1875,15 @@
+ 	emit(0x980 | (2u << 18) | (1u << 30));
+ 	emit((uint32_t)slot);
+ 	emit((uint32_t)(slot >> 32));
++	/*
++	 * laurel 2161: as Linux's a6xx_submit: Turnip assumes that the kernel invalidates the CCU at the start of a submission, and
++	 * says so nowhere else (ios-flame's first Turnip submits failed without it, ios-redfin METAL-NEXT.md section 4; here also: the
++	 * GL path and every Metal process take turns on this ring). Mesa's freedreno does not need it and is not hurt by it.
++	 */
++	emit(pkt7(CP_EVENT_WRITE, 1));
++	emit(PC_CCU_INVALIDATE_DEPTH);
++	emit(pkt7(CP_EVENT_WRITE, 1));
++	emit(PC_CCU_INVALIDATE_COLOR);
+ 	for (uint32_t i = 0; i < count; i++) {
+ 		emit(pkt7(CP_INDIRECT_BUFFER, 3));
+ 		emit((uint32_t)addresses[i]);

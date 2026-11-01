@@ -40,6 +40,13 @@ scripts/net/ssh-phone.sh "rm -f /private/var/db/negronimetal/off"
 
 ---
 
+
+## Mi A3 (laurel): the client gate (2026-11-01)
+
+The list on laurel is written by `/usr/libexec/laurel-metal-gate` (launchd job `com.laurel.metal-gate`, root, once per boot; docs/laurel_sprout/metal.md 6.1): probes until m2vtest passes, then `* -backboardd`
+in `/var/db/negronimetal/clients` and `NegroniMetal.bundle/clients.local`. Test again: `rm /var/db/negronimetal/gate` and reboot. Keep a list of your own: any first line other than `# laurel-metal-gate`.
+With no device, poster extensions wait 2-60 s before the nil (`refused_pause`, file `strikes/<name>.refused`), so they do not crash-loop at full speed.
+
 ## 2. Watchdog & Dead-Man Strikes
 
 ### What are strikes?

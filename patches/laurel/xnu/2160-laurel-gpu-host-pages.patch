@@ -1,0 +1,215 @@
+laurel 2160: the caller's own pages as GPU buffers (request 0x49), port of negroni 0232 to the topaz RedwoodGPU; stage-1 tables only.
+Why: without it a process that uses Metal's newBufferWithBytesNoCopy: fails, and m2vtest's import step (0x6505) can never pass, so
+/usr/libexec/laurel-metal-gate could never widen the clients ("LAUREL GPU SMMU: on" boots too). The pages stay wired while the handle
+lives; cleaned at import and at each submission that names them; never kept; no user mapping through the connection. RedwoodGPU's
+NegroniGPUABI now names "userptr" (Turnip's stand-in asks the kernel only then). One line: LAUREL GPU HOST PAGES: on|off. Kill switch
+gpu_hostimport=0. Design: docs/laurel_sprout/metal.md section 6.2.
+
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -93,6 +93,7 @@
+ 	kMsmGemSubmit           = 0x46,
+ 	kMsmWaitFence           = 0x47,
+ 	kMsmGemMadvise          = 0x48,
++	kRedwoodUserptr         = 0x49,         /* laurel 2160 (msm's unused GEM_SVM_NEW number): the caller's own pages as a buffer */
+ 	kMsmSubmitQueueNew      = 0x4a,
+ 	kMsmSubmitQueueClose    = 0x4b,
+ 	kMsmSubmitQueueQuery    = 0x4c,
+@@ -167,6 +168,13 @@
+ 	uint32_t surface;                       /* the IOSurface's ID */
+ 	uint32_t seed;                          /* back: its new seed */
+ };
++struct redwood_userptr {                       /* laurel 2160: redwood_drm_userptr in Turnip's stand-in (negroni 0232's layout) */
++	uint64_t pointer;                       /* a page-aligned address in the caller */
++	uint64_t size;                          /* bytes, whole pages */
++	uint32_t flags;                         /* kUserptrReadOnly: the GPU only reads them */
++	uint32_t handle;                        /* back: the buffer */
++};
++#define kUserptrReadOnly        0x1u
+ struct redwood_show {
+ 	uint64_t pixels;
+ 	uint32_t width, height, rowBytes, pad;
+@@ -185,6 +193,7 @@
+ 
+ #define GPU_BUFFERS             8192            /* a client's, at most */
+ #define GPU_BUFFER_MAX          (256u << 20)
++#define GPU_CLIENT_HOST_BYTES   (1024ull << 20)         /* laurel 2160: a client's own pages wired by host imports, at most */
+ #define GPU_SUBMIT_CMDS         128
+ #define GPU_SUBMIT_BOS          8192
+ #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
+@@ -199,6 +208,7 @@
+  */
+ #define GPU_PUSH_SAFE_MS        250
+ #define GPU_PUSH_FRAME_MS       16
++static TUNABLE(uint32_t, gGPUHostImport, "gpu_hostimport", 1);    /* laurel 2160, kill switch gpu_hostimport=0 */
+ static TUNABLE(uint32_t, gGPUSeedRule, "gpuseed", 1);   /* kill switch gpuseed=0: the 4 ms rule above for every surface */
+ 
+ static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
+@@ -341,6 +351,19 @@
+ 	 */
+ 	setProperty("RedwoodMaxBuffer", redwood_gpu_identity() ? 0x4000000ull - 0x10000ull : (uint64_t) GPU_BUFFER_MAX, 64);
+ 	setProperty("LaurelGPUSMMU", redwood_gpu_identity() ? "pass-through" : "stage 1");
++	/*
++	 * laurel 2160: pages of the caller's as GPU buffers (VK_EXT_external_memory_host; Metal's newBufferWithBytesNoCopy: and
++	 * newTextureWithBytesNoCopy:, which CoreImage, MPS and asset catalogs use) need the stage-1 tables: scattered pages.
++	 * Turnip's stand-in (negroni_drm.c connect_dev) asks for them only when this text names "userptr".
++	 */
++	if (gGPUHostImport && !redwood_gpu_identity()) {
++		setProperty("NegroniGPUABI", "msm 0x09 0x40-0x4c 0x7e, userptr 0x49, va shared");
++		IOLog("LAUREL GPU HOST PAGES: on: a client's own pages as GPU buffers (request 0x49), %llu MiB a client at most\n",
++		    GPU_CLIENT_HOST_BYTES >> 20);
++	} else {
++		IOLog("LAUREL GPU HOST PAGES: off: %s: no-copy Metal buffers fail or copy\n", gGPUHostImport ? "SMMU pass-through" :
++		    "boot-arg gpu_hostimport=0");
++	}
+ 	registerService();
+ 	return true;
+ }
+@@ -394,6 +417,7 @@
+ 	uint64_t                        pushed;         /* ... and when that was */
+ 	bool                            seen;           /* by the program: mapped, and from then on written by it */
+ 	uint32_t                        fence;          /* the last submission that names it (0: none has) */
++	bool                            host;           /* laurel 2160: the client's own pages, wired by `memory` */
+ };
+ 
+ /*
+@@ -451,6 +475,7 @@
+ 	uint32_t                fLeftCount;
+ 	struct gpu_kept         fKept[GPU_KEPT];
+ 	uint64_t                fKeptBytes;
++	uint64_t                fHostBytes;             /* laurel 2160: wired by host imports */
+ 
+ 	struct gpu_buffer * buffer(uint32_t handle);
+ 	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle,
+@@ -462,6 +487,7 @@
+ 	IOReturn gemNew(struct msm_gem_new * request);
+ 	IOReturn surfaceBuffer(struct redwood_surface * request);
+ 	IOReturn surfaceDrawn(struct redwood_drawn * request);
++	IOReturn hostPages(struct redwood_userptr * request);
+ 	IOReturn gemInfo(struct msm_gem_info * request);
+ 	IOReturn submit(struct msm_gem_submit * request);
+ 	IOReturn show(const struct redwood_show * request);
+@@ -577,6 +603,10 @@
+ 	}
+ 	b->memory = NULL;
+ 	b->surface = NULL;
++	if (b->host) {
++		fHostBytes -= b->size;          /* (releasing `memory` above or in reap() unwires the pages) */
++		b->host = false;
++	}
+ 	fBufferCount--;
+ 	fBufferBytes -= b->size;
+ }
+@@ -759,6 +789,7 @@
+ 	b->seen = false;
+ 	b->fence = 0;
+ 	b->surface = NULL;
++	b->host = false;
+ 	fBufferCount++;
+ 	fBufferBytes += size;
+ 	return b;
+@@ -1106,6 +1137,59 @@
+ }
+ 
+ /*
++ * laurel 2160 (design: negroni 0232): the caller's pages [pointer, pointer + size) as a buffer. The pages stay wired while
++ * the handle lives, so the GPU keeps the pages that were there at import even if the program unmaps the range. With
++ * kUserptrReadOnly they are wired for reading only (read-only memory of the program can be imported) and read-only for
++ * the GPU. Cache rules as for a cached buffer: pushed now (clean + invalidate) and at each submission that names them;
++ * after a GPU write the program invalidates (Turnip's vkInvalidateMappedMemoryRanges: EL0 dc civac). Stage-1 tables only:
++ * in pass-through the GPU cannot reach scattered pages. Only the task that opened the connection.
++ */
++IOReturn
++RedwoodGPUUserClient::hostPages(struct redwood_userptr * request)
++{
++	bool readOnly = (request->flags & kUserptrReadOnly) != 0;
++	IOMemoryDescriptor * memory;
++	struct gpu_buffer * b = NULL;
++	uint64_t size = request->size;
++
++	if (!gGPUHostImport || redwood_gpu_identity()) {
++		return kIOReturnUnsupported;
++	}
++	if ((request->flags & ~kUserptrReadOnly) != 0 || request->pointer == 0 || size == 0 || (request->pointer & PAGE_MASK) ||
++	    (size & PAGE_MASK) || size > GPU_BUFFER_MAX || request->pointer + size < request->pointer) {
++		return kIOReturnBadArgument;
++	}
++	if (current_task() != fTask) {
++		return kIOReturnNotPermitted;
++	}
++	memory = IOMemoryDescriptor::withAddressRange((mach_vm_address_t) request->pointer, (mach_vm_size_t) size,
++	    readOnly ? kIODirectionOut : kIODirectionInOut, fTask);
++	if (memory == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (memory->prepare() != kIOReturnSuccess) {
++		memory->release();
++		return kIOReturnVMError;                /* not mapped, or not writable without kUserptrReadOnly */
++	}
++	memory->performOperation(kIOMemoryIncoherentIOFlush, 0, size);
++	IOLockLock(gGPULock);
++	if (fHostBytes + size <= GPU_CLIENT_HOST_BYTES &&
++	    (b = newBuffer(memory, 0, size, readOnly ? MSM_BO_GPU_READONLY : 0, &request->handle)) != NULL) {
++		b->memory = memory;
++		b->kernel = NULL;
++		b->surface = NULL;
++		b->host = true;
++		fHostBytes += size;
++	}
++	IOLockUnlock(gGPULock);
++	if (b == NULL) {
++		memory->release();                      /* (unwires the pages) */
++		return kIOReturnNoMemory;
++	}
++	return kIOReturnSuccess;
++}
++
++/*
+  * laurel 2158: the GPU has drawn into a surface (eagl.c, at a frame's end): its seed moves, as a CPU write lock would
+  * move it (whoever looks at the seed sees the new picture), but nothing is in the CPU's cache: when this client's
+  * buffer of it was pushed at the old seed, it is marked pushed at the new one, so the next submission does not push
+@@ -1217,6 +1301,15 @@
+ 		if (b == NULL) {
+ 			continue;
+ 		}
++		if (b->host) {
++			/* laurel 2160: the client's own cached pages: what the CPU wrote goes to memory (read-only pages: nothing) */
++			if (!(b->flags & MSM_BO_GPU_READONLY)) {
++				b->memory->performOperation(kIOMemoryIncoherentIOStore, 0, b->size);
++				gGPUStat.flushed += b->size;
++				gGPUStat.pushes++;
++			}
++			continue;
++		}
+ 		if (b->surface != NULL && b->surface->gpuPool) {
+ 			continue;                       /* topaz: GPU pool memory is write-combined: nothing in the cache */
+ 		}
+@@ -1398,7 +1491,9 @@
+ 
+ 	IOLockLock(gGPULock);
+ 	b = buffer(type);
+-	if (b != NULL) {
++	if (b != NULL && b->host) {
++		ret = kIOReturnUnsupported;     /* laurel 2160: the program has its own mapping of these pages */
++	} else if (b != NULL) {
+ 		b->memory->retain();
+ 		b->seen = true;
+ 		*memory = b->memory;
+@@ -1429,6 +1524,7 @@
+ 		struct drm_gem_close close;
+ 		struct redwood_surface surface;
+ 		struct redwood_drawn drawn;
++		struct redwood_userptr userptr;
+ 		struct redwood_show show;
+ 	} r;
+ 	size_t size = args->structureInputSize;
+@@ -1527,6 +1623,9 @@
+ 	case kRedwoodDrawn:
+ 		ret = surfaceDrawn(&r.drawn);
+ 		break;
++	case kRedwoodUserptr:
++		ret = hostPages(&r.userptr);
++		break;
+ 	case kRedwoodShow:
+ 		ret = show(&r.show);
+ 		break;

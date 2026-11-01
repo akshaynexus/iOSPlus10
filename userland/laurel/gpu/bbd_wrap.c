@@ -17,11 +17,11 @@
  *     wait for RedwoodGPU in the loader). "" (not decided yet, early boot) or "on": the loader as before;
  *   - if the exec of the real backboardd fails, it tries /usr/libexec/backboardd.real (a second copy root-add-gpu.sh
  *     may leave) and then waits 10 s before it exits, so launchd does not spin;
- *   - laurel 2158: it starts /usr/libexec/laurel-metal-gate (userland/laurel/metal/metal_gate.c, installed by
- *     root-add-metal.sh) detached, without the loader in its environment; the gate runs once per boot (it checks that
- *     itself) and decides which processes get the Metal device. backboardd does not wait for it.
+ *   - the Metal client gate does not start here any more: this job runs as user mobile, and the gate needs root (its own
+ *     launchd job com.laurel.metal-gate, scripts/laurel/metal-gate-job.py; boot 2026-11-01 15:27, docs/laurel_sprout/metal.md 6.1).
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +29,6 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
-#include <sys/wait.h>
 
 #define REAL      "/usr/libexec/real/backboardd"
 #define LOADER    "/topaz/lib/libtopaz-inject.dylib"
@@ -37,16 +36,21 @@
 #define LOG       "/var/tmp/laurel-bbd.log"
 #define FAST_S    30
 #define MAX_FAST  2
-#define GATE      "/usr/libexec/laurel-metal-gate"
 
 static void
 say(const char *fmt, const char *a)
 {
 	char line[256];
 	FILE *f;
+	int fd;
 
 	snprintf(line, sizeof(line), fmt, a);
 	syslog(LOG_NOTICE, "LAUREL BBD: %s", line);
+	/* the USB log has the console, not syslog */
+	if ((fd = open("/dev/console", O_WRONLY | O_NOCTTY)) >= 0) {
+		dprintf(fd, "LAUREL BBD: %s\n", line);
+		close(fd);
+	}
 	if ((f = fopen(LOG, "a")) != NULL) {
 		fprintf(f, "%ld LAUREL BBD: %s\n", (long)time(NULL), line);
 		fclose(f);
@@ -125,21 +129,6 @@ main(int argc, char *argv[])
 	} else if (access(LOADER, R_OK) != 0) {
 		use_loader = 0;
 		say("off: no %s on the root", LOADER);
-	}
-	if (access(GATE, X_OK) == 0) {
-		pid_t child = fork();
-
-		if (child == 0) {
-			setsid();
-			unsetenv("DYLD_INSERT_LIBRARIES");
-			if (fork() == 0) {
-				execl(GATE, GATE, (char *)NULL);
-			}
-			_exit(0);
-		}
-		if (child > 0) {
-			(void)waitpid(child, NULL, 0);
-		}
 	}
 	if (use_loader) {
 		setenv("DYLD_INSERT_LIBRARIES", LOADER, 1);
