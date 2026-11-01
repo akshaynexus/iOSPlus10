@@ -953,3 +953,10 @@ new kill switches laurelusb_poll=0, laurelaks_passcode=0. **Owner-approval excep
 `laurelaks_reset=1`** (2904): ignores the stored software passcode for one boot, the only way back into a phone
 whose passcode is lost (no SEP, no other reset path). m9 TODO: RTC lane into sweet_spmi.c after area D merges.
 m10 host-wait behaviour documented in usb-debug.md.
+
+## Mi A3: camera crash loop, photo path, black frames (2026-11-01, branch t3/laurel-camera-photo; plug-in only; build + mock tests, NOT BOOTED)
+Owner: "Photos do not get taken, and the camera flashes in and out." Cause [V]: with Metal off in mediaserverd, Camera.app's filter thumbnail node derefs a nil Metal filter 1 s after each session starts: 6 of 6 crashes.
+Done: Metal stays out; hooks 10 + 11 prepare that node without a filter and copy unfiltered thumbnails through the CPU; a photograph with no pool buffer is retried, not counted as given; sharpness without its noise term; no scan in the dark or on a flat sweep; line `picture: no light on the sensor`.
+Not fixed, cause [U]: every frame so far holds noise only (mean 0, top 3-10 at up to 133 ms x 16x). Scene or VANA: the next boot in a lit room decides. Never seen on the phone: an `encoded` line, a saved photo, the 4000x3000 mode. Photo file is 4032x3024.
+Build: 291/291 patches, 0 LSE; plug-in sha256 320ac73d62013137...; cam-test, cam-leak-test OK; cache check PASS.
+Next: root + userdata flash (owner approves), docs/laurel_sprout/camera.md section 11 "Test steps".

@@ -606,7 +606,7 @@ Shutter -> `FigCaptureStillImageSettings qualityPrioritization` (hook: speed, on
 - [V boot 19:34, old build, 1280x720 frames] `a photograph asked for`, `StillImage: 4032x3024`, `the photograph is given`, `goes past the noise reduction`. So the handler, pool and objects CMCapture needs do come from the real graph up to the GNR node. Never seen: `encoded`, a saved file, and all of this on the 2773 mode switch.
 - **File size [V code]: the file is 4032x3024.** The graph's format and pool are the iPhone X names; the sensor frame is 4000x3000, scaled 1.008x by `isp_render_still_nv12`. Changing the format name risks the plist match: not done.
 - Bug fixed: `deliver` was void, and a picture that found no buffer in the pool was counted as given (`stills_wanted--`, line `the photograph is given`). The graph then waited for ever. Now: tried again on the next frames, after 8 tries one line with what is missing, and the preview comes back.
-- Time: render + finish 226 ms on one host thread, flat frame [V]; on the phone [I] about 1 s. Under the kernel's 3 s rule. Mock (`cam5_dark.h`): pool refuses 10 asks, the photograph comes at the third try, mode out and back, lens still.
+- Time: render + finish 226 ms on one host thread, flat frame [V]; on the phone [I] about 1 s (no measurement). Under the kernel's 3 s rule. Mock (`cam5_dark.h`): pool refuses 10 asks, the photograph comes at the third try, mode out and back, lens still.
 
 ### Is the picture real? No light in any frame so far
 
@@ -622,7 +622,7 @@ All values of boot 20:02 [V], above black, 10-bit (white 959):
 Older boots: `mean 64` (= black) at every session, since the first frame.
 
 - `1% over 8` means nothing: it was the middle of the lowest 16-step bin. Fixed in the plug-in's lines (1-step bins under 32). The kernel's line still reads 8 for a black frame.
-- Sharpness flat, and why [V calc + host test]: sharpness = steps of block means / mean squared. Noise cut off at black: `4 x 0.34 / 32 / 0.4^2 = 0.27`, whatever the noise's size and wherever the lens is. Log: 0.2795 to 0.2891 (one 0.2031 first). `cam6_test` repeats the old measure on such noise: 0.27 at every sigma. So the sweep measured noise only, with nothing in it about the lens: **the frame has no picture.**
+- Sharpness flat, and why [V calc + host test]: sharpness = steps of block means / mean squared. Noise cut off at black: `4 x 0.34 / 32 / 0.4^2 = 0.27`, almost whatever the noise's size and wherever the lens is. Log: 0.2795 to 0.2891 (one 0.2031 first). `cam6_test` repeats the old measure on such noise: sigma 1, 2, 4, 8 = 0.335, 0.282, 0.268, 0.262; sigma 2 gives green 0.8 and 0.28, as the log's `green 0-1` and 0.28. So the sweep measured noise only, with nothing in it about the lens: **the frame has no picture.**
 - Noise rises with gain (top 3 at 6.8x, 7-10 at 16x): the sensor's read-out runs [I].
 - Judgement: 133 ms x 16x would clip a lit room. Top 10 of 959 is no light on the pixels. **Cause [U]: I cannot tell from here:** (a) lens covered or a dark scene (the boot self-check at 20:02:59 may be the phone on a table; the sessions at 20:14-20:17 were in the owner's hands, scene unknown); (b) the pixels get no supply: VANA (gpio 15, equal to the DT [V]). Register tables are not the cause: qtech = sunny in modes 1, 2 and 6 [V this boot's diff], digital gains 1x, stock exposure writer the same [V section 10]. The owner's "bad quality" fits a noise picture, or a real picture in another scene; no picture file exists.
 - The torch was not on in these sessions [V]: `dark: off` 20:17:13, session 20:17:15.
@@ -631,7 +631,7 @@ The next boot decides, one test: lit room, lens free, phone in the hand. New lin
 
 ### AF scale
 
-- Noise term out of the measure: half the mean square of the difference of a cell's two greens is the noise's variance S; S / 8 is noise's share of the steps. Host [V]: noise only: 0.27 -> under 0.02; soft and sharp edges keep a ratio above 4.
+- Noise term out of the measure: half the mean square of the difference of a cell's two greens is the noise's variance S; S / 8 is noise's share of the steps. Host [V]: noise only: 0.26-0.34 -> 0.0000 at each sigma; a real edge at noise sigma 6: 0.02852 sharp, 0.00231 soft (ratio 12).
 - Window under 4 steps above black: no scan, lens stays, AFStatus 0 (no photograph held back), line `focus: waits:`. A tap in the dark is done when light comes.
 - A sweep with sharpest under 1.15 x least sharp: lens back to its start, line `focus: the sweep is flat`. It used to end at the first place measured.
 

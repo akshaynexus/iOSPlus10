@@ -4653,3 +4653,19 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - [I] Kernel-only rebuild here: 37 s with a reflink copy of main's deps/dl/theos/cache (`cp -a --reflink=always`, btrfs); AUDIT=1 leaves the patched tree in out/laurel-kernel/xnu-src.
 - Not done: gestalt answers on the phone (which of Phone, FaceTime, Compass, Watch, Measure show) [U]; the root build (sudo); no boot.
 
+
+## Mi A3: crash loop without Metal, photo path, black frames; plug-in only (2026-11-01, branch t3/laurel-camera-photo; build + mock tests, NOT BOOTED)
+- Details, table, expected lines, test: docs/laurel_sprout/camera.md section 11. Log: logs/laurel-boot-2002.txt (main checkout).
+- [V] 6 of 6 `CRASH mediaserverd` = `-[BWMultiFilterThumbnailNode prepareForCurrentConfigurationToBecomeLive]` +296, unslid 0x1a1f472f0 `strb wzr, [x0, #8]` after `[_filter filterDescriptor]`, no check, on the deferred-prepare queue. `_filter` = `[FigColorCubeMetalFilter new]`, nil because `+[FigMetalContext createMetalDevice]` is nil (0x1c789c340). Only when mediaserverd is off the Metal list: 0 of this stack in boots 18:40, 19:07, 19:34.
+- [V] `enableDeferredPrepareForNodesNotInPathOfSinkNode:`: nodes off the preview's path prepare after the first pictures. So a crash there looks like "preview for 1 s, then gone", and those nodes (still path too) have never prepared without Metal except where read in the cache: GNR, photo encoder, coordinator look safe; the rest [U].
+- Decision: Metal stays out of mediaserverd. [V] boot 19:34 with Metal: 236 `surface import refused`, 16 MiB -> `low swap` 2607 MB in 8 s, 1.7 s after the shutter. Boot 20:02 without: 0 `low swap`, but at most 40 frames a session, so no `memory at frame` line ever came: not proof of a flat footprint.
+- Hooks 10 + 11: prepare = super only without a device, render = unfiltered copy through the CPU (`camera_thumbs.c`). Output layout [V]: width x height x filter count.
+- [V] Boot 19:34 is the only shutter so far: asked, StillImage, given, past GNR, then the kill. No `encoded` line has ever been seen; the 2773 mode switch has never run.
+- Bug: `deliver` was void: a picture with no pool buffer counted as given, the shutter stayed dead. Now retried, 8 tries, then one line.
+- **Black frames.** [V] Every frame since the first boot: mean 0 above black; top 3 at 33 ms 6.8x, 7 at 21 ms 16x, 9-10 at 133 ms 16x. `1% over 8` was only the lowest 16-step bin's middle (still so in the kernel's line). Flat sweep 0.28 = pure noise: `cam6_test` on noise: 0.335, 0.282, 0.268, 0.262 at sigma 1, 2, 4, 8. Cause [U]: lens covered or dark scene, or VANA gives the pixels no supply. Tables are not it (qtech = sunny in modes 1, 2, 6). Next boot in a lit room: `picture: no light on the sensor` decides.
+- File size: 4032x3024 (iPhone X format name), made from the 4000x3000 frame, 1.008x.
+- Gotcha: a Python `s.replace` with no assert silently did nothing (wrong tab depth): the new sharpness equalled the old one, and only cam6 showed it. Assert every scripted edit.
+- Gotcha: `cam-test.sh` removes out/laurel-cam-test: do not run it together with cam-leak-test.sh. `BWGraph` private methods called with `bl` are objc_direct: no selector to call (`_loadAndConfigureFilterBundle`).
+- Tool: `dsc-dis.py` + `dsc-annotate.py` read the cache; a class's relative method list: selector base 0x18229979f in 20H392, entry size 12.
+- Build [V]: merged with origin/laurel-sprout 3ee7345. kernel-linux.sh 291/291 patches, 90 laurel, 0 failed, 0 LSE, sha256 fb4252a3fd2db69f... (no kernel change here); plug-in 164336 bytes, sha256 320ac73d62013137...; cam-test.sh OK; cam-leak-test.sh OK (cam5 + cam6); camera-cache-check.sh PASS, 11 hooks, 140 imports (run before the merge and the noise fix; neither changes the hook table or the imports).
+- Next: root (userdata) + owner test, section 11. No boot image for this change.
