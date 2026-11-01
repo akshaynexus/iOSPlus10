@@ -4748,3 +4748,10 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - Gotcha: the buffers are Normal NC: statistics copy a line to cached memory first (`lcam_light_raw`); byte-by-byte reads of a whole frame would hold the stream thread too long.
 - Gotcha: `collect` in `laurel_cam_stream.c` started each call with buffers 0, 1 in the VFE; two calls in one capture need the `wm_ring` state.
 - Built: kernel-linux.sh 293/293 patches, 0 LSE, no warning in the changed files, kernel.development.sweet.4k sha256 840f70f9799d4ae0...; NegroniCamera.driver sha256 b1f371f512523e94... (164368 bytes); cam-test: cam7 3610 checks, 0 failed; all older checks pass. Host only.
+
+## Mi A3: kernel panic log_encode.c:121 from one printf with 48 values (2026-11-01 22:22, 22:26)
+- [V log] Two panics, one at the first `LAUREL WIFI: link` line of a session; the text is glued to the end of that line:
+  `log_encode.c:121 Assertion failed: log_fits_cmd(ctx, cmd_sz)`. The owner's Control Center press was only coincidence [I].
+- [V code] os_log's kernel buffer is 256 bytes (OS_LOG_BUFFER_MAX_SIZE); each value costs 2 + 8 bytes, so about 24 values fit. 2885 made the
+  line 48 values. Patch 2887 splits it (`link`, `traffic`, `path cost`). `scripts/laurel/printf-arg-check.py` (limit 22) runs in every kernel build.
+- Panic text can sit glued at the end of a normal log line: search for `Assertion failed`, not only `panic(`.
