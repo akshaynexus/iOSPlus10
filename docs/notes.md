@@ -4116,3 +4116,19 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - Fix: laurel_bt_dma.c (SMMU identity, buffers from topaz_pool_alloc = contiguous Normal NC below 4 GiB, polled TX/RX with
   limits, faults become the off reason); FIFO mode unchanged when the bit is 0. Build 242/242, 0 LSE. Not booted.
 - Rule [I]: on a QUP without HLOS firmware loading, never touch SE + 0x1000..0x2fff (FW RAM, CLK_CTRL, DMA_IF_EN, FIFO_IF_DISABLE).
+## Mi A3: phantom key presses every 10 s = SPMI users without one lock; 2710 (2026-11-01 06:40, branch t3/laurel-spmi-phantom-keys)
+- Details: docs/laurel_sprout/battery-power.md section "SPMI: one core".
+- [V log 06:17 boot, usblog-20261101-001446] Nobody at the phone: `SWEET KEYS: key=0 down=1 pon=0x7f` + key=2 (pon 0x7f, 0x57,
+  0xc1) at 06:19:17/27/37, vol-up `gpio4:c110=0x78/0x28/0x18...` at :x5 every 10 s; `read error ... arb-status=0x9`
+  (DONE + DROPPED). GPIO5 APID 124 is read by the keys thread only and still read garbage: cross-talk between APIDs.
+- [V source] Three SPMI paths without a common lock: sweet_keys.c (own map, no lock, 20 ms poll), sweet_spmi.c (IOLock for the
+  battery; PON + USBIN lanes unlocked), laurel_haptic.c (own map + mutex). 10 s = charger guard timer + SweetBattery poll.
+- [I] The EE 0 observer channels share one command engine: a parallel command is DROPPED or gets the other command's RDATA.
+  Linux spmi-pmic-arb.c holds one raw spinlock (irqsave) over every transaction, so it never shows.
+- Fix 2710: sweet_spmi.c = the one core (one channel map, one LDXR/STXR lock with interrupts off over command + DONE wait +
+  RDATA; FAILURE/DENIED/DROPPED = error; power-off/restart/panic users run after 5 ms without it, counted `forced`). Keys,
+  haptics, PON, USBIN, battery/charger/ADC/SDAM/thermal all use it. Keys: change only after 2 agreeing clean polls.
+- Rule for new drivers: never map the SPMI arbiter or write a channel CMD register outside sweet_spmi.c; register a user
+  (enum in sweet_spmi.h) and use sweet_spmi_ext_read/_ext_write.
+- Built: 243/243 patches, 0 LSE, kernel.development.sweet.4k sha256 94981b65c163060e76491793d5a6b71df05a1b5f1c443620cf9768b615553e33.
+  NOT BOOTED.

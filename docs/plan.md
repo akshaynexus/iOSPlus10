@@ -680,3 +680,12 @@ Not booted. Next: boot; expect `TopazModem: smmu: QUP1 Bluetooth identity (sid 1
 `LAUREL BT: geni: FIFO interface off (boot left GSI): SE DMA mode, ...`, `uart: 115200 8N1 RTS/CTS, SE DMA, RX on`, `chip:`,
 `on: WCN3990 ...`. If `off: SE DMA TX does not finish with CTS ignored`: SE DMA is blocked with the FIFO interface off (then
 GPI DMA is the only path). Details: docs/laurel_sprout/bluetooth.md "SE9 left in GSI mode".
+
+## Mi A3: phantom key presses fixed in the kernel (2026-11-01 06:40, branch t3/laurel-spmi-phantom-keys, patch 2710)
+
+Observed [V, USB log, boot 06:17]: power + vol-down / vol-up "presses" every 10 s with nobody at the phone; SPMI status 0x9
+(DROPPED). Cause: keys, battery/charger and vibrator used the SPMI arbiter without one lock [V source; I hardware model].
+Done: one SPMI core in sweet_spmi.c (one lock, one channel map, status check, timeout), all users moved to it; keys need 2
+agreeing clean polls. Built 243/243, 0 LSE (sha256 94981b65...). Not booted.
+Next: boot it; leave the phone untouched 5 min: no `SWEET KEYS: key=` line; `LAUREL SPMI: on: ... users: pon keys battery
+haptic; spmi errors ...` and the 5-min `LAUREL BATTERY` line show the error counts.

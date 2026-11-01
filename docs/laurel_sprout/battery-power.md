@@ -29,6 +29,7 @@ rw channel 0x10000 * APID; `SWEET KEYS` and the 2018 PON lane use it).
 | 2301 | new `bsd/dev/laurel_pmi632.c` + `.h`: gauge, NTC, SoC model, SDAM save, SMB5 charger loop + JEITA; `SweetBattery.cpp` uses it and publishes the negroni 0271/0365 key set |
 | 2302 | charge-only boot (hook at the start of `load_init_program`), power off sets PS_HOLD type SHUTDOWN before PSCI SYSTEM_OFF |
 | 2303 | new `bsd/dev/laurel_thermal.c`: OSM cpufreq governor (Silver + Gold) + TSENS caps; replaces the topaz 0094 Gold pin |
+| 2710 | `sweet_spmi.c` = the one SPMI core: one transaction lock and one channel map for keys, PON lane, battery/charger/ADC/SDAM/thermal, USBIN lane and vibrator (section "SPMI: one core") |
 
 ## Registers (PMI632 SID 2) [V source]
 
@@ -166,10 +167,58 @@ vbat N mV ibat N mA temp N` line and the `LAUREL CHARGER` change lines come late
 - [I] SoC is a model, not the Linux QG: errors of several % (no ESR, no temperature-dependent capacity).
 - [I] The charge-mode rule depends on the PON reason bits; a wrong rule either boots iOS (safe) or holds in charge
   mode until the power key (also safe: power key boots iOS; `laurelchgmode=0` turns it off).
-- [I] The PON APID is also polled by the `SWEET KEYS` thread; our PON reads take two agreeing reads (review m2: a
-  lock shared with the keys thread would need a change in topaz `sweet_keys.c`; not done).
+- [V] Fixed by 2710: the PON APID was also polled by the `SWEET KEYS` thread without a lock (review m2). Now every SPMI
+  user takes the one lock of `sweet_spmi.c` (section "SPMI: one core"). The two agreeing PON reads stay.
 - [I] Our SDAM record 0xb1a8-0xb1ae is past the Linux QG area (0x45-0xa3) and below the PBS PON OCV (0xbc), but no
   source proves the bytes free (review m1). If Android boots again, its QG ignores them.
+
+## SPMI: one core (2710, 2026-11-01 06:40, branch t3/laurel-spmi-phantom-keys)
+
+Bug [V, logs/usblog-20261101-001446.txt, boot 06:17, nobody touched the phone]:
+- `SWEET KEYS: key=0 down=1 pon=0x7f` + `key=2 down=1 pon=0x7f`, then both up, at 06:19:17, 06:19:27, 06:19:37
+  (pon 0x7f, 0x57, 0xc1): exactly every 10 s. Vol-up the same: `key=1 down=1 ... gpio4:c110=0x78` (also 0x28, 0x80,
+  0x18, 0x34, 0x2, 0; bit 0 low = pressed) at 06:13:05, :15, :25 and later, each released 1 poll later.
+- `SWEET KEYS: read error pon-ok=1 gpio-ok=0 arb-status=0x9` (05:55:20, 06:07:35, 06:15:26): STATUS 0x9 = DONE +
+  DROPPED (spmi-pmic-arb.c PMIC_ARB_STATUS_DROPPED = bit 3). Earlier boot: `pon-ok=0 gpio-ok=1 arb-status=0x1`
+  (05:30:11..05:54:50; the printed status was the GPIO read's, the PON status was lost) and phantom presses at
+  05:29:41-43 (three power presses, then iOS started the endless vibration) and 05:29:59 / 05:30:31 (key=0 + key=2).
+- GPIO5 (APID 124) is read by the keys thread only, yet it read garbage: so the cross-talk is between different APIDs.
+
+Cause [V source, I hardware model]:
+- Three paths to the one arbiter v5, no common lock: `sweet_keys.c` (topaz 0060/0087: own map, no lock, PON APID 112 +
+  GPIO5 APID 124 every 20 ms), `sweet_spmi.c` (IOLock for battery reads/writes; the 2018 PON lane and the 2300 USBIN
+  lane without a lock) and `laurel_haptic.c` (2700: own map, own mutex). The 10 s cadence = the charger guard timer
+  (`lp_guard_fire`, "retried every 10 s") and the SweetBattery 10 s poll, which run many PMI632 reads.
+- [I] The observer channels of one EE are register windows of one command engine, not independent engines: a second
+  command while one runs is dropped (status 0x9) or completes with the other command's RDATA (the pon/gpio values above
+  look like battery/charger data, not RT_STS bits). Linux never sees this: `spmi-pmic-arb.c` holds `pmic_arb->lock`
+  (raw spinlock, irqsave) over every `pmic_arb_read_cmd` / `pmic_arb_write_cmd`. The 2700 note "each APID has its own
+  command registers, so the lanes do not race" was wrong.
+- [V source] The keys thread took one bad read as a press (no debounce): `now != state` -> event at once.
+
+Fix (2710):
+- `sweet_spmi.c` is the one core. One channel map (PPID -> APID, EE 0 entry wins; owner EE per APID), read once in
+  `sweet_spmi_init` under a mutex. One transaction lock: a word taken with LDXR/STXR (no LSE), interrupts off, held from
+  the command store to the RDATA read (as Linux). DONE wait 1 ms (PMIC_ARB_TIMEOUT_US); FAILURE / DENIED / DROPPED =
+  error; a timeout poisons that APID for the boot. Writes only on EE 0 APIDs (rw channel mapped by the core).
+- Power off / restart / panic hold (PON lane, USBIN lane) are "emergency" users: if the lock stays busy for 5 ms (a CPU
+  stopped by a panic while it held it) the transaction runs without it and is counted (`forced`).
+- Users: `pon` (laurel_reboot.c, laurel_pmi632.c PON reasons, charge-mode power key), `keys` (sweet_keys.c), `battery`
+  (sweet_spmi_read/_write: laurel_pmi632.c, SweetBattery.cpp, laurel_thermal.c; USBIN lane), `haptic` (laurel_haptic.c).
+  Each registers at its start; no driver maps the arbiter itself any more.
+- Keys: a key changes state only after 2 polls in a row (20 ms apart) read the new state with a clean status; a failed
+  read never changes a key and breaks the run. Press latency +20 ms [I: not felt].
+
+Expected lines:
+```
+SWEET BATTERY: SPMI arb=0x50010000 APIDs=256, observer reads; PON APID 112 rw lane mapped
+LAUREL KEYS: on: power+vol-down polled (PON APID 112), vol-up polled (PM6125 GPIO5 APID 124); shared SPMI lock, a change needs 2 agreeing reads
+LAUREL SPMI: on: arbiter 0x50010000, 256 APIDs, one lock and one channel map for every transaction; users: pon keys battery haptic; spmi errors pon 0 keys 0 battery 0 haptic 0, forced 0
+LAUREL BATTERY: on: PMI632 QG soc N% ... icl N mA charging; spmi errors pon 0 keys 0 battery 0 haptic 0, forced 0
+```
+The `LAUREL SPMI` line comes 60 s after the first SPMI init (users that started by then; the haptic user registers when
+iOS opens the vibrator, so it can be missing there). The error counts repeat in the 5-minute `LAUREL BATTERY` line.
+Test: phone untouched for 5 min: no `SWEET KEYS: key=` line, error counts 0 (or a few, never a key event).
 
 ## Review 2026-11-01 (ACCEPT-WITH-FIXES) and what changed
 
