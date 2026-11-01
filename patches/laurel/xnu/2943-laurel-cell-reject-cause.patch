@@ -1,0 +1,589 @@
+laurel 2943: why the network refuses a SIM: read-only facts, one line per fact: IMEI verdict (DMS 0x25; no digit kept or logged), network reject by radio + domain + cause + PLMN (NAS indication 0x68, GET_SYSTEM_INFO 0x4D), SIM reject state, selection preference (0x34), the moment a USIM turns illegal; rmtfs says what it served (partition, sector, bytes, non-zero words, counts only) and each dropped write. Boot 23:41:57: both USIMs illegal, no reason visible. No request changes the modem's state. docs/laurel_sprout/cellular.md section 12.
+
+diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
+--- a/bsd/dev/laurel_cell.c	2026-11-01 23:54:54.887376946 +0530
++++ b/bsd/dev/laurel_cell.c	2026-11-01 23:59:35.253958977 +0530
+@@ -32,7 +32,7 @@
+  *   "LAUREL CELL: on: SIM1 present (USIM ready), SIM2 absent; modem online; SIM1 registered 404-45 LTE rssi -71 rsrp -98 bars 3; ..."
+  *   "LAUREL CELL: off: <reason>"
+  * sysctl kern.laurel_cell_state: the same state as key=value lines for the SpringBoard bridge (userland/laurel/cell).
+- * Privacy: ICCID, IMSI and IMEI are never read or logged by this file.
++ * Privacy: ICCID and IMSI are never read. The IMEI is read only for its verdict (laurel 2943, laurel_cell_why.h): no digit is kept or logged.
+  * A failure turns off only the cellular client; the modem, Wi-Fi, USB and the boot go on.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -152,7 +152,7 @@
+ 	char op[20];
+ 	int rssi, rsrp;                         /* dBm, 0 = unknown */
+ 	uint64_t next;                          /* next poll, ms */
+-	uint8_t step;                           /* 0 serving system, 1 signal */
++	uint8_t step;                           /* 0 serving system, 1 signal, 2 system info (laurel 2943) */
+ };
+ static struct reg reg[2];
+ 
+@@ -520,6 +520,8 @@
+ 	return 0;
+ }
+ 
++#include "laurel_cell_why.h"                    /* laurel 2943: why the network refuses */
++
+ /* the summary; key = the same without the signal values (a change of key = a new line) */
+ static void
+ summary(char *out, size_t max, bool with_signal)
+@@ -588,6 +590,9 @@
+ 			n += snprintf(out + n, max - n, "; SIM%d not registered", s + 1);
+ 			break;
+ 		}
++		if (n < max) {
++			n += why_text(out + n, max - n, sub, r->state);
++		}
+ 		if (with_signal && n < max && r->rssi != 0) {
+ 			n += snprintf(out + n, max - n, " rssi %d", r->rssi);
+ 		}
+@@ -661,8 +666,8 @@
+ 	size_t n = 0;
+ 	const char *st = state == -1 ? "off" : (state == 0 ? "starting" : "on");
+ 
+-	n += snprintf(out + n, max - n, "state=%s\nradio=%s\ndata=%s\nsms=off\nvoice=off\nmode=%s\ncaps=%s\n", st,
+-	    state != -1 && opmode == 0 ? "online" : "off", lcd_state_key(), opmode_name(opmode), caps);
++	n += snprintf(out + n, max - n, "state=%s\nradio=%s\ndata=%s\nsms=off\nvoice=off\nmode=%s\ncaps=%s\nimei=%s\n", st,
++	    state != -1 && opmode == 0 ? "online" : "off", lcd_state_key(), opmode_name(opmode), caps, imei_key(imei_state));
+ 	for (int sub = 0; sub < 2 && n < max; sub++) {
+ 		int s = sub_view_slot(sub);
+ 		const struct reg *r = &reg[sub];
+@@ -690,6 +695,13 @@
+ 		if (n >= max) {
+ 			return;
+ 		}
++		/* laurel 2943: radio,domain,cause,network */
++		if (why[sub].rej.have && rs != 1) {
++			n += snprintf(out + n, max - n, "sub%d.reject=%s,%s,%u,%s\n", sub, why[sub].rej.rat, domain_name(why[sub].rej.dom), why[sub].rej.cause, why[sub].rej.plmn);
++			if (n >= max) {
++				return;
++			}
++		}
+ 		if (rs == 1 && r->op[0] != 0) {
+ 			n += snprintf(out + n, max - n, "sub%d.op=%s\n", sub, r->op);
+ 		} else if (rs == 1 && r->mcc != 0) {
+@@ -843,6 +855,7 @@
+ 	LOG("card status%s: SIM1 card %u app %s/%u, SIM2 card %u app %s/%u, GW primary %04x secondary %04x\n",
+ 	    ind ? " (indication)" : "", slot[0].card, slot[0].app ? app_type_name(slot[0].app_type) : "-", slot[0].app_state,
+ 	    slot[1].card, slot[1].app ? app_type_name(slot[1].app_type) : "-", slot[1].app_state, idx_gw[0], idx_gw[1]);
++	why_card();
+ 	/* a card left: its subscription's NAS data is old */
+ 	for (int sub = 0; sub < 2; sub++) {
+ 		if (sub_slot(sub) < 0) {
+@@ -998,6 +1011,9 @@
+ 			LOG("DMS GET_CAPABILITIES: error 0x%x\n", e);
+ 		}
+ 		break;
++	case DMS_GET_IDS:
++		why_ids(e, d, len);
++		break;
+ 	case DMS_GET_OPMODE:
+ 		online_sent = false;            /* the read after SET online is back: no line with the old mode before it */
+ 		v = tlv(d, len, 0x01, &l);
+@@ -1204,6 +1220,26 @@
+ 			r->rssi = r->rsrp = 0;          /* no old bars after an error */
+ 		}
+ 		break;
++	case NAS_REGISTER_IND:
++		if (e != 0) {
++			LOG("%s: REGISTER_INDICATIONS (network reject): error 0x%x; system info still has the cause\n", qc[i].name, e);
++		}
++		break;
++	case NAS_SEL_PREF:
++		why_selection(i == C_NAS1 ? 0 : 1, e, d, len);
++		break;
++	case NAS_SYS_INFO:
++		if (e == 0) {
++			why_sys_info(i == C_NAS1 ? 0 : 1, d, len);
++		} else {
++			WHY("%s: GET_SYSTEM_INFO error 0x%x\n", qc[i].name, e);
++		}
++		break;
++	case NAS_REJECT_IND:
++		if (ind) {
++			why_reject_ind(i == C_NAS1 ? 0 : 1, d, len);
++		}
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -1349,6 +1385,9 @@
+ 			dms_ev_done = true;
+ 		} else if (i == C_DMS && msg == DMS_GET_CAPS) {
+ 			caps_done = true;
++		} else if (i == C_DMS && msg == DMS_GET_IDS) {
++			ids_tries++;
++			ids_next = now + IDS_PERIOD_MS;
+ 		} else if (i == C_DMS && msg == DMS_SET_OPMODE) {
+ 			/* no answer: this round is lost, the next one comes */
+ 			LOG("DMS SET_OPERATING_MODE: no answer (round %u of %u)\n", online_tries, ONLINE_TRIES);
+@@ -1428,6 +1467,8 @@
+ 			/* laurel 2786: one read at ~450 ms said "shutting down" (5) and blocked ONLINE for the boot. Read until online, then slowly */
+ 			opmode_next = now + (opmode == 0 ? OPMODE_ONLINE_MS : OPMODE_PERIOD_MS);
+ 			qc_simple(C_DMS, DMS_GET_OPMODE);
++		} else if (why_ids_due(now)) {
++			qc_simple(C_DMS, DMS_GET_IDS);      /* laurel 2943: the verdict only; behind the radio's steps */
+ 		}
+ 	}
+ 	/* laurel 2942: the data session, on the modem's default subscription (primary) */
+@@ -1445,14 +1486,33 @@
+ 			}
+ 			continue;
+ 		}
+-		if (opmode != 0 || now < r->next || !r->bind_ok) {
++		if (!r->bind_ok) {
+ 			continue;
+ 		}
+-		if (r->step == 0) {
++		/* laurel 2943: before ONLINE: a reject comes once. An error here changes nothing else */
++		if (!why[sub].ind_done) {
++			struct qb m;
++			uint8_t on[2] = { 1, 0 };       /* network reject on, system info indications not suppressed */
++			why[sub].ind_done = true;
++			qb_init(&m, NAS_REGISTER_IND);
++			qb_tlv(&m, 0x21, on, 2);
++			qc_send(&qc[i], &m);
++			continue;
++		}
++		if (opmode != 0 || now < r->next) {
++			continue;
++		}
++		if (!why[sub].sel_done) {
++			why[sub].sel_done = true;
++			qc_simple(i, NAS_SEL_PREF);
++		} else if (r->step == 0) {
+ 			qc_simple(i, NAS_SERVING_SYSTEM);
+ 			r->step = 1;
+-		} else {
++		} else if (r->step == 1) {
+ 			qc_simple(i, NAS_SIGNAL_INFO);
++			r->step = 2;
++		} else {
++			qc_simple(i, NAS_SYS_INFO);
+ 			r->step = 0;
+ 			r->next = now + NAS_PERIOD_MS;
+ 		}
+diff -ruN a/bsd/dev/laurel_cell_why.h b/bsd/dev/laurel_cell_why.h
+--- a/bsd/dev/laurel_cell_why.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_cell_why.h	2026-11-01 23:55:38.762759725 +0530
+@@ -0,0 +1,388 @@
++/*
++ * laurel 2943 (included by laurel_cell.c): why the network refuses a SIM. Read-only QMI facts, one line per fact, a new line only on a change.
++ * Boot 23:41:57: radio online, then both USIMs "illegal" and "registration denied", and the kernel had no reason to show.
++ *  - DMS GET_DEVICE_SERIAL_NUMBERS 0x25 (libqmi "Get IDs"): is the IMEI there, is it well formed. The digits stay in the modem's answer: no copy, no line, no sysctl.
++ *  - NAS REGISTER_INDICATIONS 0x03 TLV 0x21 + indication 0x68 "Network Reject": radio, domain, cause, PLMN at the moment of the reject.
++ *  - NAS GET_SYSTEM_INFO 0x4D: service status and the last reject per radio; TLV 0x27 SIM reject state.
++ *  - NAS GET_SYSTEM_SELECTION_PREFERENCE 0x34: what the modem is allowed to try.
++ * Layouts: libqmi qmi-service-{dms,nas}.json, enums qmi-enums-nas.h [V]. No request here changes the modem's state, only what this client is told.
++ */
++#define DMS_GET_IDS         0x0025
++#define NAS_REGISTER_IND    0x0003
++#define NAS_SEL_PREF        0x0034
++#define NAS_SYS_INFO        0x004D
++#define NAS_REJECT_IND      0x0068
++
++#define IDS_PERIOD_MS       30000u              /* IMEI not valid: read again (the modem may still load its NV) */
++#define IDS_TRIES           6u
++#define WHY_LINES_MAX       96u                 /* service and reject lines a boot: a search changes them often */
++#define WHY(...)            do { if (why_lines < WHY_LINES_MAX) { why_lines++; LOG(__VA_ARGS__); } } while (0)
++
++enum { IMEI_UNKNOWN, IMEI_ABSENT, IMEI_FORMAT, IMEI_ZERO, IMEI_BAD, IMEI_VALID };
++
++struct why_rat {
++	bool seen;
++	uint8_t srv, tsrv, dom, cap, forb, rej_dom, rej_cause;
++	char plmn[8];
++};
++struct why_rej {
++	bool have;
++	uint8_t dom, cause;
++	const char *rat;
++	char plmn[8];
++};
++static struct why {
++	bool ind_done, sel_done, sim_rej_seen;
++	uint32_t sim_rej;
++	struct why_rat rat[3];                  /* LTE, UMTS, GSM */
++	struct why_rej rej;                     /* the last one */
++} why[2];
++static unsigned why_lines;
++static int imei_state = IMEI_UNKNOWN;
++static uint8_t ids_tries;
++static uint64_t ids_next;
++
++/* only the verdict leaves this function */
++static int
++imei_verdict(const uint8_t *s, uint16_t l)
++{
++	unsigned sum = 0;
++	bool zero = true;
++
++	while (s != NULL && l > 0 && (s[l - 1] == 0 || s[l - 1] == ' ')) {
++		l--;
++	}
++	if (s == NULL || l == 0) {
++		return IMEI_ABSENT;
++	}
++	if (l != 15) {
++		return IMEI_FORMAT;
++	}
++	for (unsigned i = 0; i < 15; i++) {
++		unsigned d;
++		if (s[i] < '0' || s[i] > '9') {
++			return IMEI_FORMAT;
++		}
++		d = s[i] - '0';
++		zero = zero && d == 0;
++		if (i & 1) {
++			d *= 2;
++			d = d > 9 ? d - 9 : d;
++		}
++		sum += d;
++	}
++	return zero ? IMEI_ZERO : (sum % 10 == 0 ? IMEI_VALID : IMEI_BAD);
++}
++
++static const char *
++imei_text(int st)
++{
++	switch (st) {
++	case IMEI_ABSENT: return "absent";
++	case IMEI_FORMAT: return "present, not 15 digits";
++	case IMEI_ZERO:   return "present, all zeros";
++	case IMEI_BAD:    return "present, check digit bad";
++	case IMEI_VALID:  return "present, check digit valid";
++	default:          return "unknown";
++	}
++}
++
++static const char *
++imei_key(int st)
++{
++	switch (st) {
++	case IMEI_ABSENT: return "absent";
++	case IMEI_FORMAT: return "format";
++	case IMEI_ZERO:   return "zero";
++	case IMEI_BAD:    return "bad";
++	case IMEI_VALID:  return "valid";
++	default:          return "unknown";
++	}
++}
++
++/* DMS without a binding answers for the primary subscription [I]; libqmi has no DMS binding message, so the second IMEI is not read */
++static void
++why_ids(uint16_t e, const uint8_t *d, uint32_t len)
++{
++	uint16_t l = 0, sl = 0;
++	const uint8_t *v = e == 0 ? tlv(d, len, 0x11, &l) : NULL;
++	const uint8_t *sv = e == 0 ? tlv(d, len, 0x13, &sl) : NULL;
++	int st = e != 0 && e != 0x4A ? IMEI_UNKNOWN : imei_verdict(v, l);
++
++	if (st != imei_state || ids_tries == 0) {
++		if (e != 0) {
++			LOG("IMEI: %s (GET_DEVICE_SERIAL_NUMBERS error 0x%x)\n", imei_text(st), e);
++		} else {
++			LOG("IMEI: %s; software version %s\n", imei_text(st), sv != NULL && sl != 0 ? "present" : "absent");
++		}
++	}
++	imei_state = st;
++	ids_tries++;
++	ids_next = now_ms() + IDS_PERIOD_MS;
++}
++
++static bool
++why_ids_due(uint64_t now)
++{
++	return imei_state != IMEI_VALID && ids_tries < IDS_TRIES && now >= ids_next;
++}
++
++/* TS 24.008 / 24.301 values, names as libqmi QmiNasRejectCause */
++static const char *
++reject_name(uint8_t c)
++{
++	switch (c) {
++	case 2:  return "IMSI unknown in HLR";
++	case 3:  return "illegal UE";
++	case 4:  return "IMSI unknown in VLR";
++	case 5:  return "IMEI not accepted";
++	case 6:  return "illegal ME";
++	case 7:  return "PS services not allowed";
++	case 8:  return "PS and non-PS services not allowed";
++	case 9:  return "UE identity not derived by network";
++	case 10: return "implicitly detached";
++	case 11: return "PLMN not allowed";
++	case 12: return "area not allowed";
++	case 13: return "roaming not allowed in this area";
++	case 14: return "PS services not allowed in this area";
++	case 15: return "no suitable cells in this area";
++	case 16: return "MSC not reachable";
++	case 17: return "network failure";
++	case 18: return "CS domain not available";
++	case 19: return "ESM failure";
++	case 20: return "MAC failure";
++	case 21: return "synch failure";
++	case 22: return "congestion";
++	case 23: return "UE security capabilities mismatch";
++	case 24: return "security mode rejected";
++	case 25: return "CSG not authorized";
++	case 26: return "non-EPS authentication unacceptable";
++	default: return "other cause";
++	}
++}
++
++static const char *
++domain_name(uint8_t d)
++{
++	switch (d) {
++	case 0:  return "none";
++	case 1:  return "CS";
++	case 2:  return "PS";
++	case 3:  return "CS+PS";
++	case 4:  return "camped";
++	default: return "unknown";
++	}
++}
++
++static const char *
++service_name(uint8_t s)
++{
++	switch (s) {
++	case 0:  return "none";
++	case 1:  return "limited";
++	case 2:  return "available";
++	case 3:  return "limited regional";
++	case 4:  return "power save";
++	default: return "unknown";
++	}
++}
++
++static int
++why_sim(int sub)
++{
++	int s = sub_slot(sub);
++
++	return s >= 0 ? s + 1 : sub + 1;
++}
++
++static void
++why_set_reject(int sub, const char *rat, uint8_t dom, uint8_t cause, const char *plmn, const char *how)
++{
++	struct why_rej *j = &why[sub].rej;
++
++	if (j->have && strcmp(j->rat, rat) == 0 && j->dom == dom && j->cause == cause && strcmp(j->plmn, plmn) == 0) {
++		return;
++	}
++	j->have = true;
++	j->rat = rat;
++	j->dom = dom;
++	j->cause = cause;
++	strlcpy(j->plmn, plmn, sizeof(j->plmn));
++	WHY("SIM%d reject%s: %s, domain %s, cause %u (%s), network %s\n", why_sim(sub), how, rat, domain_name(dom), cause, reject_name(cause), plmn[0] ? plmn : "unknown");
++}
++
++/* MCC and MNC are 3 chars each; a 2-digit MNC has a non-digit in the third place [I]. Only digits are copied */
++static void
++plmn_text(char *o, size_t max, const uint8_t *mcc, const uint8_t *mnc)
++{
++	size_t n = 0;
++
++	for (unsigned i = 0; i < 3 && n + 1 < max; i++) {
++		if (mcc[i] >= '0' && mcc[i] <= '9') {
++			o[n++] = (char)mcc[i];
++		}
++	}
++	if (n != 3) {
++		o[0] = 0;
++		return;
++	}
++	o[n++] = '-';
++	for (unsigned i = 0; i < 3 && n + 1 < max; i++) {
++		if (mnc[i] >= '0' && mnc[i] <= '9') {
++			o[n++] = (char)mnc[i];
++		}
++	}
++	o[n] = 0;
++}
++
++/* System Info v2: valid/value pairs: domain 0-1, capability 2-3, roaming 4-5, forbidden 6-7, LAC 8-10, CID 11-15, reject 16-18, network 19, MCC 20-22, MNC 23-25 */
++#define SYSINFO_MIN 26u
++
++static void
++why_sys_info(int sub, const uint8_t *d, uint32_t len)
++{
++	static const struct { uint8_t st, in; const char *name; } t[3] = {
++		{ 0x14, 0x19, "LTE" }, { 0x13, 0x18, "UMTS" }, { 0x12, 0x17, "GSM" },
++	};
++	struct why *w = &why[sub];
++	uint16_t l = 0;
++	const uint8_t *v;
++
++	for (int i = 0; i < 3; i++) {
++		struct why_rat f;
++
++		bzero(&f, sizeof(f));
++		f.dom = f.cap = 0xFF;
++		v = tlv(d, len, t[i].st, &l);
++		if (v != NULL && l >= 2) {
++			f.seen = true;
++			f.srv = v[0];
++			f.tsrv = v[1];
++		}
++		v = tlv(d, len, t[i].in, &l);
++		if (v != NULL && l >= SYSINFO_MIN) {
++			f.seen = true;
++			f.dom = v[0] ? v[1] : 0xFF;
++			f.cap = v[2] ? v[3] : 0xFF;
++			f.forb = v[6] && v[7];
++			if (v[19]) {
++				plmn_text(f.plmn, sizeof(f.plmn), v + 20, v + 23);
++			}
++			if (v[16] && v[18] != 0) {
++				f.rej_dom = v[17];
++				f.rej_cause = v[18];
++				/* a radio keeps its last reject: only a change is a new fact, else two radios would take turns */
++				if (f.rej_dom != w->rat[i].rej_dom || f.rej_cause != w->rat[i].rej_cause) {
++					why_set_reject(sub, t[i].name, f.rej_dom, f.rej_cause, f.plmn, "");
++				}
++			}
++		}
++		if (f.seen && (!w->rat[i].seen || memcmp(&f, &w->rat[i], sizeof(f)) != 0)) {
++			WHY("SIM%d %s: service %s (true %s), domain %s, capability %s, forbidden %u, network %s\n", why_sim(sub), t[i].name, service_name(f.srv),
++			    service_name(f.tsrv), domain_name(f.dom), domain_name(f.cap), f.forb, f.plmn[0] ? f.plmn : "unknown");
++		}
++		if (f.seen) {
++			w->rat[i] = f;
++		}
++	}
++	v = tlv(d, len, 0x27, &l);
++	if (v != NULL && l >= 4) {
++		uint32_t r;
++		memcpy(&r, v, 4);
++		if (!w->sim_rej_seen || r != w->sim_rej) {
++			WHY("SIM%d SIM reject state: %s\n", why_sim(sub), r == 0 ? "SIM unavailable" : r == 1 ? "SIM available" : r == 2 ? "CS invalid" : r == 3 ? "PS invalid" : r == 4 ? "CS and PS invalid" : "unknown");
++		}
++		w->sim_rej_seen = true;
++		w->sim_rej = r;
++	}
++}
++
++/* indication 0x68: the moment of the reject; a RAT that later leaves system info stays known */
++static void
++why_reject_ind(int sub, const uint8_t *d, uint32_t len)
++{
++	uint16_t l = 0;
++	const uint8_t *r = tlv(d, len, 0x01, &l);
++	bool ok = r != NULL && l >= 1;
++	const uint8_t *dom = tlv(d, len, 0x02, &l);
++	uint16_t l3 = 0;
++	const uint8_t *c = tlv(d, len, 0x03, &l3);
++	char plmn[8] = "";
++
++	if (!ok || dom == NULL || l == 0 || c == NULL || l3 == 0) {
++		return;
++	}
++	const uint8_t *p = tlv(d, len, 0x10, &l);
++	if (p != NULL && l >= 5) {
++		uint16_t mcc, mnc;
++		memcpy(&mcc, p, 2);
++		memcpy(&mnc, p + 2, 2);
++		snprintf(plmn, sizeof(plmn), "%03u-%0*u", mcc % 1000, p[4] ? 3 : 2, mnc % 1000);
++	}
++	why_set_reject(sub, r[0] == 8 ? "LTE" : r[0] == 5 ? "UMTS" : r[0] == 4 ? "GSM" : rat_name(r[0]), dom[0], c[0], plmn, " (indication)");
++}
++
++static void
++why_selection(int sub, uint16_t e, const uint8_t *d, uint32_t len)
++{
++	uint16_t l = 0, modes = 0xFFFF;
++	uint32_t dom = 0xFF, use = 0xFF, restr = 0;
++	uint64_t lte = 0;
++	uint8_t net = 0xFF, emerg = 0;
++	const uint8_t *v;
++
++	if (e != 0) {
++		LOG("SIM%d selection: GET_SYSTEM_SELECTION_PREFERENCE error 0x%x\n", why_sim(sub), e);
++		return;
++	}
++	if ((v = tlv(d, len, 0x10, &l)) != NULL && l >= 1) { emerg = v[0]; }
++	if ((v = tlv(d, len, 0x11, &l)) != NULL && l >= 2) { memcpy(&modes, v, 2); }
++	if ((v = tlv(d, len, 0x15, &l)) != NULL && l >= 8) { memcpy(&lte, v, 8); }
++	if ((v = tlv(d, len, 0x16, &l)) != NULL && l >= 1) { net = v[0]; }
++	if ((v = tlv(d, len, 0x18, &l)) != NULL && l >= 4) { memcpy(&dom, v, 4); }
++	if ((v = tlv(d, len, 0x1D, &l)) != NULL && l >= 4) { memcpy(&restr, v, 4); }
++	if ((v = tlv(d, len, 0x1F, &l)) != NULL && l >= 4) { memcpy(&use, v, 4); }
++	LOG("SIM%d selection: modes 0x%x (bit 2 GSM, 3 UMTS, 4 LTE), network %s, domain %s, usage %s, emergency mode %u, restriction %u, LTE bands 0x%llx\n", why_sim(sub), modes,
++	    net == 0 ? "automatic" : net == 1 ? "manual" : "unknown",
++	    dom == 0 ? "CS only" : dom == 1 ? "PS only" : dom == 2 ? "CS+PS" : dom == 3 ? "PS attach" : dom == 4 ? "PS detach" : "unknown",
++	    use == 1 ? "voice" : use == 2 ? "data" : "unknown", emerg, restr, (unsigned long long)lte);
++}
++
++/* card status: a USIM that becomes illegal is the modem's own verdict: ask at once, the reason is fresh */
++static uint8_t prev_app_state[SLOTS];
++
++static void
++why_card(void)
++{
++	for (int s = 0; s < SLOTS; s++) {
++		uint8_t st = slot[s].app ? slot[s].app_state : 0;
++
++		if (st == 6 && prev_app_state[s] != 6) {
++			LOG("SIM%d: the modem set the USIM illegal, %u s after online\n", s + 1, t_online != 0 ? (unsigned)((now_ms() - t_online) / 1000) : 0);
++			if (slot[s].sub >= 0) {
++				reg[slot[s].sub].next = 0;
++			}
++			if (imei_state != IMEI_VALID) {
++				ids_next = 0;
++			}
++		} else if (st != 6 && prev_app_state[s] == 6) {
++			LOG("SIM%d: USIM no longer illegal (app state %u)\n", s + 1, st);
++		}
++		prev_app_state[s] = st;
++	}
++}
++
++/* in the LAUREL CELL line, after the registration text */
++static size_t
++why_text(char *o, size_t max, int sub, uint8_t reg_state)
++{
++	const struct why_rej *j = &why[sub].rej;
++
++	if (reg_state == 1) {
++		return 0;
++	}
++	if (!j->have) {
++		return reg_state == 3 ? (size_t)snprintf(o, max, " (no reject cause reported)") : 0;
++	}
++	return (size_t)snprintf(o, max, " (last reject %s %s cause %u %s, network %s)", j->rat, domain_name(j->dom), j->cause, reject_name(j->cause), j->plmn[0] ? j->plmn : "unknown");
++}
+diff -ruN a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp	2026-11-01 23:54:54.888376958 +0530
++++ b/iokit/Kernel/arm/TopazModem.cpp	2026-11-01 23:55:38.767326855 +0530
+@@ -2106,10 +2106,25 @@
+ 			}
+ 			if (write) {
+ 				rmtfs_writes++;                 /* never written to the phone's EFS */
++				/* laurel 2943: the answer is ok and the data goes nowhere: say so when it happens, not only in the 20 s summary */
++				if (rmtfs_writes == 1 || (rmtfs_writes % 256) == 0) {
++					LOG("t=%u ms: rmtfs: write %u: %s sector %x, %llu bytes: answered ok, not kept (the phone's EFS stays as it was)", g_ms, rmtfs_writes,
++					    rmtfs_parts[caller - 1].part, e[0], bytes);
++				}
+ 			} else {
+ 				ok = sweet_ufs_read_part(rmtfs_parts[caller - 1].part, (uint64_t)e[0] * 512,
+ 				    rmtfs_va + (e[1] - rmtfs_pa), bytes) == 0;
+ 				rmtfs_reads++;
++				/* laurel 2943: did the modem get its EFS or a blank partition: counts only, never the content. An all-blank EFS means no IMEI and no calibration */
++				if (rmtfs_reads <= 8) {
++					uint64_t words = bytes / 8, set = 0;
++					const uint64_t *w = (const uint64_t *)(void *)(rmtfs_va + (e[1] - rmtfs_pa));
++					for (uint64_t k = 0; ok && k < words; k++) {
++						set += w[k] != 0;
++					}
++					LOG("t=%u ms: rmtfs: read %s sector %x, %llu bytes: %s, %llu of %llu words not zero", g_ms, rmtfs_parts[caller - 1].part, e[0], bytes,
++					    ok ? "ok" : "FAILED", set, words);
++				}
+ 			}
+ 		}
+ 		if (!ok && ++rmtfs_err <= 3) {

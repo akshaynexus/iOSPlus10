@@ -4880,3 +4880,14 @@ Full text: docs/laurel_sprout/camera.md section 13.
 - Gotcha: the USB log is a kernel UDP socket through the normal stack; it stopped after `usbnetcfg down` twice [V], a failed send has no line. [I] configd drops ue0's route or address.
 - Next boot decides: see the reading table in gpu.md. Kernel alone brings the guard change; `LAUREL BLANK` and the RenderBox answer need the root.
 
+
+## Mi A3: both USIMs illegal + denied: reasons read, none proven; patch 2943 (2026-11-01, branch t3/laurel-cellular-denied; build + host test, NOT BOOTED; no write to the phone)
+- Details, ranking, next-boot table: docs/laurel_sprout/cellular.md section 12.
+- [V log, boot 23:41:57] online 23:42:37; SIM2 illegal +82 s, SIM1 +99 s; 0 crash lines; rmtfs reads 3, writes 0, errors 0 at 23:42:39, no later count. rssi -104 without rsrp = a non-LTE TLV [V code].
+- [V libqmi] UIM app state 6 = illegal, 7 = ready: decode right. libqmi source: gitlab.freedesktop.org mobile-broadband/libqmi `data/qmi-service-{nas,dms,uim}.json`, `src/libqmi-glib/qmi-enums-nas.h` (host /usr/include/libqmi-glib has the enums and getter names, not TLV ids).
+- [V libqmi] GET_SYSTEM_INFO 0x4D: LTE/WCDMA/GSM info TLV 0x19/0x18/0x17 (bytes: reject valid 16, domain 17, cause 18, network valid 19, MCC 20-22, MNC 23-25), status 0x14/0x13/0x12, SIM reject state 0x27. Indication Network Reject 0x68, registered by REGISTER_INDICATIONS TLV 0x21 {enable, suppress}. DMS Get IDs 0x25: IMEI TLV 0x11. libqmi has no DMS binding and no dual standby message.
+- [V firmware] strings `Illegal UE`, `IMEI not accepted`, `/boot/modem_fs1|fs2|fsg`, `qmi_nasi_get_dual_standby_pref`. `modem-re.sh` + `grep` give these in a few seconds.
+- [V code] rmtfs pool is Normal NC, reads go to the GPT partition, writes are dropped with an ok answer; read-after-write returns old data (Linaro keeps a shadow copy in read-only mode [I from memory]; not shown to matter).
+- Lesson: an owner on Android can answer the strongest question with no iOS boot: do the same SIMs register there, do 2 IMEIs show.
+- Test pitfall: a new DMS request before `radio_step` moved the first `part:` line earlier (report on the mode answer): new reads go behind the radio's steps. `count_of "(indication)"` also matched `card status (indication)`.
+- Worktree tip: `AUDIT=1 scripts/bg.sh ...` does not pass AUDIT through tmux: it ran a full build (~4 min with ccache). Use `scripts/bg.sh NAME env AUDIT=1 scripts/laurel/kernel-linux.sh`.

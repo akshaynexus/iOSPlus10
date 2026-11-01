@@ -5,6 +5,7 @@ iOS 16.7.16 (20H392, iPhone10,3 userland). Status 2026-11-01: step 1 (kernel QMI
 modem facts; radio kept off by its IPA self-check) [V] booted (boot 20:02: the kernel reads SIM state; iOS saw no SIM, half-done-audit.md row 3). The bridge to iOS and the online fix
 (section 9, patch 2786): built + host test, NOT BOOTED. Path decision, data, SMS, voice, Settings, modem restart: section 9. The IPA phone test: section 10.
 Status later on 2026-11-01: IPA handshake [V] passes on the phone (boot 22:50); DMS mode 5 blocked ONLINE. Radio online + data (2940-2942, `laurel-celld`): built + host test, NOT BOOTED, data [I] until a phone ping: **section 11, read it first.**
+Status 2026-11-01 23:44 [V boot 23:41:57]: radio online, both USIMs turn illegal, registration denied, cause unknown. Patch 2943 reads the reason: built + host test, NOT BOOTED: **section 12.**
 
 Labels: [V] read in source, measured on the host, or in the 20H392 root; [I] inference; [U] unknown.
 Kernel patch: `patches/laurel/xnu/2760-laurel-cellular-qmi.patch` (new `bsd/dev/laurel_cell.c` + hooks in TopazModem.cpp).
@@ -113,7 +114,7 @@ data in airplane mode = low power) [I].
 - Failures -> `off`: cell=0, modem=0, SoC map, PAS boot, SMP2P item, GLINK, modem crash, watch end (`modem_watch=N`),
   modem not READY in 90 s, no UIM service 60 s after READY, UIM GET_CARD_STATUS error or no answer. The modem, Wi-Fi,
   USB and the boot are never touched by this file.
-- Privacy: ICCID, IMSI and IMEI are never read or logged.
+- Privacy: ICCID, IMSI and IMEI are never read or logged. (Since 2943: the IMEI is read for a verdict only, no digit kept or logged; section 12.)
 - `sysctl kern.laurel_cell`: the same text as the line, with the live signal.
 
 ### Expected lines (USB log)
@@ -549,3 +550,97 @@ LAUREL CELLBAR: celld: configd has: pdp_ip0 IPv4
 | `primary interface` stays `none` with Wi-Fi off | IPMonitor did not take the keys | Dump `scutil` over SSH |
 
 Host tests [V]: `scripts/laurel/test-cell.sh` 23 of 23 (`mode stays 5`: 6 bounded rounds; low power refused; all refused; indication; session; v6 refused; WDA refused; crash; `cell_data=0`; the daemon's parser on the kernel's text). `scripts/laurel/test-ipa.sh` PASS with `data_test` (register values against the sources, RX frames, cut frame, ring wrap, TX, full ring, kill switch). They do not prove any firmware or hardware answer.
+
+## 12. Both SIMs "illegal", registration denied: patch 2943 (2026-11-01, build + host test, NOT BOOTED)
+
+Phone input [V, boot 23:41:57, `logs/laurel-boot-radio.txt` + `logs/usblog-20261101-165828.txt`]: `DMS SET_OPERATING_MODE online: ok` at 23:42:37, `operating mode online (raw 0, indication, offline reason 0x0, hardware restricted 0)`. SIM2 USIM/7 -> USIM/6 at 23:43:59 (82 s after online). SIM1 USIM/7 -> USIM/6 at 23:44:16 (99 s). 23:44:37: `SIM1 registration denied rssi -104; SIM2 registration denied`. 0 modem crash lines. The client read no reason: that is what 2943 adds. **No cause is proven. 2943 changes no attach behaviour.**
+
+### 12.1 What the source reading settles
+
+| Question | Result | Label |
+| --- | --- | --- |
+| App state decode | Right. libqmi `QmiUimCardApplicationState`: 6 = ILLEGAL, 7 = READY, 4 = CHECK_PERSONALIZATION_STATE, 1 = DETECTED. Offset in the card status TLV: right (type, state, 4 personalization bytes, AID) | [V] qmi-enums-uim.h, qmi-service-uim.json |
+| Registration decode | Right. Serving system TLV 1 byte 0: 1 registered, 2 searching, 3 denied | [V] libqmi |
+| The SIMs turn illegal one by one | 17 s apart: not one local event at ONLINE | [V log] [I] |
+| Who writes "illegal" | The modem, after the online step. The AP sends no such request: `laurel_cell.c` has only CHANGE_PROVISIONING_SESSION (activate) | [V code] |
+| What makes it illegal | TS 24.301/24.008: EMM/MM cause 3, 6, 7, 8 or an authentication reject make the UE treat the USIM as invalid until power off | [I: spec from memory, not in this repo] |
+| Firmware | Strings `Illegal UE`, `IMEI not accepted`, `EPS services not allowed`, `SIM is in illegal subscription state`, `qmi_nasi_get_dual_standby_pref` exist | [V] `modem-re.sh grep` |
+| rmtfs bounds and unit | Sector x 512 at the GPT partition, inside the buffer, TLV length checked (2403), writes never reach UFS | [V] 0121, 2403 |
+| rmtfs memory seen by the modem | The pool is Normal non-cacheable (`pool_map` wc = true), so no AP cache can hide the data | [V] 0113 |
+| rmtfs partitions | modemst1, modemst2, fsg; firmware names only these three: `/boot/modem_fs1`, `fs2`, `fsg`. `fsc` is not asked for | [V log, strings] |
+| rmtfs result | reads 3, writes 0, errors 0 at 23:42:39. **No line after that time, and no line shows the content** | [V log] |
+| RSRP | SIM1 has rssi and no rsrp: `nas_signal` then read a WCDMA or GSM TLV, not LTE. SIM2 has no reading. So "hears towers" is proven only for a weak non-LTE cell | [V code] [I] |
+| Attach request missing? | No request is missing for this result: a USIM turns illegal only after the modem tried [I]. `INITIATE_ATTACH` (libqmi `Attach Detach` 0x23) is not needed for that | [I] |
+| UIM session | Primary 0000 by the modem, secondary 0100 by our CHANGE_PROVISIONING_SESSION: done. Both reach READY | [V log] |
+| UIM refresh | Not registered, so the modem waits for no client vote [I] | [V code] [I] |
+
+### 12.2 Causes, ranked (none proven)
+
+| # | Cause | For | Against | Next-boot line that decides |
+| --- | --- | --- | --- | --- |
+| 1 | IMEI absent, invalid or refused by the network (cause 5, 6) | Common to both SIMs: both IMEIs live in the same EFS [I] | EFS looks loaded (cause 4) | `IMEI: ...` + `reject: ... cause` |
+| 2 | Authentication reject or AKA failure (cause 3, 20, 21) | Makes a USIM invalid; common if the fault is in the modem's path | No AP step in that path [I]; READY cards answer the modem | `reject: ... cause 3/20/21`, `SIM reject state` |
+| 3 | The SIMs or the network: subscription off, PS not allowed (cause 7, 8, 11-15) | Only source of a cause by definition | Two SIMs at once. Unknown if the same operator | `network`, cause. **Same SIMs in Android (below)** |
+| 4 | DSDS setup: no dual standby preference from the AP | Android sends it; the modem then uses a stored value [I] | Both stacks act, so both are active [V] | `SIM reject state` with no `reject:` line. Layout of the request not in this repo |
+| 5 | EFS blank or wrong (rmtfs) | No line shows the content | `hardware restricted 0`, `offline reason 0x0`; radio works; MCFG reads only 2 digests and no `.mbn` [V log] | `rmtfs: read ... words not zero` |
+| 6 | NV or selection preference: modes, domain, restriction | Never read until now | Reject needs an attempt | `SIM1 selection: ...` |
+| 7 | Carrier MCFG policy | Android's PDC does not run | Policy selects config; it does not set a USIM illegal [I]. Digests match [V log] | `selection` bands, cause 11-15 |
+| 8 | ESM or APN (cause 19, profile 1 APN `""`) | Attach APN is empty | Cause 19 does not make a USIM invalid [I] | `cause 19` |
+| 9 | Wrong time | - | Attach uses the USIM's sequence number, not wall time [I]; modem is the time server (0x16) | Not worth a query |
+
+Cheapest evidence, no iOS boot: the owner runs Android now. **Does Android register with the same 2 SIMs, in the same place? Does `*#06#` show 2 IMEIs?** Yes + yes removes cause 3 and most of 1 for the stored IMEI. It does not prove what the modem reads under iOS. The owner reads the digits; they never go into a log or this repo.
+
+### 12.3 What 2943 does
+
+New `bsd/dev/laurel_cell_why.h` (included by `laurel_cell.c`); hunks in `laurel_cell.c`, `TopazModem.cpp`. Layouts: libqmi `qmi-service-{dms,nas}.json` [V].
+
+| Message | When | Line |
+| --- | --- | --- |
+| DMS GET_DEVICE_SERIAL_NUMBERS 0x25 | Behind the radio steps; every 30 s until valid, at most 6 | `IMEI: present, check digit valid; software version present` (or `absent`, `not 15 digits`, `all zeros`, `check digit bad`; `unknown (... error 0x..)`) |
+| NAS REGISTER_INDICATIONS 0x03, TLV 0x21 | After the bind, before ONLINE | error line only |
+| NAS indication 0x68 | The moment of a reject | `SIM1 reject (indication): LTE, domain PS, cause 6 (illegal ME), network 404-45` |
+| NAS GET_SYSTEM_INFO 0x4D | Online, every 10 s | `SIM1 LTE: service limited (true none), domain none, capability none, forbidden 0, network 404-45`; `SIM1 reject: ...`; `SIM1 SIM reject state: CS and PS invalid` (only changes, 96 lines a boot) |
+| NAS GET_SYSTEM_SELECTION_PREFERENCE 0x34 | Once, online | `SIM1 selection: modes 0x1c (bit 2 GSM, 3 UMTS, 4 LTE), network automatic, domain CS+PS, usage data, emergency mode 0, restriction 0, LTE bands 0x...` |
+| Card status | USIM turns illegal | `SIM2: the modem set the USIM illegal, 82 s after online`; the next NAS read comes at once |
+| rmtfs (not QMI client) | First 8 reads; write 1, then every 256th | `rmtfs: read modemst1 sector 0, N bytes: ok, A of B words not zero`; `rmtfs: write 1: ... answered ok, not kept (the phone's EFS stays as it was)` |
+
+Also: the `LAUREL CELL` line adds `(last reject LTE PS cause 6 illegal ME, network 404-45)` or `(no reject cause reported)`; `kern.laurel_cell_state` adds `imei=valid|bad|zero|format|absent|unknown` and `subN.reject=LTE,PS,6,404-45`.
+
+Privacy [V host test]: the IMEI digits stay in the modem's answer; `imei_verdict()` returns only a verdict. No ICCID, IMSI, LAC, CID. MCC-MNC is the network's. The second IMEI is not read: libqmi has no DMS binding message, so DMS answers for one subscription [I]. No request here changes the modem's state, and an error from any of them changes nothing else (scenario Z). No partition is written; rmtfs reads only count words.
+
+**Not done, on purpose:** no NAS SET_SYSTEM_SELECTION_PREFERENCE, no ATTACH, no dual standby request, no MCFG or NV write: none is proven needed, and each changes the modem's stored state. `GET_DUAL_STANDBY_PREF`: firmware has the handler [V]; a libqmi mailing-list search result names id 0x5C, no layout [U]: no blind request.
+
+### 12.4 Next boot (the owner's decision): how to read it
+
+| Lines | Means | Next |
+| --- | --- | --- |
+| `IMEI: absent`, `all zeros`, `check digit bad` and `words not zero` high | Modem has EFS, no good IMEI under this path | Compare with Android `*#06#`. Never write EFS or NV from here |
+| `rmtfs: read` with 0 words not zero on modemst1 and modemst2 | Blank EFS seen: **stop**, check the partitions on Android by read only | rmtfs path |
+| `IMEI: present, check digit valid` + `cause 5` or `6` | The network refuses this IMEI | Operator or registry; not code |
+| `cause 3`, `20`, `21` | Network or AKA | Same SIM on Android decides |
+| `cause 7`, `8` | Subscription has no PS service | Same SIM on Android decides |
+| `cause 11`-`15` | PLMN, area, roaming. Read `network` | Selection, operator's own cells: read `SIM LTE` lines |
+| `cause 19` | ESM: attach APN | WDS attach profile comes next |
+| `SIM reject state: CS and PS invalid`, no `reject:` line | Modem's own verdict, no cause reported | Dual standby layout; modem logs |
+| `selection` with `restriction` not 0, `manual`, PS missing, LTE bit missing | Stored preference blocks it | A SET request is then proven needed |
+| `service ... available` on a radio and `registered` | It works; earlier result was the place or the network | Data session runs |
+
+Expected order [I], only new lines:
+
+```
+TopazModem: t=.. ms: rmtfs: read modemst1 sector 0, 2097152 bytes: ok, .. of 262144 words not zero
+TopazModem: t=.. ms: rmtfs: read modemst2 sector 0, 2097152 bytes: ok, .. of 262144 words not zero
+TopazModem: t=.. ms: rmtfs: read fsg sector 0, 2097152 bytes: ok, .. of 262144 words not zero
+LaurelCell: IMEI: present, check digit valid; software version present
+LaurelCell: SIM1 selection: modes 0x.. (bit 2 GSM, 3 UMTS, 4 LTE), network automatic, domain CS+PS, usage .., emergency mode 0, restriction 0, LTE bands 0x..
+LaurelCell: SIM1 LTE: service limited (true none), domain none, capability none, forbidden 0, network ...
+LaurelCell: SIM1 reject (indication): LTE, domain PS, cause N (...), network ...
+LaurelCell: SIM2: the modem set the USIM illegal, N s after online
+LaurelCell: SIM1 SIM reject state: CS and PS invalid
+LAUREL CELL: on: SIM1 present (USIM illegal), SIM2 present (USIM illegal); modem online; SIM1 registration denied (last reject LTE PS cause N ..., network ...) rssi ..; SIM2 registration denied (...); data off: session not up yet; SMS, voice off: not built
+```
+The rmtfs sizes are [I]: 3 reads of whole partitions is a guess from `reads 3`. The boot also shows if the modem writes EFS (`rmtfs: write 1:`); no write line was possible before.
+
+A reject writes the SIM's own EPS update status and deletes its GUTI [I, spec]: normal, the next attach starts clean. "Illegal" lasts until the modem restarts [I]. The USIM is not damaged. Rejects by a wrong IMEI do not harm the phone's EFS: no AP path writes it [V].
+
+Host test [V]: `scripts/laurel/test-cell.sh` 26 of 26 (X: phone's pattern, both denied, cause in system info and indication, repeats give no line, no IMEI digit in log, status or state; Y: 8 verdicts, cut TLVs, 2 radios with rejects do not take turns, bounded tries; Z: modem refuses all new messages, the rest as before). It does not prove any firmware answer. Kernel [V]: `kernel-linux.sh` on base da447e0: 309/309 patches, 0 failed, 0 LSE, printf-arg-check OK, kernel.development.sweet.4k sha256 d8050810a1ef823b..., series 6c1d5d0e81daacb1 Patch dev tree: `scripts/laurel/cell-why-patch.sh`.

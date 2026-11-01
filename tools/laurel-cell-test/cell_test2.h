@@ -13,6 +13,18 @@ state_now(void)
 	return out;
 }
 
+static int
+digit_run(const char *t)
+{
+	int best = 0, n = 0;
+
+	for (; *t != 0; t++) {
+		n = *t >= '0' && *t <= '9' ? n + 1 : 0;
+		best = n > best ? n : best;
+	}
+	return best;
+}
+
 static void
 scenario2(char s)
 {
@@ -162,7 +174,8 @@ scenario2(char s)
 		run_ms(25000, true);
 		cellbar_parse(state_now(), &cs);
 		CHECK(cs.sub[0].bars == 0 && cs.sub[0].reg == 2);
-		CHECK(strstr(state_now(), "imsi") == NULL && strstr(state_now(), "iccid") == NULL && strstr(state_now(), "imei") == NULL);
+		/* laurel 2943: the key imei= has a verdict; no identity: no run of digits as long as one */
+		CHECK(strstr(state_now(), "imsi") == NULL && strstr(state_now(), "iccid") == NULL && digit_run(state_now()) < 14);
 		laurel_cell_off("modem crashed: x");
 		cellbar_parse(state_now(), &cs);
 		CHECK(cs.state == CB_OFF && cs.sub[0].bars == 0 && cs.sub[0].reg == 0 && !cs.radio_online);
