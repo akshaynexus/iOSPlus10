@@ -1,4 +1,4 @@
-laurel 2600: Bluetooth on the Mi A3. WCN3990 over the GENI UART of QUP1 SE9 (0x4c90000, GPIO 10-13 qup14): GCC wrap 1 votes + s4 RCG (DFS levels or the Linux table), FIFO mode, polled, RTS/CTS. Power: PM6125 L9/L16/L17/L23 through the RPM (topaz_rpm_write), power pulses 0xC0 at 2400 and 0xFC at 115200 (no BT_EN). Bring-up as Linux hci_qca/btqca: EDL version (vendor event), 0xfc48 to 3000000 baud, crbtfw%02x.tlv rampatch + crnv%02x.bin NVM (speed tag 17) read at run time from the phone's FAT16 bluetooth_b (then _a) partition, HCI reset, BD_ADDR (the chip's own if unique, else the ADT local-mac-address, 0xfc14 + read back). iOS side (negroni 0332/0333/0336/0337 path): kernel control com.apple.uart.bluetooth, /dev/uart.bluetooth, /dev/cu.bluetooth, /dev/btwake, HCI answers for bluetoothd's Broadcom vendor commands, in-band sleep bytes. LaurelBluetooth.cpp: ADT /arm-io/bluetooth nub gets the address in use, or is hidden when Bluetooth is off. One line: 'LAUREL BT: on: WCN3990 product .. rom .., crbtfw21.tlv + crnv21.bin, 3000000 baud, BD_ADDR ..' or 'LAUREL BT: off: <why>'. Kill switch laurelbt=0. One small file per step (bsd/dev/laurel_bt*.c). Details: docs/laurel_sprout/bluetooth.md.
+laurel 2600: Bluetooth on the Mi A3. WCN3990 over the GENI UART of QUP1 SE9 (0x4c90000, GPIO 10-13 qup14): GCC wrap 1 votes + s4 RCG (DFS levels or the Linux table), FIFO interface on (SE_FIFO_IF_DISABLE 0x2008: the boot leaves SE9 for GSI), FIFO mode, polled, RTS/CTS. Power: PM6125 L9/L16/L17/L23 through the RPM (topaz_rpm_write), power pulses 0xC0 at 2400 and 0xFC at 115200 (no BT_EN). Bring-up as Linux hci_qca/btqca: EDL version (vendor event), 0xfc48 to 3000000 baud, crbtfw%02x.tlv rampatch + crnv%02x.bin NVM (speed tag 17) read at run time from the phone's FAT16 bluetooth_b (then _a) partition, HCI reset, BD_ADDR (the chip's own if unique, else the ADT local-mac-address, 0xfc14 + read back). iOS side (negroni 0332/0333/0336/0337 path): kernel control com.apple.uart.bluetooth, /dev/uart.bluetooth, /dev/cu.bluetooth, /dev/btwake, HCI answers for bluetoothd's Broadcom vendor commands, in-band sleep bytes. LaurelBluetooth.cpp: ADT /arm-io/bluetooth nub gets the address in use, or is hidden when Bluetooth is off. One line: 'LAUREL BT: on: WCN3990 product .. rom .., crbtfw21.tlv + crnv21.bin, 3000000 baud, BD_ADDR ..' or 'LAUREL BT: off: <why>'. Kill switch laurelbt=0. One small file per step (bsd/dev/laurel_bt*.c). Details: docs/laurel_sprout/bluetooth.md.
 
 diff -ruN a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files	2026-11-01 05:15:56.526294173 +0530
@@ -211,13 +211,14 @@ diff -ruN a/bsd/dev/laurel_bt.c b/bsd/dev/laurel_bt.c
 diff -ruN a/bsd/dev/laurel_bt_clk.c b/bsd/dev/laurel_bt_clk.c
 --- a/bsd/dev/laurel_bt_clk.c	1970-01-01 05:30:00.000000000 +0530
 +++ b/bsd/dev/laurel_bt_clk.c	2026-11-01 05:15:56.551294408 +0530
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,222 @@
 +/*
 + * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 1b: bring up QUP1 SE9 for the UART.
 + * Mappings, GCC branch votes (wrap 1 core/core_2x/AHB + s4), the s4 RCG (DFS levels as XBL left them, else the
-+ * Linux table), pins GPIO 10-13 to qup14, GENI FIFO mode, 8N1 at 115200, RX command started.
-+ * The self-check is here: no UART firmware in SE9, FIFO interface off, or a QUP clock that does not run =
-+ * Bluetooth off with the reason (USB, UFS and the boot are not touched).
++ * Linux table), FIFO interface on (the boot leaves SE9 for GSI), pins GPIO 10-13 to qup14, GENI FIFO mode, 8N1 at
++ * 115200, RX command started.
++ * The self-check is here: no UART firmware in SE9, a FIFO interface that stays off, or a QUP clock that does not
++ * run = Bluetooth off with the reason (USB, UFS and the boot are not touched).
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -296,10 +297,6 @@ diff -ruN a/bsd/dev/laurel_bt_clk.c b/bsd/dev/laurel_bt_clk.c
 +		*why = "QUP1 SE9 has no UART firmware";
 +		return ENODEV;
 +	}
-+	if (rd(SE(GENI_IF_DISABLE_RO)) & 1u) {
-+		*why = "QUP1 SE9 FIFO interface is off (GSI only)";
-+		return ENODEV;
-+	}
 +	if (u.tx_depth < 4 || u.rx_depth < 4) {
 +		*why = "QUP1 SE9 FIFO depth not usable";
 +		return ENODEV;
@@ -332,6 +329,35 @@ diff -ruN a/bsd/dev/laurel_bt_clk.c b/bsd/dev/laurel_bt_clk.c
 +		wr(SE(GENI_M_CMD_CTRL), CMD_CANCEL);
 +		(void)lbt_wait_bits(SE(GENI_M_IRQ_STATUS), M_CMD_CANCEL, true, 2000);
 +	}
++}
++
++/*
++ * The boot firmware leaves SE9 for GSI: GENI_IF_DISABLE_RO bit 0 = 1 (seen 2026-11-01). It shows SE_FIFO_IF_DISABLE
++ * (SE + 0x2008), which Linux writes last in geni_load_se_fw (clear = FIFO, set = GSI; UART is always FIFO),
++ * after geni_configure_xfer_mode (DMA mode off, no GSI events) and DMA_IF_EN. The UART firmware stays loaded.
++ * Self-check: the read-only bit must clear, else Bluetooth is off.
++ */
++static int
++fifo_if_on(const char **why)
++{
++	uint32_t was = rd(SE(SE_FIFO_IF_DISABLE)), dma = rd(SE(SE_DMA_IF_EN)), ro;
++
++	if (!(rd(SE(GENI_IF_DISABLE_RO)) & FIFO_IF_DISABLE)) {
++		return 0;
++	}
++	s_cancel();
++	wr(SE(GENI_DMA_MODE_EN), rd(SE(GENI_DMA_MODE_EN)) & ~1u);
++	wr(SE(SE_GSI_EVENT_EN), 0);
++	wr(SE(SE_DMA_IF_EN), dma | 1u);
++	wr(SE(SE_FIFO_IF_DISABLE), was & ~FIFO_IF_DISABLE);
++	ro = rd(SE(GENI_IF_DISABLE_RO));
++	LBT_SAY("geni: FIFO interface was off (GSI from boot): FIFO_IF_DISABLE %#x -> %#x, DMA_IF_EN %#x, RO %#x\n",
++	    was, rd(SE(SE_FIFO_IF_DISABLE)), rd(SE(SE_DMA_IF_EN)), ro);
++	if (ro & FIFO_IF_DISABLE) {
++		*why = "QUP1 SE9 FIFO interface stays off (GSI only)";
++		return ENODEV;
++	}
++	return 0;
 +}
 +
 +/* geni_se_init + geni_se_select_mode(FIFO) + msm_geni_serial_port_setup + set_termios (8N1, RTS/CTS) */
@@ -387,7 +413,7 @@ diff -ruN a/bsd/dev/laurel_bt_clk.c b/bsd/dev/laurel_bt_clk.c
 +		*why = "register mapping failed";
 +		return ENOMEM;
 +	}
-+	if ((e = clocks(why)) != 0 || (e = geni_check(why)) != 0) {
++	if ((e = clocks(why)) != 0 || (e = geni_check(why)) != 0 || (e = fifo_if_on(why)) != 0) {
 +		return e;
 +	}
 +	pins();
@@ -1250,7 +1276,7 @@ diff -ruN a/bsd/dev/laurel_bt_fw.c b/bsd/dev/laurel_bt_fw.c
 diff -ruN a/bsd/dev/laurel_bt_geni.h b/bsd/dev/laurel_bt_geni.h
 --- a/bsd/dev/laurel_bt_geni.h	1970-01-01 05:30:00.000000000 +0530
 +++ b/bsd/dev/laurel_bt_geni.h	2026-11-01 05:15:56.551294408 +0530
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,118 @@
 +/*
 + * laurel 2600: private to laurel_bt_uart.c + laurel_bt_clk.c: QUP1 SE9 addresses, GENI registers, UART state.
 + */
@@ -1336,6 +1362,10 @@ diff -ruN a/bsd/dev/laurel_bt_geni.h b/bsd/dev/laurel_bt_geni.h
 +#define SE_HW_PARAM_0           0xe24u
 +#define SE_HW_PARAM_1           0xe28u
 +#define SE_DMA_GENERAL_CFG      0xe30u
++/* qcom-geni-se.c (Linux 6.18) geni_load_se_fw: the writable side of GENI_IF_DISABLE_RO */
++#define SE_DMA_IF_EN            0x2004u         /* bit 0 DMA interface on */
++#define SE_FIFO_IF_DISABLE      0x2008u         /* bit 0 FIFO interface off (set for GSI) */
++#define FIFO_IF_DISABLE         (1u << 0)
 +#define M_CMD_DONE              (1u << 0)
 +#define M_CMD_CANCEL            (1u << 4)
 +#define S_CMD_CANCEL            (1u << 4)

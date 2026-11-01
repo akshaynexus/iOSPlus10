@@ -645,3 +645,12 @@ Review fixes built 04:47 (B1 NTC-gated charger + 30 s NTC watchdog, M1 hard JEIT
 m4-m7): `areaD-k2304`, 223 patches, 0 LSE. Not booted. Table in `docs/laurel_sprout/battery-power.md` "Review".
 Safety re-check fixes built 05:01 on laurel-int-1 (MUST 1-3, SHOULD 4-6): `areaD-k2305`, 231 patches, 0 LSE. Not booted.
 Unattended-safety follow-up built 05:10 (F1-F5, safe limits before system sleep): `areaD-k2306`, 231 patches, 0 LSE. Not booted.
+
+## Mi A3: Bluetooth SE9 GSI -> FIFO interface (2026-11-01 06:05, branch t3/laurel-bt-se9-fifo, patch 2600)
+
+Observed [V boot 05:52]: rails on, clocks run, SE9 FW 0x20c (UART), then `LAUREL BT: off: QUP1 SE9 FIFO interface is off (GSI
+only)`. Cause [V Linux 6.18 geni_load_se_fw]: GENI_IF_DISABLE_RO (0x64) shows the writable SE_FIFO_IF_DISABLE (SE + 0x2008).
+Done [V build]: `fifo_if_on` clears it (after DMA mode off, GSI events off, DMA_IF_EN on) and checks 0x64 again. Kernel builds:
+241/241 patches, 0 LSE, kcheck syntax OK, kernel.development.sweet.4k sha256 1b59818b... Not booted.
+Next: boot; expect `LAUREL BT: geni: FIFO interface was off (GSI from boot): FIFO_IF_DISABLE 0x1 -> 0, ..., RO 0`, then
+`uart: 115200 8N1 RTS/CTS, RX on`, `chip: ...` and `on: WCN3990 ...`. Details: docs/laurel_sprout/bluetooth.md.

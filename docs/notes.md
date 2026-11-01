@@ -4068,3 +4068,19 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - Built 05:48 in the worktree: 241/241 patches applied, 0 LSE, no new warnings, kernel.development.sweet.4k sha256 42e4ea88...
   NOT BOOTED. Next boot: expect `LAUREL VIBRATOR: on: ... a repeat ends after 60 s ...`, `request kind` lines, and a repeat ends
   with `repeat stopped by the <key> key` or `repeat stopped: 60 s and no new request`.
+
+## Mi A3: Bluetooth stopped at "QUP1 SE9 FIFO interface is off (GSI only)"; 2600 turns the FIFO interface on (2026-11-01, BT agent, branch t3/laurel-bt-se9-fifo)
+- Details: docs/laurel_sprout/bluetooth.md section "SE9 left in GSI mode".
+- [V log 05:52:41] Rails on, clocks run (vote 0x43c4020), s4 DFS off, QUP 0x20000000, SE9 FW 0x20c (UART), FIFO 16/32 words,
+  then `off: QUP1 SE9 FIFO interface is off (GSI only)` (GENI_IF_DISABLE_RO 0x64 bit 0 = 1).
+- [V Linux 6.18 qcom-geni-se.c geni_load_se_fw] 0x64 only shows SE_FIFO_IF_DISABLE (SE + 0x2008, writable; clear = FIFO,
+  set = GSI), written last after the mode registers and SE_DMA_IF_EN (0x2004). UART is always FIFO there. So: a soft
+  setting, no firmware load and no GPI DMA path are necessary.
+- [V 4.14 laurel kernel] msm_geni_serial (BT port) uses SE_DMA and never reads the bit; only spi-geni-qcom reads it.
+- [I] Who sets GSI (XBL QUP loader or a UEFI DXE) is not known.
+- Fix: `fifo_if_on` in laurel_bt_clk.c (cancel, DMA mode off, GSI events off, DMA_IF_EN on, clear 0x2008 bit 0, read 0x64
+  again; still set = BT off only). Line `LAUREL BT: geni: FIFO interface was off (GSI from boot): ...`.
+- [V gcc-trinket.c] DFS off is not a problem: 3000000 x 32 = 96 MHz is an exact entry of the RCG table (GPLL0 aux2 300 MHz
+  x 8/25); lbt_hci_speed sets it and back before 0xfc48. [I] needs CX >= LOW (no CX vote made).
+- [I] Risk: an xPU on SE + 0x2000 can ignore the write (self-check -> off) or give a bus error. Kill switch laurelbt=0.
+- New helper: `scripts/laurel/patch-refresh-new.py PATCH TREE FILE...` replaces new-file hunks of a patch in place.
