@@ -1,6 +1,11 @@
 # Plan and status
 
 ## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
+iOS 26 kernel round (2026-11-02, branch t3/laurel-ios26-kernel, not merged; COMPILE AND LINK ONLY, NEVER RUN, nothing flashed): docs/laurel_sprout/ios26-kernel.md.
+Done: every Mi A3 patch on xnu-12377.121.6, plain arm64, native Linux (`make laurel-ios26-kernel`): 309 result lines, 210 applied, 83 applied+rules, 11 base, 5 skipped, 0 errors. Linked; 0 LSE/RCpc; armv80-check 0; printf-arg-check OK. New: `LAUREL PACEMU`, `LAUREL CE` (DER entitlements), auth rebases written as plain pointers, arm64e accepted, donor parameter (N104AP), iOS 26 boot image script (`make laurel-ios26-image`, own folder).
+Open [U]: no boot; no iOS 26 root; user-client ABIs of 23F84 not traced; the "kernel needs" list of t3/laurel-ios26-userland not read (not on origin yet).
+Next: merge when the owner agrees; T1 only when the owner asks for a flash (section 8 of that page). The userland list, when it exists, goes against section 4.
+
 AirPlay and AirDrop round (2026-11-01, branch t3/laurel-airplay-airdrop, patches 2930 + 2931, NOT RUN ON THE PHONE): owner "AirPlay and AirDrop both aren't working: enable or fix them". docs/laurel_sprout/airplay-airdrop.md.
 Done: `LAUREL AWDL` self-check (only looks at scanned frames; sends nothing; awdl=0); `laurel-airplay` job and `LAUREL AIRPLAY` line (airplay=0, AIRPLAY=0); AirDrop preferences for en0 (AIRDROP_LAN=0); wifip2pd stays out.
 [V] qcacld monitor device has no Tx, OWL needs injection; negroni 0347 has no data path and never ran. [I] no awdl0 is the right state now. [V] mirroring has no AppleAVE2Driver. [I] Apple TV/HomePod may fail at /fp-setup or PTP. [U] AirPlay audio on en0: no blocker found, no run log.

@@ -150,8 +150,11 @@ _APPLE = os.environ.get('APPLE', os.path.expanduser('~/op10-apple'))
 # (owner decision 2026-11-02; values read from the ADT: docs/laurel_sprout/ios26-kernel.md; scripts/laurel/ios26-donor.sh).
 DONORS = {
     'd22ap': dict(compatible='D22AP', model='iPhone10,3', target='D22', sub='D22AP', adt=os.path.join(_APPLE, 'd22ap.adt')),
+    # dram_all: xnu-12377 reads /chosen dram-base + dram-size as the whole DRAM (is_dram_addr, pmap_construct_pte, pmap_map_bd): a
+    # write-combined mapping outside it becomes Device-GRE, where unaligned access and DC ZVA fault. The screen (0x5c000000) and the GPU
+    # pool are outside the window, so give all three banks. The window itself stays in darwinboot-memory-size and boot_args.
     'n104ap': dict(compatible='N104AP', model='iPhone12,1', target='N104', sub='N104AP',
-                   adt=os.path.join(_APPLE, 'ios26', '23F84-n104ap', 'n104ap.adt')),
+                   adt=os.path.join(_APPLE, 'ios26', '23F84-n104ap', 'n104ap.adt'), dram_all=(0x40000000, 0x180000000)),
 }
 DONOR = DONORS['d22ap']
 _topaz_product = topaz.d22ap_product
@@ -173,6 +176,9 @@ def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwin
     chosen = find(root, 'chosen')
     setprop(chosen, 'dram-base', u64(dram[0]))
     setprop(chosen, 'dram-size', u64(dram[1]))
+    if DONOR.get('dram_all'):
+        setprop(chosen, 'dram-base', u64(DONOR['dram_all'][0]))
+        setprop(chosen, 'dram-size', u64(DONOR['dram_all'][1]))
     setprop(chosen, 'display-scale', u32(2))
     setprop(chosen, 'laurel-ram-banks', b''.join(u64(b, sz) for b, sz in RAM_BANKS))   # laurel 2100 self-check
     setprop(chosen, 'laurel-ram-reserved', b''.join(u64(b, sz) for b, sz in RAM_RESERVED))
@@ -311,8 +317,8 @@ def check(root, cores, boot='gold', darwinboot=False):
     fb = find(root, 'sweet-fbcon')
     assert struct.unpack('<I', getprop(fb, 'stride'))[0] == FB_W * 4
     base, size = (struct.unpack('<Q', getprop(find(root, 'chosen'), k))[0] for k in ('dram-base', 'dram-size'))
-    assert base >= 0x62100000, 'kernel RAM must be above the fixed carve-outs (highest ends at 0x62100000)'
-    if base + size > 1 << 32:
+    assert DONOR.get('dram_all') or base >= 0x62100000, 'kernel RAM must be above the fixed carve-outs (highest ends at 0x62100000)'
+    if not DONOR.get('dram_all') and base + size > 1 << 32:
         print(f'mkadt: note: kernel RAM reaches above 4 GiB ({((1 << 32) - base) >> 20} MiB below): display/GPU/DMA '
               f'buffers ask for RAM below 4 GiB (laurel 2100/2101)', file=sys.stderr)
     banks = getprop(find(root, 'chosen'), 'laurel-ram-banks')
