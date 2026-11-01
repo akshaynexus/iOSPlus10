@@ -11,10 +11,15 @@ import sys
 
 def mtlb_size(d, o):
     # header: 'MTLB', target u16, version u16 u16, type u8, os u8, os version u16 u16, file size u64
-    if d[o:o + 4] != b"MTLB" or o + 24 > len(d):
+    if d[o:o + 4] != b"MTLB" or o + 88 > len(d):
         return 0
     size = struct.unpack_from("<Q", d, o + 16)[0]
     return size if 88 <= size <= len(d) - o else 0
+
+
+def bitcode_size(d, o):
+    # offset table after the header: function list, public metadata, private metadata, bitcode (offset, size pairs). A kind 0x80 container has no bitcode: AGX only.
+    return struct.unpack_from("<Q", d, o + 24 + 7 * 8)[0]
 
 
 def main():
@@ -42,7 +47,11 @@ def main():
     if not found:
         print(f"{sys.argv[1]}: no AIR (AGX code only, {len(d)} bytes)")
         sys.exit(3)
-    o, z, how = max(found, key=lambda x: x[1])
+    found = [f for f in found if bitcode_size(d, f[0]) > 0]
+    if not found:
+        print(f"{sys.argv[1]}: no AIR bitcode (AGX code and a function table only, {len(d)} bytes)")
+        sys.exit(3)
+    o, z, how = max(found, key=lambda x: bitcode_size(d, x[0]))
     open(sys.argv[2], "wb").write(d[o:o + z])
     print(f"{sys.argv[1]}: AIR {z} bytes, {how} ({len(found)} found)")
 

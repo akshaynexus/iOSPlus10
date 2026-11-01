@@ -64,8 +64,8 @@ def main():
             frags.append((name, res[6:].rstrip(")")))
     for name, vert in frags:
         print(f"R\t{name}\t{vert}\t{name}\t{colors(d, name)}\t{vdesc(d, vert)}\t{constants(d, name, vert)}")
-    # CoreAnimation's fixed function shader, as create_fragment_shader asks for it. Types [V]: bool 53, uchar 49, uchar2 50, uchar4 52. Values: the generic pipeline and a grid
-    # of specializations [I: the values are a sample, not CA's list]; other fc_* keep the stand-in zero values of the plan.
+    # CoreAnimation's generic fixed function shader (fc_generic=1), as create_fragment_shader asks for it. Types [V]: bool 53, uchar 49, uchar2 50, uchar4 52. A specialized fixed_frag
+    # needs CA's real Spec values: a test grid here gave 1 instruction (no outputs), which proves nothing, so it is not in the plan. Real keys come from the phone's pipelines.log.
     if os.path.exists(os.path.join(d, "fixed_frag_lph_cph.fc")):
         base = {"fc_generic": "53:0", "fc_vertex_layout": "49:0", "fc_framebuffer_fetch": "53:0", "fc_attachment_count": "49:1"}
         for prec in ("lph_cph", "lph_cpf"):
@@ -83,17 +83,6 @@ def main():
             row(f"ca_generic_{prec}", {"fc_generic": "53:1", "fc_vertex_layout": "49:0", "fc_has_attachment_0": "53:1"}, "fixed_vert_lph_gen", "-")
             ref.clear()
             ref.update(ref_saved)
-            # a CoreAnimation draw: images 0..3, each sampled with a plain 2D texture function; color opcodes as a uchar4 (fc_color_opcodes%d, Metal type 52)
-            for images in (0, 1, 2, 3):
-                over = {"fc_image_count": f"49:{images}", "fc_blend_function": "49:1", "fc_has_attachment_0": "53:1"}
-                for i in range(images):
-                    over[f"fc_image_function{i}"] = "49:1"
-                    over[f"fc_coord_function{i}"] = "49:0"
-                    over[f"fc_plane_count{i}"] = "49:1"
-                    over[f"fc_texcoord_count{i}"] = "49:1"
-                    over[f"fc_filter{i}"] = "49:1"
-                for tex in (0, 1, 2):
-                    row(f"ca_spec_{prec}_img{images}_tex{tex}", dict(over, fc_texture_function=f"49:{tex}"))
     print()
 
 

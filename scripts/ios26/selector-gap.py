@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """selector-gap.py [--front FILE] [--plugin FILE] LISTING...: Metal selectors that images of the 23F84 cache send and the frontend does not answer.
 
-  LISTING = a `dsc-image.py lst` listing (out/ios26/metal-spi/QuartzCore.lst); FUNCTION filter with NAME@REGEX ("QuartzCore.lst@MetalContext").
+  LISTING = a `dsc-image.py lst` listing (out/ios26/metal-spi/QuartzCore.lst); FUNCTION filter with NAME@REGEX ("QuartzCore.lst@MetalContext");
+            or NAME.sel = `dsc-image.py syms IMAGE` output: all selector stubs of an image (scripts/ios26/metal-trace.sh).
 Static [V]: every `_objc_msgSend$sel` stub call in the listing, against the protocols of Metal's class dump (out/ios26/metal-spi/Metal.classdump.txt)
 and the methods of the frontend (out/metal/src/flame/.../NativeBridgeMetalFrontend.mm), including _MTLDevice's own for the device.
 A missing selector is a crash only if the object that receives it is ours [I]; `respondsToSelector:` guards are not read here.
@@ -88,6 +89,8 @@ def class_methods(name):
 
 
 def sent(listing):
+    if listing.endswith(".sel"):            # dsc-image.py syms IMAGE | grep objc_msgSend$: every selector stub of the image
+        return {m.group(1) for m in re.finditer(r"_objc_msgSend\$(\S+)", open(listing, errors="replace").read())}
     path, _, rx = listing.partition("@")
     want = re.compile(rx) if rx else None
     on, out = want is None, set()

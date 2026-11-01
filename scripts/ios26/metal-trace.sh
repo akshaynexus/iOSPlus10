@@ -20,3 +20,9 @@ for p in /System/Library/Frameworks/Metal.framework/Metal /System/Library/Framew
   "$IPSW" class-dump "$C/dyld_shared_cache_arm64e" "$n" > "$S/$n.classdump.txt" 2>"$S/$n.classdump.log" || echo "class-dump $n: failed"
   echo "$n: $(wc -l < "$S/$n.classdump.txt") class-dump lines"
 done
+# every selector stub of the frameworks SpringBoard and the system UI load (fast: symbols only), for scripts/ios26/selector-gap.py
+for lib in RenderBox IconRendering CoreUI CoreImage MPSCore MPSImage MetalKit MetalPerformanceShaders UIKitCore VFX VectorKit SwiftUICore SpringBoard SpringBoardFoundation SpriteKit \
+    MPSNeuralNetwork CMImaging FrontBoard BaseBoardUI ClockKitUI PosterKit PosterBoardServices MaterialKit WebCore; do
+  ( python3 -I "$REPO/scripts/laurel/dsc-image.py" "$C" syms "$lib" 2>/dev/null | grep 'objc_msgSend\$' > "$S/$lib.sel" || true; echo "$lib: $(wc -l < "$S/$lib.sel") selector stubs" ) &
+done
+wait

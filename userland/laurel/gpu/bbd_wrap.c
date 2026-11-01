@@ -38,6 +38,10 @@
 #define GL_OFF    "/private/var/db/laurelgl/off"
 #define FAST_S    30
 #define MAX_FAST  2
+#ifdef LAUREL_BBD_METAL
+#define BBD_METAL_FLAG "/private/var/db/negronimetal/backboardd-metal"
+#define BBD_METAL_OFF  "/private/var/db/negronimetal/strikes/backboardd-metal-off"
+#endif
 
 static void
 say(const char *fmt, const char *a)
@@ -117,6 +121,35 @@ main(int argc, char *argv[])
 		fclose(f);
 	}
 
+#ifdef LAUREL_BBD_METAL
+	/*
+	 * The iOS 16 test option "backboardd on Metal" (scripts/laurel/ios16-bbd-metal-build.sh; never in the default build). A fast exit with Metal on is Metal's: one mark, and the
+	 * guard counts from zero for GL, so a failed test ends on the GL path, not on the software renderer. The plug-in reads the mark and gives no device: CoreAnimation takes GL.
+	 */
+	if (access(BBD_METAL_FLAG, F_OK) == 0) {
+		char had[64] = "";
+		int boots = 0;
+
+		if ((f = fopen(BBD_METAL_OFF, "r")) != NULL) {
+			if (fscanf(f, "%63s %d", had, &boots) != 2) {
+				boots = 0;
+			}
+			fclose(f);
+		}
+		if (strcmp(had, session) != 0 && fast >= 1) {
+			if ((f = fopen(BBD_METAL_OFF, "w")) != NULL) {
+				fprintf(f, "%s %d\n", session, boots + 1);
+				fclose(f);
+			}
+			say("metal: off: %s: backboardd exited within 30 s of its start with Metal on: GL from this start on", session);
+			fast = 0;
+			if ((f = fopen(STATE, "w")) != NULL) {
+				fprintf(f, "%s %d %ld\n", session[0] ? session : "-", fast, now);
+				fclose(f);
+			}
+		}
+	}
+#endif
 	if (bootarg_zero(args, "gpu") || bootarg_zero(args, "gl")) {
 		use_loader = 0;
 		say("off: %s in the boot-args: no GL loader", bootarg_zero(args, "gpu") ? "gpu=0" : "gl=0");

@@ -16,7 +16,7 @@ set -eu
 R=${1:?usage: METAL=1 $0 MOUNTED_ROOT}
 if [ "${METAL:-0}" != 1 ]; then echo "metal: skipped (METAL=1 adds NegroniMetal.bundle + probes)"; exit 0; fi
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-S=$REPO/out/metal/stage
+S=${METAL_STAGE:-$REPO/out/metal/stage}
 NAME=${PLUGIN_NAME:-NegroniMetal}
 [ -d "$R/System/Library/Extensions" ] || { echo "$R does not look like an iOS root" >&2; exit 1; }
 [ -d "$S/usr/local/bin" ] || { echo "no $S: run scripts/metal/build.sh first" >&2; exit 1; }
