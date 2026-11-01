@@ -1,7 +1,7 @@
 #!/bin/bash
 # Mi A3 iOS 26.5.2 (23F84, iPhone12,1 N104AP) root: an HFS+ image, built on Linux with no Apple tool and no root access. It writes nothing to a device.
 #   scripts/bg.sh ios26-root scripts/laurel/ios26-root.sh
-#   FORCE=1     build again when the inputs did not change      VAR_GIB=8   refuse less free space
+#   ROOT_OUT=DIR    another output folder   FORCE=1     build again when the inputs did not change      VAR_GIB=8   refuse less free space
 # Steps: 1. read-only apfs-fuse mounts of the three donor images; 2. scripts/laurel/ios26-root-spec.py: layout, lowered files, tweaks with an audit line per item,
 # trust data, spec; 3. op10tool hfs-build; 4. checks: op10tool hfs-verify (every file against its SHA-256), fsck.hfsplus -n, a real read-only kernel mount (udisks) with
 # scripts/laurel/ios26-root-check.py. Inputs: scripts/ios26/fetch-os.sh, sysos-tree.sh, lower-userland.sh with DEV=n104ap (docs/laurel_sprout/ios26-userland.md section 2).
@@ -18,7 +18,8 @@ B=$APPLE/ios26/$BUILD-$DEV
 D=$B/os
 T=$B/tree
 L=$B/lowered
-R=$B/root
+# ROOT_OUT: another output folder (a test next to a root that another job uses). Default the path of the docs
+R=${ROOT_OUT:-$B/root}
 W=$R/work
 IMG=$R/ios26-root.img
 TOOL=$OUT/bin/op10tool
@@ -95,9 +96,10 @@ cleanup; LOOP=; trap - EXIT
   echo "kernel read-only mount: $kmount"
   [ -f "$W/mount-check.txt" ] && cat "$W/mount-check.txt"
   echo "tweak audit:"; cat "$W/audit.txt"
-  echo "not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, audio HAL, Bluetooth userland, camera, HEVC, status bar, XNUtils, SSH"
+  echo "not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, audio HAL, Bluetooth userland, camera, HEVC, status bar, XNUtils. SSH and the debug tools: the debug-ios26 line above"
 } > "$R/report.txt"
 ln -sfn "$R" "$OUT/ios26/root-$DEV"
+grep ' debug-ios26:' "$W/audit.txt" || echo "off       debug-ios26: no audit line"
 grep ' metal26:' "$W/audit.txt" || echo "off       metal26: no audit line"
 sha256sum "$IMG.manifest" "$W/spec"
 ls -l "$IMG"; du -h "$IMG"

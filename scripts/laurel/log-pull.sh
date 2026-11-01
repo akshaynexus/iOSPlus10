@@ -7,6 +7,7 @@
 #    Decoded with op10tool bootlog --file into OUT/bootlog-<boot>.txt.
 # 2. If that area was never written (kernel before 2900, or "LAUREL BOOTLOG: off"): the topaz 0047 area,
 #    the last 1025 blocks ("SWEETLOG", ufsrw=1), decoded with external/ios-topaz/tools/sweet-log.py.
+# Reads with no write; the next iOS boot overwrites this log within seconds, so read it before that boot.
 # On a running iOS with SSH the same area comes from /dev/laurelbootlog: scripts/laurel/phone-ssh.sh bootlog.
 # Over USB without SSH (a good boot): out/bin/op10tool bootlog.
 set -eu

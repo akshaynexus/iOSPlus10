@@ -236,8 +236,8 @@ An earlier run (base 037cd81, head 87e778d) gave `12 same bytes, 3 with a byte d
 | K6 | Display waits for a surface's GPU work as `topaz_surface_drawn` does, for surfaces imported by Turnip | Section 5 | [V] source |
 | K7 | Sleeping fence wait: short spin, then sleep woken by `CACHE_FLUSH_TS` IRQ | Hot 0151: 50 us + 250 us sleeps. Ours polls every 200 us. Fits the A610 better than the A640: a weak CPU pays more for polling [I] | Hot |
 | K8 | Vsync notification carries the refresh period | Hot 0121: CA's frame deadlines were always in the past without it | Hot; check ours |
-| K9 | Ad-hoc signatures with 4 KiB pages from `/System/Library/Extensions` and `/usr/local/bin` run in a platform process | Our files are `ldid -S`; the AMFI stand-in or a trust bundle must take them | [U] on 12377 |
-| K10 | `launchd.plist` is signed (`launchd.plist.sig`) [V]. To set `CA_DISABLE_FRAMEBUFFER_COMPRESSION=1` in the backboardd job, the track needs Hot's boot-arg `launchd_unsecure_cache=1` or its own trust | First-boot BGRA, as Hot. Preference files are the fallback already written | [V] file; Hot |
+| K9 | Ad-hoc signatures with 4 KiB pages from `/System/Library/Extensions` and `/usr/local/bin` run in a platform process | Our files are `ldid -S`; the AMFI stand-in takes every signature on the root and has no library validation hook | [V code, 12377, not run]: `ios26-first-boot.md` section 2 |
+| K10 | `launchd.plist` is signed (`launchd.plist.sig`) [V]. `launchd_cache_loader` of 23F84 skips the check with `launchd_unsecure_cache=` [V disassembly], which `uefi-image.sh` sets. So a job can go in: the SSH job does. `CA_DISABLE_FRAMEBUFFER_COMPRESSION=1` in the backboardd job is possible the same way | First-boot BGRA, as Hot. Preference files are the fallback already written | [V code, not run] |
 | K11 | `work_interval` instance ops 6, 7, 8 | Hot, zeta: stripped ops that CA's work intervals call | Hot 0151 |
 
 ## 8. Performance estimate. All [I]; no measured frame exists on this path
@@ -288,7 +288,7 @@ NMTL[.. backboardd]: LAUREL METAL26: first frame on a screen surface (720 x 1560
 NMTL[.. backboardd]: LAUREL METAL26: screen: L of 64 samples lit, ...
 ```
 
-Failure on iOS 26 has **no fallback**: `LAUREL METAL26: off: ...: CA::WindowServer::AccelServer::renderer has no renderer, the screen stays as it is`. The USB log stays. The first-boot root has no SSH (`ios26-root.md`). There is no GL on 23F84 (`ios26-userland.md` 8.1).
+Failure on iOS 26 has **no fallback**: `LAUREL METAL26: off: ...: CA::WindowServer::AccelServer::renderer has no renderer, the screen stays as it is`. The USB log stays, and SSH stays (`ios26-first-boot.md`). There is no GL on 23F84 (`ios26-userland.md` 8.1).
 
 
 ## 10. Second Metal option, switch and bench

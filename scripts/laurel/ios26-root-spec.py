@@ -428,6 +428,78 @@ def trust(t, a, work):
     t.audit('trust data', 'built', f'{"; ".join(srcs)}; merged {len(ent)} entries, {added} new from the lowering, {missing_attr} without an original attribute. The kernel does not read this file: trust caches are off, built-in AMFI marks every signed file on the root (ios26-kernel.md 3). It is the input if the kernel ever loads one')
 
 
+def apply_stage(t, stage, keep_mode=()):
+    """What a script left on a stage goes into the tree, owner 0:0: new folders and symlinks too. A file the tree has keeps its owner and mode (keep_mode: paths that keep them anyway)."""
+    files = 0
+    for dirp, dirs, names in os.walk(stage):
+        dirs.sort()
+        rel = os.path.relpath(dirp, stage).encode()
+        rel = b'' if rel == b'.' else rel
+        for n in sorted(dirs):
+            q = os.path.join(rel, n.encode()) if rel else n.encode()
+            full = os.path.join(dirp, n)
+            if q not in t.n:
+                t.mkdirs(rel) if rel else None
+                t.n[q] = Node('d', stat.S_IMODE(os.stat(full).st_mode), 0, 0, t.mtime, b'')
+        for n in sorted(names):
+            q = os.path.join(rel, n.encode()) if rel else n.encode()
+            full = os.path.join(dirp, n)
+            if os.path.islink(full):
+                t.n[q] = Node('l', 0o755, 0, 0, t.mtime, os.fsencode(os.readlink(full)))
+            elif q in t.n and t.n[q].kind == 'f':
+                with open(full, 'rb') as f:
+                    t.write(q, f.read(), stat.S_IMODE(os.stat(full).st_mode) if q in keep_mode else None)
+            else:
+                with open(full, 'rb') as f:
+                    t.write(q, f.read(), stat.S_IMODE(os.stat(full).st_mode), 0, 0)
+            files += 1
+    return files
+
+
+def debug(t, work, script=None):
+    """The debug path of the first boot: scripts/laurel/root-debug-ios26.sh on a stage with the launchd.plist of this tree (docs/laurel_sprout/ios26-first-boot.md). Before air() and metal(), and it
+    needs neither: 23F84 has no GL path, so with no picture this is how the phone speaks. Its script fails or it is off: the root is built without it and with one audit line `off debug-ios26`,
+    which ios26-root.sh prints at its end. Nothing else of the root changes then."""
+    import shutil
+    import subprocess
+    script = script or os.path.join(REPO, 'scripts', 'laurel', 'root-debug-ios26.sh')
+    if not os.path.exists(script):
+        t.audit('debug-ios26', 'off', f'no {script}')
+        return
+    stage = os.path.join(work, 'debug-stage')
+    shutil.rmtree(stage, ignore_errors=True)
+    os.makedirs(os.path.join(stage, os.path.dirname(XPC)))
+    with open(os.path.join(stage, XPC), 'wb') as f:
+        f.write(t.read(XPC))
+    os.chmod(os.path.join(stage, XPC), 0o644)
+    # the stock commands: a toybox applet must not shadow one. The volume paths, also the cryptex links of this tree
+    names = os.path.join(work, 'debug-stock-names')
+    with open(names, 'wb') as f:
+        for k in sorted(t.n):
+            if any(k.startswith(p) and b'/' not in k[len(p):] for p in (b'bin/', b'sbin/', b'usr/bin/', b'usr/sbin/')):
+                f.write(os.path.basename(k) + b'\n')
+    # the check of root-add-ssh.py: root's entry, its shell. Same bytes back
+    for e in ('private/etc/master.passwd', 'private/etc/passwd'):
+        if t.exists(e):
+            os.makedirs(os.path.join(stage, os.path.dirname(e)), exist_ok=True)
+            with open(os.path.join(stage, e), 'wb') as f:
+                f.write(t.read(e))
+    env = dict(os.environ, STOCK_NAMES=names)
+    r = subprocess.run(['bash', script, stage], capture_output=True, text=True, env=env, preexec_fn=lambda: os.umask(0o022))
+    tag = 'laurel-root: debug-ios26: '
+    said = [x[len(tag):] for x in (r.stdout + r.stderr).strip().splitlines() if x.startswith(tag)]
+    if r.returncode != 0:
+        t.audit('debug-ios26', 'off', said[-1] if said else ((r.stderr or r.stdout).strip().splitlines() or ['no output'])[-1])
+        shutil.rmtree(stage, ignore_errors=True)
+        return
+    files = apply_stage(t, stage)
+    for x in said:
+        item, _, note = x.partition(': ')
+        t.audit('debug ' + item, 'applied', note)
+    t.audit('debug-ios26', 'applied', f'{files} files and links; the same in a root with no compositor. Not proven until it runs on the phone')
+    shutil.rmtree(stage, ignore_errors=True)
+
+
 def air(t, work, script=None):
     """AirDrop and AirPlay parts of scripts/laurel/root-air-ios26.sh (branch t3/laurel-ios26-airdrop). That script edits a mounted root; this build has no writable mount, so it runs
     on a stage with the launchd.plist of this tree, and what it leaves there goes into the image. Not in this tree: nothing changes, and the image stays the same bytes. It fails: the
@@ -587,6 +659,137 @@ def metal_self_test(d):
     return all(checks)
 
 
+def debug_self_test(d):
+    """The debug hook with the real script: stage, jobs, owners, modes, links, no change on a failure; it stays when Metal and AirDrop fail. Its own scratch out/ssh, so no real key changes. Real binaries of
+    out/ssh/ios when this host has them, else made-up plain arm64 files."""
+    import shutil
+    import subprocess
+    MAIN = subprocess.run(['git', '-C', REPO, 'worktree', 'list', '--porcelain'], capture_output=True, text=True).stdout.splitlines()
+    MAIN = MAIN[0].split(' ', 1)[1] if MAIN else REPO
+    real = next((os.path.join(x, 'out/ssh/ios') for x in (REPO, MAIN) if os.path.isfile(os.path.join(x, 'out/ssh/ios/dropbearmulti'))), None)
+    so = os.path.join(d, 'sshout')
+    if real:
+        os.makedirs(so)
+        os.symlink(real, os.path.join(so, 'ios'))
+    else:
+        os.makedirs(os.path.join(so, 'ios'))
+        for n in 'dropbearmulti dash toybox usbnetcfg laurelnet usbreboot oslogstream'.split():
+            with open(os.path.join(so, 'ios', n), 'wb') as f:
+                f.write(struct.pack('<IIIIIIII', 0xfeedfacf, 0x0100000c, 0, 2, 0, 0, 0, 0))
+            os.chmod(os.path.join(so, 'ios', n), 0o755)
+        with open(os.path.join(so, 'ios', 'toybox.applets'), 'w') as f:
+            f.write('ls cat ps tail\n')
+
+    def tree():
+        work = os.path.join(d, 'dw')
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(os.path.join(work, 'overlay'))
+        t = Tree(work)
+        src = os.path.join(d, 'dl.plist')
+        with open(src, 'wb') as f:
+            plistlib.dump({'LaunchDaemons': {'/System/Library/LaunchDaemons/com.apple.wifip2pd.plist': {'Label': 'p'}}}, f, fmt=plistlib.FMT_BINARY)
+        t.mkdirs(os.path.dirname(XPC).encode())
+        t.n[XPC.encode()] = Node('f', 0o644, 0, 0, 5, src.encode())
+        t.mkdirs(b'bin')
+        t.mkdirs(b'private/var/root')
+        t.mkdirs(b'private/etc')
+        t.n[b'bin/ps'] = Node('f', 0o755, 0, 0, 5, src.encode())
+        pw = os.path.join(d, 'mp')
+        with open(pw, 'w') as f:
+            f.write('root:/smx7MYTQIi2M:0:0::0:0:System Administrator:/var/root:/bin/sh\n')
+        t.n[b'private/etc/master.passwd'] = Node('f', 0o600, 0, 0, 5, pw.encode())
+        return t, work
+    env = {k: os.environ.get(k) for k in ('SSH_OUT', 'DEBUG26')}
+    os.environ['SSH_OUT'] = so
+    t, work = tree()
+    debug(t, work)
+    J = '/System/Library/LaunchDaemons/dev.iosplus10.dropbear.plist'
+    jobs = plistlib.loads(t.read(XPC))['LaunchDaemons']
+    job = jobs.get(J, {})
+    a = job.get('ProgramArguments', [])
+    prefs = plistlib.loads(t.read(b'private/var/preferences/SystemConfiguration/preferences.plist'))
+    svc = prefs['NetworkServices']['1F05B0E7-0000-4000-8000-0000000000E0']
+    n = t.n
+    checks = [
+        a[:5] == ['/usr/local/bin/dropbear', '-F', '-E', '-p', '192.168.7.2:22'],
+        '-s' not in a and not any(x == '22' or x.startswith('0.0.0.0') for x in a),
+        job.get('RunAtLoad') is True and job.get('KeepAlive') is True and job.get('MinimalBootProfile') is True and job.get('POSIXSpawnType') == 'Interactive' and job.get('EnablePressuredExit') is False,
+        job.get('StandardErrorPath') == '/dev/console' and 'StandardOutPath' not in job,
+        not any('Library/Logs' in str(v) or 'backboardd' in str(v) for v in job.values()),
+        '/System/Library/LaunchDaemons/dev.iosplus10.usbnetcfg.plist' not in jobs and 'Router' not in svc['IPv4'] and svc['IPv4']['Addresses'] == ['192.168.7.2'],
+        n[XPC.encode()].mode == 0o644 and n[XPC.encode()].uid == 0,
+        n[b'usr/local/bin/dropbearmulti'].mode == 0o755 and n[b'usr/local/bin/dropbearmulti'].uid == 0,
+        n[b'usr/local/bin/dropbear'].kind == 'l' and n[b'usr/local/bin/dropbear'].src == b'dropbearmulti',
+        n[b'bin/sh'].kind == 'l' and n[b'bin/sh'].src == b'/usr/local/bin/dash',
+        b'usr/local/bin/ps' not in n and n[b'usr/local/bin/ls'].kind == 'l',
+        n[b'private/var/root/.ssh'].mode == 0o700 and n[b'private/var/root/.ssh/authorized_keys'].mode == 0o600 and b'ssh-' in t.read(b'private/var/root/.ssh/authorized_keys'),
+        b'/bin/sh' in t.read(b'private/etc/shells'),
+        n[b'private/etc/master.passwd'].mode == 0o600 and b'/smx7MYTQIi2M' in t.read(b'private/etc/master.passwd'),
+        any(x.startswith('applied') and 'debug ssh' in x and '192.168.7.2:22' in x for x in t.audit_lines),
+        any(x.startswith('applied') and 'debug-ios26' in x for x in t.audit_lines),
+    ]
+    # no secret of the scratch out/ssh beyond its keys, and the private key is never on the root
+    checks.append(not any(b'phone_ed25519' in k for k in n))
+    # Metal and AirDrop fail: the job and the binaries stay
+    os.environ['METAL_STAGE'] = os.path.join(d, 'absent')
+    t.mkdirs(b'usr/libexec')
+    t.n[b'usr/libexec/backboardd'] = Node('f', 0o755, 0, 0, 5, b'/dev/null')
+    metal(t, work)
+    del os.environ['METAL_STAGE']
+    bad = os.path.join(d, 'bad-air.sh')
+    with open(bad, 'w') as f:
+        f.write('#!/bin/bash\necho "laurel-root: air-ios26: no" >&2; exit 1\n')
+    air(t, work, bad)
+    checks += [J in plistlib.loads(t.read(XPC))['LaunchDaemons'], any(x.startswith('off') and 'metal26' in x for x in t.audit_lines), any(x.startswith('off') and 'air-ios26' in x for x in t.audit_lines), b'usr/local/bin/dropbearmulti' in t.n]
+    # the same with no compositor job at all and a tree with no bundle: nothing here reads them
+    checks.append(not any(b'NegroniMetal' in k for k in t.n))
+    root_manifest(t, os.path.join(d, 'no-stamp'))
+    first = t.read(b'usr/share/laurel/root-manifest').decode().splitlines()
+    import re
+    checks += [bool(re.fullmatch(r'\S+ \S+ kernel-series none features 3 installed 1 off 2 missing 0', first[0])), t.n[b'usr/share/laurel/root-manifest'].mode == 0o644]
+    # kill switch and a missing tool: off, the tree stays
+    os.environ['DEBUG26'] = '0'
+    t, work = tree()
+    before = set(t.n)
+    debug(t, work)
+    checks += [set(t.n) == before, any(x.startswith('off') and 'DEBUG26=0' in x for x in t.audit_lines)]
+    os.environ.pop('DEBUG26')
+    os.environ['SSH_OUT'] = os.path.join(d, 'no-ssh')
+    t, work = tree()
+    before = set(t.n)
+    debug(t, work)
+    checks.append(set(t.n) == before and any(x.startswith('off') and 'no-ssh' in x for x in t.audit_lines))
+    for k, v in env.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    print(f'debug hook self-test: {sum(checks)} of {len(checks)}, binaries {"real " + real if real else "made up"}')
+    print('  ' + ' '.join(f'{i}:{"ok" if c else "FAIL"}' for i, c in enumerate(checks)))
+    return all(checks)
+
+
+def root_manifest(t, stamp=None):
+    """/usr/share/laurel/root-manifest: the kernel prints its first line, `LAUREL BUILD: root ...` (patch 2912). The time is the commit's, so the same commit gives the same bytes. Features: the hooks of this root, from their audit lines."""
+    import importlib.util
+    import subprocess
+    sp = importlib.util.spec_from_file_location('build_stamp', os.path.join(REPO, 'scripts', 'laurel', 'build-stamp.py'))
+    bs = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(bs)
+    stamp = stamp or os.path.join(REPO, 'out/laurel-kernel-ios26/out/kernel.ios26.development.sweet.4k.stamp')
+    series = (bs.read_stamp(stamp) or {}).get('series', 'none')
+    when = subprocess.run(['git', '-C', REPO, 'log', '-1', '--format=%cd', '--date=format:%Y%m%dT%H%M%S'], capture_output=True, text=True).stdout.strip() or 'none'
+    rows = []
+    for name in ('debug-ios26', 'air-ios26', 'metal26'):
+        hit = [x for x in t.audit_lines if x.split(None, 1)[1].startswith(name + ':')]
+        rows.append((name, 'installed' if hit and hit[-1].startswith('applied') else 'off', hit[-1].split(': ', 1)[1] if hit else 'no audit line'))
+    n = {w: sum(r[1] == w for r in rows) for w in ('installed', 'off')}
+    text = '%s %s kernel-series %s features %d installed %d off %d missing 0\n' % (bs.commit(), when, series, len(rows), n['installed'], n['off'])
+    text += ''.join('feature\t%s\t%s\t%s\n' % r for r in rows)
+    t.write('usr/share/laurel/root-manifest', text.encode(), 0o644, 0, 0)
+    t.audit('root-manifest', 'built', text.splitlines()[0])
+
+
 def self_test():
     """The air hook with a stand-in script: its files, owners, a removed job, a failure, a missing script. Host only, no donor files."""
     import shutil
@@ -646,7 +849,8 @@ echo "laurel-root: air-ios26: fake"
         checks += [set(t.n) == set(n), not t.audit_lines]
         print(f'air hook self-test: {sum(checks)} of {len(checks)}')
         ok_metal = metal_self_test(d)
-    sys.exit(0 if all(checks) and ok_metal else 1)
+        ok_debug = debug_self_test(d)
+    sys.exit(0 if all(checks) and ok_metal and ok_debug else 1)
 
 
 def main():
@@ -733,9 +937,11 @@ def main():
     print(f'{linked} cryptex-only paths linked at the root; {through} reached through a symlink of the OS volume')
     print('tweaks:')
     tweaks(t, a)
+    debug(t, work)
     air(t, work)
     metal(t, work)
     trust(t, a, work)
+    root_manifest(t)
     # a place for the reader of the first boot
     with open(os.path.join(work, 'audit.txt'), 'w') as f:
         f.write('\n'.join(t.audit_lines) + '\n')
