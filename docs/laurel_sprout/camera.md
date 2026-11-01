@@ -1,7 +1,9 @@
 # Mi A3 (laurel_sprout) camera: hardware, path decision, step 1
 
 Status 2026-11-01: step 1 (power + CCI + chip ID of all four cameras) is code, kernel patch 2770, built (249/249
-patches, 0 LSE). Not run on the phone yet. The Camera app does not work yet: no frame path and no iOS side.
+patches, 0 LSE). Step 2 (rear IMX586 RDI raw frames 1280x720, fps line, `camframe` picture over USB) is code, kernel
+patch 2771, built (252/252 patches, 0 LSE), host-tested (section 8). Neither ran on the phone yet. The Camera app does
+not work yet: no iOS side.
 Labels: [V] read in a file or seen in a tool output (source given), [I] inference, [U] unknown.
 
 ## 1. Hardware
@@ -46,6 +48,8 @@ vendor image (`/etc/camera/camera_config.xml`, `/lib/libmmcamera_laurus_<sensor>
 - [V] IMX586 library: one init table (531 register writes at `.data`+0x9f2c, starts with INCK 0x0136/0x0137 =
   0x1800 = 24 MHz) and 7 per-mode tables (86-95 writes each; mode 6 = 1280x720 at `.data`+0x7f368, 95 writes).
   Entries are `{u16 addr, u16 data, u32 delay}`. The S5K4H7 tables have 16-bit data (other entry form, not decoded).
+  Correction (step 2, [V] `scripts/laurel/camera-tables.py`): mode 6 starts at `.data`+0x7f370 and has **94** writes; the
+  95th "write" {0x0001, 0} at 0x7f368 is the trailer of the table before it (data_type 1, delay 0). Full layout: section 8.
 
 ### CAMSS blocks (SM6125 = "trinket", camera v2 / CAMSS gen1, the sdm660 type)
 
@@ -54,7 +58,7 @@ vendor image (`/etc/camera/camera_config.xml`, `/lib/libmmcamera_laurus_<sensor>
 | Block | Address | IRQ (SPI) | Notes |
 | --- | --- | --- | --- |
 | CCI (I2C for sensors) | 0x5c0c000 | 207 | 2 masters; clocks camera_ahb 0x17008, camss_top_ahb 0x560a0, cci_ahb 0x52020, cci 0x5201c, RCG 0x52004 (37.5 MHz) |
-| CSIPHY0/1/2 | 0x1628000 / 0x1629000 / 0x162a000 | 72 / 73 / 74 | `qcom,csiphy-v3.5` (3-phase PHY used as D-PHY); clk mux 0x5c00120 |
+| CSIPHY0/1/2 | 0x1628000 / 0x1629000 / 0x162a000 | 72 / 73 / 74 | `qcom,csiphy-v3.5` (3-phase PHY used as D-PHY); clk mux 0x5c00120 + 4n (CSIPHY1: 0x5c00124) |
 | CSID0-3 | 0x5c30000 + 0x400 n | 208-211 | `qcom,csid-v5.0`; vdd L18A 1.232 V |
 | ISPIF | 0x5c31000 | 212 | `qcom,ispif-v3.0`, routes CSID -> VFE RDI/PIX |
 | VFE0 / VFE1 | 0x5c10000 / 0x5c14000 | 214 / 215 | `qcom,vfe48`; VBIF 0x5c40000; GDSC vfe0 0x1454004 |
@@ -135,7 +139,7 @@ and the mm-camera ISP configuration in user space); UVC-style USB gadget (no hos
 ## 5. Steps
 
 1. **Done (code, patch 2770): find the cameras.** Power, CCI, chip ID of each slot, one line. Section 6.
-2. Capture path, rear IMX586 at 1280x720 (mode 6): MCLK 24 MHz (GPLL9 M/N 1/24), sensor init + mode 6 tables from
+2. **Done (code, patch 2771, section 8):** capture path, rear IMX586 at 1280x720 (mode 6). Plan was: MCLK 24 MHz (GPLL9 M/N 1/24), sensor init + mode 6 tables from
    `/usr/share/firmware/laurel-camera/libmmcamera_laurus_imx586_*.so` (root step `scripts/laurel/root-camera.sh`,
    to write; parser = `camera-sensors.py` logic in the kernel), CSIPHY1 D-PHY 4 lanes (settle count from the lane
    rate), CSID1 RX RAW10 VC0 DT 0x2b, ISPIF CSID1 -> VFE0 RDI0, VFE0 RDI0 write master into 3 buffers of 1.15 MB
@@ -144,7 +148,7 @@ and the mm-camera ISP configuration in user space); UVC-style USB gadget (no hos
    (`topaz_smmu_identity`), VFE GDSC + vfe0/csi/cphy/ispif clocks, frame done by polling the VFE bus status. Self-
    check: the first frame arrives (sequence, line count). TPG first in the same code path when the sensor does not
    stream (the CSID TG is the CSID's own input, not a separate test path).
-3. `/dev/negronicam`-compatible node (`NCFRAME1`, RAW10, bayer order of the mode, black level 64 [I]) + exposure /
+3. Next: `/dev/negronicam`-compatible node (`NCFRAME1`, RAW10, bayer order of the mode, black level 64 [I]) + exposure /
    gain writes (IMX586 0x0202 coarse integration, 0x0204 analog gain).
 4. iOS: build `userland/camera` for laurel (sensor 1 = rear), root step (plug-in + ADT `camera-rear`), test Camera.app
    preview + photo.
@@ -200,3 +204,132 @@ Test (no root change; owner approval for the boot partition write):
 scripts/bg.sh cam-inv scripts/laurel/camera-inventory.sh    # ~1 min: simg2img + debugfs + parser
 cat out/laurel/camera/sensors.txt
 ```
+
+## 8. Step 2 (patch 2771): rear RDI raw frames, fps line, picture over USB
+
+Status 2026-11-01: code, built (252/252 patches, 0 LSE, kernel sha256 dcbae3a4...), host tests pass. **Not run on the
+phone.** Labels as above: [V] seen in a file or tool output, [I] inference.
+
+### Files (kernel, `bsd/dev/`, each < 300 lines, each `scripts/laurel/kcheck.sh` OK)
+
+| File | Content |
+| --- | --- |
+| `laurel_cam_lib.h` | stock sensor library parser (pure, host-tested): ELF32 `.data`, tables, modes, CSI parameters, CCI bursts |
+| `laurel_cam_rdi.h` | pure helpers: CSID lane word, CSIPHY lane mask/enable/blocks, settle scaling, RAW10, AE, read protocol |
+| `laurel_cam_clk.c` | VFE0/VFE1 GDSCs, PLL choice, 5 RCGs, 18 branches + throttle vote, full restore |
+| `laurel_cam_csi.c` | CSIPHY1 D-PHY lane sequence, CSID1 RX or test generator, CSID counters |
+| `laurel_cam_ispif.c` | ISPIF reset/init, CSID1 -> VFE0 RDI0, frame-boundary enable/disable |
+| `laurel_cam_vfe.c` | VFE0 reset, VBIF, QoS/DS, RDI0 -> WM0 frame-based ping-pong, polled status, halt |
+| `laurel_cam_sensor.c` | library file from the root, MCLK 24 MHz, power-up, chip ID, init + mode tables, exposure, stream on/off |
+| `laurel_cam_stream.c` | one capture run (bring-up order, frame loop, AE, TPG fallback, teardown), sysctl `kern.laurel_camera_stream` |
+| `laurel_cam_ctl.c` | stream thread (root wait, buffers, SMMU), USB commands `camframe` / `caminfo` / `camread` |
+| `laurel_cam_st.h` | state shared by stream.c and ctl.c |
+| changed: `laurel_cam.c` (start of step 2 after the scan, `lcam_power`), `laurel_cam_hw.c` (MCLK 24 MHz, exports), `laurel_cam.h`, `sweet_usb.c` (camera commands, binary reply), `bsd/conf/files` | |
+
+### Sensor tables at run time [V]
+
+The kernel holds no register table. `/usr/share/firmware/laurel-camera/libmmcamera_laurus_{imx586_qtech,imx586_sunny,
+imx582_qtech}.so` (root step `scripts/laurel/root-camera.sh`, called by `root.sh`, `CAMERA=0` skips; the files come
+from `scripts/laurel/camera-inventory.sh`, never in git). `sensor_lib_t` layout in `.data`, the same in all three files:
+
+| Offset | Content |
+| --- | --- |
+| 0x0000 / 0x20 / 0x30 | name[32] / slave (8-bit) / chip ID register + chip ID |
+| 0x5fa4 | output format 0, connection 1 (MIPI), raw 1 (10-bit), filter 3 (RGGB [I: mm-camera enum BGGR, GBRG, GRBG, RGGB]) |
+| 0x5fb4 | output registers 0x034c/0x034e/0x0342/0x0340, exposure 0x0202, gain 0x0204, vert_offset 48 (0x5fcc) |
+| 0x9f2c | init table: 3000 x {u16 addr, u16 data, u32 delay}, then u16 size (0 in the file), u32 addr_type 2, u32 data_type 1, u32 delay |
+| 0x5c090 + k x 0x5dd0 | resolution table k (same form) |
+| 0xae1f0 | u32 mode count (7), then 0x60-byte records: x, y, line_length, frame_length, vt_pixel_clk at +12, op_pixel_clk u64 at +0x58 |
+| 0xae740 | lanes 4, settle 0x13, 3-phase 0 |
+| 0xae744 + k x 0x104 | CID LUT: count 1, {cid 0, dt 0x2b, decode 2} |
+
+IMX586 qtech = sunny: init 531 writes (239 CCI bursts of consecutive registers), mode 6 94 writes (39 bursts); IMX582
+qtech: 408 / 114. Mode 6 sets RAW10 (0x0112/0x0113 = 0x0a), 4 lanes (0x0114 = 3), line 5376, frame 780 lines,
+exposure 732 lines, analog gain code 0x70. `cam-test.sh` compares the C parser with `camera-tables.py` byte for byte.
+
+### Hardware sequence (values: research of 2026-11-01, downstream camera_v2 first, mainline camss cross-check)
+
+1. `lcam_hw_on` (step 1: camss_top GDSC, AHB, CCI), CCI reset.
+2. `lcam_sclk_on`: PLLs voted, used only when locked: GPLL4 -> CSIPHY timer + csiphy source 268.8 MHz (Android's rate,
+   settle 0x13 unchanged) and VFE 403.2 MHz; else timer 200 MHz from GPLL0 (settle scaled to 0x0e) and VFE from GPLL8
+   480 / GPLL9 576 / GPLL6 256 MHz. CSID1 200 MHz (GPLL0 / 3). VFE0 + VFE1 GDSCs (ISPIF reset covers both). 18 branches,
+   each checked with CLK_OFF (ahb2phy_csi has hardware gating: no check). throttle_rt_axi vote 0x79004 bit 26.
+3. Sensor: MCLK0 24 MHz (GPLL9 main / 24 M/N: M 1, N ~23, D ~24, CFG src 2 hid 1 dual edge; GPLL9 not locked = 19.2 MHz
+   + line), step 1 power-up list, chip ID again, init + mode tables, `0x0100 = 0` (LP-11).
+4. VFE0: reset 0x3f7 (RESET_ACK bit 31), VBIF 0x124/0xac/0xd0, BUS_CFG 0x101, QoS 0xfff8fff8 x 8, DS 0xcccc0011 x 16 +
+   0x110, WM0 ADDR_CFG 0x2 (frame based, period 1), pattern 1, subsample all, UB 682, PING/PONG = buffers 0/1, masks,
+   RDI_CFG_0 7, XBAR WM0 <- RDI0 (0xc << 8), WM0 on (0xcec = 2), reload, REG_UPDATE 0x2.
+5. ISPIF: reset 0x000f1fff (bit 27), init values, RDI mux 0x5c00028 = CSID1, INPUT_SEL bits 5:4 = 1, CID mask 1, IRQ group
+   0x02492000, INTF_CMD_0 = 0xfffffdff (RDI0 enable at frame boundary).
+6. CSID1: reset 0x7ffff (bit 11), CORE_CTRL_0 0x32103, CORE_CTRL_1 (1 << 17) | 0xf (HW version >= 0x30000000), LUT VC0 0x2b,
+   CID0 cfg 0x23.
+7. CSIPHY1: reset 0x800, mux 0x5c00124 = 1, 0x814 = 0xd5, 0x818 = 1, per lane (D0, CLK, D1, D2, D3) the msm_csiphy
+   2-phase values, settle in cfg3, IRQ masks 0x82c..0x854, clear.
+8. Exposure (AE state), stream on, frames for 2 s (self-check) / 1.5 s (`camframe`): WM0 ping-pong done -> the finished
+   buffer leaves the VFE, the spare one goes in (3 buffers: 2 in the VFE, the latest kept out); REG_UPDATE at each RDI0
+   reg update; AE every 4 frames (mean of 2304 samples, target 180 above black 64, exposure first, gain up to 16x).
+9. Stream off, VFE stop + bus halt, ISPIF stop, CSID reset, CSIPHY off, sensor power-down, clocks back, CCI off, GDSC back.
+
+Buffers: 3 x 1,152,000 bytes (1600 x 720) from the GPU pool (`topaz_gpu_pool_alloc`: contiguous, below 4 GiB, Normal
+NC, so no cache maintenance). gpu=0 or no pool in the ADT = `off: no frame buffer ...`. SMMU: `topaz_smmu_identity(0x420, 0)`
+and `(0x421, 2)`. No interrupt line: the status words are polled every 1 ms (a frame takes 10.7 ms at 93.5 fps).
+
+### Lines (USB log / console)
+
+```
+LAUREL CAMERA: on: rear IMX586 (0x1a id 0x0586), ...; CCI 37500000 Hz, MCLK 19.2 MHz; capture path: rear RDI (stream line follows)
+LAUREL CAMERA: sensor: laurus_imx586_qtech from libmmcamera_laurus_imx586_qtech.so: init + mode 6 in 278 CCI writes, MCLK 24000000 Hz
+LAUREL CAMERA: rear stream: 1280x720 RAW10 at 93.5 fps, frame 186 (kept for camframe), mean 240, exposure 732 lines gain 4.00x, VFE errors 0 (0); libmmcamera_laurus_imx586_qtech.so, MCLK 24000000 Hz, CSIPHY1 4 lanes settle 0x13 (timer 268 MHz), VFE 403 MHz, buffers 0xc...
+```
+
+(numbers [I]: 93.5 fps from the mode table; the frame count is about 2 s x fps.) Failure lines:
+`rear stream: off: no /usr/share/firmware/laurel-camera/libmmcamera_laurus_imx586_*.so (root step root-camera.sh)`,
+`off: no frame buffer below 4 GiB from the GPU pool (...)`, `off: apps SMMU: ...`, `off: VFE0 reset does not finish`,
+`off: ISPIF reset does not finish`, `off: CSID reset does not finish`, `off: a camera branch clock does not run` (with a
+`clk: <name> CBCR ...` line), `off: no PLL for the VFE clock is locked`, `off: no chip ID answer after the power-up`, and
+`off: no frame from the sensor in 1 s (CSID packets N ECC E CRC C irq .., CSIPHY status .., ISPIF .., VFE ...); CSID test
+pattern: K frames at F fps (...)`. How to read the last one: CSID packets 0 = nothing on the lanes (sensor not
+streaming, CSIPHY settle/lanes); packets > 0 but no frame = CSID/ISPIF/VFE; test pattern frames > 0 = the back end and
+the memory path work. Possible cause not handled [I]: the VFE AXI path needs a bus vote (DT msm-bus MASTER_VFE ->
+EBI, 100 MB/s; no RPM-SMD bus voter in this kernel): no ping-pong done + no halt ack points there.
+
+### Picture on the host
+
+```
+make usblog                              # USB link (once)
+scripts/laurel/cam-frame.sh              # new 1.5 s capture, read, logs/camera/camframe-genN.raw10 + .png
+scripts/laurel/cam-frame.sh --raw logs/camera/camframe-gen2.raw10 --bayer BGGR   # convert again, other Bayer order
+```
+
+`op10tool camframe` (tools/op10tool/src/camframe.rs): `caminfo`, `camframe`, polls until a new generation is ready,
+then `camread G O` with 32 requests in flight and resends after 300 ms (823 parts per frame). PNG: RAW10 unpack, black
+64, bilinear demosaic, grey-world white balance (gains 1..4), 99th percentile -> white, sRGB gamma. A test-pattern frame
+(`bayer TPG`) is shown grey. Host tests: `scripts/laurel/cam-test.sh` (69 + 31 checks, C = Python tables),
+`scripts/laurel/cam-frame-test.sh` (mock phone with 5 % loss: byte-equal frame, PNG).
+
+### Test steps (owner approval for the boot partition write; root rebuild for the tables)
+
+1. `scripts/laurel/camera-inventory.sh` (stock vendor image -> `out/laurel/camera/lib`), then the root with the tables:
+   `scripts/bg.sh laurel-root sudo scripts/laurel/root.sh` (root-camera.sh runs in step 2) and flash userdata as usual.
+2. `scripts/bg.sh cam-kernel scripts/laurel/kernel-linux.sh`, image (`scripts/laurel/uefi-image.sh`), flash with
+   `scripts/laurel/flash-boot.sh` after the owner says yes.
+3. USB log: the `LAUREL CAMERA: rear stream:` line about 2 s after the root mount; `sysctl kern.laurel_camera_stream`.
+4. `scripts/laurel/cam-frame.sh`: look at the PNG. Wrong colours: `--raw ... --bayer BGGR|GRBG|GBRG`. Dark or white: the
+   AE state is in `caminfo` (exposure lines, gain x1024).
+5. Kill switch `camera=0` (step 1 and step 2).
+
+### Open points
+
+- [U] GPLL4/GPLL9 lock state at boot on this phone (the clock lines and the stream line show which path ran).
+- [U] Bus vote for the VFE writes (see above). [U] CSID1 HW version (CORE_CTRL_1 is written only from 0x30000000).
+- [I] Bayer order RGGB from the library enum; check on the first picture.
+- The ext4 reader of branch t3/laurel-cellular-ipa2 (`laurel_ext4.c`, WIP, in a patch also numbered 2770: a number
+  clash to fix at merge) could read the libraries straight from the vendor partition and drop the root step.
+
+### Next steps (not done)
+
+- Step 3: `/dev/negronicam` with the NCFRAME1 ABI of negroni `userland/camera` (120-byte header + RAW10 frame; write =
+  exposure/gain), a continuous stream mode (the capture loop of laurel_cam_stream.c without the time limit, frames
+  handed to readers), bayer RGGB and black level 64 in the header.
+- Step 4: the iOS side: `userland/camera` plug-in built for laurel (sensor 1 = rear), root step (plug-in + ADT
+  `camera-rear` + `/product/camera`), Camera.app preview + photo.

@@ -832,3 +832,14 @@ Observed [V, usblog boot 07:44:5x, laurel-int-1 8660387, root of 07:16]:
 - `LAUREL RTC: saved offset ...` after the host settime.
 - `LAUREL CELL: on: SIM1 present (USIM detected), SIM2 absent; ... radio off: no AP IPA driver yet`; NAS1 BIND_SUBSCRIPTION error
   0x3, DMS GET_OPERATING_MODE error 0x4a (to check in step 2).
+
+## Mi A3: camera step 2 built: rear RDI raw frames + picture over USB (2026-11-01, branch t3/laurel-camera-rdi, patch 2771; NOT BOOTED)
+
+Done [V]: kernel patch 2771 (CSIPHY1 D-PHY, CSID1, ISPIF, VFE0 RDI0 write master into 3 GPU-pool buffers, SMMU identity
+0x420/0x421, MCLK 24 MHz from GPLL9, sensor init + 1280x720 tables parsed at run time from the stock library on the root,
+simple AE, 2 s self-check with fps line, `camframe`/`caminfo`/`camread` on the USB command server); root step
+`scripts/laurel/root-camera.sh` (in root.sh, CAMERA=0 skips); host `op10tool camframe` + `scripts/laurel/cam-frame.sh`
+(RAW10 -> PNG with demosaic). Build 252/252 patches, 0 LSE, kernel sha256 dcbae3a4...; host tests pass (cam-test,
+cam-frame-test). Details: docs/laurel_sprout/camera.md section 8.
+Next: owner flash (root with tables + boot image), read `LAUREL CAMERA: rear stream:` and run `scripts/laurel/cam-frame.sh`;
+then step 3 `/dev/negronicam` (NCFRAME1) and step 4 the iOS plug-in.

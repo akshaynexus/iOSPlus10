@@ -2,6 +2,7 @@
 //! Simple glue stays in shell/Python under scripts/.
 
 mod bootlog;
+mod camframe;
 mod ctl;
 mod fat;
 mod im4p;
@@ -75,6 +76,29 @@ enum Cmd {
         #[arg(long, default_value = "192.168.7.2")]
         host: String,
     },
+    /// Mi A3 rear camera frame over USB (kernel patch 2771): new capture, read, OUT/camframe-genN.raw10 + .png
+    /// (demosaic, white balance, gamma). --raw FILE: convert a saved RAW10 frame only.
+    Camframe {
+        /// the phone's address
+        #[arg(long, default_value = "192.168.7.2")]
+        host: String,
+        /// output directory
+        #[arg(long, default_value = "logs/camera")]
+        out: PathBuf,
+        /// take the frame the phone keeps (no new capture)
+        #[arg(long)]
+        no_capture: bool,
+        /// convert this RAW10 file (MIPI packed) instead of reading the phone
+        #[arg(long)]
+        raw: Option<PathBuf>,
+        #[arg(long, default_value_t = 1280)]
+        width: u32,
+        #[arg(long, default_value_t = 720)]
+        height: u32,
+        /// Bayer order for --raw: RGGB, BGGR, GRBG, GBRG or TPG (grey)
+        #[arg(long, default_value = "RGGB")]
+        bayer: String,
+    },
     /// Boot log of the last boots (kernel patch 0367): writes OUT/bootlog-<boot>.txt per boot and prints one
     /// summary line per boot (end: panic / reset without panic / clean / still running) and its last 5 lines.
     /// Source: the USB command server (UDP 5141) or --file (dump of /dev/negronibootlog or of the area)
@@ -123,6 +147,9 @@ fn main() -> Result<()> {
         Cmd::Fatls { image, paths, part_bytes } => fat::run(&image, &paths, part_bytes),
         Cmd::Im4p { input, output } => im4p::run(&input, &output),
         Cmd::Ctl { command, host } => ctl::run(command, &host),
+        Cmd::Camframe { host, out, no_capture, raw, width, height, bayer } => {
+            camframe::run(camframe::Args { host, out, no_capture, raw, width, height, bayer })
+        }
         Cmd::Bootlog { count, host, file, out, kernels, mkarea } => {
             bootlog::run(bootlog::Args { count, host, file, out, kernels, mkarea })
         }
