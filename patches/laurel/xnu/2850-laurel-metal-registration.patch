@@ -288,10 +288,11 @@ diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
 index 43f86a1..cf51eef 100644
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -13,6 +13,7 @@ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitc
+@@ -13,7 +13,8 @@ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitc
  iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
  iokit/Kernel/arm/TopazAudio.cpp                                  optional iokitcpp
  iokit/Kernel/arm/TopazRpm.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/LaurelBluetooth.cpp                             optional iokitcpp
 +iokit/Kernel/arm/LaurelMetal.cpp                                 optional iokitcpp
  iokit/Kernel/arm/SweetAMFIService.cpp                            optional iokitcpp
  iokit/Kernel/arm/SweetBusy.cpp                                   optional iokitcpp
