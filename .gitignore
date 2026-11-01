@@ -11,7 +11,7 @@
 *.adt
 getvar*.txt
 backup/
-!scripts/backup/      # the scripts are ours; the phone data lives in ~/laurel-backup and ~/op10-backup
+!scripts/backup/
 dumps/
 out/
 inputs/
