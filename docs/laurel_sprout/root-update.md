@@ -103,4 +103,21 @@ So the sparse image stays worth keeping: `root.sh` still makes it on each run.
 
 `root-update-test.sh` runs twice: GNU tools, then toybox 0.8.15 + dash of `out/ssh/host` alone in PATH (the same sources as the phone's). Cases: file list and classes, plist merge, key step, smoke step, inode of a "running" file, setuid, names with spaces and a quote, dry run writes nothing, failure in the commit with rollback, `--rollback` gives the same tree, lost link in the transfer and the commit, second run does nothing, removal of a dropped file, each refusal. `root-dry-run.sh` runs `root-delta.py` on the copy with the real stages.
 
-Not covered by a test: real HFS+, real SSH transfer rate, XNU rename under running daemons, `pmregister`, `ctl reboot`, stock `df` and `mount` output. See `docs/plan.md` for what ran on the phone.
+Results, merged tree (d571276 + this branch) [V]: `root-update-test.sh` 94 of 94 with GNU tools, 94 of 94 with toybox + dash. `build-honest-test.sh` 60 of 60. `root-dry-run.sh` PASS with `AIRPLAY=0 CELL=0` (their new stages are not built on this host): 12 installed, 2 off, 9739 paths, 593 MB. Before the merge, all 13 features: 9740 paths. A simulation with the real `launchd.plist` and `/private/var` plists of the 21:57 image: the job left the cache, dropbear got `-s`, Wi-Fi service kept, USB service without router and DNS, last in the order.
+
+## 8. The one read on the real phone (2026-11-01 23:45, read-only, 52 s, no file written)
+
+`rootupdate/main.py --dry-run` with the payload of `root-dry-run.sh`, not of `root.sh`, with the root of 21:57. Password login through `ssh-phone.sh` worked. Stat of 9740 paths and sha256 of the same-size files worked with the phone's toybox, stock `df` and `mount` [V].
+
+| Plan line | Meaning |
+| --- | --- |
+| exit 3: `volume size changed: phone 16384 MiB, new root 976248 MiB` | Correct for this payload: it was made on /home. A `root.sh` payload is made on the 16 GiB image. The phone's number is right |
+| 9481 `owner or mode` | Artifact: the copy has the host user as owner. A `root.sh` payload has the root's owners |
+| host key, `/usr/local/bin/df` | Artifact: this copy made a new host key and has no stock `df`. A real `root.sh` run has neither |
+| `mkdir /private/var/containers/Temp` | Real: the phone has no such folder. [I] Boot removes it. Fixed: such a folder alone is no reason for an update (`plan.trivial`) |
+| 12 of 13 plists: no change; `preferences.plist`: merge | Real: the phone holds our keys; only the USB service changes |
+| 18 files, about 42 MB, of which the two big ones: `NegroniMetal` 22.9 MB, `libOSMesa` 17.1 MB | Real for that stage set. A new build gives other numbers |
+
+## 9. Never run on the phone
+
+Owner rule, 2026-11-01: no flash, reboot or write to the phone unless the owner asks. So the write path has never run on the phone. Unproven: `tar xpf` from SSH on HFS+ and the transfer rate; rename under running daemons on XNU; setuid and owners on the phone; the key login with `-s`; the commit detached with `setsid nohup` under dropbear; `ctl reboot` after the commit; `pmregister` on this root; boot of the updated root; the kernel's in-place first line (its 199-character limit is from the source of patch 2912). `sudo root.sh` was not run either (sudo needs a password here), so no real payload exists yet. Start with `scripts/laurel/root-update.sh --dry-run` after a `root.sh` run: it writes nothing.

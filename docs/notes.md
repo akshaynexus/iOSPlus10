@@ -4850,6 +4850,8 @@ Full text: docs/laurel_sprout/camera.md section 13.
 - Gotcha: a `check` that redirects to the same file as `expect` eats the output: root-update-test.sh keeps `$T/last`.
 - Gotcha: out/ssh/hostkeys in the main checkout has root-only files: `cp -r` of out/ssh fails; `root-add-ssh.py` then makes a new key in a worktree and rewrites that worktree's known_hosts: set PHONE_KNOWN_HOSTS to the main checkout's for the real phone. No `phone_ed25519` in the main checkout before the next `sudo root.sh`.
 - Gotcha: `uptime` is not on the phone. `op10tool ctl reboot` is a hard reset: `sync` first.
+- [V phone, read-only plan] `/private/var/containers/Temp` is not on the phone, though the image has it; [I] boot removes it. A plan must not count such a folder as a change, or "nothing to do" never comes (`plan.trivial`).
+- The write path has never run on the phone: owner rule of 2026-11-01. root-update.md sections 8, 9.
 - A root step that adds a state file in /private/var (the phone changes it): add it to `KEEP` in root-delta.py, else an update overwrites it.
 - Host test of phone scripts: `out/ssh/host/{toybox,dash}` are Linux builds of the phone's tools; ROOT_UPDATE_PHONE_PATH puts them alone in PATH.
 ## Mi A3: AirPlay and AirDrop (2026-11-01, branch t3/laurel-airplay-airdrop, patches 2930 + 2931, userland/laurel/airplay; built + host tests, NOT RUN ON THE PHONE; docs/laurel_sprout/airplay-airdrop.md)
