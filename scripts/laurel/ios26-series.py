@@ -1,7 +1,7 @@
 """Mi A3 (SWEET machine config) series on xnu-12377.121.6: profile for scripts/ios26/apply-series.py.
 
 Same method as the negroni port (patches/xnu-12377/README.md): one series, data rules, base-owned files, an explicit
-skip list. Series = external/ios-topaz/xnu/patches/*.patch + patches/laurel/xnu/*.patch, sorted by name, the same 309
+skip list. Series = external/ios-topaz/xnu/patches/*.patch + patches/laurel/xnu/*.patch, sorted by name, the same 310
 patches as the iOS 16 kernel (scripts/laurel/kernel-linux.sh). A driver fix lands once.
 
 Base: patches/xnu-12377/0001 (non-Apple SoC base, shared with negroni) + patches/laurel/xnu-12377/NNNN-*.patch.

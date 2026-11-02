@@ -202,6 +202,8 @@ if command -v llvm-objdump >/dev/null; then
   echo "kernel-linux: LSE/RCpc instructions in the kernel: $n (must be 0: Kryo 260 is ARMv8.0)"
   # a printf with too many values panics the kernel at run time (log_encode.c:121)
   python3 -I "$REPO/scripts/laurel/printf-arg-check.py" "$W/xnu-src/xnu-8796.141.3" || exit 1
+  # laurel 2960: a range after the table end is a panic on a fault
+  python3 -I "$REPO/scripts/laurel/copyio-table-check.py" "$O.unstripped" || exit 1
   if [ "$n" != 0 ]; then
     llvm-objdump -d --mattr=+v8.5a "$O.unstripped" |
       grep -P "^[0-9a-f]+ <|$pat" | grep -B1 -P "$pat" | grep -P '^[0-9a-f]+ <' | sort -u >&2 || true

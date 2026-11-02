@@ -164,6 +164,12 @@ static volatile u64 g_exit;     /* where a case that ends in a signal goes */
 static volatile int g_lazy_fixes;       /* rules: faults that were fixed, as vm_fault would */
 static volatile u64 g_lazy_addr;
 static u64 g_counts[A64E_NCLASS];
+#ifdef LSE0081
+/* scripts/laurel/test-lse0081.sh: the iOS 16 path (topaz 0081 + laurel 2960) in place of laurel_a64emu. Fault path: as the kernel, through the kernel's table */
+extern const u64 copyio_recover_table[], copyio_recover_table_end[];
+extern const char lse0081_text_start[], lse0081_text_end[], lse0081_copyio_error[];
+static volatile u64 g_panics;
+#endif
 
 static void
 segv_handler(int sig, void *si, void *uc)
@@ -172,6 +178,31 @@ segv_handler(int sig, void *si, void *uc)
 	u64 pc = sc->r.pc;
 
 	(void)si;
+#ifdef LSE0081
+	if (pc >= (u64)lse0081_text_start && pc < (u64)lse0081_text_end) {
+		/* as handle_kernel_abort(): no entry in the table is a panic. An entry: vm_fault for the user map, success runs the access again, else recovery */
+		for (const u64 *t = copyio_recover_table; t < copyio_recover_table_end; t += 3) {
+			if (pc >= t[0] && pc < t[1]) {
+				if (g_lazy_addr && (sc->fault_address & ~0xfffULL) == g_lazy_addr) {
+					sys6(SYS_mprotect, (long)g_lazy_addr, 4096, 3, 0, 0, 0);
+					g_lazy_addr = 0;
+					g_lazy_fixes++;
+					return;
+				}
+				sc->r.pc = t[2];
+				return;
+			}
+		}
+#ifdef LSE0081_BEFORE
+		/* the old text: the kernel panics here. Count it and go on, so that the run shows every difference */
+		g_panics++;
+		sc->r.pc = (u64)lse0081_copyio_error;
+		return;
+#else
+		die("PANIC: copyio recovery: a fault in the LSE code is not in the table");
+#endif
+	}
+#endif
 	for (const u64 *t = __start_a64emu_recover; t < __stop_a64emu_recover; t += 3) {
 		if (pc >= t[0] && pc < t[1]) {
 			/* a fault in the LL/SC or load code: as handle_kernel_abort(). A lazy page is fixed and the access runs again; else recovery */
@@ -275,7 +306,11 @@ enc_b(const u32 *from, const void *to)
 
 /* memory window */
 #define MEMSZ 2048
+#ifdef LSE0081
+static u8 mem[4096] __attribute__((aligned(4096)));     /* its own page: the test changes the protection of the page */
+#else
 static u8 mem[MEMSZ + 64] __attribute__((aligned(4096)));
+#endif
 #define CELL (mem + MEMSZ / 2)
 
 static u64 rs;
@@ -457,6 +492,13 @@ static const struct tmpl tmpls[] = {
 	{ 0x38200000, RD | RN | RM | (3u << 30) | (3u << 22) | (7u << 12), A64E_LSE, 3, TK_LSE, "ldop" },
 	{ 0x38208000, RD | RN | RM | (3u << 30) | (3u << 22), A64E_LSE, 3, TK_LSE, "swp" },
 	{ 0x08A07C00, RD | RN | RM | (3u << 30) | (1u << 22) | (1u << 15), A64E_LSE, 3, TK_CAS, "cas" },
+#ifdef LSE0081
+	{ 0x38BFC000, RD | RN | (3u << 30), A64E_LSE, 3, TK_RCPC, "ldapr" },
+	/* the neighbours that must stay undefined: LDAPR with other A, R; other values of o3:opc; CAS with Rt2 not 31 */
+	{ 0x383FC000, RD | RN | (3u << 30) | (3u << 22), A64E_LSE, 3, TK_RCPC, "ldapr-ar" },
+	{ 0x38208000, RD | RN | RM | (3u << 30) | (3u << 22) | (7u << 12), A64E_LSE, 3, TK_LSE, "o3" },
+	{ 0x08A00000, RD | RN | RM | (3u << 30) | (1u << 22) | (1u << 15) | (0x1Fu << 10), A64E_LSE, 3, TK_CAS, "cas-rt2" },
+#endif
 	{ 0x08207C00, RD | RN | RM | (1u << 30) | (1u << 22) | (1u << 15), A64E_CASP, 3, TK_CASP, "casp" },
 	/* RCpc */
 	{ 0x38BFC000, RD | RN | (3u << 30), A64E_RCPC, 3, TK_RCPC, "ldapr" },
@@ -922,6 +964,10 @@ exh_main(const char *mode, const char *path)
 	return 0;
 }
 
+#ifdef LSE0081
+#include "harness_hooks.inc"
+#endif
+
 static int
 cases_main(const char *mode, const char *cls_name, u64 ncases, u64 seed, const char *path, int dump, u64 dump_n)
 {
@@ -965,6 +1011,9 @@ cases_main(const char *mode, const char *cls_name, u64 ncases, u64 seed, const c
 		struct plan p;
 		g_mark = MARK_OK;
 		make_case(&tmpls[ti], &s, &p, native);
+#ifdef LSE0081
+		lse0081_prepare(&s, &p, native);
+#endif
 		if (native && cls == A64E_SYSREG) {
 			__asm__ volatile (".long 0xD503405F");  /* msr DIT, #0: a case before it left DIT on, and an A73 has no DIT to keep */
 		}
@@ -982,6 +1031,9 @@ cases_main(const char *mode, const char *cls_name, u64 ncases, u64 seed, const c
 			print_state("in", &s);
 		}
 		run_case(&s);
+#ifdef LSE0081
+		lse0081_restore();
+#endif
 		finish_case(&s, &in, &p, native);
 		if (dump && n == dump_n) {
 			wr(1, "mark ");
@@ -1021,6 +1073,12 @@ cases_main(const char *mode, const char *cls_name, u64 ncases, u64 seed, const c
 	out_u(ncases);
 	wr(1, " emulated ");
 	out_u(g_counts[cls]);
+#ifdef LSE0081
+	wr(1, " panics ");
+	out_u(g_panics);
+	wr(1, " lazy ");
+	out_u((u64)g_lazy_fixes);
+#endif
 	wr(1, "\n");
 	return 0;
 }
@@ -1057,6 +1115,9 @@ mapa(u64 *p, int prot)
 	return r;
 }
 
+#ifdef LSE0081
+#include "harness_rules.inc"
+#else
 static int
 rules_main(void)
 {
@@ -1177,6 +1238,7 @@ rules_main(void)
 	wr(1, "\n");
 	return g_fail != 0;
 }
+#endif
 
 /* ---- threads: LL/SC on real threads against the emulated words ---- */
 void llsc_add(volatile u64 *, u64);
@@ -1314,6 +1376,10 @@ threads_main(u64 iter)
 	out_u(iter * 2 * NTHR);
 	wr(1, "\n");
 	bad |= g_plain != iter * 2 * NTHR;
+#ifdef LSE0081
+	/* CASP is not in 0081: it stays undefined on the iOS 16 kernel */
+	return bad;
+#endif
 	g_pair[0] = g_pair[1] = 0;
 	g_torn = 0;
 	start_all(4, 5);

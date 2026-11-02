@@ -1,0 +1,111 @@
+laurel 2960: iOS 16 EL0 LSE emulation (topaz 0081). The table end moves after the four ranges (a fault in an emulated word was a panic); LDUMIN uses the flags of the values (it always stored the operand); a bad pointer gives EXC_BAD_ACCESS, also with the second vm_fault, not EXC_BAD_INSTRUCTION; top byte ignored; LDAPR with other A, R stays undefined. iOS 16 only: patches/laurel/xnu-12377/skip.txt. Test: scripts/laurel/test-lse0081.sh.
+
+--- a/osfmk/arm64/machine_routines_asm.s
++++ b/osfmk/arm64/machine_routines_asm.s
+@@ -1311,9 +1311,6 @@
+ 
+ #endif // defined(HAS_APPLE_PAC)
+ 
+-    /* THIS MUST STAY LAST IN THIS FILE */
+-	COPYIO_RECOVER_TABLE_SYM	copyio_recover_table_end
+-
+ /* vim: set sw=4 ts=4: */
+ 
+ 
+@@ -1382,6 +1379,7 @@
+ 	csel	\r\()11, \r\()10, \r\()2, hi
+ 	cmp	w1, #6
+ 	b.eq	5f
++	cmp	\r\()10, \r\()2	/* laurel 2960: the flags of the values, not of cmp w1, #6: LDUMIN always stored the operand */
+ 	csel	\r\()11, \r\()10, \r\()2, lo
+ 5:	\stx	w9, \r\()11, [x0]
+ 	cbnz	w9, 1b
+@@ -1400,3 +1398,10 @@
+ 	SWEET_LSE w, ldaxr,  stlxr,  w, "mov w12, w10",  "mov w13, w2"
+ 	SWEET_LSE x, ldaxr,  stlxr,  x, "mov x12, x10",  "mov x13, x2"
+ #endif /* SWEET */
++
++    /*
++     * THIS MUST STAY LAST IN THIS FILE
++     * laurel 2960: moved here. find_copyio_recovery_entry() walks up to this symbol: the four ranges of the code above were after it, so a fault in an emulated LSE word
++     * (a first write to a COW page, a page not there yet, a bad pointer) was a kernel panic.
++     */
++	COPYIO_RECOVER_TABLE_SYM	copyio_recover_table_end
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -881,6 +881,34 @@
+ extern int _sweet_lse_w(user_addr_t, uint32_t, uint64_t, uint64_t, uint64_t *);
+ extern int _sweet_lse_x(user_addr_t, uint32_t, uint64_t, uint64_t, uint64_t *);
+ 
++__dead2 static void
++sweet_lse_bad_access(arm_saved_state_t *state, mach_exception_data_type_t code, user_addr_t va)
++{
++	mach_exception_data_type_t codes[2] = { code, (mach_exception_data_type_t)va };
++
++	thread_reset_pcs_will_fault(current_thread());
++	set_saved_state_far(state, va);
++	exception_triage(EXC_BAD_ACCESS, codes, 2);
++	__builtin_unreachable();
++}
++
++/*
++ * laurel 2960: the access gave EFAULT. handle_kernel_abort() already ran vm_fault with THREAD_UNINT and it failed. Ask once more, as handle_user_abort() does, for the real
++ * result. Success: the map changed in between. KERN_ABORTED: a signal is pending. In both, back to EL0 on the same word, which traps again. Else what the real word gives:
++ * EXC_BAD_ACCESS with the code and address, PC on the word, no register changed.
++ */
++static bool
++sweet_lse_fault(arm_saved_state_t *state, user_addr_t va, user_addr_t addr, bool write)
++{
++	kern_return_t kr = vm_fault(current_map(), vm_map_trunc_page(addr, PAGE_MASK), write ? (VM_PROT_READ | VM_PROT_WRITE) : VM_PROT_READ,
++	    FALSE, VM_KERN_MEMORY_NONE, THREAD_ABORTSAFE, NULL, 0);
++
++	if (kr != KERN_SUCCESS && kr != KERN_ABORTED) {
++		sweet_lse_bad_access(state, kr, va);
++	}
++	return true;
++}
++
+ /*
+  * topaz (Cortex-A53/A73, ARMv8.0): the iPhone X userland still has LSE
+  * atomics (LD<op>, SWP, CAS) and LDAPR outside its CPU-capability checks.
+@@ -904,8 +932,8 @@
+ 			op = opc;
+ 		} else if (opc == 0) {
+ 			op = 8;         /* SWP */
+-		} else if (opc == 4 && rs == 31) {
+-			op = 10;        /* LDAPR */
++		} else if (opc == 4 && rs == 31 && ((instr >> 22) & 3) == 2) {
++			op = 10;        /* LDAPR: A = 1, R = 0. laurel 2960: other values are undefined */
+ 		} else {
+ 			return false;
+ 		}
+@@ -926,9 +954,17 @@
+ 		return false;
+ 	}
+ 
+-	user_addr_t addr = rn == 31 ? get_saved_state_sp(state) : get_saved_state_reg(state, rn);
+-	if ((addr & ((1ULL << size) - 1)) != 0 || addr >= MACH_VM_MAX_ADDRESS) {
+-		return false;
++	/*
++	 * laurel 2960: as the real word at EL0. The top byte is ignored (TBI0). Bit 55 stays in addr, so an address of the upper half is above the limit and never reaches the
++	 * access, which at EL1 would reach kernel memory. Alignment comes first, as in the CPU. These gave EXC_BAD_INSTRUCTION before.
++	 */
++	user_addr_t va = rn == 31 ? get_saved_state_sp(state) : get_saved_state_reg(state, rn);
++	user_addr_t addr = va & 0x00FFFFFFFFFFFFFFULL;
++	if ((addr & ((1ULL << size) - 1)) != 0) {
++		sweet_lse_bad_access(state, EXC_ARM_DA_ALIGN, va);
++	}
++	if (addr >= MACH_VM_MAX_ADDRESS) {
++		sweet_lse_bad_access(state, KERN_INVALID_ADDRESS, va);
+ 	}
+ 	switch (size) {
+ 	case 0: err = _sweet_lse_b(addr, op, operand, compare, &old); break;
+@@ -937,7 +973,7 @@
+ 	default: err = _sweet_lse_x(addr, op, operand, compare, &old); break;
+ 	}
+ 	if (err != 0) {
+-		return false;
++		return sweet_lse_fault(state, va, addr, op != 10);
+ 	}
+ 	if (dst != 31) {
+ 		set_saved_state_reg(state, dst, (register_t)old);

@@ -10,6 +10,7 @@ pat='\t(cas\w*|ldadd\w*|ldset\w*|ldclr\w*|ldeor\w*|swp\w*|ldapr\w*)\s'
 n=$(llvm-objdump -d --mattr=+v8.5a "$K" | grep -cP "$pat" || true)
 echo "kernel-ios26: LSE/RCpc instructions in the kernel: $n (must be 0: Kryo 260 is ARMv8.0)"
 python3 -I "$REPO/scripts/laurel/printf-arg-check.py" "$XNU_SRC" || exit 1
+python3 -I "$REPO/scripts/laurel/copyio-table-check.py" "$K.unstripped" || exit 1
 # 22 words (21 on the iOS 16 kernel, same symbols + one lz4 constant): data under these symbols, decoded as instructions (2026-11-02)
 python3 -I "$REPO/scripts/laurel/armv80-check.py" --data-syms K256,_lz4_decode_asm,_lz4_encode_2gb,fleh_irq_sp1,fleh_fiq_sp1,preempt_underflow,preempt_count_notzero,_update_mdscr "$K.unstripped" || exit 1
 if [ "$n" != 0 ]; then

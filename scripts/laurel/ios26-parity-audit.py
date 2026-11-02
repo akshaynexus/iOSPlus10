@@ -92,6 +92,7 @@ ROWS = [
         action='ios26-root-spec.py main() and tweaks()', claims=('script:mkiosroot.sh',)),
     row('Kernel base: CPU, RAM, UFS, boot, power off', 'kernel', '2000 2003 2004 2009 2011 2012 2015 2016 2018 2100 2404 2902 2906 2916', kind='kernel', action=NOTE_KERNEL),
     row('Sandbox grants, entitlements', 'kernel', '2903 2910', kind='kernel', action='Grants by entitlement, not by process name [V 2910]; 23F84 ops: post/9000'),
+    row('EL0 LSE emulation fixes of topaz 0081', 'kernel 2960', '2960', kind='na', action='iOS 26 has its own emulator (laurel_a64emu) and post/9000 moved the table end; 2960 is in skip.txt: docs/laurel_sprout/ios16-lse.md'),
     row('Dual boot, build stamp', 'kernel; dual-boot.sh; root-manifest', '2912 2950', paths=('usr/share/laurel/root-manifest',), action='The manifest has one row per hook here'),
 ]
 

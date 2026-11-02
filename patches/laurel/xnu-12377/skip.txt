@@ -6,3 +6,4 @@
 0007-sweet-stub-apple-internal-headers.patch not needed: base 0001 guards sart.h, uat.h and tunables.s with XNU_MONITOR or APPLE_ARM64_ARCH_FAMILY; 12377 task.c has no t_kpc
 0013-sweet-kmem-rng-without-corecrypto.patch in base 0005: 12377 moved the kmem guard-object random from vm_kern.c to vm_map_store.c; SplitMix64 code ported there
 2011-laurel-boot-line-1024.patch upstream: 12377 BOOT_LINE_LENGTH is 1024 (pexpert/pexpert/arm64/boot.h)
+2960-laurel-lse-emulation.patch not needed: iOS 16 fix of the topaz 0081 text. On this kernel LSE goes to laurel_a64emu, and post/9000 moved the table end; 0081 stays only with laurelemu=0 (base 0003), unchanged here so that this kernel stays byte-identical
