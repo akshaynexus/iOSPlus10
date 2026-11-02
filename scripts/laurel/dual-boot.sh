@@ -639,7 +639,23 @@ switch)
   _inst=$(sed -n 's/^installed .* \([0-9a-f]\{64\}\)$/\1/p' "$RESULT" 2>/dev/null | tail -1)
   [ -n "$_inst" ] || die "no record of an installed root: dual-boot.sh install"
   _h=$(ash "head -c 1048576 /dev/block/by-name/iosroot | sha256sum") || die "cannot read iosroot on the phone"
-  [ "${_h%% *}" = "$_inst" ] || die "iosroot does not start with the installed root: dual-boot.sh install"
+  if [ "${_h%% *}" != "$_inst" ]; then
+    # [V phone 2026-11-02] A writable iOS boot changes the volume header and journal in the first MiB. So after the read-only gate, a writable switch accepts the same volume: signature, create date, block size and block count against the image. Anything else is still refused.
+    _img=$(sed -n 's/^installed [^ ]* \(.*\) [0-9a-f]\{64\}$/\1/p' "$RESULT" 2>/dev/null | tail -1)
+    _same=0
+    if [ "$m" = rw ] && grep -q '^ro-on ' "$RESULT" 2>/dev/null && [ -f "$_img" ]; then
+      _pv=$(ash "dd if=/dev/block/by-name/iosroot bs=512 skip=2 count=1 2>/dev/null | od -An -tx1 -N48") || die "cannot read iosroot on the phone"
+      _pv=$(echo "$_pv" | tr -d ' \n')
+      _iv=$(dd if="$_img" bs=512 skip=2 count=1 2>/dev/null | od -An -tx1 -N48 | tr -d ' \n')
+      # hex digits: signature 0-3, create date 32-39, block size 80-87, total blocks 88-95
+      for _f in 1-4 33-40 81-96; do
+        [ "$(echo "$_pv" | cut -c$_f)" = "$(echo "$_iv" | cut -c$_f)" ] || _same=2
+      done
+      [ "$_same" = 2 ] || _same=1
+    fi
+    [ "$_same" = 1 ] || die "iosroot does not start with the installed root: dual-boot.sh install"
+    say "iosroot: the same volume as the installed root; a writable iOS boot changed its header"
+  fi
   [ -f "$bi" ] || die "missing $bi: dual-boot.sh image${1:+ $1}"
   "$REPO/scripts/laurel/android-guard.sh" boot-image "$bi"
   grep -q "^mode $m\$" "$bi.dualboot" || die "$bi is not a $m image"
