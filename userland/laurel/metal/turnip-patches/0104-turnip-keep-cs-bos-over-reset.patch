@@ -1,0 +1,68 @@
+laurel (Mi A3, iOS 26): tu_cs_reset frees all BOs of a command stream but the last, so a command buffer that grew makes them again after each reset: a kernel buffer, a map, a free per frame. RedwoodGPU boot 16 with live glass: 650 to 683 buffers made in 5 s, 680 to 1385 us each, while the kernel keeps nothing under 256 KiB.
+A reset CS keeps up to 8 BOs per array and takes them at its next growth. A command buffer is reset only after the GPU is done with it. Applied by scripts/gpu/turnip-build.sh (TU_EXTRA_PATCHES). [V] code path, compiled; effect on the count: next boot.
+
+--- a/src/freedreno/vulkan/tu_cs.h	2026-11-03 03:01:15.224352563 +0530
++++ b/src/freedreno/vulkan/tu_cs.h	2026-11-03 03:01:40.128173218 +0530
+@@ -76,6 +76,9 @@
+    uint32_t bo_count;
+    uint32_t bo_capacity;
+    uint32_t *start;
++   /* laurel: BOs kept over a reset, for the next growth of this CS */
++   struct tu_bo *spare[8];
++   uint32_t spare_count;
+ };
+ 
+ #define TU_COND_EXEC_STACK_SIZE 4
+--- a/src/freedreno/vulkan/tu_cs.cc	2026-11-03 03:01:15.223997171 +0530
++++ b/src/freedreno/vulkan/tu_cs.cc	2026-11-03 03:01:40.128394586 +0530
+@@ -81,6 +81,11 @@
+       tu_bo_finish(cs->device, cs->read_write.bos[i]);
+    }
+ 
++   for (uint32_t i = 0; i < cs->read_only.spare_count; ++i)
++      tu_bo_finish(cs->device, cs->read_only.spare[i]);
++   for (uint32_t i = 0; i < cs->read_write.spare_count; ++i)
++      tu_bo_finish(cs->device, cs->read_write.spare[i]);
++
+    if (cs->refcount_bo)
+       tu_bo_finish(cs->device, cs->refcount_bo);
+ 
+@@ -155,6 +160,18 @@
+ 
+    struct tu_bo *new_bo;
+ 
++   /* laurel: one kept over a reset: no new kernel buffer, no map (RedwoodGPU made 130 buffers a second with live glass) */
++   for (uint32_t i = bos->spare_count; i > 0; --i) {
++      if (bos->spare[i - 1]->size >= size * sizeof(uint32_t)) {
++         new_bo = bos->spare[i - 1];
++         bos->spare[i - 1] = bos->spare[--bos->spare_count];
++         bos->bos[bos->bo_count++] = new_bo;
++         cs->start = cs->cur = cs->reserved_end = (uint32_t *) new_bo->map;
++         cs->end = cs->start + new_bo->size / sizeof(uint32_t);
++         return VK_SUCCESS;
++      }
++   }
++
+    VkResult result =
+       tu_bo_init_new(cs->device, NULL, &new_bo, size * sizeof(uint32_t),
+                      (enum tu_bo_alloc_flags)(COND(!cs->writeable,
+@@ -501,11 +518,19 @@
+    }
+ 
+    for (uint32_t i = 0; i + 1 < cs->read_only.bo_count; ++i) {
++      if (cs->read_only.spare_count < ARRAY_SIZE(cs->read_only.spare)) {
++         cs->read_only.spare[cs->read_only.spare_count++] = cs->read_only.bos[i];
++         continue;
++      }
+       TU_RMV(resource_destroy, cs->device, cs->read_only.bos[i]);
+       tu_bo_finish(cs->device, cs->read_only.bos[i]);
+    }
+ 
+    for (uint32_t i = 0; i + 1 < cs->read_write.bo_count; ++i) {
++      if (cs->read_write.spare_count < ARRAY_SIZE(cs->read_write.spare)) {
++         cs->read_write.spare[cs->read_write.spare_count++] = cs->read_write.bos[i];
++         continue;
++      }
+       TU_RMV(resource_destroy, cs->device, cs->read_write.bos[i]);
+       tu_bo_finish(cs->device, cs->read_write.bos[i]);
+    }
