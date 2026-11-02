@@ -314,6 +314,7 @@
 2914-laurel-touch-event-stamp.patch                            applied
 2915-laurel-frame-path.patch                                   applied
 2916-laurel-wired-screen-first.patch                           applied
+2917-laurel-frame-motion-end.patch                             applied
 2920-laurel-mic-wcd937x.patch                                  applied
 2930-laurel-wifi-awdl-header.patch                             applied
 2931-laurel-awdl-self-check.patch                              applied
@@ -335,4 +336,6 @@
 9004-laurel-cs-no-page-hash.patch                              post
 9005-laurel-backlight-calibration.patch                        post
 9006-laurel-hid-2238.patch                                     post
-== series: 213 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
+9007-laurel-stackshot-late-cpu.patch                           post
+9008-laurel-vsync-refresh-period.patch                         post
+== series: 214 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors

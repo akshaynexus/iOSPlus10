@@ -52,4 +52,6 @@ header or kernelcache is in git: they stay in `out/` and `~/op10-apple/`.
 
 `post/9007`: `LAUREL DEBUG ACK: on: stackshot given up`: a CPU late for a stackshot costs that stackshot (as in xnu-8796), not a panic; `debug-ack` 100 ms in place of 12.5 ms on this timer. Boot 11: panic 2 s after Preferences started, CPU 5 late. Why CPU 5 was late: [U].
 
+`post/9008`: `LAUREL FRAME: on: vsync gives CoreAnimation the refresh period`: the third number of the vsync message is the period on 23F84, not a counter (`docs/laurel_sprout/gpu.md` "The 24 fps windows"). Kill switch `sweetfb_period=0`.
+
 Host tests of what lives in `post/9000`: `scripts/laurel/test-a64emu.sh` (emulator), `scripts/laurel/test-slide.sh` (slide on 4 KiB pages), `scripts/laurel/test-apple80211.sh` (23F84 Apple80211).

@@ -1152,3 +1152,7 @@ Done: fence wait no longer spins (`negroni_drm.c`, deadline on the kernel's cloc
 Results [V host]: `test-fence-wait.sh c811ee5`: 1 system call against 3,900. `test-renderbox-effects.sh`: 3 pipelines made for FD610, the control gives the phone's refusal. `ios26-root-spec.py --self-test`: perf 12 of 12, recover 7 of 7, parity 42 of 42 (with the stages a worktree has). `ios26-metal-build.sh all` from a fresh fetch: 8 Mach-O files, 0 failed, 0 instructions newer than ARMv8.0.
 Not proven: all of it on the phone; pixels of the effects; what the 8 on-device learning jobs' clients do with no service.
 Next: new root + the owner's flash (`ios26-root.sh`, then `dual-boot.md`); read section 7 of the doc. Kernel: 745 MHz (section 5). Then pool (section 6).
+## Mi A3 iOS 26: the 24 fps windows (2026-11-03, branch t3/compositor-24fps-investigation; kernel built, NOT BOOTED)
+Done: cause found: backboardd's boot-UI spinner, 24 images in 1 s, after a backboardd restart; not a cap and no clock error. Patch 2917: a motion that ends has its LAUREL FRAME lines. post/9008: vsync gives the refresh period, the old value was a tick counter.
+Results [V host]: `frame-pace.py --test` all pass; kernel-ios26-linux.sh builds with both patches. Details: `docs/laurel_sprout/gpu.md` "The 24 fps windows".
+Next: boot the kernel; read `LAUREL FRAME: motion ended` during a Settings scroll, and `oslogstream` at a restart to name the spinner. Open: the 135 s to the end of the spinner in boot 12.

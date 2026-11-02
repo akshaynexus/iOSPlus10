@@ -5210,3 +5210,8 @@ Full text: `docs/laurel_sprout/ios26-gpu-lag.md`.
 - The kernel holds CX + MX NOM for the boot, and stock 745 MHz needs just that: the next cheap GPU gain, not done (no host proof).
 - `LAUREL CPU TOP` hides ended tasks: 197 to 284 s a minute in boot 11, names [U].
 
+## 2026-11-03: Mi A3 iOS 26: "24 fps" is backboardd's boot-UI spinner, and vsync sent a counter as the period
+- [V] 23F84 backboardd: `BKDisplayRenderOverlaySpinny`: 24 images, 1.0 s, discrete keyframes. Shown after a restart of backboardd, not at the first start of a boot. Gaps 2 + 3 ticks, 120 + 120 in 10 s, as `scripts/laurel/frame-pace.py --test` gives. [I] It is what ran in the windows: no log line names it.
+- [V] `late` = gap over 20 ms, no missed deadline. A SWEET FPS line needs 10 s with no pause, so the real UI had no line: patch 2917 prints a motion when it ends.
+- [V] `vsync_callback` reads a2 + a3 as the next refresh; we sent a3 = tick counter. post/9008 sends the period; kill switch `sweetfb_period=0`. Not booted. The 19.2 / 24 MHz idea is wrong: tick and INTF1 are right on the host clock.
+- Do not chase 24 fps again: first run `frame-pace.py LOG`. Details: `docs/laurel_sprout/gpu.md` "The 24 fps windows".

@@ -937,6 +937,30 @@ Reading: `moving` near 60 and few `<36` gaps = smooth. `M past one panel frame` 
 
 `sweetfb_lock=0` (plain timer), `gpuclientseed=0`, `glenv=FD_MESA_DEBUG=gmem` (tiles), `NEGRONIMETAL_RB_FAMILY=0`. A planes failure turns itself off with one line. Touch: `sweettouchirq=0` as before.
 
+## The 24 fps windows are the boot-UI spinner (boot 2026-11-03 00:49; patches 2917, post/9008; built, NOT BOOTED)
+
+**Result.** `SWEET FPS: 239 frames in 10008 ms ... 239 late` is not a cap. It is the pace of one animation in backboardd.
+
+| Label | Fact | Evidence |
+|---|---|---|
+| [V] | `-[BKDisplayRenderOverlaySpinny _startAnimating]`: `CAKeyframeAnimation` on `contents`, `kCAAnimationDiscrete`, duration 1.0 s, repeat 2^31. `_spinnyImageSequence`: `imageCount:24` | `/usr/libexec/backboardd`, code 0x100028404 and 0x100028018. The phone's file has the same two instructions at file offsets 164060 and 165016 (`od`) |
+| [V] | `-[BKBootUIOverlayVendor currentOverlayWithLevel:]`: `isFirstBoot` gives the Apple logo; all else gives "Current bootUI is the spinny". `-[BKBootUIPresenter _queue_updateOverlayForReason:]` removes it when the screen owner finished startup | 0x10009fcbc, 0x1000a4308 |
+| [V] | All 24 fps windows follow a backboardd restart: pid 395, 500, 1339. The first start of a boot (pid 66) has 7 to 16 frames/s and no such window | `logs/usblog-20261103-000638.txt` |
+| [V] | Tick correct: 600 ticks of 16666 us; `SWEET INTF1: 300 frames in 5 s` each 5.0 s on the host clock; `hw.tbfrequency` 19200000. So no 19.2/24 MHz error in the tick | log, `ksysctl` |
+| [V] | Gaps: `<36 120, <52 120, longer 0`, 240 flips (00:08:03). `frame-pace.py --test`: a 1/24 s timer on 1/60 s ticks gives exactly this. A fixed cost per frame gives one gap size, so no load gives a 2 + 3 mix | `scripts/laurel/frame-pace.py` |
+| [V] | Same number with no Metal device and CPUs 96 % busy, and on Metal with CPUs 26 % busy. CA can go faster: 00:49:08 has 15 gaps under 20 ms | log |
+| [V] | Screen black in the window: `0 of 64 samples lit` at 5 s, the next screen line at 140 s; 400 KB out of the cache in each 5 s line. Lit UI after: backboardd 0.0 to 0.2 % CPU, 3317 to 3386 command buffers in 30 s | log, `ps` |
+| [I] | The spinner is what ran in these windows. No log line names it: the os_log lines did not reach the USB log | To prove at the next restart: `oslogstream` lines `Current bootUI is the spinny`, `updateOverlay: Dismissing overlay` |
+| [U] | Why the screen owner took 135 s in boot 12 and about 25 s in the restart of 00:07:42. The spinner ended near 00:51:21, with `display off` and the owner's key presses in the same seconds | |
+
+**Meaning of the line.** `late` is every gap over 20 ms, so a 24 Hz animation is 100 % late with no missed deadline: `0 past one panel frame` in the same window. `came N us after the tick` is tick to SwapEnd. A window ends with a line only after 10 s with no pause over 500 ms, so the real UI, with pauses, printed nothing. Boot 12 has no line after 00:51:12, with Preferences open: the GPU line has 12 to 56 submissions per 5 s there. **Before 2917 no 23F84 log has a frame rate of real use.**
+
+**2917** (both kernels): at a pause over 500 ms, a motion of 10 frames or more prints `LAUREL FRAME: motion ended: N frames in M ms` and the two LAUREL FRAME lines.
+
+**Second defect, real, not the 24: post/9008** (12377 only). [V] `IOMobileFramebufferVsyncNotifyFunc` gives the three numbers of the message to `IOMFBServer::vsync_callback(fb, a1, a2, a3, refcon)`. a1 goes only to kdebug. a2 is this refresh, `add x22, x20, x21` makes a2 + a3 the next one. That time is the one `render_for_time` gets and the one compared with the next update; a3 is also `videoRefreshPeriod`. Our order was (refresh, refresh, **counter**). At 19.2 MHz the "period" is 3.1 us per tick: 3.75 ms after 20 min, right only after 89 min, 135 ms after 12 h. Now (counter, refresh, period), kill switch `sweetfb_period=0`. This answers K8 of `ios26-metal.md`. IOS-26-Hot 0121: 15.8 to 21 fps on a Home swipe for the same slot [their log, not verified]. [V model] A due time inside a tick renders one tick later with the old value (`frame-pace.py`). [I] Expected: the spinner stays at 24; UI motion loses up to one tick of delay. With 16 ms of GPU a frame (the GPU line in these windows) + 6 ms flush to latch, a full-screen redraw has 2 ticks: about 30 fps until the GPU cost falls. iOS 16 stays as it was: its QuartzCore was not read here [U].
+
+Tools: `scripts/ios26/objc-methods.py BINARY [CLASS]`, `scripts/ios26/objc-stub-sel.py BINARY VADDR...`, `scripts/laurel/dsc-image.py CACHE fn QuartzCore __ZN2CA12WindowServer11IOMFBServer14vsync_callbackEP21__IOMobileFramebufferyyyPv`.
+
 ## Black layers (boot 2026-11-01 23:28; patches 2916, eagl 0006, Mesa 0003; built + host test, NOT BOOTED)
 
 Owner: "Maps shows a map, but all in black. Widgets are failing to render again." Kernel 4ec4584, root 21:57 (3fba60e). Logs: `logs/laurel-boot-maps.txt` (ends 23:31:36), `logs/phone/metal.log` (pulled 23:31), good boot `logs/laurel-boot-2208.txt`. **No line below proves a map on the screen: a host build cannot.** [V] log, source or binary. [I] inference. [U] unknown.
