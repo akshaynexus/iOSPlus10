@@ -1,0 +1,16 @@
+--- a/osfmk/vm/vm_resident.c	2026-11-02 17:57:06.550949551 +0530
++++ b/osfmk/vm/vm_resident.c	2026-11-02 17:57:06.561851319 +0530
+@@ -2780,7 +2780,12 @@
+ 	vm_page_pages = vm_pages_count; /* used to report to user space */
+ 
+ 	if (!vm_himemory_mode) {
+-		for (uint32_t i = npages; i-- > 0;) {
++		/*
++		 * laurel: npages is an estimate. The loop above stops at the last real page, so entries from
++		 * vm_pages_count on were never initialized, and on warm RAM they hold old bytes. The first
++		 * iOS 26 boot on the Mi A3 panicked here: vm_page.h:1167 NEXT_PAGE(mem) == VM_PAGE_NULL.
++		 */
++		for (uint32_t i = vm_pages_count; i-- > 0;) {
+ 			/* skip retired pages */
+ 			if (!VMP_ERROR_GET(vm_page_get(i))) {
+ 				vm_page_release_startup(vm_page_get(i));
