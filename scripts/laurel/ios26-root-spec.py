@@ -139,6 +139,27 @@ def program(job):
     return os.path.basename(prog)
 
 
+def no_recover_on_crash(t, jets):
+    """Bring-up: launchd must not reboot the phone when a UI daemon crashes 3 times in 60 s. The flag is the key RecoverOnCrash in Version4/Daemon/Override of the jetsam file
+    (backboardd, SpringBoard, configd, runningboardd on N104) [V launchd 0x10000ea10, 0x100021c4c; docs/laurel_sprout/ios26-backboardd.md section 4]. Without it the job restarts every
+    ThrottleInterval and SSH stays up. Cost: the phone does not reboot itself out of such a loop, so no boot uses up a retry of slot b. RECOVER_ON_CRASH=1 at the root build keeps Apple's key."""
+    if os.environ.get('RECOVER_ON_CRASH') == '1':
+        t.audit('jetsam RecoverOnCrash', 'kept', 'RECOVER_ON_CRASH=1: launchd reboots after 3 crashes in 60 s of these daemons, and SSH goes with it')
+        return
+    gone = set()
+    for j in jets:
+        d = plistlib.loads(t.read(j))
+        over = d.get('Version4', {}).get('Daemon', {}).get('Override', {})
+        names = [n for n, e in over.items() if isinstance(e, dict) and e.pop('RecoverOnCrash', None) is not None]
+        if names:
+            t.write(j, plistlib.dumps(d, fmt=plistlib.FMT_BINARY))
+            gone.update(names)
+    if gone:
+        t.audit('jetsam RecoverOnCrash', 'applied', f'removed from {sorted(gone)}: a crash loop of these daemons restarts them and does not reboot the phone, so SSH stays up; the phone does not reboot itself out of such a loop: Power + Vol Down, or op10tool ctl bootloader; RECOVER_ON_CRASH=1 at the root build keeps the key')
+    else:
+        t.audit('jetsam RecoverOnCrash', 'not-found', 'no daemon has the key')
+
+
 def tweaks(t, a):
     if not t.exists(XPC):
         raise SystemExit(f'no {XPC} in the OS volume')
@@ -245,6 +266,7 @@ def tweaks(t, a):
         t.audit('jetsam ' + os.path.basename(j).decode(), 'applied', f'{r1}; {r2}')
     if not jets:
         t.audit('jetsam', 'not-found', 'no jetsamproperties plist')
+    no_recover_on_crash(t, jets)
 
     # InterfaceNamer
     n = 'System/Library/SystemConfiguration/InterfaceNamer.bundle/Info.plist'
@@ -1498,6 +1520,47 @@ def boot_tasks(launchd_path):
         at = end
 
 
+def recover_self_test(d):
+    """The key leaves each daemon, and nothing else changes; RECOVER_ON_CRASH=1 keeps it."""
+    import shutil
+    j = b'System/Library/LaunchDaemons/com.apple.jetsamproperties.N104.plist'
+    def tree():
+        work = os.path.join(d, 'r')
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(os.path.join(work, 'overlay'))
+        t = Tree(work)
+        src = os.path.join(d, 'jet.plist')
+        with open(src, 'wb') as f:
+            plistlib.dump({'Version4': {'Daemon': {'Override': {'com.apple.backboardd': {'JetsamPriority': 170, 'RecoverOnCrash': True}, 'com.apple.logd': {'JetsamPriority': 1}}}, 'Extension': {'x': 1}}}, f, fmt=plistlib.FMT_BINARY)
+        t.mkdirs(os.path.dirname(j))
+        t.n[j] = Node('f', 0o644, 0, 0, 5, src.encode())
+        return t
+    t = tree()
+    no_recover_on_crash(t, [j])
+    o = plistlib.loads(t.read(j))['Version4']
+    checks = [
+        o['Daemon']['Override']['com.apple.backboardd'] == {'JetsamPriority': 170},
+        o['Daemon']['Override']['com.apple.logd'] == {'JetsamPriority': 1},
+        o['Extension'] == {'x': 1},
+        any(x.startswith('applied') and 'RecoverOnCrash' in x and 'com.apple.backboardd' in x for x in t.audit_lines),
+    ]
+    os.environ['RECOVER_ON_CRASH'] = '1'
+    t = tree()
+    no_recover_on_crash(t, [j])
+    del os.environ['RECOVER_ON_CRASH']
+    checks += [
+        plistlib.loads(t.read(j))['Version4']['Daemon']['Override']['com.apple.backboardd'].get('RecoverOnCrash') is True,
+        any(x.startswith('kept') and 'RecoverOnCrash' in x for x in t.audit_lines),
+    ]
+    t = tree()
+    no_recover_on_crash(t, [j])
+    no_recover_on_crash(t, [j])
+    checks.append(any(x.startswith('not-found') and 'RecoverOnCrash' in x for x in t.audit_lines))
+    print(f'recover hook self-test: {sum(checks)} of {len(checks)}')
+    if not all(checks):
+        raise SystemExit('recover hook self-test failed')
+
+
 def self_test():
     """The air hook with a stand-in script: its files, owners, a removed job, a failure, a missing script. Host only, no donor files."""
     import shutil
@@ -1556,6 +1619,7 @@ echo "laurel-root: air-ios26: fake"
         air(t, w, os.path.join(d, 'absent.sh'))
         checks += [set(t.n) == set(n), not t.audit_lines]
         print(f'air hook self-test: {sum(checks)} of {len(checks)}')
+        recover_self_test(d)
         ok_metal = metal_self_test(d)
         ok_debug = debug_self_test(d)
         ok_parity = parity_self_test(d)

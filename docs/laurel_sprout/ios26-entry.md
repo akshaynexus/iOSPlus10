@@ -81,12 +81,12 @@ Line: `<Critical>: rebooting due to critical process crashes: runningboardd` [V 
 | Item | |
 |---|---|
 | Who asks | launchd, code at 0x100021c4c. Not watchdogd, not a panic [V] |
-| Test | Crash exit, and service flag bit 60 (`[x19,#0x587]` bit 4), and consecutive crash count == `[x19,#0x414]`. Default count 3 (0x100009320, 0x10000641c) [V] |
+| Test | Crash exit, and service flag bit 60 (`[x19,#0x587]` bit 4), and crash count in the last 60 s == `[x19,#0x414]`. Default count 3 (0x100009320, 0x10000641c) [V]. The window: `ios26-backboardd.md` section 4 |
 | Why runningboardd first | Its job has `ThrottleInterval 1` [V]: 3 crashes in 1.5 s (pids 27, 105, 107). Other jobs have 10 s, so they reach 2 before this [I] |
-| Where the flag comes from | Handlers at 0x10000b668 (`_RecoverOnCrash`) and 0x10000ea18 (`RecoverOnCrash`). The job on the root has no such key [V], so the source is [U] |
+| Where the flag comes from | Handlers at 0x10000b668 (`_RecoverOnCrash`, a job key) and 0x10000ea18 (`RecoverOnCrash`). The job has no such key. **Source found in boot 9: the key in the jetsam file: `ios26-backboardd.md` section 4** |
 | The feature gate | 0x100049f9c: returns true when launchd is younger than 300 s or a byte is 0. False prints `Feature disabled, device would have rebooted due to %s` [V] |
 | Does the fix of section 1 settle it? | [I] Yes: runningboardd reaches `main()` [V host]; the rule needs 3 crashes in a row |
-| A clean way to stay up with SSH | Not needed now. If another job loops: raise its `ThrottleInterval` in `ios26-root-spec.py` `tweaks()`, the same place as the `_PanicOnCrash` rename: it gives time, and hides nothing. Nothing in this branch does this |
+| A clean way to stay up with SSH | Boot 9 needed it: `no_recover_on_crash()` in `ios26-root-spec.py`: `ios26-backboardd.md` section 4 |
 
 ## 6. Next boot
 

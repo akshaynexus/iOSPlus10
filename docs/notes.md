@@ -5165,3 +5165,15 @@ Full text: `docs/laurel_sprout/ios26-entry.md`.
 - `LAUREL EMU: counts pac=1`: first trap `braaz x16` at 0x2a353075c in `libsystem_platform`, a word of the tool's "left, not proven" list. The report prints at the first trap and then every 60 s.
 - The next boot must print `LAUREL CS: off: ... first UserEventAgent`, and no `pc 0x100000000`.
 
+## Mi A3 iOS 26: backboardd dies in CoreBrightness, launchd reboots (2026-11-02, branch t3/laurel-ios26-bbd; host only, no flash)
+Full text: `docs/laurel_sprout/ios26-backboardd.md`.
+- Symbols of 23F84: `lowered/` has no `.symbols` file: the crash in `lowered/` shows 23 exports. Use `dsc-image.py ~/op10-apple/ios26/23F84-n104ap/tree/cache syms IMAGE`: same addresses, 11,749 names in CoreBrightness. Subtract the slide of `LAUREL DYLD: cache on`.
+- 23F84 CoreBrightness `_DisplayCreateWithCapabilitiesAndID`: `getBacklightCalibration:` NO -> `__DisplaySliderToLogicalBrightnessInternal` before `backlight-marketing-table` is read. That path always faults. So `backlight-calibration-parameters` is required on 23F84. On 20H392 it was optional (`patches/xnu/README-brightness.md`).
+- `IODeviceTree:/core-brightness -> none` was a false lead: N104AP has no such node. Compare a refused path against the donor's ADT and the iOS 16 log first.
+- `launchd` crash rule: flag bit 60, count 3, window 60 s (0x100081de8), not "3 in a row". Flag source: `RecoverOnCrash` in `Version4/Daemon/Override` of the jetsam file: backboardd, SpringBoard, configd, runningboardd.
+- `dead-man: strike N`: with no reboot, an early crash loop reaches `NEGRONIMETAL_STRIKE_LIMIT=6` in about one minute, and then no Metal device. Read the first crash.
+- **Host replay past `main()`:** `ios26-user-emu.py --display-create PLIST` runs one real function of the cache from `main()`, with IOKit and CFPreferences stopped at their entry, and a property through the real `IOCFUnserialize`. It gave the phone's fault at the same offsets in 14 s. So a crash in a framework's synchronous code can be fixed and proved with no flash. Add `--container` for the frames above. Traps: answering every unknown syscall with 0 breaks dyld (only after `main()`); NSUserDefaults goes to XPC: answer it at the method; `IOObjectConformsTo` must look at the name.
+- `cryptexd`: `libimage4` `panic: failed to get manifest properties`: no `/chosen/manifest-properties` in our ADT. No fix: not on any path we need yet. `devicerecoverytool`: no `/options`: leave it: it runs only on the reboot path, and a working one would ask for a recovery boot.
+- zsh eats `=====` as an argument (`=cmd` expansion): use no such `echo` in a tool call.
+- A worktree kernel build: `cp -a --reflink=always` of `dl deps kdk cache` of the main `out/laurel-kernel-ios26`: 169 s.
+- Next boot must print `LAUREL BACKLIGHT: on: calibration for CoreBrightness: max 430, mid 107, min 840/1000 nits, table of 17 points; no digital dimming`, and no `CRASH backboardd` at `...924`.

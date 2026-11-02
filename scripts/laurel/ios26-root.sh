@@ -104,6 +104,7 @@ cleanup; LOOP=; trap - EXIT
 ln -sfn "$R" "$OUT/ios26/root-$DEV"
 grep ' debug-ios26:' "$W/audit.txt" || echo "off       debug-ios26: no audit line"
 grep ' metal26:' "$W/audit.txt" || echo "off       metal26: no audit line"
+grep ' jetsam RecoverOnCrash:' "$W/audit.txt" || echo "off       jetsam RecoverOnCrash: no audit line"
 # the other hooks: only the ones that are off (the report has all)
 grep '^off ' "$W/audit.txt" | grep -v -E ' (debug-ios26|metal26):' | cut -c1-200 || true
 sha256sum "$IMG.manifest" "$W/spec"

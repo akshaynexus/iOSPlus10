@@ -333,4 +333,5 @@
 9002-laurel-no-panic-region.patch                              post
 9003-laurel-dyld-cache-line.patch                              post
 9004-laurel-cs-no-page-hash.patch                              post
+9005-laurel-backlight-calibration.patch                        post
 == series: 213 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors

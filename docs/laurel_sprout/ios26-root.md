@@ -50,6 +50,7 @@ Same inputs, same bytes: the build hashes the spec, the changed files and each l
 `report.txt` and `/usr/share/laurel/ios26-root-audit.txt` have one line per item: `applied`, `kept`, `not-found` or `built`, with the reason.
 
 - launchd: `_PanicOnCrash` renamed in 9 jobs; CommCenter, the iOS 16 list, aned and three programs dropped; `CA_HEARTBEAT_RATE` 60 [U on 26]; `launchd.plist.sig` kept (it does not match, the same as the iOS 16 root that boots); cryptexd kept [U].
+- Bring-up: `RecoverOnCrash` removed from the jetsam file (backboardd, SpringBoard, configd, runningboardd): a crash loop does not reboot the phone, so SSH stays up; the phone does not reboot itself out of it. `RECOVER_ON_CRASH=1` at the build keeps it. `ios26-root.sh` prints the line: `ios26-backboardd.md` section 4.
 - Containers, logd stores, plain system keybag, InterfaceNamer 10 s, MediaToolbox, jetsam widget limit: applied.
 - Preferences: key names of iOS 16; each marked [U] where 26 was not read.
 - `activation data ark`: **not-found**. The 23F84 OS volume has no mobileactivationd system container. The kernel path stays; enough on 26: [U].

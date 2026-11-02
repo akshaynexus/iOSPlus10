@@ -1,0 +1,75 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2350,6 +2350,64 @@ AppleARMBacklight::setProperties(OSObject *properties)
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * laurel 9005 (iOS 26 only): what CoreBrightness of 23F84 must read on the backlight service. A real AppleARMBacklight publishes both: it makes
++ * backlight-calibration-parameters from /backlight of the device tree and syscfg, and backlight-marketing-table comes from the device tree.
++ * Without the first, _DisplayCreateWithCapabilitiesAndID calls __DisplaySliderToLogicalBrightnessInternal before the table of the second exists,
++ * and that reads table[0] through a NULL pointer: backboardd dies with far 0 (docs/laurel_sprout/ios26-backboardd.md).
++ * All values are 16.16. Table: 17 points as on N104AP, slider 0..1 to nits, on the curve of laurel_level_for(): nits max * s^2, not under the panel's
++ * lowest level. No current values: an AMOLED panel has no LED current, and CoreBrightness only prints these three. No digital-dimming-min-nits: it
++ * would turn digital dimming on. Mid is the table's middle point, as on N104AP (LmidProduct 155 = table[8]).
++ */
++static void
++laurel_bl_calibration(AppleARMBacklight *bl, uint32_t nits, uint32_t level_min, uint32_t level_max)
++{
++	enum { kPoints = 17 };
++	static const char * const zero[] = { "current-for-max-backlight", "current-for-mid-backlight", "hardware-max-current-limit" };
++	uint32_t table[kPoints];
++	bool ok = false;
++
++	if (nits == 0 || level_max == 0 || level_min >= level_max) {
++		IOLog("LAUREL BACKLIGHT: off: no calibration for CoreBrightness: %u nits, DBV %u..%u: backboardd cannot start its display\n", nits, level_min, level_max);
++		return;
++	}
++	const uint32_t low = (uint32_t)(((uint64_t)nits << 16) * level_min / level_max);
++	for (uint32_t i = 0; i < kPoints; i++) {
++		uint32_t v = (uint32_t)(((uint64_t)nits << 16) * i * i / ((kPoints - 1) * (kPoints - 1)));
++		table[i] = v < low ? low : v;
++	}
++	const struct { const char *key; uint32_t value; } q16[] = {
++		{ "lMaxProduct", table[kPoints - 1] }, { "lMidProduct", table[(kPoints - 1) / 2] }, { "lMinProduct", table[0] },
++		{ "lMaxPanel", table[kPoints - 1] }, { "lMidPanel", table[(kPoints - 1) / 2] }, { "lMinPanel", table[0] },
++	};
++	OSDictionary *d = OSDictionary::withCapacity(10);
++	OSData *t = OSData::withBytes(table, sizeof(table));
++	if (d != NULL && t != NULL) {
++		ok = true;
++		for (size_t i = 0; i < sizeof(q16) / sizeof(q16[0]); i++) {
++			OSNumber *n = OSNumber::withNumber((uint64_t)q16[i].value, 32);
++			ok = n != NULL && d->setObject(q16[i].key, n) && ok;
++			OSSafeReleaseNULL(n);
++		}
++		for (size_t i = 0; i < sizeof(zero) / sizeof(zero[0]); i++) {
++			OSNumber *n = OSNumber::withNumber(0ULL, 32);
++			ok = n != NULL && d->setObject(zero[i], n) && ok;
++			OSSafeReleaseNULL(n);
++		}
++	}
++	if (ok) {
++		ok = bl->setProperty("backlight-marketing-table", t) && bl->setProperty("backlight-calibration-parameters", d);
++	}
++	OSSafeReleaseNULL(d);
++	OSSafeReleaseNULL(t);
++	if (ok) {
++		IOLog("LAUREL BACKLIGHT: on: calibration for CoreBrightness: max %u, mid %u, min %u/1000 nits, table of %u points; no digital dimming\n",
++		    table[kPoints - 1] >> 16, table[(kPoints - 1) / 2] >> 16, (uint32_t)(((uint64_t)table[0] * 1000) >> 16), (uint32_t)kPoints);
++	} else {
++		IOLog("LAUREL BACKLIGHT: off: no calibration for CoreBrightness: no memory for the properties: backboardd cannot start its display\n");
++	}
++}
++
+ /*
+  * laurel 2201: publish AppleARMBacklight only with the GPU renderer (topaz 0110: with the CPU renderer,
+  * CoreBrightness's digital dimming took the UI under 1 fps). RedwoodGPU is published by TopazAdreno.cpp
+@@ -2380,6 +2438,7 @@ AppleCLCD::blPublisher(void *self, __unused wait_result_t result)
+ 		bl->setProperty("max-nits", (unsigned long long)fb->fBlNits, 32);
+ 		bl->setProperty("min-nits", (unsigned long long)((LAUREL_BL_MIN * fb->fBlNits + fb->fBlMax - 1) / fb->fBlMax), 32);
+ 		bl->publish(laurel_value_for(fb->fBlLevel, fb->fBlMax), fb->fBlLevel * fb->fBlNits / fb->fBlMax);
++		laurel_bl_calibration(bl, fb->fBlNits, LAUREL_BL_MIN, fb->fBlMax);
+ 		if (bl->attach(fb)) {
+ 			fb->fBacklight = bl;    /* keeps the reference */
+ 			bl->registerService();

@@ -7,7 +7,12 @@ of the libraries, not for a daemon's work. So it answers one question: does this
     scripts/laurel/test-ios26-user-emu.sh [LOWERED_DIR]      PASS when the programs reach main()
 
 EMU_LOWERED=DIR selects the lowered folder (default: the shared one). Exit 0: reached main(). Exit 3: it did not. See docs/laurel_sprout/ios26-entry.md.
-A stop after main() ("int 7" in libdispatch or libxpc, an abort) is normal: this fake kernel has no workqueue and no launchd. Read the first stop only if main() did not run."""
+A stop after main() ("int 7" in libdispatch or libxpc, an abort) is normal: this fake kernel has no workqueue and no launchd. Read the first stop only if main() did not run.
+
+--display-create PLIST: at main() of /usr/libexec/backboardd, run CoreBrightness' real DisplayCreateWithCapabilitiesAndID(service, 0, 0, 1) instead of main(). The plist is the registry of the
+AppleARMBacklight it reads. IOKit and CFPreferences calls stop at their entry; a property comes from IOKit's real IOCFUnserialize. Blocks that the function queues do not run: it answers for the synchronous part only.
+With --container: the frames of the phone's crash: -[CBDisplayContaineriOS handleDisplayArrival:] -> setupInternalModules -> -[CBDisplayModuleiOS initWithBacklight:queue:display:], with no CADisplay (nil).
+scripts/laurel/test-ios26-bbd-emu.sh is the test (docs/laurel_sprout/ios26-backboardd.md)."""
 import os, struct, sys, time, errno, collections, argparse, bisect, mmap as pymmap, hashlib
 from unicorn import *
 from unicorn.arm64_const import *
@@ -28,6 +33,8 @@ ap.add_argument('--trace-size', type=int, default=4000)
 ap.add_argument('--verbose', action='store_true')
 ap.add_argument('--inits', action='store_true', help='list the images whose initializers ran (slower: a hook on each basic block)')
 ap.add_argument('--env', action='append', default=[])
+ap.add_argument('--display-create', metavar='PLIST', help='at main(): run CoreBrightness DisplayCreateWithCapabilitiesAndID, with this plist as the registry of AppleARMBacklight')
+ap.add_argument('--container', action='store_true', help='with --display-create: the frames of the crash, from [[CBDisplayContaineriOS alloc] initWithBacklightService:] and -start. No CADisplay here: messages to it answer nil')
 args = ap.parse_args()
 
 u32 = lambda b, o: struct.unpack_from('<I', b, o)[0]
@@ -577,6 +584,9 @@ def bsd(n):
         stop_reason[0] = 'kill'
         mu.emu_stop(); return
     if args.verbose: print('unknown syscall', n, hex(x(0)), hex(x(1)), hex(x(2)), 'pc', where(mu.reg_read(UC_ARM64_REG_PC)))
+    if args.display_create and reached[0] and n != 1:  # workqueue, kevent: libdispatch asks for a thread or a timer. Blocks stay on their queues, timers do not fire
+        fake_calls['syscall %d' % n] += 1
+        return ret_ok(0)
     return ret_err(errno.ENOSYS)
 
 SYSCTL_NAMES = {'hw.pagesize': 4096, 'hw.ncpu': 8, 'hw.activecpu': 8, 'hw.logicalcpu': 8, 'hw.physicalcpu': 8, 'hw.cputype': 0x100000c, 'hw.cpusubtype': 2, 'hw.memsize': 0x180000000, 'kern.argmax': 262144, 'hw.pagesize32': 4096, 'hw.cachelinesize': 64, 'hw.cpufamily': 0x07d34b9f}
@@ -678,21 +688,217 @@ def hook_main(uc, addr, size, ud):
         reached[0] = True
         s = uc.reg_read(UC_ARM64_REG_SP)
         print('reached main(): pc %s, sp 0x%x (0x%x below the stack top), %d syscalls' % (where(addr), s, STACK_TOP - s, sc_count[0]))
+        if args.display_create:
+            display_create_start(uc)
 mu.hook_add(UC_HOOK_CODE, hook_main, begin=EXE + main_entry, end=EXE + main_entry + 3)
 mu.hook_add(UC_HOOK_INTR, hook_intr)
 mu.hook_add(UC_HOOK_MEM_UNMAPPED, hook_unmapped)
 if args.trace_after == 0 or args.inits:
     enable_trace()
 
+# ---- --display-create: the real CoreBrightness function, with a fake IOKit at the function level ----
+UNTIL = 0x2f0000000     # the fake return address of the function
+SERVICE = 0x1234        # the io_object_t of AppleARMBacklight
+fake_calls = collections.Counter()
+display_result = [None]
+
+def guest_read(a, n):
+    p = a & ~0x3fff
+    while p < a + n:
+        map_cache_page(p)
+        p += 0x4000
+    return bytes(mu.mem_read(a, n))
+
+def cf_const_string(a):
+    """A constant CFString of the cache: isa, flags, pointer, length."""
+    if not a:
+        return ''
+    w = guest_read(a, 32)
+    ptr, n = u64(w, 16) & 0xfffffffff, u64(w, 24)
+    return guest_read(ptr, n).decode(errors='replace') if ptr and n < 256 else '?'
+
+def serialize(v):
+    """A plist value as the XML of IOCFUnserialize."""
+    import base64
+    if isinstance(v, bool):
+        return '<true/>' if v else '<false/>'
+    if isinstance(v, int):
+        return '<integer size="32">0x%x</integer>' % (v & 0xffffffff)
+    if isinstance(v, bytes):
+        return '<data>%s</data>' % base64.b64encode(v).decode()
+    if isinstance(v, str):
+        return '<string>%s</string>' % v
+    if isinstance(v, dict):
+        return '<dict>' + ''.join('<key>%s</key>%s' % (k, serialize(x)) for k, x in v.items()) + '</dict>'
+    raise SystemExit('no XML for %r' % (v,))
+
+def ret_now(uc, v):
+    setx(0, v)
+    pending[0] = uc.reg_read(UC_ARM64_REG_LR)
+    uc.emu_stop()
+
+def display_create_start(uc):
+    """At main(): every hook, then the call. Addresses from the symbols of the original cache: the lowered one has the same layout."""
+    import importlib.util, plistlib
+    sp_ = importlib.util.spec_from_file_location('dsc_image', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dsc-image.py'))
+    dsc = importlib.util.module_from_spec(sp_)
+    sp_.loader.exec_module(dsc)
+    c = dsc.Cache(BASE + '/tree/cache')
+    def syms(part):
+        return {n: a for a, k, n in dsc.symbols(c, c.find(part)[0])}
+    iokit = syms('IOKit.framework/Versions/A/IOKit')
+    cf = syms('CoreFoundation.framework/CoreFoundation')
+    trace_ = syms('libsystem_trace.dylib')
+    cb = syms('CoreBrightness.framework/CoreBrightness')
+    props = plistlib.load(open(args.display_create, 'rb'))
+    unser = iokit['_IOCFUnserialize'] + SLIDE
+
+    def prop(uc, name, key, alloc):
+        k = cf_const_string(key)
+        if k in props:
+            fake_calls['%s %s: found' % (name, k)] += 1
+            xml = anon(0x10000)
+            mu.mem_write(xml, serialize(props[k]).encode() + b'\0')
+            setx(0, xml); setx(1, alloc); setx(2, 0); setx(3, 0)
+            pending[0] = unser
+            uc.emu_stop()
+        else:
+            fake_calls['%s %s: none' % (name, k)] += 1
+            ret_now(uc, 0)
+    def hook(name, fn):
+        a = iokit.get(name, 0) or cf.get(name, 0) or trace_.get(name, 0)
+        if not a:
+            print('no symbol', name)
+            return
+        mu.hook_add(UC_HOOK_CODE, lambda uc, ad, sz, ud: fn(uc), begin=a + SLIDE, end=a + SLIDE + 3)
+    hook('_IORegistryEntrySearchCFProperty', lambda uc: prop(uc, 'search', x(2), x(3)))
+    hook('_IORegistryEntryCreateCFProperty', lambda uc: prop(uc, 'read', x(1), x(2)))
+    def counted(name, v):
+        def f(uc):
+            fake_calls[name] += 1
+            ret_now(uc, v)
+        hook(name, f)
+    # A set is a write to the driver, and the function must not fail on it. Each call is counted for the report.
+    def set_prop(uc):
+        fake_calls['set %s' % cf_const_string(x(1))] += 1
+        ret_now(uc, 0)
+    hook('_IORegistryEntrySetCFProperty', set_prop)
+    for n in ('_IORegistryEntrySetCFProperties', '_IOObjectRetain', '_IOObjectRelease', '_IOConnectRelease', '_IOServiceClose', '_IONotificationPortCreate', '_IONotificationPortSetDispatchQueue', '_IOServiceAddMatchingNotification', '_IOServiceAddInterestNotification',
+              '_IOServiceGetMatchingService', '_IOServiceGetMatchingServices', '_IORegistryEntryFromPath', '_IOIteratorNext', '_IOServiceOpen', '_IOConnectCallMethod', '_IOConnectCallScalarMethod', '_IORegistryEntryGetRegistryEntryID',
+              '_CFPreferencesCopyAppValue', '_CFPreferencesCopyValue', '_CFPreferencesCopyMultiple', '_CFPreferencesGetAppBooleanValue', '_CFPreferencesGetAppIntegerValue',
+              '_os_log_type_enabled'):
+        counted(n, 0)
+    def conforms(uc):
+        k = rdstr(x(1))
+        fake_calls['_IOObjectConformsTo %s' % k] += 1
+        ret_now(uc, 1 if k in ('AppleARMBacklight', 'IOService', 'IORegistryEntry') else 0)
+    hook('_IOObjectConformsTo', conforms)
+    for n in ('_CFPreferencesAppSynchronize', '_CFPreferencesSynchronize', '_CFPreferencesSetAppValue', '_CFPreferencesSetValue', '_CFPreferencesSetMultiple'):
+        counted(n, 1)
+    # The iterator of IOServiceGetMatchingServices gives the one AppleARMBacklight, then the end
+    def matching(uc):
+        fake_calls['_IOServiceGetMatchingServices'] += 1
+        mu.mem_write(x(2), struct.pack('<I', SERVICE + 4))
+        ret_now(uc, 0)
+    hook('_IOServiceGetMatchingServices', matching)
+    left = [1]
+    def next_(uc):
+        fake_calls['_IOIteratorNext'] += 1
+        ret_now(uc, SERVICE if x(0) == SERVICE + 4 and left.pop() else 0) if left else ret_now(uc, 0)
+    hook('_IOIteratorNext', next_)
+    def entry_id(uc):
+        fake_calls['_IORegistryEntryGetRegistryEntryID'] += 1
+        mu.mem_write(x(1), struct.pack('<Q', 0x100000123))
+        ret_now(uc, 0)
+    hook('_IORegistryEntryGetRegistryEntryID', entry_id)
+    name_ = anon(0x1000)
+    mu.mem_write(name_, b'AppleARMBacklight\0')
+    def copy_class(uc):
+        fake_calls['_IOObjectCopyClass'] += 1
+        setx(0, 0); setx(1, name_); setx(2, 0x8000100)
+        pending[0] = cf['_CFStringCreateWithCString'] + SLIDE
+        uc.emu_stop()
+    hook('_IOObjectCopyClass', copy_class)
+    mu.mem_map(UNTIL, 0x1000, UC_PROT_ALL)
+    if args.container:
+        # NSUserDefaults goes to cfprefsd through XPC: no launchd here. Every read answers "not set"
+        for n, a in syms('Foundation.framework/Foundation').items():
+            if n.startswith('-[NSUserDefaults(NSUserDefaults) ') and 'init' not in n:
+                mu.hook_add(UC_HOOK_CODE, lambda uc, ad, sz, ud: (fake_calls.update(['NSUserDefaults read']), ret_now(uc, 0)), begin=a + SLIDE, end=a + SLIDE + 3)
+        # setupInternalModules: "if (caDisplay != nil || this function)". Here there is no CADisplay.
+        a = cb['_CBU_IsAccessory']
+        mu.hook_add(UC_HOOK_CODE, lambda uc, ad, sz, ud: ret_now(uc, 1), begin=a + SLIDE, end=a + SLIDE + 3)
+        objc = syms('libobjc.A.dylib')
+        s_ = anon(0x1000)
+        mu.mem_write(s_, b'CBDisplayContaineriOS\0')
+        steps.extend([
+            (objc['_objc_getClass'] + SLIDE, lambda r: [s_, 0]),
+            (objc['_objc_alloc'] + SLIDE, lambda r: [r, 0]),
+            (cb['-[CBDisplayContaineriOS initWithBacklightService:]'] + SLIDE, lambda r: [r, 0, SERVICE]),
+            (cb['-[CBDisplayContaineriOS handleDisplayArrival:]'] + SLIDE, lambda r: (the_self.append(r), [r, 0, SERVICE])[1]),
+            (cb['-[CBDisplayContaineriOS setupInternalModules]'] + SLIDE, lambda r: [the_self[0], 0]),
+        ])
+        print('display-create: %s, %d properties; container path' % (args.display_create, len(props)))
+    else:
+        fn = cb['_DisplayCreateWithCapabilitiesAndID'] + SLIDE
+        print('display-create: %s, %d properties; DisplayCreateWithCapabilitiesAndID at %s' % (args.display_create, len(props), where(fn)))
+        steps.append((fn, lambda r: [SERVICE, 0, 0, 1]))
+    next_step(uc)
+    uc.emu_stop()
+
+steps = []
+the_self = []
+last_result = [0]
+def next_step(uc):
+    """The next call of the list, with the result of the one before."""
+    fn, a = steps.pop(0)
+    args_ = a(last_result[0])
+    for i, v in enumerate(args_):
+        setx(i, v)
+    print('call', where(fn), [hex(v) for v in args_])
+    uc.reg_write(UC_ARM64_REG_LR, UNTIL)
+    pending[0] = fn
+
+def display_create_report():
+    pc = mu.reg_read(UC_ARM64_REG_PC)
+    print('--- fake IOKit, CFPreferences calls')
+    for k, n in sorted(fake_calls.items()):
+        print(' %4d %s' % (n, k))
+    if pc != UNTIL:
+        print('RESULT display-create: did not return: pc %s lr %s stop %s' % (where(pc), where(mu.reg_read(UC_ARM64_REG_LR)), stop_reason[0]))
+        return 3
+    d = x(0)
+    if args.container:
+        print('RESULT display-create: the container path returned')
+        return 0
+    if not d:
+        print('RESULT display-create: returned NULL')
+        return 3
+    f = lambda o: struct.unpack('<f', mu.mem_read(d + o, 4))[0]
+    tp = u64(mu.mem_read(d + 0x48, 8), 0)
+    tn = u32(mu.mem_read(d + 0x40, 4), 0)
+    table = [round(v, 2) for v in struct.unpack('<%df' % tn, mu.mem_read(tp, 4 * tn))] if tp and tn < 1000 else []
+    print('display 0x%x: table at +0x48 0x%x, %d entries: %s' % (d, tp, tn, table))
+    print('lMaxProduct %.2f lMidProduct %.2f lMinProduct %.2f lMaxPanel %.2f lMidPanel %.2f lMinPanel %.2f milliAmps2Nits %.2f' % tuple(f(o) for o in (0x514, 0x518, 0x51c, 0x520, 0x524, 0x528, 0x52c)))
+    print('digital dimming flag +0x5ec %d, extrabright +0x5ed %d' % (bytes(mu.mem_read(d + 0x5ec, 1))[0], bytes(mu.mem_read(d + 0x5ed, 1))[0]))
+    print('RESULT display-create: returned a display')
+    return 0
+
 pc = DYLD + 0x30f0
 t0 = time.time()
 while True:
     try:
-        mu.emu_start(pc, 0xffffffffffffff00, timeout=args.secs * 1000000, count=args.max)
+        mu.emu_start(pc, UNTIL if args.display_create else 0xffffffffffffff00, timeout=args.secs * 1000000, count=args.max)
     except UcError as e:
         print('UcError', e)
         break
     if pending[0] is not None:
+        pc = pending[0]
+        pending[0] = None
+        continue
+    if mu.reg_read(UC_ARM64_REG_PC) == UNTIL and steps:
+        last_result[0] = x(0)
+        next_step(mu)
         pc = pending[0]
         pending[0] = None
         continue
@@ -731,4 +937,6 @@ if trace:
     for a in list(trace)[-200:]:
         print(hex(a), where(a))
 print('RESULT %s: %s' % (EXE_PATH, 'reached main()' if reached[0] else 'main() NOT reached: ' + str(stop_reason[0])))
+if args.display_create:
+    sys.exit(display_create_report())
 sys.exit(0 if reached[0] else 3)
