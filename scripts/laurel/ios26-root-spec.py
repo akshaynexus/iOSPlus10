@@ -299,7 +299,14 @@ def tweaks(t, a):
     f = 'private/var/preferences/FeatureFlags/Domain/ExtensionKit.plist'
     t.mkdirs(os.path.dirname(f).encode())
     t.write(f, plistlib.dumps({'enforce_xpc_cache_code_signing': {'Enabled': False}}, fmt=plistlib.FMT_XML), 0o644, 0, 0)
-    t.audit('ExtensionKit flag', 'applied', 'enforce_xpc_cache_code_signing off; the flag name on 26: [U]')
+    # The system file too. 23F84 [V]: domain ExtensionKit, flag enforce_xpc_cache_code_signing, Enabled true in System/Library/FeatureFlags/Domain. On: lsd reads extensions.plist only through its detached signature; a failure leaves a catalog with no widget and no poster point.
+    # Both points are only in that file, not in ExtensionKit/ExtensionPoints [V]. Off: a plain read of the same file. This does not depend on which level init_featureflags takes.
+    g = 'System/Library/FeatureFlags/Domain/ExtensionKit.plist'
+    if t.exists(g):
+        d = plist_load(t, g)
+        d['enforce_xpc_cache_code_signing'] = {'Enabled': False}
+        t.write(g, plistlib.dumps(d, fmt=plistlib.FMT_BINARY))
+    t.audit('ExtensionKit flag', 'applied', 'enforce_xpc_cache_code_signing off, system and /var/preferences: lsd reads the extension points with no signature [V name in 23F84 ExtensionFoundation]')
 
     # jetsam
     sys.path.insert(0, os.path.join(REPO, 'scripts', 'ios16'))
@@ -721,7 +728,7 @@ def metal_self_test(d):
         t.n[db + b'cache'].mode == 0o1777 and t.n[db + b'strikes'].mode == 0o1777 and t.n[db + b'stack'].mode == 0o1777,
         t.n[db + b'metal.log'].mode == 0o666,
         t.exists(db + b'clients') and t.exists(db + b'env') and t.exists(db + b'build.txt'),
-        b'-PosterBoard' in t.read(db + b'clients'),
+        b'-PosterBoard' not in t.read(db + b'clients'),
         t.n[b'usr/libexec/backboardd'].src == src.encode(),
         t.n[pref].uid == MOBILE and plistlib.loads(t.read(pref))['CAEnableFramebufferCompression'] is False,
         not t.exists(B + b'options') and not t.exists(b'Applications/XNUtils.app'),
@@ -1258,6 +1265,85 @@ def staged_apps(t):
     return f'{len(apps)} apps moved to /Applications, their placeholders gone; the first LaunchServices seed registers them. Same volume: no size change'
 
 
+WALLPAPER_SIZE = (720, 1560)        # the panel: 360x780 pt @2 (ios26-parity.md, Resolution)
+WALLPAPER_HEIC = b'Library/Wallpaper/Collections/iOS_17~iphone.wallpaperCollection/Wallpapers/7565.iOS_17-414w-896h@2x~iphone.wallpaper/7565.iOS_17_Background-414w-896h@2x~iphone.ca/assets/Background Dark.HEIC'     # the default of 23F84 on this model: DefaultWallpapers~iphone.plist 'default' 7565
+CPBITMAP_MAGIC = 0xDCB543A2         # AppSupport CPBitmapCreateImagesFromData 23F84, 0x196b799fc: last word; format 4, 6, 7: an encoded image [V]
+AUTOBAHN_OFF = {'Autobahn': {'Enabled': False}, 'AutobahnLegacyMigration': {'Enabled': False}, 'AutobahnLegacyMigrationSupportingDistinctHome': {'Enabled': False}}
+
+
+def cpbitmap(png, w, h):
+    return png + struct.pack('<7I', 0, 0, w, h, 4, 1, CPBITMAP_MAGIC)
+
+
+def gradient_png(w, h):
+    """When the build host cannot decode the HEIC: Apple's colours as a plain gradient. Pure Python, the same bytes each time."""
+    import zlib
+    rows = bytearray()
+    for y in range(h):
+        k = y / max(1, h - 1)
+        px = bytes((int(40 + 150 * k), int(8 + 10 * k), int(70 - 30 * k)))
+        rows += b'\0' + px * w
+    def chunk(t, b):
+        return struct.pack('>I', len(b)) + t + b + struct.pack('>I', zlib.crc32(t + b))
+    return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(bytes(rows), 9)) + chunk(b'IEND', b'')
+
+
+def wallpaper_pngs(t, work):
+    """(full, thumbnail, what). From the donor's own default when heif-dec and ImageMagick are on the build host, else the gradient. PNG with no dates: same inputs, same bytes."""
+    import shutil
+    import subprocess
+    w, h = WALLPAPER_SIZE
+    dec, mag = shutil.which('heif-dec') or shutil.which('heif-convert'), shutil.which('magick') or shutil.which('convert')
+    if dec and mag and t.exists(WALLPAPER_HEIC):
+        tmp = os.path.join(work, 'wallpaper-tmp')
+        shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(tmp)
+        try:
+            src, png = os.path.join(tmp, 'a.heic'), os.path.join(tmp, 'a.png')
+            with open(src, 'wb') as f:
+                f.write(t.read(WALLPAPER_HEIC))
+            out = []
+            subprocess.run([dec, '-o', png, src] if dec.endswith('heif-dec') else [dec, src, png], check=True, capture_output=True)
+            for name, (a, b) in (('f.png', (w, h)), ('t.png', (w // 3, h // 3))):
+                q = os.path.join(tmp, name)
+                subprocess.run([mag, png, '-resize', f'{a}x{b}^', '-gravity', 'center', '-extent', f'{a}x{b}', '-strip', '-depth', '8', '-define', 'png:exclude-chunks=date,time', 'PNG24:' + q], check=True, capture_output=True)
+                with open(q, 'rb') as f:
+                    out.append(f.read())
+            return out[0], out[1], 'the default of 23F84 (iOS 17 background, dark)'
+        except (OSError, subprocess.CalledProcessError):
+            pass
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return gradient_png(w, h), gradient_png(w // 3, h // 3), 'a gradient: this build host has no heif-dec + ImageMagick, or no donor file'
+
+
+def wallpaper(t, work):
+    """SpringBoard draws Lock and Home from PaperBoardUI, with the Autobahn flags off. Autobahn on waits for a poster of PosterBoard, and none comes here: see docs/laurel_sprout/ios26-wallpaper-widgets.md.
+    Files: PBUIWallpaperDirectoryDataStore 23F84: CPSharedResourcesDirectory + Library/SpringBoard, LockBackground / HomeBackground + .cpbitmap [V]. Idea and key list: IOS-26-Hot make-ios26-overlay.py (self-reported on 23F84).
+    Off: WALLPAPER=0: Autobahn stays on, no file, the black of today. Settings > Wallpaper writes the same store."""
+    w, h = WALLPAPER_SIZE
+    full, thumb, what = wallpaper_pngs(t, work)
+    domain = b'System/Library/FeatureFlags/Domain/SpringBoard.plist'
+    base = plist_load(t, domain) if t.exists(domain) else {}
+    base.update(AUTOBAHN_OFF)
+    t.write(domain, plistlib.dumps(base, fmt=plistlib.FMT_BINARY), 0o644, 0, 0)
+    t.mkdirs(b'private/var/preferences/FeatureFlags/Domain')
+    t.write(b'private/var/preferences/FeatureFlags/Domain/SpringBoard.plist', plistlib.dumps(AUTOBAHN_OFF, fmt=plistlib.FMT_BINARY), 0o644, 0, 0)
+    q = b'private/var/mobile/Library'
+    for d in (q, q + b'/SpringBoard'):
+        if d not in t.n:
+            t.n[d] = Node('d', 0o755, MOBILE, MOBILE, t.mtime, b'')
+    tw, th = w // 3, h // 3
+    for name, data in (('LockBackground.cpbitmap', cpbitmap(full, w, h)), ('HomeBackground.cpbitmap', cpbitmap(full, w, h)),
+                       ('LockBackgroundThumbnail.cpbitmap', cpbitmap(thumb, tw, th)), ('HomeBackgroundThumbnail.cpbitmap', cpbitmap(thumb, tw, th)),
+                       ('LockBackgroundThumbnail.jpg', thumb), ('HomeBackgroundThumbnail.jpg', thumb)):
+        t.write(q + b'/SpringBoard/' + name.encode(), data, 0o644, MOBILE, MOBILE)
+    merge_pref(t, 'com.apple.PaperBoard', {'SBWallpaperHasVideoKey': False, 'SBWallpaperMagnifyHomeScreenKey': False, 'SBWallpaperMagnifyLockScreenKey': False, 'SBWallpaperParallaxFactorHomeScreen': 0.0,
+               'SBWallpaperParallaxFactorLockScreen': 0.0, 'SBWallpaperPortraitHomeScreenKey': True, 'SBWallpaperPortraitLockScreenKey': True, 'SBWallpaperZoomScaleHomeScreen': 1.0,
+               'SBWallpaperZoomScaleLockScreen': 1.0, 'kSBProceduralWallpaperHomeUserSetKey': False, 'kSBProceduralWallpaperLockUserSetKey': False})
+    return f'Autobahn flags off in SpringBoard\'s domain (system + /var/preferences); Lock and Home {w}x{h} cpbitmap, {len(full)} bytes: {what}'
+
+
 def parity(t, work):
     """Every hook of docs/laurel_sprout/ios26-parity.md. None needs another to work, unless its line says so. After debug(), air(), metal(): each one adds to their launchd.plist."""
     feature(t, 'gpu-firmware', 'GPU', gpu_firmware)
@@ -1286,12 +1372,13 @@ def parity(t, work):
     feature(t, 'brightness', 'BRIGHTNESS', brightness)
     feature(t, 'bold-text', None, bold_text)
     feature(t, 'staged-apps', 'STAGED_APPS', staged_apps)
+    feature(t, 'wallpaper', 'WALLPAPER', wallpaper, work)
     t.audit('aggregated', 'not-found', 'com.apple.aggregated is not in 23F84 [V launchd.plist has only .addaily]: nothing to bring back; its limit of root-system-features.py has no job')
     t.audit('mesa-eagl', 'not-found', 'no GL path on 23F84: CA::WindowServer::AccelServer::renderer is Metal or nothing [V ios26-userland.md 8.1]. Not missing: metal26 is the compositor')
     t.audit('root-update', 'off', 'not ported before a boot: the update path needs SSH on a booted iOS 26 root and has never written on a phone on iOS 16. Evidence needed: docs/laurel_sprout/ios26-parity.md "No-wipe update"')
 
 
-FEATURES = ('debug-ios26', 'air-ios26', 'metal26', 'gpu-firmware', 'statusbar', 'notch', 'cell', 'ringer', 'audio', 'bluetooth', 'camera-tables', 'camera-plugin', 'flashlight', 'hevc', 'xnutils', 'brightness', 'bold-text', 'staged-apps', 'root-update')
+FEATURES = ('debug-ios26', 'air-ios26', 'metal26', 'gpu-firmware', 'statusbar', 'notch', 'cell', 'ringer', 'audio', 'bluetooth', 'camera-tables', 'camera-plugin', 'flashlight', 'hevc', 'xnutils', 'brightness', 'bold-text', 'staged-apps', 'wallpaper', 'root-update')
 
 
 def root_manifest(t, stamp=None):
@@ -1476,6 +1563,10 @@ def parity_self_test(d):
     ok('status bar: root global', t.n[p].uid == 0 and t.n[p].mode == 0o600)
     ok('staged apps: moved with their files', t.exists('Applications/MobileCal.app/MobileCal') and t.exists('Applications/MobileCal.app/sub') and not t.exists('private/var/staged_system_apps/MobileCal.app'))
     ok('staged apps: placeholder gone', not t.exists('System/Library/AppPlaceholders/MobileCal.app'))
+    wp = t.read(b'private/var/mobile/Library/SpringBoard/HomeBackground.cpbitmap') if t.exists(b'private/var/mobile/Library/SpringBoard/HomeBackground.cpbitmap') else b''
+    ok('wallpaper: png + trailer: 720x1560, format 4, magic; flags off at both levels; owner mobile', line(t, 'wallpaper').startswith('applied') and wp[:4] == b'\x89PNG' and struct.unpack('<7I', wp[-28:])[2:] == (720, 1560, 4, 1, CPBITMAP_MAGIC)
+       and t.n[b'private/var/mobile/Library/SpringBoard/HomeBackground.cpbitmap'].uid == MOBILE and plist_load(t, b'System/Library/FeatureFlags/Domain/SpringBoard.plist')['Autobahn'] == {'Enabled': False}
+       and plist_load(t, b'private/var/preferences/FeatureFlags/Domain/SpringBoard.plist')['AutobahnLegacyMigration'] == {'Enabled': False})
     ok('manifest row for each hook', all(line(t, x) for x in FEATURES if x not in ('debug-ios26', 'air-ios26', 'metal26')))
     ok('notes of what is not a build here', line(t, 'mesa-eagl').startswith('not-found') and line(t, 'aggregated').startswith('not-found') and 'camera-plugin' in ' '.join(t.audit_lines))
     # switches
