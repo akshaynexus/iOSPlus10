@@ -53,5 +53,6 @@ IFS=$old_ifs
 if [ $check_only = 1 ]; then say "$differ file(s) differ"; exit 0; fi
 sh_phone "printf '%s\n' '# laurel: the root list' '$LIST' > /private/var/db/negronimetal/clients && printf '%s\n' '$LIST' > /System/Library/Extensions/NegroniMetal.bundle/clients.local && rm -f /private/var/db/negronimetal/off /private/var/db/negronimetal/strikes/gpu-lost"
 say "Metal list: $LIST"
-sh_phone 'sync; killall -9 backboardd' || say "killall failed: restart the UI by hand"
+# no killall on this root [V phone]
+sh_phone 'sync; p=$(ps -ax -o pid=,comm= | grep "/backboardd$" | awk "{print \$1}"); [ -n "$p" ] && kill -9 $p' || die "no restart of the UI: no backboardd process"
 say "done: the UI restarts. Read: LAUREL METAL26: on, SWEET FPS, LAUREL DEBUG ACK in logs/usblog-*.txt"
