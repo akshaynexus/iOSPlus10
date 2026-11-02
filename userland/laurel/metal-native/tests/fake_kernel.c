@@ -293,7 +293,9 @@ static void *fake_map(void *ctx, uint32_t handle, uint64_t size)
 
 static void fake_unmap(void *ctx, uint32_t handle, void *address, uint64_t size)
 {
-	(void)ctx; (void)handle; (void)address; (void)size;
+	struct fake_kernel *k = ctx;
+	(void)handle; (void)address; (void)size;
+	k->stats.unmaps++;
 }
 
 const struct nw_ops fake_kernel_ops = {fake_call, fake_map, fake_unmap};

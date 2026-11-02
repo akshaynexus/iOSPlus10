@@ -1163,3 +1163,6 @@ Done: patch 2961 (`gpu.md` section "All stock levels"): PLL1 320/465, GPLL0 300/
 Results [V host]: `scripts/laurel/test-gpu-opp.sh` PASS (table against source and the phone's DTB; 1904 level changes with failures; 4 controls). Series 0 errors. Kernel built (see the branch report).
 Next: a boot. Read `LAUREL GPU CLOCK: on: MHz=GCC/CP` and `LAUREL DDR`. If DDR does not follow: owner decision on `Enab`. Guess [I]: 39 ms a long submission -> 25 to 28 ms.
 
+## 2026-11-03: Mi A3: native Metal stack, third option (branch `t3/native-adreno-metal-driver`, not merged)
+Done on the host, no phone: winsys, PM4, AIR -> ir3 with no Vulkan (141 of 154, 218 of 218 real keys), 148 frontend calls, third option, phone image passes abi, ARMv8.0 and import checks. Register state at a draw agrees with Turnip's on 2 scenes, 0 unexpected. **Never drew a pixel. The Objective-C frontend and the IOKit transport never ran.** GL ES: not built; route found.
+Next: owner's yes for `nmn-scene` on the phone (`docs/laurel_sprout/ios26-native-metal.md` section 8). Found on the way, for the default stack: a real CA pass runs in 108 tiles (section 3.3).

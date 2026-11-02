@@ -1120,10 +1120,10 @@ pub(crate) fn write_descriptors(e: &mut NmbEncoder, cb: &mut NmbCommandBuffer, d
                 };
                 write_buffer_descriptor(w.ty, iova, length, slot)?;
             }
-            WriteSource::Texture { slot: s, view } => write_texture(e, cb, s.stage, s.index, Some(view), slot)?,
+            WriteSource::Texture { slot: s, view } => write_texture(e, cb, s.stage, s.index, Some(view), w.ty == vk::DescriptorType::STORAGE_IMAGE, slot)?,
             WriteSource::CombinedImageSampler { image, sampler } => {
                 match image {
-                    metal2vulkan::bind::ImageSource::Texture { slot: s, view } => write_texture(e, cb, s.stage, s.index, Some(view), slot)?,
+                    metal2vulkan::bind::ImageSource::Texture { slot: s, view } => write_texture(e, cb, s.stage, s.index, Some(view), false, slot)?,
                     metal2vulkan::bind::ImageSource::Neutral(metal2vulkan::bind::NeutralResource::Image { view_type, .. }) => write_neutral_image(e, *view_type, slot)?,
                     other => return Err(format!("image source {other:?} has no native path yet")),
                 }
@@ -1320,10 +1320,30 @@ fn write_buffer_descriptor(ty: vk::DescriptorType, iova: u64, length: u64, slot:
     Ok(())
 }
 
-fn write_texture(e: &NmbEncoder, cb: &mut NmbCommandBuffer, stage: Stage, index: u32, _view: Option<&metal2vulkan::bind::ImageViewDesc>, slot: *mut u32) -> Result<(), String> {
+/// The plan's channel mapping (Metal's texture swizzle, and the swizzle a format's emulation needs), as Mesa's PIPE_SWIZZLE: x, y, z, w, 0, 1.
+fn swizzle_of(view: Option<&metal2vulkan::bind::ImageViewDesc>) -> [u8; 4] {
+    let mut out = [0u8, 1, 2, 3];
+    if let Some(v) = view {
+        let c = v.components;
+        for (i, s) in [c.r, c.g, c.b, c.a].into_iter().enumerate() {
+            out[i] = match s {
+                vk::ComponentSwizzle::R => 0,
+                vk::ComponentSwizzle::G => 1,
+                vk::ComponentSwizzle::B => 2,
+                vk::ComponentSwizzle::A => 3,
+                vk::ComponentSwizzle::ZERO => 4,
+                vk::ComponentSwizzle::ONE => 5,
+                _ => i as u8,
+            };
+        }
+    }
+    out
+}
+
+fn write_texture(e: &NmbEncoder, cb: &mut NmbCommandBuffer, stage: Stage, index: u32, view: Option<&metal2vulkan::bind::ImageViewDesc>, storage: bool, slot: *mut u32) -> Result<(), String> {
     let t = e.stages[stage_slot(stage)?].textures.get(&index).ok_or("a texture slot with nothing bound")?.clone();
-    let identity = [0u8, 1, 2, 3];
-    unsafe { nmn_descriptor_image(t.image as *const NmnImage, t.pipe_format, t.view_type, t.base_level, t.levels, t.base_layer, t.layers, identity.as_ptr(), false, slot) };
+    let swizzle = swizzle_of(view);
+    unsafe { nmn_descriptor_image(t.image as *const NmnImage, t.pipe_format, t.view_type, t.base_level, t.levels, t.base_layer, t.layers, swizzle.as_ptr(), storage, slot) };
     if t.must_name() {
         cb.names.push(t.bo() as usize);
     }

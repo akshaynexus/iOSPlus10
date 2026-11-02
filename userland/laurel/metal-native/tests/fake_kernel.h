@@ -4,7 +4,7 @@
 #define FAKE_KERNEL_H
 #include "nw.h"
 struct fake_stats {
-	uint64_t submissions, ibs, names, dwords, bad_parity, bad_ib, unknown_opcode, gem_new, gem_close, surfaces;
+	uint64_t submissions, ibs, names, dwords, bad_parity, bad_ib, unknown_opcode, gem_new, gem_close, surfaces, unmaps;
 };
 struct fake_kernel;
 struct fake_kernel *fake_kernel_new(const char *rd_path /* NULL: none */, uint64_t pool_bytes);

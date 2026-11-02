@@ -60,7 +60,8 @@ libc = "0.2"
 panic = "unwind"
 debug = 1
 TOML
-export NMN_PROFILE=$PROFILE
+python3 -I "$REPO/scripts/laurel/native/profile.py" "$PROFILE" "$W/profile.json"
+export NMN_PROFILE=$W/profile.json
 cargo "+$RUST_TOOLCHAIN" build --release --manifest-path "$W/Cargo.toml" --target "$triple" --target-dir "$W/target" -j "$NPROC"
 cp "$W/target/$triple/release/libnative_metal_native.a" "$W/"
 ls -la "$W"/*.a

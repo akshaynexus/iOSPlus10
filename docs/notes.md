@@ -5255,3 +5255,16 @@ Full text: `docs/laurel_sprout/gpu.md` section "All stock levels". Patch 2961, b
 - Lesson: a class in UIKitCore can have a twin in SystemStatusUI (STUI prefix). Find which process uses which before a hook. `strings` of one image is not enough: read `dsc-image.py DIR images`.
 - [U] The look of FixedSplit on 26; apps (own process, UIKit path, the pref applies [I]).
 
+## 2026-11-03: Mi A3 native Metal stack (branch t3/native-adreno-metal-driver; host only, no phone)
+Full text: `docs/laurel_sprout/ios26-native-metal.md`. Not merged. Never drew a pixel.
+- **Seam:** the frontend needs only 148 `nmb_*` calls. Keep it; replace what is under it. The translator crate works with no `ash`: `Device::new(DeviceDescription::from_khronos_json(...))`, `compile_render_pipeline`, `plan`, `instantiate_draw`.
+- **The strongest host method here:** one C scene through the bridge's C ABI, linked with the real default stack on drm-shim and with the new stack on a fake kernel; Mesa's `cffdump --summary` on both; compare the registers at the draw. It found 3 bugs at once. `FD_RD_DUMP=enable,full`, files in `/tmp`, `RNN_PATH=.../src/freedreno/registers`. Build `-Dtools=freedreno`.
+- **A real CA key on the default stack runs in 108 tiles [V host]:** every CA key has `fc_framebuffer_fetch`, m2v gives input attachments, Turnip then sets `sysmem_single_prim_mode`, and `tu_autotune_use_bypass` then answers "not sysmem". CA's memoryless RGBA16F `colorAttachments[1]` takes 2/3 of GMEM though this key does not write it: 36 -> 108 tiles, 9.6 MB of real memory. How much of the GPU time: [U].
+- Only 78 of 218 real rows really read the framebuffer: `nir_lower_input_attachments` progress. Scan with that pass; variable flags after DCE are not the same thing.
+- The log's "KB out of the cache" is per submission, not per window (`RedwoodGPU.cpp` 1603). I read it wrong first.
+- `ir3_shader_from_nir` takes the NIR: `ralloc_steal(NULL, nir)` before it. `glsl_type_singleton_init_or_ref` first. Stage variants live outside `ir3_shader`: free both.
+- `A6XX_x(.qword = )` macros expand to a value and an empty `{}`: use an array initializer in a macro, not a template.
+- Turnip's `((uint16_t *)sp_out)[i]` needs `-fno-strict-aliasing`. With -O2 the table is zeros.
+- Do not run `cd` into `out/` in a tool call: the tool shell keeps it. zsh does not split `$F`: use `bash -c` for a flag list.
+- `compute_apl` asks 32 x 32 threads a group: the host profile's floor refuses it; real value 1024 (`threadsize_base` 64 x `max_waves` 16) [V source].
+- Existing FD610 GL binaries (`libOSMesa`, `libtopaz-gl`, `libtopaz-inject`): 0 missing imports against 23F84 [V].

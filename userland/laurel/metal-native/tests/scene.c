@@ -299,7 +299,7 @@ int main(int argc, char **argv)
 	NmbEncoder *ce = b3 ? nmb_compute_encoder_new(b3) : NULL;
 	if (ce == NULL || !nmb_compute_set_pipeline(ce, kp))
 		FAIL("compute encoder");
-	const uint64_t groups[3] = {4, 4, 1}, per[3] = {32, 32, 16};
+	const uint64_t groups[3] = {4, 4, 1}, per[3] = {32, 32, 1};
 	if (!nmb_compute_dispatch(ce, groups, per, false)) {
 		printf("scene: compute refused: %s\n", nmb_last_error());
 		nmb_encoder_discard(ce);

@@ -138,11 +138,16 @@ static void test_kinds(void)
 	uint32_t offset = 99, row = 0;
 	struct nw_bo *s = nw_bo_import_surface(d, id, &offset, &row);
 	CHECK(s && s->kind == NW_BO_SURFACE && offset == 0 && row == 2880, "surface");
+	/* the CPU address of a surface is its owner's: nw_bo_free must not unmap it (the fake kernel's unmap counts) */
+	s->map = (void *)0x1000;
 	CHECK(nw_bo_import_surface(d, 77, NULL, NULL) == NULL, "no such surface");
 	void *pages = aligned_alloc(4096, 8192);
 	struct nw_bo *h = nw_bo_import_host(d, pages, 8192, false);
 	CHECK(h && h->kind == NW_BO_HOST && h->map == pages, "host pages");
-	nw_bo_free(d, a); nw_bo_free(d, b); nw_bo_free(d, s); nw_bo_free(d, h);
+	nw_bo_free(d, a); nw_bo_free(d, b);
+	uint64_t unmaps = fake_kernel_stats(k)->unmaps;
+	nw_bo_free(d, s); nw_bo_free(d, h);
+	CHECK(fake_kernel_stats(k)->unmaps == unmaps, "a surface or host buffer was unmapped");
 	free(pages);
 	nw_device_close(d);
 	fake_kernel_free(k);

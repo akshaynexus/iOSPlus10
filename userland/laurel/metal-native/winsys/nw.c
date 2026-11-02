@@ -204,7 +204,8 @@ void nw_bo_free(struct nw_device *d, struct nw_bo *b)
 {
 	if (b == NULL)
 		return;
-	if (b->map != NULL && b->kind != NW_BO_HOST)
+	/* only what this file mapped: a surface's or host range's address is the caller's */
+	if (b->map != NULL && (b->kind == NW_BO_POOL || b->kind == NW_BO_SCATTERED))
 		d->ops->unmap(d->ctx, b->handle, b->map, b->size);
 	bo_close_handle(d, b->handle);
 	pthread_mutex_lock(&d->lock);

@@ -23,7 +23,7 @@ Marks: **[V]** read or run here (file, command, log). **[I]** inference or estim
 | GL ES on this winsys | **Stage 6, for apps only** | [V `ios26-userland.md`] On 23F84 the render server has no GL path. CoreAnimation is Metal only. GL is for apps | [V] |
 | 60 fps with full live glass | **Not reachable by a driver** | The cost is pixels x instructions on 1 SP. Section 3.3 | [I] |
 
-**Honest size.** Stages 2 and 3 are host work with strong tests. Stage 4 can reach "the right registers on the host", not "the right pixels". Pixels need the phone. A first start on the phone will find faults that no host test finds. Section 8 lists what the phone test must show.
+**Honest size.** Stages 2 and 3 are host work with strong tests. Stage 4 reached "the right registers on the host", not "the right pixels". Pixels need the phone. A first start on the phone will find faults that no host test finds. Section 8 lists what the phone test must show.
 
 ## 2. Call census of 23F84
 
@@ -86,7 +86,7 @@ Why [V code, `RedwoodGPU.cpp` `submit`]:
 | Buffers in the kernel | one or more per Metal object, m2v 8 MB blocks | 4 MB slabs + a list of freed large buffers | [V] code, host test; [U] pool use on the phone |
 | Memoryless | real memory per surface | shared | [V] CA asks; [I] saving; [U] the pool number |
 | Descriptor sets | Vulkan pools + updates per draw | words written to the upload ring | [I] |
-| State per submission | Turnip runs `tu6_init_hw` at each primary VkCommandBuffer begin (`tu_cmd_buffer.cc` 2662): about 70 registers + WFI + cache invalidate [V]. How many VkCommandBuffers a submission holds: [U]; the log gives 11.6 IBs per submission, and one VkCommandBuffer can be several IBs | one init IB per submission, called, not copied. The kernel's ring is shared with other processes, so one init per submission must stay | [I] |
+| State per command buffer | Turnip runs `tu6_init_hw` at each primary VkCommandBuffer begin (`tu_cmd_buffer.cc` 2662): about 70 registers + WFI + cache invalidate [V]. How many VkCommandBuffers a submission holds: [U]; the log gives 11.6 IBs per submission, and one VkCommandBuffer can be several IBs | the same register list today (section 6.4), program state called. A stored init IB is the next step. The kernel's ring is shared with other processes, so one init per submission must stay | [V] code |
 | CCU mode switch | per pass with autotune: flush, invalidate, WFI [V code] | none: always sysmem | [I] |
 | Shader bounds checks | `DevicePolicy` containment on (m2v default) | The same: stage 3 measured no gain with them off | [V host] |
 
@@ -156,7 +156,7 @@ Facts this rests on [V `RedwoodGPU.cpp`, `TopazAdreno.cpp`]:
 - The display's wait needs the render target surface named. So **every surface a command buffer writes is named.** Surfaces it reads are named too, so a client's later CPU read and the push rule stay right.
 - Scattered buffers (pool full, address below `kSamePlaceBase`) are cached. They need a name when the CPU wrote them. `nw_bo.kind` holds this. Pool memory is write-combined: no push.
 - Host pages (0x49): each name pushes the whole buffer. Name them only after a CPU write the frontend reports.
-- The ring (`redwood_gpu_submit`): `CP_REG_TO_MEM` time stamp, CCU invalidate depth and color, the IBs, `RB_DONE_TS`, `CACHE_FLUSH_TS`. So each submission starts with an empty CCU and ends flushed. **Other processes run on the same ring between submissions, so no register state survives a submission.** Hence one init IB per submission.
+- The ring (`redwood_gpu_submit`): `CP_REG_TO_MEM` time stamp, CCU invalidate depth and color, the IBs, `RB_DONE_TS`, `CACHE_FLUSH_TS`. So each submission starts with an empty CCU and ends flushed. **Other processes run on the same ring between submissions, so no register state survives a submission.** Hence an init per submission.
 - Deadline clock: `millisecondsUntil` reads `mach_continuous_time`: user space must use `CLOCK_MONOTONIC_RAW` (`ios26-gpu-lag.md` cause 2). `nw_now_ns` does.
 
 Descriptors, the bindless model: m2v's layout is set 0 (dense, per command) and set 1 (heap arrays). Turnip's lowering (`tu_shader.cc`, MIT) turns each into `bindless_resource_ir3` with a 16-dword stride per element. `native` does the same in its own pass, and writes A6XX descriptors into the upload ring. `SP_BINDLESS_BASE` + `HLSQ_BINDLESS_BASE` point at it. No descriptor pool, no copy. Push constants: `CP_LOAD_STATE6` per stage.
@@ -185,18 +185,50 @@ Items that came from closed sources, so far [V `strings`]:
 | The driver has per-bucket render modes and a "direct" (sysmem) path: `Per-Bucket RenderMode Setting`, `Hint invalid: Direct render forced from panel`, `Very low number of draws with a GMEM load` | `lib64/egl/libGLESv2_adreno.so` strings | Support for the choice of sysmem as a normal path: not a port |
 | One named erratum: `Errata128AddWFIForVSwithUBWCTextureFetchInNonSinglePrimMode` | same | If `native` turns UBWC on for a texture read in a vertex shader: a WFI there. **Open: which chips, the file does not say by string alone** [U]. No UBWC in the first version |
 
-No disassembly was needed yet. If a stage needs one, the doc will list file and offset.
+No closed library was disassembled: `strings` only, and nothing in the driver came from them. So every closed-source item is the table above.
 
 ## 6. Stages and state
 
-| Stage | State | Proof |
-|---|---|---|
-| 1 This doc | Done | |
-| 2 Winsys + PM4 | Winsys done; PM4 in progress | `scripts/laurel/native/test.sh winsys`: PASS under ASan and UBSan, against a fake kernel with the real kernel's submit rules [V host]. Not run on the phone |
-| 3 Shader path | **Done on the host** | Section 6.3 [V host]. Pixels: [U] |
-| 4 Metal objects | Compile objects only | |
-| 5 Third option | Not started | |
-| 6 GL ES | Not started | |
+| Stage | State | Proof | Not proven |
+|---|---|---|---|
+| 1 This doc | Done | | |
+| 2 Winsys + PM4 | **Done on the host** | 6.1, 6.2 [V host] | IOKit transport never ran. No GPU ran this stream |
+| 3 Shader path | **Done on the host** | 6.3 [V host] | Pixels |
+| 4 Metal objects | **Compositor set written; links and draws on the fake kernel** | 6.4 [V host] | The Objective-C frontend and the plug-in compiled and linked, and **never ran** on any host: they need iOS. No frame |
+| 5 Third option | **Done on the host** | 6.5 [V host] | Selector never ran with this option. The full bundle was not assembled here: it needs the `default` and `hot` builds |
+| 6 GL ES | **Not built.** Route found, no new code | 6.6 | Everything |
+
+**This is not a working driver yet. It has never drawn a pixel.** It is a complete path from AIR to packets, with registers that agree with Turnip's in the tests below.
+
+### 6.1 Winsys
+
+`userland/laurel/metal-native/winsys/`. `scripts/laurel/native/test.sh winsys`: **PASS under ASan and UBSan** [V host], against `tests/fake_kernel.c`, which has the real kernel's submit rules (128 IBs, 8,192 names, an IB inside a named buffer, parity of each packet).
+
+Checked: 4,000 small objects take at most 2 kernel buffers; no overlap; freed gaps join; a 9 MiB buffer comes back from the free list; 1,000 names of one buffer are one name; 300 IBs are refused before the kernel; a surface's CPU address is not unmapped.
+
+### 6.2 PM4: the same draw, against Turnip
+
+`scripts/laurel/native/ref-capture.sh` runs `tests/scene.c` through the **real** default stack on Mesa's drm-shim. `scripts/laurel/native/pm4-compare.sh` runs **the same file** on the native stack. Mesa's `cffdump` decodes both. `pm4-diff.py` compares every register at the draw, and it exits 1 on any unexplained difference. Results [V host]:
+
+| Scene | Same | Addresses | From the shader's code | By design | **Unexpected** |
+|---|---:|---:|---:|---:|---:|
+| Plain pipeline (`std_vert1_lph` + `luma_boost_lph`), `TU_DEBUG=sysmem` | 155 | 7 | 7 | 4 | **0** |
+| Real CA key of the phone (`fixed_frag_lph_cph`), `TU_DEBUG=sysmem` | 161 | 9 | 1 | 12 | **0** |
+
+Differences by design, each in `DESIGN` of `pm4-diff.py`: push constants per stage, not shared; flush mode only when the code reads the framebuffer; an attachment no program writes is not bound; no UBWC yet.
+
+The test found real bugs before any phone did [V]: a strict-aliasing error that zeroed the vertex output table at -O2 (Turnip's casts need `-fno-strict-aliasing`, which Mesa's build passes); the viewport's y sign; descriptor sets emitted before the program's state invalidate.
+
+What the same scene costs [V host, counts only, one quad]:
+
+| | Default, autotune (what the phone runs) | Default, sysmem | `native` |
+|---|---:|---:|---:|
+| Top-level command dwords | **7,166** | 481 | **279** (413 with the blit submission) |
+| IBs in the submission | 3 | 2 | 1 |
+| Buffers named | 18 | 14 | **2** |
+| Bytes in named buffers | 49 MB | 48 MB | a few chunks |
+
+Limit: **this compares state, not behaviour.** Equal registers at a draw do not prove the order of events, flushes or the blit paths. Packet order was read against Turnip, not compared. Compute and blits have no register comparison: they only pass the packet walk and decode with no unknown opcode.
 
 ### 6.3 Stage 3: the shader path, with no Vulkan
 
@@ -226,21 +258,112 @@ What this says:
 
 What was reused [V]: `tu_shader.cc`'s order of passes, `build_bindless`, `gather_push_constants`, ported in `nmn_shader.c` with credit. Set 0 and set 1 of m2v map to bindless bases 0 and 1.
 
+### 6.4 Stage 4: Metal objects
+
+`bridge/src/`: all 148 `nmb_*` calls of the frontend link [V]. The frontend's sources are unchanged.
+
+| Works on the fake kernel [V host] | Written, no test | **Refuses with a reason** |
+|---|---|---|
+| Device, library, functions, specialization, render + compute pipelines, buffers, textures, samplers, render encoder, blit encoder (copy, fill, texture, mips, readback), compute dispatch, commit, wait, completion | Heaps, views, IOSurface textures (`nmn_note_surface`), events, depth + stencil state, host-page buffers | Argument buffers, indirect draws and dispatches, visibility results, pipeline variants a plan asks for, compute descriptor options, planar YUV formats, formats outside the table (`BGR10_XR` and others) |
+
+Mapping of Apple's features:
+
+| Feature | `native` |
+|---|---|
+| Memoryless | One shared backing per size and format, and not bound when no program writes it [V code]. **No GMEM** |
+| Tile shaders, imageblocks, raster order groups | Answers 0, as the default stack. Tile functions are refused |
+| Framebuffer fetch | Texture read at the fragment's position + `FLUSH_PER_OVERLAP_AND_OVERWRITE`, only for a program that reads it. 78 of 218 real rows [V]. [U] on the phone: a read and a write of one target need the CCU flush this mode gives; the blob's and Turnip's choice, not tested here |
+| Residency sets, `useResource`, `useHeap` | One address space: nothing to do |
+| Device answers | The default stack's table on FD610: `bridge/src/answers.tsv`, made by `tests/dump-answers.c` [V]. So a framework takes the same path on both stacks |
+| Shader events | Signal at completion. A wait blocks the commit for at most 100 ms: **[I] not a real GPU wait** |
+| Store actions | Sysmem stores all. "Don't care" saves no bandwidth yet |
+| UBWC | Off in the first version: fewer flushes to get right. One closed-source erratum to read first (section 5). Bandwidth gain left for later [I] |
+| Timing | One thread per committed command buffer waits on the kernel's fence: simple, not free. A worker is a later step |
+
+**Known risk to read first on the phone:** `nmn_cmd_init` runs per command buffer, not as one stored IB, and I did not build the "called, not copied" init of section 3.2. Program state is called. So the state gain per command buffer is smaller than that table says.
+
+### 6.5 Stage 5: the third option
+
+| Check | Result [V host] |
+|---|---|
+| `scripts/bg.sh ios26-metal-native scripts/laurel/ios26-metal-native-build.sh` | `out/ios26/metal-native/NegroniMetal`, 18.99 MB (default: 22.9 MB + Turnip 10.9 MB). It builds nothing of the other two stacks |
+| `abi-check.py` | 3 Mach-O files, 0 failed |
+| `armv80-check.py` | 0 instructions newer than ARMv8.0 in all 3 |
+| `check-imports.py` against 23F84 | PASS, 0 missing |
+| `option-rule-test.sh` | PASS, with new rows: `native` falls back at once on a reported failure, and stays on the default until written again |
+| `xnutils-test.sh` | PASS: `metaloption native` |
+
+- Bundle: `ios26-metal-options.sh` adds `options/native/NegroniMetal` when that file exists. **An option, never the default:** `NMTL_OPTION_DEFAULT` did not change.
+- Failure: the selector's existing rules (no device, crash, no frame in 240 s, black screen), with the line `LAUREL METAL NATIVE: off: reason`.
+- The default build: the plug-in changes are under `#ifdef NMTL_NATIVE`, the selector only changes its failure tag. `ios16-compat-run.sh` was **not** run on this branch: run it before a merge.
+
+### 6.6 Stage 6: GL ES
+
+**No new GL code.** The short way already exists, and it is not on this winsys's code, only on its kernel requests:
+
+- The Mi A3 has a GL path on iOS 16 that ran on this GPU: Mesa freedreno, `libOSMesa.8.dylib` + `libtopaz-gl.dylib` (ios-topaz, `scripts/laurel/mesa-linux.sh`), 32.9 fps moving [V `gpu.md`].
+- Those three files against the 23F84 cache: **0 missing imports** [V host, `check-imports.py`].
+- 23F84 still has `OpenGLES.framework`, `GLEngine`, `libGFXShared`, 580 same symbols [V `images.txt`, `ios26-userland.md`].
+- CoreAnimation on 23F84: Metal only. **GL here is for apps** [V].
+
+Not done: a per-app gate on iOS 26, an inject route that 23F84 accepts, any run. A gallium winsys on `nw.c` gives nothing: Mesa's freedreno needs the libdrm shape, which `redwood-drm` already gives over the same requests. So I do not recommend writing one. [I]
+
 ## 7. Time [I]
 
-| Stage | Work | Then |
-|---|---|---|
-| 2, 3 | About a day of agent time each | Host-proven |
-| 4 | Several days for the compositor's set | Registers right on the host, pixels unproven |
-| 5 | Hours | Option in the selector |
-| Phone bring-up | Unknown. Expect faults and hangs. **Days to weeks with the owner in the loop** | First pixels |
-| 6 | 1 to 2 days: NegroniGL's freedreno gallium already runs on iOS 16 through the same ABI | Apps only |
+| Work | Estimate |
+|---|---|
+| Stages 2 to 5 to this state on the host | Done in one session |
+| Phone bring-up to a first correct frame | Unknown. Expect hangs. Days to weeks with the owner in the loop |
+| Argument buffers, variants, YUV: what the frameworks refuse first | Days, led by `refused` lines |
+| GL ES for apps | Days, after the Metal bench |
 
 ## 8. What the phone test must show first
 
-Not asked yet. Stage reports will say exactly what runs and what it writes.
+**No phone was used. Nothing below has run.** I ask only through the owner, one step at a time.
 
-1. A tool over SSH, writes nothing but its own log: device open, GET_PARAM values, one submit of a `CP_MEM_WRITE`, fence.
-2. A clear + one draw into a buffer, read back.
-3. The compositor with the option, with the fallback armed. Lines: `LAUREL METAL NATIVE: on|off: ...`.
-4. The bench of `ios26-metal.md` 10.5, three stacks. The numbers that decide: `present_p50/p95`, GPU per submission, kernel time per submission, pool free, names per submission.
+### Step 1: the scene tool (asks for: SSH to a booted iOS 26 phone)
+
+| Item | Value |
+|---|---|
+| Runs | `scripts/net/phone-run.sh -s out/ios26/metal-native/nmn-scene none /var/tmp/nmn-cache /System/Library/Frameworks/QuartzCore.framework/default.metallib` |
+| Writes | The tool's copy in a temp folder, removed after the run. **No partition, no root change, no setting** |
+| Should show | `scene: wait 0 status 4 error ''`; `pixel (0,0)` and `(360,780)` not 0; `copied byte 5a`; `scene: compute: PASS` |
+| Risk | **A bad stream hangs the GPU. The kernel then stops it until a reboot (`docs/gpu-abi.md` section 3 item 7), for every stack.** The compositor stops too, and the owner must reboot the phone. Nothing is lost on disk |
+| Answers | Does the IOKit transport work; does the GPU accept this stream; first pixels |
+
+Known test limit: the tool has no `metallib` on its own: the path above must exist on that root, and QuartzCore's file is not plain AIR on every build [V `metal-libs.tsv` lists it with AIR]. A wrong path says so at once.
+
+### Step 2, only after step 1 shows pixels: the compositor
+
+| Item | Value |
+|---|---|
+| Needs | A root with the selector: the first-boot root has the default stack only (`ios26-metal.md` section 10) |
+| Writes | `/System/Library/Extensions/NegroniMetal.bundle/options/native/NegroniMetal`; `/private/var/db/negronimetal/option` = `native` through XNUtils, then Restart UI. No partition write beyond what that root already needs |
+| Should show | `LAUREL METAL: on: stack native`; then `LAUREL METAL26: on: stack native: the screen is lit 60 s after the first frame`; the kernel's windows with far fewer names |
+| On failure | `LAUREL METAL NATIVE: off: reason`, back on the default stack |
+
+### Step 3: the bench
+
+`ios26-metal.md` 10.5, three stacks: `default`, `hot`, `native`. The numbers that decide: `present_p50/p95`, GPU us per submission, kernel us per submission, names per submission, pool free.
+
+**The first thing the bench must answer:** how much of the GPU time was tile replay (section 3.3). A cheap early test with no new driver is `tumode sysmem` and `CA_ENABLE_MEMORYLESS=0` on the default stack [I]. It may give part of this gain sooner.
+
+### Estimated gain, all [I], no timing exists
+
+| Case | Today | `native` |
+|---|---|---|
+| Kernel time per submission | 0.7 to 33 ms | 0.1 to 0.3 ms |
+| Names per submission | 881 to 1,537 | 2 to about 20 |
+| Memory | 9.6 MB per screen surface for an unused target; m2v's blocks | Not bound; slabs |
+| GPU per submission | 121 to 304 ms with live glass | **Unknown.** If tile replay is the main cost, large. If the shaders are, 10 to 25 % |
+
+## 9. Files for the phone
+
+| File | State |
+|---|---|
+| `out/ios26/metal-native/nmn-scene` | Built, ad-hoc signed, 18.97 MB. Git-ignored |
+| `out/ios26/metal-native/NegroniMetal` -> `options/native/NegroniMetal` | Built, ad-hoc signed, 18.99 MB. Git-ignored |
+| The selector and the bundle | `ios26-metal-options.sh`: not assembled here |
+| XNUtils with `native` | `xnutils-build.sh`: host-tested, not rebuilt for the phone here |
+
+Rebuild: `scripts/bg.sh ios26-metal-native scripts/laurel/ios26-metal-native-build.sh`. Tests: `scripts/laurel/native/test.sh`, `ref-capture.sh`, `pm4-compare.sh`, `ir3-native.sh`.

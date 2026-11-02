@@ -59,7 +59,8 @@ libc = "0.2"
 panic = "unwind"
 debug = 1
 TOML
-export NMN_PROFILE=$PROFILE SDKROOT=$SDK IPHONEOS_DEPLOYMENT_TARGET=16.0
+python3 -I "$REPO/scripts/laurel/native/profile.py" "$PROFILE" "$W/profile.json"
+export NMN_PROFILE=$W/profile.json SDKROOT=$SDK IPHONEOS_DEPLOYMENT_TARGET=16.0
 cargo "+$RUST_TOOLCHAIN" build --release --manifest-path "$W/Cargo.toml" --target aarch64-apple-ios --target-dir "$W/target" -j "$NPROC"
 RLIB=$W/target/aarch64-apple-ios/release/libnative_metal_native.a
 LIBS="$B/src/compiler/spirv/libvtn.a $B/src/compiler/nir/libnir.a $B/src/compiler/libcompiler.a $B/src/freedreno/ir3/libfreedreno_ir3.a $B/src/freedreno/isa/libir3decode.a $B/src/freedreno/isa/libir3encode.a $B/src/compiler/isaspec/libisaspec.a $B/src/freedreno/common/libfreedreno_common.a $B/src/freedreno/fdl/libfreedreno_layout.a $B/src/util/libmesa_util.a $B/src/util/blake3/libblake3.a $B/src/c11/impl/libmesa_util_c11.a"
