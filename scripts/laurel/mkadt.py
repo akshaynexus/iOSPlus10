@@ -154,7 +154,7 @@ DONORS = {
     # write-combined mapping outside it becomes Device-GRE, where unaligned access and DC ZVA fault. The screen (0x5c000000) and the GPU
     # pool are outside the window, so give all three banks. The window itself stays in darwinboot-memory-size and boot_args.
     'n104ap': dict(compatible='N104AP', model='iPhone12,1', target='N104', sub='N104AP',
-                   adt=os.path.join(_APPLE, 'ios26', '23F84-n104ap', 'n104ap.adt'), dram_all=(0x40000000, 0x180000000)),
+                   adt=os.path.join(_APPLE, 'ios26', '23F84-n104ap', 'n104ap.adt'), dram_all=(0x40000000, 0x180000000), seed_bytes=256),
 }
 DONOR = DONORS['d22ap']
 _topaz_product = topaz.d22ap_product
@@ -164,6 +164,9 @@ topaz.d22ap_product = lambda: _topaz_product(DONOR['adt'])   # its default path 
 def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwinboot=False):
     topaz.FB_W, topaz.FB_H, topaz.FB_STRIDE = FB_W, FB_H, FB_W * 4
     topaz.SWEET_ECID = LAUREL_ECID
+    # xnu-12377 on arm64 asks 4 x SHA512 = 256 seed bytes (prng_random.c BOOTLOADER_ENTROPY_REQUEST_SIZE) and panics with less [V phone 2026-11-02]; topaz gives 64.
+    if seed is None and DONOR.get('seed_bytes'):
+        seed = os.urandom(DONOR['seed_bytes'])
     root = topaz.build(seed=seed, native=True)
 
     root.props = [(k, f, v) for k, f, v in root.props]
