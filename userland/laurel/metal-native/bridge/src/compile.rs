@@ -43,6 +43,15 @@ impl Stage {
         Ok(Stage { entry: CString::new(module.entry_point.as_str()).map_err(|_| "entry name")?, spec, spirv: module.spirv.clone(), stage })
     }
 
+    pub fn with(mut self, over: &[NmnSpec]) -> Stage {
+        for o in over {
+            if let Some(s) = self.spec.iter_mut().find(|s| s.id == o.id) {
+                s.value = o.value;
+            }
+        }
+        self
+    }
+
     pub fn input(&self) -> NmnStageInput {
         NmnStageInput { stage: self.stage, spirv: self.spirv.as_ptr(), words: self.spirv.len(), entry: self.entry.as_ptr(), spec: self.spec.as_ptr(), spec_count: self.spec.len() as u32 }
     }
@@ -70,6 +79,11 @@ fn why_text(why: &[c_char]) -> String {
 }
 
 pub fn render_program(compiler: *mut NmnCompiler, p: &RenderPipeline) -> Result<Program, String> {
+    render_program_spec(compiler, p, &[])
+}
+
+/// With the plan's specialization values over each stage's defaults.
+pub fn render_program_spec(compiler: *mut NmnCompiler, p: &RenderPipeline, over: &[NmnSpec]) -> Result<Program, String> {
     let bindings = lay_out(&p.layout)?;
     let push = p.layout.push_constants.iter().map(|r| r.offset + r.size).max().unwrap_or(0);
     let layout = NmnLayout { bindings: bindings.as_ptr(), binding_count: bindings.len() as u32, push_bytes: push };
@@ -77,8 +91,8 @@ pub fn render_program(compiler: *mut NmnCompiler, p: &RenderPipeline) -> Result<
     let mut fragment = None;
     for m in &p.stages {
         match m.stage {
-            vk::ShaderStage::VERTEX => vertex = Some(Stage::new(m, 0)?),
-            vk::ShaderStage::FRAGMENT => fragment = Some(Stage::new(m, 1)?),
+            vk::ShaderStage::VERTEX => vertex = Some(Stage::new(m, 0)?.with(over)),
+            vk::ShaderStage::FRAGMENT => fragment = Some(Stage::new(m, 1)?.with(over)),
             other => return Err(format!("stage {other:?} has no native path")),
         }
     }
@@ -105,4 +119,28 @@ pub fn compute_program(compiler: *mut NmnCompiler, p: &ComputePipeline) -> Resul
         return Err(why_text(&why));
     }
     Ok(Program(program))
+}
+
+/// The vertex format of the translator's input state -> Mesa's pipe format (pipe_format numbers come from nmn_pm4's Metal table: the translator speaks Vulkan formats).
+pub fn vertex_format_pipe(f: vk::Format) -> Option<u32> {
+    let metal = match f {
+        vk::Format::R32G32B32A32_SFLOAT => 125,
+        vk::Format::R16G16B16A16_SFLOAT => 115,
+        vk::Format::R32G32_SFLOAT => 105,
+        vk::Format::R16G16_SFLOAT => 65,
+        vk::Format::R32_SFLOAT => 55,
+        vk::Format::R8G8B8A8_UNORM => 70,
+        vk::Format::B8G8R8A8_UNORM => 80,
+        vk::Format::R32G32B32A32_UINT => 123,
+        vk::Format::R32G32B32A32_SINT => 124,
+        vk::Format::R16G16B16A16_UINT => 113,
+        vk::Format::R32G32_UINT => 103,
+        vk::Format::R32_UINT => 53,
+        _ => return None,
+    };
+    Some(unsafe { nmn_format_from_metal(metal) })
+}
+
+pub fn vertex_format_is_float(f: vk::Format) -> bool {
+    !matches!(f, vk::Format::R32G32B32A32_UINT | vk::Format::R32G32B32A32_SINT | vk::Format::R16G16B16A16_UINT | vk::Format::R32G32_UINT | vk::Format::R32_UINT)
 }

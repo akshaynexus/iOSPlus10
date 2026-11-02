@@ -1,7 +1,7 @@
 #!/bin/bash
 # Stage 3 of the native stack: CoreAnimation's pipelines through AIR -> SPIR-V (metal2vulkan crate) -> NIR -> our lowering -> ir3 for FD610, with no Vulkan, no Turnip, no drm-shim. The same harness as scripts/ios26/ir3-check.sh (userland/laurel/metal/tests/ca-pipelines.c), so the count is comparable: 141 of 154 on the default stack.
 #   scripts/bg.sh nmn-ir3 scripts/laurel/native/ir3-native.sh [PLAN ...]     default: the 154-row plan and the real keys of the phone
-# A pipeline made here says that the code exists, not that its pixels are right. NMN_POLICY=safe keeps the translator's bounds checks.
+# A pipeline made here says that the code exists, not that its pixels are right. NMN_POLICY=unsafe turns the translator's bounds checks off, to measure them.
 # Output: out/ios26/native/ir3/<plan>/{result.tsv,stats.tsv}.
 set -euo pipefail
 . "$(cd "$(dirname "$0")/.." && pwd)/metal-env.sh"

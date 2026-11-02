@@ -1,0 +1,1362 @@
+// SPDX-License-Identifier: MIT
+//! Resources, command buffers and encoders behind bridge/NativeMetalObjects.h: what the compositor needs, on the PM4 layer (pm4/nmn_pm4.cc). What is not here is refused: nmb_last_error says so, and the frontend turns a refusal into Metal's error.
+use crate::ffi::*;
+use crate::objects::*;
+use metal2vulkan::bind::{BindState, BoundBuffer, BoundSampler, BoundTexture, DrawCall, SamplerDescriptor, StageTable, TextureFacts, WriteSource};
+use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureType};
+use metal2vulkan::pipeline::Stage;
+use metal2vulkan::vk;
+use std::collections::HashMap;
+use std::ffi::{c_char, c_void};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+
+const SLOT_BYTES: usize = 64;
+const SHARED: u64 = 0;
+const MEMORYLESS: u64 = 3;
+
+pub(crate) struct Gpu {
+    pub dev: *mut NwDevice,
+    pub gpu: *mut NmnGpu,
+    zero: Mutex<NwSlice>,
+    transient: Mutex<HashMap<(u32, u32, u32), Arc<Slice>>>,
+    neutrals: Mutex<HashMap<u32, Arc<TextureObj>>>,
+    pub names_total: AtomicU64,
+}
+// SAFETY: nw_device has its own lock; nmn_gpu is read only after creation but for private memory, which grows under bake's caller.
+unsafe impl Send for Gpu {}
+unsafe impl Sync for Gpu {}
+
+impl Gpu {
+    pub fn open() -> Result<Arc<Gpu>, String> {
+        let mut why = [0 as c_char; 256];
+        let text = |w: &[c_char]| unsafe { std::ffi::CStr::from_ptr(w.as_ptr()) }.to_string_lossy().into_owned();
+        unsafe {
+            let mut ctx = std::ptr::null_mut();
+            let ops = nmn_platform_ops(&mut ctx, why.as_mut_ptr(), why.len());
+            if ops.is_null() {
+                return Err(text(&why));
+            }
+            let dev = nw_device_open(ops, ctx, why.as_mut_ptr(), why.len());
+            if dev.is_null() {
+                return Err(text(&why));
+            }
+            let gpu = nmn_gpu_new(dev, why.as_mut_ptr(), why.len());
+            if gpu.is_null() {
+                nw_device_close(dev);
+                return Err(text(&why));
+            }
+            let mut zero = NwSlice::empty();
+            if !nw_slice_new(dev, 65536, 4096, &mut zero) {
+                return Err("no GPU memory for the zero buffer".into());
+            }
+            Ok(Arc::new(Gpu { dev, gpu, zero: Mutex::new(zero), transient: Mutex::new(HashMap::new()), neutrals: Mutex::new(HashMap::new()), names_total: AtomicU64::new(0) }))
+        }
+    }
+    fn zero_iova(&self) -> u64 {
+        self.zero.lock().unwrap().iova
+    }
+    fn neutral_image(self: &Arc<Gpu>, key: u32, _kind: u32, layers: u32) -> Result<Arc<TextureObj>, String> {
+        let mut map = self.neutrals.lock().unwrap();
+        if let Some(t) = map.get(&key) {
+            return Ok(t.clone());
+        }
+        let metal_kind = match key { 1 => 0u64, 2 => 5, 3 => 7, _ => 2 };
+        let d = NmbTextureDescriptor { kind: metal_kind, format: 70, width: 1, height: 1, depth: 1, levels: 1, samples: 1, array_length: 1, usage: 1, options: 0 };
+        let _ = layers;
+        let t = new_texture(self, &d, None)?;
+        map.insert(key, t.clone());
+        Ok(t)
+    }
+}
+
+pub(crate) struct Slice {
+    gpu: Arc<Gpu>,
+    s: Mutex<NwSlice>,
+    pub iova: u64,
+    pub map: usize,
+    pub size: u64,
+    bo: usize,
+}
+impl Slice {
+    fn new(gpu: &Arc<Gpu>, size: u64, align: u64) -> Result<Arc<Slice>, String> {
+        let mut s = NwSlice::empty();
+        if !unsafe { nw_slice_new(gpu.dev, size.max(1), align, &mut s) } {
+            return Err(format!("no GPU memory for {size} bytes"));
+        }
+        Ok(Arc::new(Slice { gpu: gpu.clone(), iova: s.iova, map: s.map as usize, size, bo: s.bo as usize, s: Mutex::new(s) }))
+    }
+    pub fn bo(&self) -> *mut NwBoHead {
+        self.bo as *mut NwBoHead
+    }
+}
+impl Drop for Slice {
+    fn drop(&mut self) {
+        let mut s = self.s.lock().unwrap();
+        unsafe { nw_slice_free(self.gpu.dev, &mut *s) };
+    }
+}
+
+/// Memory of a buffer: a slice of ours, an imported surface, or the caller's pages.
+enum Backing {
+    Slice(Arc<Slice>),
+    Bo { gpu: Arc<Gpu>, bo: usize, offset: u64 },
+}
+impl Drop for Backing {
+    fn drop(&mut self) {
+        if let Backing::Bo { gpu, bo, .. } = self {
+            unsafe { nw_bo_free(gpu.dev, *bo as *mut NwBoHead) };
+        }
+    }
+}
+impl Backing {
+    fn iova(&self) -> u64 {
+        match self {
+            Backing::Slice(s) => s.iova,
+            Backing::Bo { bo, offset, .. } => unsafe { (*(*bo as *mut NwBoHead)).iova + offset },
+        }
+    }
+    fn bo(&self) -> *mut NwBoHead {
+        match self {
+            Backing::Slice(s) => s.bo(),
+            Backing::Bo { bo, .. } => *bo as *mut NwBoHead,
+        }
+    }
+    fn map(&self) -> *mut c_void {
+        match self {
+            Backing::Slice(s) => s.map as *mut c_void,
+            Backing::Bo { bo, offset, .. } => unsafe {
+                let b = *bo as *mut NwBoHead;
+                if (*b).map.is_null() { std::ptr::null_mut() } else { ((*b).map as *mut u8).add(*offset as usize) as *mut c_void }
+            },
+        }
+    }
+    fn must_name(&self) -> bool {
+        match self {
+            Backing::Slice(s) => unsafe { (*s.bo()).kind == NW_BO_SCATTERED },
+            Backing::Bo { .. } => true,
+        }
+    }
+}
+
+pub struct NmbBuffer {
+    pub(crate) b: Arc<BufferObj>,
+}
+pub(crate) struct BufferObj {
+    backing: Backing,
+    length: u64,
+    surface_id: u32,
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_buffer_new(d: *mut NmbDevice, length: u64, _options: u64, bytes: *const c_void) -> *mut NmbBuffer {
+    guard(std::ptr::null_mut(), || {
+        let gpu = &get(d)?.gpu;
+        let s = Slice::new(gpu, length, 256)?;
+        unsafe {
+            if bytes.is_null() {
+                std::ptr::write_bytes(s.map as *mut u8, 0, length as usize);
+            } else {
+                std::ptr::copy_nonoverlapping(bytes as *const u8, s.map as *mut u8, length as usize);
+            }
+        }
+        Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Slice(s), length, surface_id: 0 }) }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_buffer_new_no_copy(d: *mut NmbDevice, pointer: *mut c_void, length: u64, _options: u64) -> *mut NmbBuffer {
+    guard(std::ptr::null_mut(), || {
+        let gpu = &get(d)?.gpu;
+        let bo = unsafe { nw_bo_import_host(gpu.dev, pointer, length, false) };
+        if bo.is_null() {
+            return Err("the kernel refused the host pages".into());
+        }
+        Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Bo { gpu: gpu.clone(), bo: bo as usize, offset: 0 }, length, surface_id: 0 }) }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_release(b: *mut NmbBuffer) {
+    release(b)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_contents(b: *const NmbBuffer) -> *mut c_void {
+    guard(std::ptr::null_mut(), || Ok(get(b)?.b.backing.map()))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_length(b: *const NmbBuffer) -> u64 {
+    guard(0, || Ok(get(b)?.b.length))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_gpu_address(b: *const NmbBuffer) -> u64 {
+    guard(0, || Ok(get(b)?.b.backing.iova()))
+}
+
+// ---- textures ----
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct NmbTextureDescriptor {
+    pub kind: u64,
+    pub format: u64,
+    pub width: u64,
+    pub height: u64,
+    pub depth: u64,
+    pub levels: u64,
+    pub samples: u64,
+    pub array_length: u64,
+    pub usage: u64,
+    pub options: u64,
+}
+
+pub(crate) struct TextureObj {
+    gpu: Arc<Gpu>,
+    image: usize,
+    pipe_format: u32,
+    desc: NmbTextureDescriptor,
+    backing: Option<Arc<BufferObj>>, // over a buffer or a surface
+    memory: Option<Arc<Slice>>,
+    parent: Option<Arc<TextureObj>>,
+    view_type: u32,
+    base_level: u32,
+    levels: u32,
+    base_layer: u32,
+    layers: u32,
+    memoryless: bool,
+}
+impl Drop for TextureObj {
+    fn drop(&mut self) {
+        if self.parent.is_none() {
+            unsafe { nmn_image_free(self.image as *mut NmnImage) };
+        }
+    }
+}
+impl TextureObj {
+    fn storage_mode(d: &NmbTextureDescriptor) -> u64 {
+        (d.options >> 4) & 0xf
+    }
+    fn must_name(&self) -> bool {
+        if let Some(p) = &self.parent {
+            return p.must_name();
+        }
+        self.backing.as_ref().is_some_and(|b| b.backing.must_name()) || self.memory.as_ref().is_some_and(|m| unsafe { (*m.bo()).kind == NW_BO_SCATTERED })
+    }
+    fn bo(&self) -> *mut NwBoHead {
+        if let Some(p) = &self.parent {
+            return p.bo();
+        }
+        if let Some(b) = &self.backing {
+            return b.backing.bo();
+        }
+        self.memory.as_ref().map_or(std::ptr::null_mut(), |m| m.bo())
+    }
+    fn view_kind(metal: u64) -> u32 {
+        // MTLTextureType: 0 1D, 1 1D array, 2 2D, 3 2D array, 4 2D MS, 5 cube, 6 cube array, 7 3D, 8 2D MS array, 9 buffer
+        match metal {
+            0 | 1 => NMN_IMAGE_1D,
+            5 | 6 => NMN_IMAGE_CUBE,
+            7 => NMN_IMAGE_3D,
+            _ => NMN_IMAGE_2D,
+        }
+    }
+    fn facts(&self) -> Result<TextureFacts, String> {
+        let t = TextureType::try_from(self.desc.kind as u32).map_err(|_| format!("texture type {}", self.desc.kind))?;
+        let f = PixelFormat::try_from(self.desc.format as u32).map_err(|_| format!("pixel format {}", self.desc.format))?;
+        let mut facts = TextureFacts::new(t, f);
+        facts.sample_count = self.desc.samples.max(1) as u32;
+        facts.array_length = self.desc.array_length.max(1) as u32;
+        facts.mipmap_level_count = self.desc.levels.max(1) as u32;
+        Ok(facts)
+    }
+}
+
+pub struct NmbTexture {
+    pub(crate) t: Arc<TextureObj>,
+}
+
+fn new_texture(gpu: &Arc<Gpu>, d: &NmbTextureDescriptor, over: Option<(&Arc<BufferObj>, u64, u64)>) -> Result<Arc<TextureObj>, String> {
+    let pipe = unsafe { nmn_format_from_metal(d.format) };
+    if pipe == 0 {
+        return Err(format!("pixel format {} has no native path", d.format));
+    }
+    let kind = TextureObj::view_kind(d.kind);
+    let mode = TextureObj::storage_mode(d);
+    // private and memoryless render targets take the GPU's own layout; everything the CPU can touch stays linear, so replace and getBytes are plain copies
+    let tiled = over.is_none() && mode >= 2;
+    let stride = over.map_or(0, |o| o.2 as u32);
+    let layers = if d.kind == 5 || d.kind == 6 { (d.array_length.max(1) * 6) as u32 } else { d.array_length.max(1) as u32 };
+    let image = unsafe { nmn_image_new(gpu.gpu, pipe, kind, d.width as u32, d.height.max(1) as u32, d.depth.max(1) as u32, d.levels.max(1) as u32, layers, d.samples.max(1) as u32, tiled, stride) };
+    if image.is_null() {
+        return Err("no layout for this texture".into());
+    }
+    let size = unsafe { nmn_image_size(image) };
+    let mut memory = None;
+    let mut backing = None;
+    let memoryless = mode == MEMORYLESS && over.is_none();
+    if let Some((b, offset, _)) = over {
+        unsafe { nmn_image_bind(image, b.backing.iova() + offset) };
+        backing = Some(b.clone());
+    } else if memoryless {
+        // One backing for each size and format: a memoryless texture's content is undefined between encoders, by Metal's rule. It is allocated at the first use of the pass, and a pass that never writes it binds nothing at all.
+        let key = (pipe, d.width as u32, d.height as u32);
+        let mut map = gpu.transient.lock().unwrap();
+        let m = match map.get(&key) {
+            Some(m) => m.clone(),
+            None => {
+                let m = Slice::new(gpu, size, 4096)?;
+                map.insert(key, m.clone());
+                m
+            }
+        };
+        unsafe { nmn_image_bind(image, m.iova) };
+        memory = Some(m);
+    } else {
+        let m = Slice::new(gpu, size, 4096)?;
+        unsafe { nmn_image_bind(image, m.iova) };
+        memory = Some(m);
+    }
+    let levels = d.levels.max(1) as u32;
+    Ok(Arc::new(TextureObj { gpu: gpu.clone(), image: image as usize, pipe_format: pipe, desc: *d, backing, memory, parent: None, view_type: kind, base_level: 0, levels, base_layer: 0, layers, memoryless }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_new(d: *mut NmbDevice, descriptor: *const NmbTextureDescriptor) -> *mut NmbTexture {
+    guard(std::ptr::null_mut(), || Ok(boxed(NmbTexture { t: new_texture(&get(d)?.gpu, get(descriptor)?, None)? })))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_new_on_buffer(b: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64, bytes_per_row: u64, _iosurface: bool) -> *mut NmbTexture {
+    guard(std::ptr::null_mut(), || {
+        let buffer = &get(b)?.b;
+        let gpu = match &buffer.backing {
+            Backing::Slice(s) => s.gpu.clone(),
+            Backing::Bo { gpu, .. } => gpu.clone(),
+        };
+        Ok(boxed(NmbTexture { t: new_texture(&gpu, get(descriptor)?, Some((buffer, offset, bytes_per_row)))? }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_new_linear(b: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64, bytes_per_row: u64, _bytes_per_image: u64) -> *mut NmbTexture {
+    nmb_texture_new_on_buffer(b, descriptor, offset, bytes_per_row, false)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_release(t: *mut NmbTexture) {
+    release(t)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_describe(t: *const NmbTexture, out: *mut NmbTextureDescriptor) {
+    guard((), || {
+        unsafe { *out = get(t)?.t.desc };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_texture_replace(t: *mut NmbTexture, region: *const u64, level: u64, slice: u64, bytes: *const c_void, bytes_per_row: u64, _bytes_per_image: u64, _length: u64) -> bool {
+    guard(false, || {
+        let t = &get(t)?.t;
+        let r = unsafe { std::slice::from_raw_parts(region, 6) };
+        if TextureObj::storage_mode(&t.desc) >= 2 {
+            return Err("replaceRegion on a private texture".into());
+        }
+        let map = t.memory.as_ref().map(|m| m.map as *mut u8).or(t.backing.as_ref().map(|b| b.backing.map() as *mut u8)).ok_or("no CPU mapping")?;
+        unsafe {
+            let cpp = nmn_format_blocksize(t.pipe_format) as u64;
+            let pitch = nmn_image_pitch(t.image as *const NmnImage, level as u32) as u64;
+            let base = nmn_image_layer_offset(t.image as *const NmnImage, level as u32, slice as u32);
+            for y in 0..r[4] {
+                let dst = map.add((base + (r[1] + y) * pitch + r[0] * cpp) as usize);
+                let src = (bytes as *const u8).add((y * bytes_per_row) as usize);
+                std::ptr::copy_nonoverlapping(src, dst, (r[3] * cpp) as usize);
+            }
+        }
+        Ok(true)
+    })
+}
+
+// ---- samplers and depth state ----
+
+pub struct NmbSampler {
+    pub(crate) words: [u32; 16],
+    pub(crate) desc: SamplerDescriptor,
+}
+
+#[repr(C)]
+pub struct NmbSamplerDescriptor {
+    pub min_filter: u64,
+    pub mag_filter: u64,
+    pub mip_filter: u64,
+    pub s_address: u64,
+    pub t_address: u64,
+    pub r_address: u64,
+    pub border_color: u64,
+    pub normalized: u64,
+    pub max_anisotropy: u64,
+    pub compare: u64,
+    pub lod_average: u64,
+    pub lod_min: f32,
+    pub lod_max: f32,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sampler_new(_d: *mut NmbDevice, descriptor: *const NmbSamplerDescriptor) -> *mut NmbSampler {
+    guard(std::ptr::null_mut(), || {
+        let s = get(descriptor)?;
+        let state = NmnSamplerState { min_filter: s.min_filter as u32, mag_filter: s.mag_filter as u32, mip_filter: s.mip_filter as u32, s_address: s.s_address as u32, t_address: s.t_address as u32, r_address: s.r_address as u32, border_color: s.border_color as u32, normalized: s.normalized as u32, max_anisotropy: s.max_anisotropy as u32, compare: s.compare as u32, lod_min: s.lod_min, lod_max: s.lod_max };
+        let mut words = [0u32; 16];
+        unsafe { nmn_descriptor_sampler(&state, 0, words.as_mut_ptr()) };
+        let mut desc = SamplerDescriptor::new();
+        desc.normalized_coordinates = s.normalized != 0;
+        desc.lod_min_clamp = s.lod_min;
+        desc.lod_max_clamp = s.lod_max;
+        Ok(boxed(NmbSampler { words, desc }))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sampler_release(s: *mut NmbSampler) {
+    release(s)
+}
+
+// ---- queues and command buffers ----
+
+pub struct NmbQueue {
+    gpu: Arc<Gpu>,
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_queue_new(d: *mut NmbDevice) -> *mut NmbQueue {
+    guard(std::ptr::null_mut(), || Ok(boxed(NmbQueue { gpu: get(d)?.gpu.clone() })))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_queue_release(q: *mut NmbQueue) {
+    release(q)
+}
+
+struct Upload {
+    cur: Arc<Slice>,
+    used: u64,
+}
+
+pub struct NmbCommandBuffer {
+    gpu: Arc<Gpu>,
+    cs: Box<NwCs>,
+    held_textures: Vec<Arc<TextureObj>>,
+    held_buffers: Vec<Arc<BufferObj>>,
+    held_slices: Vec<Arc<Slice>>,
+    held_baked: Vec<Arc<Baked>>,
+    held_streams: Vec<Box<NwCs>>,
+    names: Vec<usize>,
+    upload: Option<Upload>,
+    state: Arc<(Mutex<CbState>, Condvar)>,
+    handlers: Vec<(extern "C" fn(*mut c_void), usize)>,
+    scheduled: Vec<(extern "C" fn(*mut c_void), usize)>,
+    open: bool,
+}
+#[derive(Default)]
+struct CbState {
+    status: u64,
+    error: String,
+}
+
+impl NmbCommandBuffer {
+    fn upload(&mut self, bytes: u64, align: u64) -> Result<(u64, *mut u8), String> {
+        const CHUNK: u64 = 64 * 1024;
+        let need_new = match &self.upload {
+            Some(u) => ((u.used + align - 1) & !(align - 1)) + bytes > u.cur.size,
+            None => true,
+        };
+        if need_new {
+            let s = Slice::new(&self.gpu, bytes.max(CHUNK), 4096)?;
+            self.held_slices.push(s.clone());
+            self.upload = Some(Upload { cur: s, used: 0 });
+        }
+        let u = self.upload.as_mut().unwrap();
+        let at = (u.used + align - 1) & !(align - 1);
+        u.used = at + bytes;
+        Ok((u.cur.iova + at, (u.cur.map as u64 + at) as *mut u8))
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_new(q: *mut NmbQueue) -> *mut NmbCommandBuffer {
+    guard(std::ptr::null_mut(), || {
+        let gpu = get(q)?.gpu.clone();
+        let mut cs: Box<NwCs> = Box::new(unsafe { std::mem::zeroed() });
+        unsafe {
+            nw_cs_init(&mut *cs, gpu.dev);
+            nmn_cmd_init(&mut *cs, gpu.gpu);
+        }
+        Ok(boxed(NmbCommandBuffer { gpu, cs, held_textures: vec![], held_buffers: vec![], held_slices: vec![], held_baked: vec![], held_streams: vec![], names: vec![], upload: None, state: Arc::new((Mutex::new(CbState::default()), Condvar::new())), handlers: vec![], scheduled: vec![], open: false }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_release(c: *mut NmbCommandBuffer) {
+    if !c.is_null() {
+        let b = unsafe { Box::from_raw(c) };
+        drop(b);
+    }
+}
+impl Drop for NmbCommandBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            nw_cs_finish(&mut *self.cs);
+            for s in &mut self.held_streams {
+                nw_cs_finish(&mut **s);
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_on_completed(c: *mut NmbCommandBuffer, handler: extern "C" fn(*mut c_void), context: *mut c_void) -> bool {
+    guard(false, || {
+        unsafe { c.as_mut() }.ok_or("null command buffer")?.handlers.push((handler, context as usize));
+        Ok(true)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_on_scheduled(c: *mut NmbCommandBuffer, handler: extern "C" fn(*mut c_void), context: *mut c_void) -> bool {
+    guard(false, || {
+        unsafe { c.as_mut() }.ok_or("null command buffer")?.scheduled.push((handler, context as usize));
+        Ok(true)
+    })
+}
+
+/// What the waiting thread keeps alive until the fence: every resource the stream can read.
+struct Retained {
+    _t: Vec<Arc<TextureObj>>,
+    _b: Vec<Arc<BufferObj>>,
+    _s: Vec<Arc<Slice>>,
+    _p: Vec<Arc<Baked>>,
+    streams: Vec<Box<NwCs>>,
+    cs: Box<NwCs>,
+    gpu: Arc<Gpu>,
+}
+// SAFETY: the stream is not touched again until the fence; then the owner thread frees it.
+unsafe impl Send for Retained {}
+impl Drop for Retained {
+    fn drop(&mut self) {
+        unsafe {
+            nw_cs_finish(&mut *self.cs);
+            for s in &mut self.streams {
+                nw_cs_finish(&mut **s);
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_commit(c: *mut NmbCommandBuffer) -> bool {
+    guard(false, || {
+        let cb = unsafe { c.as_mut() }.ok_or("null command buffer")?;
+        if cb.open {
+            return Err("commit with an encoder open".into());
+        }
+        let mut fence = 0u32;
+        unsafe {
+            nw_cs_end_ib(&mut *cb.cs);
+            let mut s: NwSubmit = std::mem::zeroed();
+            nw_submit_begin(&mut s, cb.gpu.dev);
+            nw_submit_stream(&mut s, &mut *cb.cs);
+            for &b in &cb.names {
+                nw_submit_name(&mut s, b as *mut NwBoHead);
+            }
+            let e = nw_submit_go(&mut s, &mut fence);
+            cb.gpu.names_total.fetch_add(s.name_count as u64, Ordering::Relaxed);
+            nw_submit_end(&mut s);
+            if e != 0 {
+                let mut st = cb.state.0.lock().unwrap();
+                st.status = 5;
+                st.error = format!("the kernel refused the submission: errno {e}");
+                cb.state.1.notify_all();
+                return Err(st.error.clone());
+            }
+        }
+        for (h, ctx) in cb.scheduled.drain(..) {
+            h(ctx as *mut c_void);
+        }
+        let mut replacement: Box<NwCs> = Box::new(unsafe { std::mem::zeroed() });
+        unsafe { nw_cs_init(&mut *replacement, cb.gpu.dev) };
+        let cs = std::mem::replace(&mut cb.cs, replacement);
+        let retained = Retained { _t: std::mem::take(&mut cb.held_textures), _b: std::mem::take(&mut cb.held_buffers), _s: std::mem::take(&mut cb.held_slices), _p: std::mem::take(&mut cb.held_baked), streams: std::mem::take(&mut cb.held_streams), cs, gpu: cb.gpu.clone() };
+        let handlers = std::mem::take(&mut cb.handlers);
+        let state = cb.state.clone();
+        {
+            state.0.lock().unwrap().status = 2;
+        }
+        // One thread per command buffer that waits on the kernel's fence. The kernel sleeps in the wait, so a waiting thread costs no CPU.
+        let spawned = std::thread::Builder::new().name("nmn-complete".into()).spawn(move || {
+            let gpu = retained.gpu.clone();
+            let mut e;
+            loop {
+                e = unsafe { nw_fence_wait(gpu.dev, fence, 5_000_000_000) };
+                if e != libc::ETIMEDOUT {
+                    break;
+                }
+            }
+            drop(retained);
+            {
+                let mut st = state.0.lock().unwrap();
+                st.status = if e == 0 { 4 } else { 5 };
+                if e != 0 {
+                    st.error = format!("the GPU did not finish: errno {e}");
+                }
+            }
+            state.1.notify_all();
+            for (h, ctx) in handlers {
+                h(ctx as *mut c_void);
+            }
+        });
+        spawned.map_err(|e| format!("completion thread: {e}"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_wait_scheduled(_c: *mut NmbCommandBuffer) -> bool {
+    true // a commit hands the stream to the ring before it returns
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_wait(c: *mut NmbCommandBuffer, timeout_ms: u64) -> i32 {
+    guard(1, || {
+        let cb = get(c)?;
+        let mut st = cb.state.0.lock().unwrap();
+        let start = std::time::Instant::now();
+        while st.status < 4 {
+            if timeout_ms == 0 {
+                st = cb.state.1.wait(st).unwrap();
+            } else {
+                let left = std::time::Duration::from_millis(timeout_ms).saturating_sub(start.elapsed());
+                if left.is_zero() {
+                    return Ok(1);
+                }
+                st = cb.state.1.wait_timeout(st, left).unwrap().0;
+            }
+        }
+        Ok(0)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_status(c: *const NmbCommandBuffer) -> u64 {
+    guard(5, || Ok(get(c)?.state.0.lock().unwrap().status))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_error(c: *const NmbCommandBuffer, out: *mut c_char, size: usize) -> usize {
+    guard(0, || {
+        let cb = get(c)?;
+        let st = cb.state.0.lock().unwrap();
+        let bytes = st.error.as_bytes();
+        let n = bytes.len().min(size.saturating_sub(1));
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, out, n);
+            if size > 0 {
+                *out.add(n) = 0;
+            }
+        }
+        Ok(n)
+    })
+}
+
+// ---- render encoder ----
+
+#[repr(C)]
+pub struct NmbPassAttachment {
+    pub texture: *mut NmbTexture,
+    pub level: u64,
+    pub slice: u64,
+    pub depth_plane: u64,
+    pub load: u64,
+    pub store: u64,
+    pub clear: [f64; 4],
+    pub resolve_texture: *mut NmbTexture,
+    pub resolve_level: u64,
+    pub resolve_slice: u64,
+    pub resolve_depth_plane: u64,
+}
+#[repr(C)]
+pub struct NmbRenderPassDescriptor {
+    pub colors: [NmbPassAttachment; 8],
+    pub depth: NmbPassAttachment,
+    pub stencil: NmbPassAttachment,
+    pub width: u64,
+    pub height: u64,
+    pub array_length: u64,
+    pub samples: u64,
+    pub visibility: *mut NmbBuffer,
+}
+
+/// A baked program of one (pipeline, plan's specialization).
+pub(crate) struct Baked {
+    gpu: Arc<Gpu>,
+    b: usize,
+    pub(crate) reads_fb: bool,
+    program: crate::compile::Program,
+}
+// SAFETY: read only after baking.
+unsafe impl Send for Baked {}
+unsafe impl Sync for Baked {}
+impl Drop for Baked {
+    fn drop(&mut self) {
+        unsafe { nmn_baked_free(self.gpu.gpu, self.b as *mut NmnBaked) };
+    }
+}
+
+#[derive(Clone)]
+enum BoundBuf {
+    Buffer(Arc<BufferObj>, u64),
+    Bytes(Vec<u8>),
+}
+
+#[derive(Default)]
+struct StageBindings {
+    buffers: HashMap<u32, BoundBuf>,
+    textures: HashMap<u32, Arc<TextureObj>>,
+    samplers: HashMap<u32, ([u32; 16], SamplerDescriptor)>,
+}
+
+pub struct NmbEncoder {
+    cb: *mut NmbCommandBuffer,
+    gpu: Arc<Gpu>,
+    kind: u32, // 0 render, 1 compute, 2 blit
+    pass: Option<PassRecord>,
+    draws: Box<NwCs>,
+    stages: [StageBindings; 3],
+    pipeline: Option<*const NmbRenderPipeline>,
+    raster: NmnRaster,
+    plan_cache: HashMap<(usize, Vec<u8>), Arc<PlanEntry>>,
+    attachment_written: u32,
+}
+
+struct PassRecord {
+    colors: Vec<Option<(Arc<TextureObj>, u64, u64, u64, u64, [f64; 4])>>,
+    depth: Option<Arc<TextureObj>>,
+    depth_load: u64,
+    depth_store: u64,
+    clear_z: f64,
+    w: u32,
+    h: u32,
+    samples: u32,
+}
+
+pub(crate) struct PlanEntry {
+    plan: metal2vulkan::bind::BindingPlan,
+    baked: Arc<Baked>,
+    offsets: HashMap<(u32, u32), (u32, u32)>,
+    set_slots: Vec<u32>,
+    outputs: u32,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_encoder_new(c: *mut NmbCommandBuffer, d: *const NmbRenderPassDescriptor) -> *mut NmbEncoder {
+    guard(std::ptr::null_mut(), || {
+        let cb = unsafe { c.as_mut() }.ok_or("null command buffer")?;
+        if cb.open {
+            return Err("another encoder is open".into());
+        }
+        let d = get(d)?;
+        let mut colors = vec![];
+        for a in &d.colors {
+            if a.texture.is_null() {
+                colors.push(None);
+            } else {
+                colors.push(Some((get(a.texture)?.t.clone(), a.level, a.slice, a.load, a.store, a.clear)));
+            }
+        }
+        while colors.last().is_some_and(|c| c.is_none()) {
+            colors.pop();
+        }
+        let depth = if d.depth.texture.is_null() { None } else { Some(get(d.depth.texture)?.t.clone()) };
+        let mut draws: Box<NwCs> = Box::new(unsafe { std::mem::zeroed() });
+        unsafe { nw_cs_init(&mut *draws, cb.gpu.dev) };
+        cb.open = true;
+        let w = d.width as u32;
+        let h = d.height as u32;
+        let raster = NmnRaster { viewport: [0.0, 0.0, w as f64, h as f64, 0.0, 1.0], scissor: [0, 0, w, h], cull_mode: 0, winding: 0, fill_mode: 0, depth_bias: 0.0, slope_scale: 0.0, bias_clamp: 0.0, line_width: 1.0, blend_color: [0.0; 4], stencil_front: 0, stencil_back: 0, depth_func: 7, depth_write: false, depth_test: false, reads_framebuffer: false, pass_width: w, pass_height: h };
+        Ok(boxed(NmbEncoder { cb: c, gpu: cb.gpu.clone(), kind: 0, pass: Some(PassRecord { colors, depth, depth_load: d.depth.load, depth_store: d.depth.store, clear_z: d.depth.clear[0], w, h, samples: d.samples.max(1) as u32 }), draws, stages: Default::default(), pipeline: None, raster, plan_cache: HashMap::new(), attachment_written: 0 }))
+    })
+}
+
+fn stage_index(stage: u32) -> Result<usize, String> {
+    if stage < 3 { Ok(stage as usize) } else { Err(format!("stage {stage}")) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_set_buffer(e: *mut NmbEncoder, stage: u32, b: *mut NmbBuffer, offset: u64, index: u32) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        let s = stage_index(stage)?;
+        if b.is_null() {
+            e.stages[s].buffers.remove(&index);
+        } else {
+            e.stages[s].buffers.insert(index, BoundBuf::Buffer(get(b)?.b.clone(), offset));
+        }
+        Ok(true)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_set_buffer_offset(e: *mut NmbEncoder, stage: u32, offset: u64, index: u32) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        match e.stages[stage_index(stage)?].buffers.get_mut(&index) {
+            Some(BoundBuf::Buffer(_, o)) => {
+                *o = offset;
+                Ok(true)
+            }
+            _ => Err("setBufferOffset on no buffer".into()),
+        }
+    })
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_encoder_set_bytes(e: *mut NmbEncoder, stage: u32, bytes: *const c_void, length: usize, index: u32) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        let data = unsafe { std::slice::from_raw_parts(bytes as *const u8, length) }.to_vec();
+        e.stages[stage_index(stage)?].buffers.insert(index, BoundBuf::Bytes(data));
+        Ok(true)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_set_texture(e: *mut NmbEncoder, stage: u32, t: *mut NmbTexture, index: u32) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        let s = stage_index(stage)?;
+        if t.is_null() {
+            e.stages[s].textures.remove(&index);
+        } else {
+            e.stages[s].textures.insert(index, get(t)?.t.clone());
+        }
+        Ok(true)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_set_sampler(e: *mut NmbEncoder, stage: u32, x: *mut NmbSampler, index: u32) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        let s = stage_index(stage)?;
+        if x.is_null() {
+            e.stages[s].samplers.remove(&index);
+        } else {
+            let x = get(x)?;
+            e.stages[s].samplers.insert(index, (x.words, x.desc.clone()));
+        }
+        Ok(true)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_pipeline(e: *mut NmbEncoder, p: *mut NmbRenderPipeline) -> bool {
+    guard(false, || {
+        unsafe { e.as_mut() }.ok_or("null encoder")?.pipeline = Some(p);
+        Ok(true)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_viewport(e: *mut NmbEncoder, v: *const f64) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        e.raster.viewport.copy_from_slice(unsafe { std::slice::from_raw_parts(v, 6) });
+        Ok(true)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_scissor(e: *mut NmbEncoder, r: *const u64) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        let r = unsafe { std::slice::from_raw_parts(r, 4) };
+        e.raster.scissor = [r[0] as u32, r[1] as u32, r[2] as u32, r[3] as u32];
+        Ok(true)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_raster(e: *mut NmbEncoder, cull: u64, winding: u64, fill: u64) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        e.raster.cull_mode = cull as u32;
+        e.raster.winding = winding as u32;
+        e.raster.fill_mode = fill as u32;
+        Ok(true)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_stencil_reference(e: *mut NmbEncoder, front: u32, back: u32) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        e.raster.stencil_front = front;
+        e.raster.stencil_back = back;
+        Ok(true)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_blend_color(e: *mut NmbEncoder, c: *const f32) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        e.raster.blend_color.copy_from_slice(unsafe { std::slice::from_raw_parts(c, 4) });
+        Ok(true)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_depth_bias(e: *mut NmbEncoder, bias: f32, slope: f32, clamp: f32) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        e.raster.depth_bias = bias;
+        e.raster.slope_scale = slope;
+        e.raster.bias_clamp = clamp;
+        Ok(true)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_line_width(e: *mut NmbEncoder, w: f32) -> bool {
+    guard(false, || {
+        unsafe { e.as_mut() }.ok_or("null encoder")?.raster.line_width = w;
+        Ok(true)
+    })
+}
+
+fn build_state(e: &NmbEncoder) -> Result<BindState, String> {
+    let mut state = BindState::default();
+    for (i, stage) in [Stage::Kernel, Stage::Vertex, Stage::Fragment].iter().enumerate() {
+        let b = &e.stages[i];
+        if b.buffers.is_empty() && b.textures.is_empty() && b.samplers.is_empty() {
+            continue;
+        }
+        let mut table = StageTable::default();
+        for (k, v) in &b.buffers {
+            table.buffers.insert(
+                *k,
+                match v {
+                    BoundBuf::Buffer(buf, offset) => BoundBuffer::Buffer { length: buf.length, offset: *offset, gpu_address: buf.backing.iova(), device_address: None, attribute_stride: None },
+                    BoundBuf::Bytes(d) => BoundBuffer::Bytes { len: d.len() as u32, attribute_stride: None },
+                },
+            );
+        }
+        for (k, t) in &b.textures {
+            table.textures.insert(*k, BoundTexture::Texture { facts: t.facts()?, resource_id: None });
+        }
+        for (k, s) in &b.samplers {
+            table.samplers.insert(*k, BoundSampler::new(s.1.clone()));
+        }
+        state.stages.insert(*stage, table);
+    }
+    Ok(state)
+}
+
+/// The plan and the program for this shape. The second call for a shape is a hash lookup. No Vulkan pipeline exists: a specialization is one more ir3 compile, at most once.
+fn plan_entry(e: &mut NmbEncoder, device_pipeline: &NmbRenderPipeline, state: &BindState) -> Result<Arc<PlanEntry>, String> {
+    let shape = state.shape();
+    let key = (device_pipeline as *const _ as usize, format!("{shape:?}").into_bytes());
+    if let Some(p) = e.plan_cache.get(&key) {
+        return Ok(p.clone());
+    }
+    let cached = device_pipeline.plans.lock().unwrap().get(&key.1).cloned();
+    if let Some(p) = cached {
+        e.plan_cache.insert(key, p.clone());
+        return Ok(p);
+    }
+    let dev = unsafe { device_pipeline.device.as_ref() }.ok_or("the pipeline's device")?;
+    let pipeline = &device_pipeline.pipeline;
+    let plan = pipeline.plan(&dev.device, &shape).map_err(|x| format!("plan: {x:?}"))?;
+    if !plan.variant.is_empty() {
+        return Err(format!("this draw asks for pipeline variant {:?}, which has no native path yet", plan.variant));
+    }
+    let spec: Vec<NmnSpec> = plan.specialization.entries.iter().map(|m| {
+        let at = m.offset as usize;
+        let mut w = [0u8; 4];
+        let n = (m.size as usize).min(4);
+        w[..n].copy_from_slice(&plan.specialization.data[at..at + n]);
+        NmnSpec { id: m.constant_id, value: u32::from_le_bytes(w) }
+    }).collect();
+    let program = crate::compile::render_program_spec(dev.compiler, pipeline, &spec)?;
+    let bindings = crate::compile::lay_out(&pipeline.layout)?;
+    let mut offsets = HashMap::new();
+    let mut set_slots = vec![];
+    for b in &bindings {
+        offsets.insert((b.set, b.binding), (b.offset, b.stride));
+        if set_slots.len() <= b.set as usize {
+            set_slots.resize(b.set as usize + 1, 0);
+        }
+        // a heap array is counted only to the element a plan names: its full count is the profile's maximum
+        set_slots[b.set as usize] = set_slots[b.set as usize].max(b.offset + b.stride * b.count.min(4096));
+    }
+    let fixed = fixed_state(device_pipeline, pipeline)?;
+    let mut why = [0 as c_char; 256];
+    let fs = unsafe { nmn_program_variant(program.0, 1) };
+    let baked = unsafe { nmn_bake_render(e.gpu.gpu, nmn_program_variant(program.0, 0), fs, &fixed, why.as_mut_ptr(), why.len()) };
+    if baked.is_null() {
+        return Err(unsafe { std::ffi::CStr::from_ptr(why.as_ptr()) }.to_string_lossy().into_owned());
+    }
+    let reads_fb = program.stage_info(1).is_some_and(|i| i.reads_framebuffer);
+    let outputs = program.stage_info(1).map_or(0, |i| i.color_outputs);
+    let entry = Arc::new(PlanEntry { plan, baked: Arc::new(Baked { gpu: e.gpu.clone(), b: baked as usize, reads_fb, program }), offsets, set_slots, outputs });
+    device_pipeline.plans.lock().unwrap().insert(key.1.clone(), entry.clone());
+    e.plan_cache.insert(key, entry.clone());
+    Ok(entry)
+}
+
+/// The descriptor's blend and vertex state, in the native program's terms.
+fn fixed_state(p: &NmbRenderPipeline, r: &metal2vulkan::pipeline::RenderPipeline) -> Result<NmnFixed, String> {
+    let mut f: NmnFixed = unsafe { std::mem::zeroed() };
+    let d = &p.fixed;
+    let mut count = 0;
+    for (i, c) in d.colors.iter().enumerate() {
+        if c.format == 0 {
+            continue;
+        }
+        count = i as u32 + 1;
+        f.blend[i] = NmnBlend { enable: c.blending != 0, src_rgb: c.source_rgb, dst_rgb: c.destination_rgb, op_rgb: c.rgb_operation, src_a: c.source_alpha, dst_a: c.destination_alpha, op_a: c.alpha_operation, write_mask: c.write_mask };
+    }
+    f.color_count = count;
+    f.samples = d.samples;
+    f.rasterizer_discard = r.graphics.rasterizer_discard;
+    for a in &r.vertex_input.attributes {
+        let i = a.location as usize;
+        if i >= f.attrs.len() {
+            return Err("vertex attribute location".into());
+        }
+        let Some(pipe) = crate::compile::vertex_format_pipe(a.format) else {
+            return Err(format!("vertex format {:?} has no native path", a.format));
+        };
+        let binding = r.vertex_input.bindings.iter().find(|b| b.binding == a.binding);
+        f.attrs[i] = NmnVertexAttr { pipe_format: pipe, offset: a.offset, binding: a.binding, instanced: binding.is_some_and(|b| b.input_rate == vk::VertexInputRate::INSTANCE), step_rate: 1, is_float: crate::compile::vertex_format_is_float(a.format) };
+        f.attr_count = f.attr_count.max(i as u32 + 1);
+    }
+    Ok(f)
+}
+
+/// One draw: the plan decides, this writes it.
+fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, u64, bool, i32)>, primitive: u32, counts: (u32, u32, u32, u32)) -> Result<(), String> {
+    let pipeline_ptr = e.pipeline.ok_or("a draw with no pipeline")?;
+    let device_pipeline = unsafe { pipeline_ptr.as_ref() }.ok_or("the pipeline")?;
+    let state = build_state(e)?;
+    let entry = plan_entry(e, device_pipeline, &state)?;
+    let commands = entry.plan.instantiate_draw(&state, &draw).map_err(|x| format!("draw: {x:?}"))?;
+    let cb = unsafe { e.cb.as_mut() }.ok_or("the command buffer")?;
+    cb.held_baked.push(entry.baked.clone());
+
+    // descriptor sets in the upload ring: no pools, no updates, no copies
+    let mut set_memory: Vec<(u64, *mut u32)> = vec![];
+    for slots in &entry.set_slots {
+        let (iova, map) = cb.upload((*slots as u64).max(1) * SLOT_BYTES as u64, 64)?;
+        unsafe { std::ptr::write_bytes(map, 0, (*slots as usize).max(1) * SLOT_BYTES) };
+        set_memory.push((iova, map as *mut u32));
+    }
+    for w in &entry.plan.descriptors {
+        let (offset, stride) = *entry.offsets.get(&(w.set, w.binding)).ok_or("a descriptor with no slot")?;
+        let at = (offset + stride * w.array_element) as usize;
+        let slot = unsafe { set_memory.get(w.set as usize).ok_or("set")?.1.add(at * 16) };
+        let range = commands.descriptor_ranges.iter().find(|r| r.set == w.set && r.binding == w.binding);
+        match &w.source {
+            WriteSource::Buffer { slot: s } | WriteSource::InlineBytes { slot: s } => {
+                let bound = e.stages[stage_slot(s.stage)?].buffers.get(&s.index).cloned();
+                let (iova, length) = match &bound {
+                    Some(BoundBuf::Buffer(b, off)) => {
+                        if b.backing.must_name() {
+                            cb.names.push(b.backing.bo() as usize);
+                        }
+                        cb.held_buffers.push(b.clone());
+                        let r = range.map(|r| r.range);
+                        (b.backing.iova() + r.map_or(*off, |r| r.offset), r.map_or(b.length - off, |r| r.range))
+                    }
+                    Some(BoundBuf::Bytes(d)) => {
+                        let (iova, map) = cb.upload((d.len() as u64).max(16), 64)?;
+                        unsafe { std::ptr::copy_nonoverlapping(d.as_ptr(), map, d.len()) };
+                        (iova, d.len() as u64)
+                    }
+                    None => (e.gpu.zero_iova(), 65536),
+                };
+                write_buffer_descriptor(w.ty, iova, length, slot)?;
+            }
+            WriteSource::Texture { slot: s, view } => write_texture(e, cb, s.stage, s.index, Some(view), slot)?,
+            WriteSource::CombinedImageSampler { image, sampler } => {
+                match image {
+                    metal2vulkan::bind::ImageSource::Texture { slot: s, view } => write_texture(e, cb, s.stage, s.index, Some(view), slot)?,
+                    metal2vulkan::bind::ImageSource::Neutral(metal2vulkan::bind::NeutralResource::Image { view_type, .. }) => write_neutral_image(e, *view_type, slot)?,
+                    other => return Err(format!("image source {other:?} has no native path yet")),
+                }
+                let second = unsafe { slot.add(16) };
+                match sampler {
+                    metal2vulkan::bind::SamplerSource::Slot { slot: s, .. } => {
+                        let x = e.stages[stage_slot(s.stage)?].samplers.get(&s.index).ok_or("no sampler bound")?;
+                        unsafe { std::ptr::copy_nonoverlapping(x.0.as_ptr(), second, 16) };
+                    }
+                    metal2vulkan::bind::SamplerSource::Neutral(_) => write_neutral_sampler(second),
+                    metal2vulkan::bind::SamplerSource::Immutable => {
+                        let layout = &device_pipeline.pipeline.layout;
+                        let d = layout.sets.iter().find(|x| x.set == w.set).and_then(|x| x.bindings.iter().find(|b| b.binding == w.binding)).and_then(|b| b.immutable_sampler.as_ref()).ok_or("an immutable sampler the layout does not name")?;
+                        write_immutable_sampler(d, second);
+                    }
+                    other => return Err(format!("sampler source {other:?} has no native path yet")),
+                }
+            }
+            WriteSource::Sampler { slot: s, .. } => {
+                let x = e.stages[stage_slot(s.stage)?].samplers.get(&s.index).ok_or("no sampler bound")?;
+                unsafe { std::ptr::copy_nonoverlapping(x.0.as_ptr(), slot, 16) };
+            }
+            WriteSource::Neutral(n) => match n {
+                metal2vulkan::bind::NeutralResource::ZeroBuffer { .. } | metal2vulkan::bind::NeutralResource::Sink { .. } => write_buffer_descriptor(w.ty, e.gpu.zero_iova(), 65536, slot)?,
+                metal2vulkan::bind::NeutralResource::Sampler { .. } => write_neutral_sampler(slot),
+                metal2vulkan::bind::NeutralResource::Image { view_type, .. } => write_neutral_image(e, *view_type, slot)?,
+                other => return Err(format!("neutral resource {other:?} has no native path yet")),
+            },
+            WriteSource::Attachment { color_index } => {
+                let pass = e.pass.as_ref().ok_or("an attachment outside a pass")?;
+                let (t, level, layer, ..) = pass.colors.get(*color_index as usize).and_then(|c| c.as_ref()).ok_or("the fetched attachment is not bound")?;
+                let identity = [0u8, 1, 2, 3];
+                unsafe { nmn_descriptor_image(t.image as *const NmnImage, t.pipe_format, NMN_IMAGE_2D, *level as u32, 1, *layer as u32, 1, identity.as_ptr(), false, slot) };
+                e.attachment_written |= 1 << color_index;
+            }
+            other => return Err(format!("descriptor source {other:?} has no native path yet")),
+        }
+    }
+
+    let cs: *mut NwCs = &mut *e.draws;
+    unsafe {
+        // program first: its stream invalidates constants and state, and what follows is the draw's own
+        nmn_cmd_program(cs, entry.baked.b as *const NmnBaked);
+        let sets: Vec<u64> = set_memory.iter().map(|s| s.0).collect();
+        if !sets.is_empty() {
+            nmn_cmd_descriptor_sets(cs, sets.as_ptr(), sets.len() as u32, true);
+        }
+        let mut raster = e.raster;
+        raster.reads_framebuffer = entry.baked.reads_fb;
+        nmn_cmd_raster(cs, &raster);
+        // the push range of each stage
+        for w in &commands.push_constants {
+            let stages = [(vk::ShaderStageFlags::VERTEX, 0u32), (vk::ShaderStageFlags::FRAGMENT, 1u32)];
+            for (flag, stage) in stages {
+                if !w.stages.contains(flag) {
+                    continue;
+                }
+                let (mut first, mut vec4s, mut lo) = (0u32, 0u32, 0u32);
+                if !nmn_program_push_range(entry.baked.program.0, stage, &mut first, &mut vec4s, &mut lo) || vec4s == 0 {
+                    continue;
+                }
+                let mut image = vec![0u8; vec4s as usize * 16];
+                let lo_bytes = lo as usize * 4;
+                for (i, byte) in w.bytes.iter().enumerate() {
+                    let at = w.offset as usize + i;
+                    if at >= lo_bytes && at - lo_bytes < image.len() {
+                        image[at - lo_bytes] = *byte;
+                    }
+                }
+                nmn_cmd_push(cs, stage, first, image.as_ptr() as *const c_void, vec4s);
+            }
+        }
+        // vertex buffers
+        let mut iova = vec![];
+        let mut size = vec![];
+        let mut stride = vec![];
+        for v in &entry.plan.vertex_buffers {
+            let binding = v.binding as usize;
+            if iova.len() <= binding {
+                iova.resize(binding + 1, 0u64);
+                size.resize(binding + 1, 0u32);
+                stride.resize(binding + 1, 0u32);
+            }
+            let bound = e.stages[1].buffers.get(&v.buffer_index).cloned();
+            let (mut address, length) = match &bound {
+                Some(BoundBuf::Buffer(b, off)) => {
+                    if b.backing.must_name() {
+                        cb.names.push(b.backing.bo() as usize);
+                    }
+                    cb.held_buffers.push(b.clone());
+                    (b.backing.iova() + off, b.length - off)
+                }
+                Some(BoundBuf::Bytes(d)) => {
+                    let (a, map) = cb.upload((d.len() as u64).max(16), 64)?;
+                    std::ptr::copy_nonoverlapping(d.as_ptr(), map, d.len());
+                    (a, d.len() as u64)
+                }
+                None => (e.gpu.zero_iova(), 65536),
+            };
+            if let Some(o) = commands.buffer_offsets.iter().find(|o| o.0 == v.binding) {
+                address = address - bound_offset(&bound) + o.1;
+            }
+            iova[binding] = address;
+            size[binding] = length as u32;
+            stride[binding] = commands.vertex_strides.iter().find(|s| s.0 == v.binding).map(|s| s.1).or_else(|| device_pipeline.pipeline.vertex_input.bindings.iter().find(|b| b.binding == v.binding).and_then(|b| match b.stride { metal2vulkan::pipeline::VertexStride::Static(s) => Some(s), _ => None })).unwrap_or(0);
+        }
+        nmn_cmd_vertex_buffers(cs, iova.as_ptr(), size.as_ptr(), stride.as_ptr(), iova.len() as u32);
+        let (count, instances, first, first_instance) = counts;
+        match index {
+            Some((b, offset, wide, base)) => {
+                if b.backing.must_name() {
+                    cb.names.push(b.backing.bo() as usize);
+                }
+                let cpp = if wide { 4 } else { 2 };
+                nmn_cmd_draw_indexed(cs, primitive, count, instances, b.backing.iova() + offset, ((b.length - offset) / cpp) as u32, wide, base, first_instance);
+                cb.held_buffers.push(b);
+            }
+            None => nmn_cmd_draw(cs, primitive, count, instances, first, first_instance),
+        }
+    }
+    e.attachment_written |= entry.outputs;
+    Ok(())
+}
+
+fn bound_offset(b: &Option<BoundBuf>) -> u64 {
+    match b {
+        Some(BoundBuf::Buffer(_, o)) => *o,
+        _ => 0,
+    }
+}
+
+fn stage_slot(s: Stage) -> Result<usize, String> {
+    match s {
+        Stage::Kernel => Ok(0),
+        Stage::Vertex => Ok(1),
+        Stage::Fragment => Ok(2),
+        other => Err(format!("stage {other:?} has no native path")),
+    }
+}
+
+/// A constexpr sampler of the shader, from the translator's Vulkan-shaped description.
+fn write_immutable_sampler(d: &vk::SamplerDesc, slot: *mut u32) {
+    let address = |m: vk::SamplerAddressMode| match m {
+        vk::SamplerAddressMode::REPEAT => 2u32,
+        vk::SamplerAddressMode::MIRRORED_REPEAT => 3,
+        vk::SamplerAddressMode::CLAMP_TO_BORDER => 5,
+        vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE => 1,
+        _ => 0,
+    };
+    let linear = |f: vk::Filter| u32::from(f == vk::Filter::LINEAR);
+    let state = NmnSamplerState { min_filter: linear(d.min_filter), mag_filter: linear(d.mag_filter), mip_filter: if d.mipmap_mode == vk::SamplerMipmapMode::LINEAR { 2 } else { 1 }, s_address: address(d.address_mode_u), t_address: address(d.address_mode_v), r_address: address(d.address_mode_w), border_color: 0, normalized: 1, max_anisotropy: 1, compare: 0, lod_min: d.min_lod, lod_max: d.max_lod };
+    unsafe { nmn_descriptor_sampler(&state, 0, slot) };
+}
+
+fn write_neutral_sampler(slot: *mut u32) {
+    let state = NmnSamplerState { min_filter: 0, mag_filter: 0, mip_filter: 0, s_address: 0, t_address: 0, r_address: 0, border_color: 0, normalized: 1, max_anisotropy: 1, compare: 0, lod_min: 0.0, lod_max: 0.0 };
+    unsafe { nmn_descriptor_sampler(&state, 0, slot) };
+}
+
+/// A slot the shader declares and nothing is bound to: one texel of zeros of the view's kind, kept for the device's life.
+fn write_neutral_image(e: &NmbEncoder, view: vk::ImageViewType, slot: *mut u32) -> Result<(), String> {
+    let (key, kind, layers) = match view {
+        vk::ImageViewType::CUBE | vk::ImageViewType::CUBE_ARRAY => (2u32, NMN_IMAGE_CUBE, 6u32),
+        vk::ImageViewType::TYPE_3D => (3, NMN_IMAGE_3D, 1),
+        vk::ImageViewType::TYPE_1D | vk::ImageViewType::TYPE_1D_ARRAY => (1, NMN_IMAGE_1D, 1),
+        _ => (0, NMN_IMAGE_2D, 1),
+    };
+    let t = e.gpu.neutral_image(key, kind, layers)?;
+    let identity = [0u8, 1, 2, 3];
+    unsafe { nmn_descriptor_image(t.image as *const NmnImage, t.pipe_format, kind, 0, 1, 0, layers, identity.as_ptr(), false, slot) };
+    Ok(())
+}
+
+fn write_buffer_descriptor(ty: vk::DescriptorType, iova: u64, length: u64, slot: *mut u32) -> Result<(), String> {
+    match ty {
+        vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => unsafe { nmn_descriptor_ubo(iova, length, slot) },
+        vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => unsafe { nmn_descriptor_ssbo(iova, length, slot) },
+        other => return Err(format!("a buffer in descriptor type {other:?}")),
+    }
+    Ok(())
+}
+
+fn write_texture(e: &NmbEncoder, cb: &mut NmbCommandBuffer, stage: Stage, index: u32, _view: Option<&metal2vulkan::bind::ImageViewDesc>, slot: *mut u32) -> Result<(), String> {
+    let t = e.stages[stage_slot(stage)?].textures.get(&index).ok_or("a texture slot with nothing bound")?.clone();
+    let identity = [0u8, 1, 2, 3];
+    unsafe { nmn_descriptor_image(t.image as *const NmnImage, t.pipe_format, t.view_type, t.base_level, t.levels, t.base_layer, t.layers, identity.as_ptr(), false, slot) };
+    if t.must_name() {
+        cb.names.push(t.bo() as usize);
+    }
+    cb.held_textures.push(t);
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_draw(e: *mut NmbEncoder, primitive: u64, start: u32, count: u32, instances: u32, base_instance: u32) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        let draw = DrawCall::Primitives { vertex_start: start, vertex_count: count, instance_count: instances, base_instance };
+        let _ = PrimitiveType::try_from(primitive as u32).map_err(|_| "primitive type")?;
+        emit_draw(e, draw, None, primitive as u32, (count, instances, start, base_instance))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_draw_indexed(e: *mut NmbEncoder, primitive: u64, count: u32, index_type: u64, indices: *mut NmbBuffer, offset: u64, instances: u32, base_vertex: i32, base_instance: u32) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        let b = get(indices)?.b.clone();
+        let wide = index_type == 1;
+        let it = if wide { vk::IndexType::UINT32 } else { vk::IndexType::UINT16 };
+        let draw = DrawCall::Indexed { index_count: count, index_type: it, index_buffer: metal2vulkan::bind::IndexBufferRef::new(0, b.length), index_offset: offset, instance_count: instances, base_vertex, base_instance };
+        emit_draw(e, draw, Some((b, offset, wide, base_vertex)), primitive as u32, (count, instances, 0, base_instance))?;
+        Ok(true)
+    })
+}
+
+/// A pass is written at the end of the encoder, when it is known which targets its programs write. A target that no program wrote and whose store is "don't care" is not bound: no memory, no bandwidth (doc section 3.3). The draws stream is one IB, called.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_end(e: *mut NmbEncoder) -> bool {
+    guard(false, || {
+        let enc = unsafe { Box::from_raw(e) };
+        let mut enc = enc;
+        let cb = unsafe { enc.cb.as_mut() }.ok_or("the command buffer")?;
+        cb.open = false;
+        if let Some(pass) = enc.pass.take() {
+            let mut p: NmnPass = unsafe { std::mem::zeroed() };
+            p.width = pass.w;
+            p.height = pass.h;
+            p.samples = pass.samples;
+            p.color_count = pass.colors.len() as u32;
+            for (i, c) in pass.colors.iter().enumerate() {
+                let Some((t, level, layer, load, store, clear)) = c else { continue };
+                let written = enc.attachment_written & (1 << i) != 0;
+                let keep = *load == 1 || *store != 0;
+                if t.memoryless && !written {
+                    continue;
+                }
+                if !written && !keep {
+                    continue;
+                }
+                p.colors[i] = NmnColorTarget { image: t.image as *const NmnImage, pipe_format: t.pipe_format, level: *level as u32, layer: *layer as u32, clear: *load == 2, clear_value: *clear };
+                if t.must_name() || t.backing.is_some() {
+                    cb.names.push(t.bo() as usize);
+                }
+                cb.held_textures.push(t.clone());
+            }
+            if let Some(d) = &pass.depth {
+                p.depth = d.image as *const NmnImage;
+                p.clear_depth = pass.depth_load == 2;
+                p.clear_z = pass.clear_z;
+                let _ = pass.depth_store;
+                cb.held_textures.push(d.clone());
+            }
+            let cs: *mut NwCs = &mut *cb.cs;
+            unsafe {
+                nmn_cmd_pass_begin(cs, enc.gpu.gpu, &p);
+                nw_cs_end_ib(&mut *enc.draws);
+                // the draws' chunks are copied into the main stream as calls
+                for i in 0..enc.draws.ib_count {
+                    let ib = &*enc.draws.ibs.add(i as usize);
+                    let (iova, dwords) = (ib.iova, ib.dwords);
+                    let words = [nw_pkt7(0x3f, 3), iova as u32, (iova >> 32) as u32, dwords];
+                    nw_reserve_copy(cs, words.as_ptr(), 4);
+                }
+                for i in 0..enc.draws.chunk_count {
+                    cb.names.push(*enc.draws.chunks.add(i as usize) as usize);
+                }
+                nmn_cmd_pass_end(cs, &p);
+            }
+        }
+        // the stream of draws lives until the fence, with the command buffer
+        let draws = std::mem::replace(&mut enc.draws, Box::new(unsafe { std::mem::zeroed() }));
+        cb.held_streams.push(draws);
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_discard(e: *mut NmbEncoder) {
+    if !e.is_null() {
+        let enc = unsafe { Box::from_raw(e) };
+        if let Some(cb) = unsafe { enc.cb.as_mut() } {
+            cb.open = false;
+        }
+    }
+}

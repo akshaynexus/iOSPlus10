@@ -469,6 +469,14 @@ static bool finish_stage(struct nmn_compiler *c, const struct nmn_layout *layout
 	i->has_kill = v->has_kill;
 	i->writes_z = v->writes_pos;
 	i->needs_full_quad = v->need_full_quad;
+	i->color_outputs = 0;
+	if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+		for (unsigned r = 0; r < 8; r++) {
+			int idx = ir3_find_output(v, (gl_varying_slot)(FRAG_RESULT_DATA0 + r));
+			if (idx >= 0 && VALIDREG(ir3_get_output_regid(&v->outputs[idx])))
+				i->color_outputs |= 1u << r;
+		}
+	}
 	return true;
 }
 

@@ -17,7 +17,7 @@ case $what in
 host)
   S=$OUT/ios26/turnip-host/mesa
   B=$OUT/ios26/native/mesa-host
-  CC_FLAGS="-O2 -g -fPIC -Wall -Wno-unused-parameter"
+  CC_FLAGS="-O2 -g -fPIC -fno-strict-aliasing -Wall -Wno-unused-parameter"
   triple=$(rustc "+$RUST_TOOLCHAIN" -vV | sed -n 's/^host: //p')
   ;;
 *) echo "build.sh: host" >&2; exit 2 ;;
@@ -39,8 +39,9 @@ PY
 INC="@$W/flags.rsp -I$S/src/freedreno -I$S/include -I$B/src/compiler -I$S/src/compiler"
 DEFS=""
 clang -std=gnu11 $CC_FLAGS $DEFS $INC -c "$N/shader/nmn_shader.c" -o "$W/nmn_shader.o"
-clang -std=gnu11 $CC_FLAGS $DEFS $INC -c "$N/winsys/nw.c" -o "$W/nw.o"
-rm -f "$W/libnmn_c.a"; ar rcs "$W/libnmn_c.a" "$W/nmn_shader.o" "$W/nw.o"
+clang -std=gnu11 $CC_FLAGS $DEFS $INC -I"$N/winsys" -c "$N/winsys/nw.c" -o "$W/nw.o"
+clang++ -std=c++17 -fno-exceptions -fno-rtti $CC_FLAGS -Wno-c99-designator -Wno-c++11-narrowing -Wno-missing-field-initializers -Wno-unused-function $DEFS $INC -I"$N/winsys" -I"$N/pm4" -I"$S/src/freedreno/fdl" -I"$B/src/freedreno/registers/adreno" -I"$B/src/freedreno/registers" -c "$N/pm4/nmn_pm4.cc" -o "$W/nmn_pm4.o"
+rm -f "$W/libnmn_c.a"; ar rcs "$W/libnmn_c.a" "$W/nmn_shader.o" "$W/nw.o" "$W/nmn_pm4.o"
 cat > "$W/Cargo.toml" <<TOML
 [package]
 name = "native-metal-native"

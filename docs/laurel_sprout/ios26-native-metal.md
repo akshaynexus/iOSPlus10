@@ -88,7 +88,7 @@ Why [V code, `RedwoodGPU.cpp` `submit`]:
 | Descriptor sets | Vulkan pools + updates per draw | words written to the upload ring | [I] |
 | State per submission | Turnip runs `tu6_init_hw` at each primary VkCommandBuffer begin (`tu_cmd_buffer.cc` 2662): about 70 registers + WFI + cache invalidate [V]. How many VkCommandBuffers a submission holds: [U]; the log gives 11.6 IBs per submission, and one VkCommandBuffer can be several IBs | one init IB per submission, called, not copied. The kernel's ring is shared with other processes, so one init per submission must stay | [I] |
 | CCU mode switch | per pass with autotune: flush, invalidate, WFI [V code] | none: always sysmem | [I] |
-| Shader bounds checks | `DevicePolicy` containment on (m2v default) | Off for the compositor: Apple's shaders are trusted. Stage 3 measures the instructions | [I] until stage 3 |
+| Shader bounds checks | `DevicePolicy` containment on (m2v default) | The same: stage 3 measured no gain with them off | [V host] |
 
 ### 3.3 Where the GPU time goes on the default stack: found on the host
 
@@ -220,7 +220,7 @@ No disassembly was needed yet. If a stage needs one, the doc will list file and 
 What this says:
 
 - **All the glass shaders compile for FD610 through this path** [V]. Code exists; the pixels are [U].
-- **There is no shader gain to expect from this stack:** same ir3, same SPIR-V. `NMN_POLICY=safe` (the translator's containment on) gives the same counts for the 8 shaders above [V], so "off" gains nothing here: the default stays off only because of the other policy checks; I keep the switch.
+- **There is no shader gain to expect from this stack:** same ir3, same SPIR-V. Containment on or off gives the same counts for these shaders [V], so the stack keeps metal2vulkan's default policy, as the default stack does. `NMN_POLICY=unsafe` is a developer's switch at build test time only.
 - `simple_rim_lph` is 8 % larger, cause not found [U]. [I] the default stack's number came with another build of the tables. A real fix only if CA asks that shader often.
 - **Only 78 of the 218 real rows read the framebuffer** [V: `nir_lower_input_attachments` made progress]. Glass and blur do not read it. On the default stack all of them take the flush state and GMEM (section 3.3), because the decision is by the fetch state and not by the code. `native` decides per program.
 

@@ -5,6 +5,8 @@
 
 mod compile;
 mod ffi;
+mod draw;
 mod objects;
 
+pub use draw::*;
 pub use objects::*;

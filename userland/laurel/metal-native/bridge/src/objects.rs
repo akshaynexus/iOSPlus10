@@ -64,6 +64,7 @@ pub struct NmbDevice {
     pub(crate) device: Device,
     pub(crate) compiler: *mut NmnCompiler,
     pub(crate) stats: bool,
+    pub(crate) gpu: std::sync::Arc<crate::draw::Gpu>,
 }
 // SAFETY: ir3_compiler is read only after its creation: Turnip shares one between threads.
 unsafe impl Send for NmbDevice {}
@@ -74,10 +75,10 @@ impl Drop for NmbDevice {
     }
 }
 
-/// `NMN_POLICY=safe` keeps metal2vulkan's containment. The default for this stack is off: the compositor's shaders are Apple's, and a bounds check costs instructions on one SP.
+/// metal2vulkan's default, as the default stack. `NMN_POLICY=unsafe`: containment and isolation off. Stage 3 measured no fewer instructions with them off on the compositor's shaders, so off is not the default.
 fn policy() -> DevicePolicy {
     let mut p = DevicePolicy::default();
-    if std::env::var("NMN_POLICY").as_deref() != Ok("safe") {
+    if std::env::var("NMN_POLICY").as_deref() == Ok("unsafe") {
         p.containment = ContainmentPolicy::UnsafeOff;
         p.isolation = GuestIsolation::Off;
     }
@@ -94,7 +95,8 @@ pub unsafe extern "C" fn nmb_device_open(_loader: *const c_char, _cache: *const 
         if compiler.is_null() {
             return Err(unsafe { CStr::from_ptr(why.as_ptr()) }.to_string_lossy().into_owned());
         }
-        Ok(boxed(NmbDevice { device, compiler, stats: std::env::var_os("NMN_STATS").is_some() }))
+        let gpu = crate::draw::Gpu::open()?;
+        Ok(boxed(NmbDevice { device, compiler, stats: std::env::var_os("NMN_STATS").is_some(), gpu }))
     })
 }
 
@@ -235,7 +237,29 @@ pub extern "C" fn nmb_function_release(f: *mut NmbFunction) {
 // ---- pipelines ----
 
 pub struct NmbComputePipeline(pub(crate) Program, pub(crate) std::sync::Arc<metal2vulkan::pipeline::ComputePipeline>);
-pub struct NmbRenderPipeline(pub(crate) Program, pub(crate) std::sync::Arc<metal2vulkan::pipeline::RenderPipeline>);
+/// The translator's pipeline; the fixed state of its descriptor; its programs per bind shape (a plan and a specialization: the second use is a lookup).
+pub struct NmbRenderPipeline {
+    pub(crate) first: Program,
+    pub(crate) pipeline: std::sync::Arc<metal2vulkan::pipeline::RenderPipeline>,
+    pub(crate) fixed: PipelineFixed,
+    pub(crate) device: *const NmbDevice,
+    pub(crate) plans: std::sync::Mutex<std::collections::HashMap<Vec<u8>, std::sync::Arc<crate::draw::PlanEntry>>>,
+}
+pub(crate) struct ColorFixed {
+    pub format: u64,
+    pub blending: u64,
+    pub source_rgb: u32,
+    pub destination_rgb: u32,
+    pub rgb_operation: u32,
+    pub source_alpha: u32,
+    pub destination_alpha: u32,
+    pub alpha_operation: u32,
+    pub write_mask: u32,
+}
+pub(crate) struct PipelineFixed {
+    pub colors: Vec<ColorFixed>,
+    pub samples: u32,
+}
 
 fn print_stage(name: &str, stage: &str, i: &NmnStageInfo) {
     println!("stat\t{name}\t{stage}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", i.instructions, i.nops, i.movs, i.covs, i.sizedwords, i.half_regs, i.full_regs, i.const_vec4, i.tex_ops, i.mem_ops, i.sstall, i.systall, i.loops, i.reads_framebuffer as u32);
@@ -409,6 +433,11 @@ pub extern "C" fn nmb_render_pipeline_new(d: *mut NmbDevice, descriptor: *const 
         let device = get(d)?;
         let pipeline = device.device.compile_render_pipeline(&render_descriptor(descriptor)?, &Budget::standard()).map_err(e("render pipeline"))?;
         let program = render_program(device.compiler, &pipeline)?;
+        let source = get(descriptor)?;
+        let fixed = PipelineFixed {
+            colors: source.colors.iter().map(|c| ColorFixed { format: c.format, blending: c.blending, source_rgb: c.source_rgb as u32, destination_rgb: c.destination_rgb as u32, rgb_operation: c.rgb_operation as u32, source_alpha: c.source_alpha as u32, destination_alpha: c.destination_alpha as u32, alpha_operation: c.alpha_operation as u32, write_mask: c.write_mask as u32 }).collect(),
+            samples: source.samples.max(1) as u32,
+        };
         if device.stats {
             let name = std::env::var("NMN_STAT_NAME").unwrap_or_default();
             for (i, stage) in ["vertex", "fragment"].iter().enumerate() {
@@ -417,7 +446,7 @@ pub extern "C" fn nmb_render_pipeline_new(d: *mut NmbDevice, descriptor: *const 
                 }
             }
         }
-        Ok(boxed(NmbRenderPipeline(program, std::sync::Arc::new(pipeline))))
+        Ok(boxed(NmbRenderPipeline { first: program, pipeline: std::sync::Arc::new(pipeline), fixed, device: d, plans: std::sync::Mutex::new(std::collections::HashMap::new()) }))
     })
 }
 

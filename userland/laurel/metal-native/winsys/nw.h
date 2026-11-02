@@ -106,6 +106,7 @@ static inline void nw_cs_reserve(struct nw_cs *cs, uint32_t dwords)
 		nw_cs_grow(cs, dwords);
 }
 static inline void nw_cs_emit(struct nw_cs *cs, uint32_t v) { *cs->cur++ = v; }
+void nw_reserve_copy(struct nw_cs *cs, const uint32_t *words, uint32_t count);
 static inline void nw_cs_emit_qw(struct nw_cs *cs, uint64_t v) { *cs->cur++ = (uint32_t)v; *cs->cur++ = (uint32_t)(v >> 32); }
 static inline uint64_t nw_cs_iova(const struct nw_cs *cs) { return cs->start_iova + (uint64_t)((const char *)cs->cur - (const char *)cs->start); }
 

@@ -565,6 +565,13 @@ lost:
 	cs->start_iova = 0;
 }
 
+void nw_reserve_copy(struct nw_cs *cs, const uint32_t *words, uint32_t count)
+{
+	nw_cs_reserve(cs, count);
+	memcpy(cs->cur, words, count * 4);
+	cs->cur += count;
+}
+
 /* ---- submission ---- */
 
 void nw_submit_begin(struct nw_submit *s, struct nw_device *d)

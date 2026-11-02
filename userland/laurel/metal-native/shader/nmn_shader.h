@@ -49,6 +49,7 @@ struct nmn_stage_info {
 	uint32_t instrlen;      /* units of 16 instructions */
 	bool reads_framebuffer; /* an input attachment survives into this stage's code */
 	bool has_kill, writes_z, needs_full_quad;
+	uint32_t color_outputs; /* bit per render target this stage writes */
 };
 
 struct nmn_program;     /* one vertex + one fragment, or one compute */
