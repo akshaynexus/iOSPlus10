@@ -336,6 +336,12 @@ need_root_verified() {
   esac
 }
 
+# [V 2026-11-02] Another Android phone can be on adb, also with no USB port. Pin all adb calls to the Mi A3: owner's order, and a bare adb can reach the other phone.
+if [ -z "${ANDROID_SERIAL:-}" ]; then
+  for _s in $(timeout 5 adb devices 2>/dev/null | sed -n 's/\tdevice$//p'); do
+    if [ "$(timeout 5 adb -s "$_s" shell getprop ro.product.device 2>/dev/null | tr -d '\r')" = laurel_sprout ]; then ANDROID_SERIAL=$_s; export ANDROID_SERIAL; break; fi
+  done
+fi
 cmd=${1:-}
 [ $# = 0 ] || shift
 case "$cmd" in
@@ -656,10 +662,11 @@ ro-result)
   [ -f "$log" ] || die "missing $log"
   grep -q '^android-opened ' "$RESULT" 2>/dev/null || die "no record that Android opened its data on the new layout"
   m=$(marker)
-  _l=$(grep -a 'LAUREL DUALBOOT: \(on\|off\|no root\)' "$log" | tail -1 || true)
+  # The USB log can drop the prefix "LAUREL " [V phone 2026-11-02].
+  _l=$(grep -a 'DUALBOOT: \(on\|off\|no root\)' "$log" | tail -1 || true)
   case "$_l" in
-  *"LAUREL DUALBOOT: on: root = iosroot, LUN 0, first block $IOSROOT_FIRST, $IOSROOT_BLOCKS blocks "*", read-only ($m)"*) ;;
-  *"LAUREL DUALBOOT: on:"*) die "the line is not the one of a read-only boot on the plan's partition with this kernel: $_l" ;;
+  *"DUALBOOT: on: root = iosroot, LUN 0, first block $IOSROOT_FIRST, $IOSROOT_BLOCKS blocks "*", read-only ($m)"*) ;;
+  *"DUALBOOT: on:"*) die "the line is not the one of a read-only boot on the plan's partition with this kernel: $_l" ;;
   "") die "$log has no LAUREL DUALBOOT line: no result. The writable image stays refused" ;;
   *) die "the kernel said no: $_l. No result: the writable image stays refused" ;;
   esac

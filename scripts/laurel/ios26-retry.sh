@@ -11,6 +11,8 @@ cd "$(dirname "$0")/../.."
 M=${1:-}
 [ "$M" != ro ] || M=
 DB="sh scripts/laurel/dual-boot.sh"
+# [V 2026-11-02] Another Android phone can be on the same computer: every adb call goes to the Mi A3 by its serial, or stops.
+mi_a3() { for _s in $(timeout 5 adb devices 2>/dev/null | sed -n 's/\tdevice$//p'); do [ "$(timeout 5 adb -s "$_s" shell getprop ro.product.device 2>/dev/null | tr -d '\r')" = laurel_sprout ] && { echo "$_s"; return 0; }; done; return 1; }
 run() { "$@" > /tmp/ios26-retry.$$ 2>&1 || { cat /tmp/ios26-retry.$$; rm -f /tmp/ios26-retry.$$; die "failed: $*"; }; tail -n 1 /tmp/ios26-retry.$$; rm -f /tmp/ios26-retry.$$; }
 say() { echo "$(date +%H:%M:%S) ios26-retry: $*"; }
 die() { say "STOP: $*"; exit 1; }
@@ -20,15 +22,18 @@ wait_fb() { c=0; until fb_ok; do [ "$c" -lt "$1" ] || return 1; sleep 3; c=$((c 
 fb_get() { for _t in 1 2 3 4; do _v=$(timeout 10 fastboot getvar "$1" 2>&1 | sed -n "s/^$1: *//p" | tr -d '\r'); [ -z "$_v" ] || { echo "$_v"; return 0; }; done; return 0; }
 wait_android() {
   c=0
-  until [ "$(timeout 3 adb get-state 2>/dev/null)" = device ] && [ "$(timeout 5 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; do
+  until _ser=$(mi_a3) && [ "$(timeout 5 adb -s "$_ser" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; do
     [ "$c" -lt 60 ] || return 1; sleep 5; c=$((c + 1))
   done
+  ANDROID_SERIAL=$_ser; export ANDROID_SERIAL
 }
 to_root() { timeout 15 adb root >/dev/null 2>&1 || true; sleep 3; c=0; until [ "$(timeout 3 adb get-state 2>/dev/null)" = device ]; do [ "$c" -lt 20 ] || return 1; sleep 2; c=$((c + 1)); done; }
 
 say "building the image"
 run $DB image $M
-if [ "$(timeout 3 adb get-state 2>/dev/null || true)" = device ] && [ "$(timeout 5 adb shell getprop ro.boot.slot_suffix 2>/dev/null | tr -d '\r')" = _a ]; then
+_ser=$(mi_a3 || true)
+if [ -n "$_ser" ] && [ "$(timeout 5 adb -s "$_ser" shell getprop ro.boot.slot_suffix 2>/dev/null | tr -d '\r')" = _a ]; then
+  ANDROID_SERIAL=$_ser; export ANDROID_SERIAL
   say "Android is already on slot a"
 else
   # A panic hold answers on USB: this asks for fastboot with no buttons, and the session it gives is clean.
