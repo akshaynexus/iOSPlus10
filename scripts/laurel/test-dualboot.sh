@@ -43,6 +43,7 @@ done
 # the one change to the driver: its SCSI command goes to the RAM disk. ufs_scsi_hw (the MMIO path) stays compiled and unused.
 sed -e 's/^ufs_scsi(const uint8_t \*cdb/ufs_scsi_hw(const uint8_t *cdb/' -e 's/\bufs_scsi(\([a-z]\)/ufs_scsi_fake(\1/g' "$X/bsd/dev/sweet_ufs.c" > "$D/k/sweet_ufs_host.c"
 cp "$T/laurel_dualboot.h" "$D/k/"
+[ ! -f "$X/bsd/dev/laurel_ufs_queue.h" ] || cp "$X/bsd/dev/laurel_ufs_queue.h" "$D/k/"
 grep -q '^ufs_scsi_hw(const' "$D/k/sweet_ufs_host.c"
 sed -i '1i static int ufs_scsi_fake(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write);' "$D/k/sweet_ufs_host.c"
 $CC -std=gnu11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter -Wno-format -Wno-duplicate-decl-specifier \
