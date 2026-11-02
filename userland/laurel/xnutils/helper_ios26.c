@@ -1,6 +1,6 @@
 /*
  * The iOS 26 verbs of powermenu-helper (built with XT_IOS26: scripts/laurel/xnutils-build.sh, XNUTILS_IOS26=1). docs/laurel_sprout/ios26-metal.md section 10.
- *   metaloption default|hot    which Metal stack NegroniMetal.bundle's selector takes at the next start of a process; clears the selector's counts
+ *   metaloption default|hot|native    which Metal stack NegroniMetal.bundle's selector takes at the next start of a process; clears the selector's counts
  *   tumode auto|sysmem|gmem    the TU_DEBUG line of the env file (Turnip's render mode); next start of a process that reads /var/db
  *   liveglass on|off           live CABackdropLayer capture is the default; off writes the kill switch file: within 5 s, Restart UI when the kill switch was not there at the device open
  *   metalstate                 KEY=VALUE lines: setting, running stack, why, counts, Turnip mode, glass

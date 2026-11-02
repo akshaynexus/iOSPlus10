@@ -1,0 +1,32 @@
+fragment functions 130, with a default-stack number 126
+median instructions: native 80.0, default 92.0
+native smaller 21, same 92, larger 13
+glass_background_lph: native 841, default 837
+glass_background_sdf_lph: native 1707, default 1703
+glass_foreground_sdf_lph: native 686, default 686
+glass_foreground_lph: native 194, default 194
+narrow_blur_27_frag_lph: native 150, default 150
+variable_blur_frag_lph: native 147, default 147
+simple_rim_lph: native 6570, default 6066
+asg_frag_lph: native 593, default 593
+ca_generic_lph_cph: native 48975, default -
+real keys: 107 distinct rows; read the framebuffer: 36
+fixed_frag: 91 rows; read the framebuffer: 35; instructions median 100, max 617
+  luma_boost_lph: 38 instructions, reads framebuffer 1
+  attachment_clear_frag_lph: 5 instructions, reads framebuffer 0
+  narrow_blur_15_frag_lph: 108 instructions, reads framebuffer 0
+  variable_blur_downsample_frag_lph: 98 instructions, reads framebuffer 0
+  glass_background_no_bleed_lph: 723 instructions, reads framebuffer 0
+  downsample_4_frag_lph: 42 instructions, reads framebuffer 0
+  home_affordance_base_lph: 76 instructions, reads framebuffer 0
+  narrow_blur_27_frag_lph: 150 instructions, reads framebuffer 0
+  narrow_blur_23_frag_lph: 136 instructions, reads framebuffer 0
+  downsample_8_frag_lph: 122 instructions, reads framebuffer 0
+  glass_background_sdf_no_bleed_lph: 1589 instructions, reads framebuffer 0
+  displacement_map_lph: 36 instructions, reads framebuffer 0
+  narrow_blur_19_frag_lph: 122 instructions, reads framebuffer 0
+  glass_foreground_sdf_lph: 686 instructions, reads framebuffer 0
+  narrow_blur_7_frag_lph: 80 instructions, reads framebuffer 0
+  single_pass_blur_3_lph: 80 instructions, reads framebuffer 0
+
+real key rows, fragment stage: reads framebuffer 78, does not 140

@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include "option_rule.h"
 #include "present_stats.h"
-static int known(const char *n) { return !strcmp(n, "hot"); }
+static int known(const char *n) { return !strcmp(n, "hot") || !strcmp(n, "native"); }
 static int fails_seen;
 static void want(const char *label, const char *got, const char *expect)
 {
@@ -22,6 +22,14 @@ int main(void)
 	want("empty setting", nmtl_option_choose("", known, &s, 0, 0, 1, why, sizeof(why)), "default");
 	want("unknown option", nmtl_option_choose("junk", known, &s, 0, 0, 1, why, sizeof(why)), "default");
 	if (why[0] == 0) { printf("FAIL unknown option has no reason\n"); fails_seen++; }
+	/* the third option goes through the same rule: a reported failure returns it to the default at once */
+	{
+		struct nmtl_option_state n;
+		memset(&n, 0, sizeof(n));
+		want("native: first start", nmtl_option_choose("native", known, &n, 0, 0, 1, why, sizeof(why)), "native");
+		want("native: reported failure: the default", nmtl_option_choose("native", known, &n, 0, 1, 1, why, sizeof(why)), "default");
+		want("native: stays default until written again", nmtl_option_choose("native", known, &n, 0, 0, 1, why, sizeof(why)), "default");
+	}
 	want("first start", nmtl_option_choose("hot", known, &s, 0, 0, 1, why, sizeof(why)), "hot");
 	want("second start, no ok: 1 fail", nmtl_option_choose("hot", known, &s, 0, 0, 1, why, sizeof(why)), "hot");
 	want("third start, no ok: 2 fails, default", nmtl_option_choose("hot", known, &s, 0, 0, 1, why, sizeof(why)), "default");

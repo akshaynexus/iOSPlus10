@@ -2,7 +2,7 @@
  * NegroniMetal.bundle's executable on the iOS 26 root: the Metal.framework plug-in class. It picks one stack, loads it, and hands over. The stacks are separate images (options/<name>/NegroniMetal) because
  * their Objective-C classes have the same names, so one process never loads two. Setting: /private/var/db/negronimetal/option, or BUNDLE/option.local for a sandboxed process; first word; read once, at the process's
  * device open. Changing it needs the process to restart: XNUtils offers Restart UI. Rule: option_rule.h. Docs: docs/laurel_sprout/ios26-metal.md section 10.
- * Lines: LAUREL METAL: on: stack NAME ...  |  LAUREL METAL: off: <reason>: stack default.
+ * Lines: LAUREL METAL: on: stack NAME ...  |  LAUREL METAL: off: <reason>: stack default. The native stack's own: LAUREL METAL NATIVE: off: <reason> (docs/laurel_sprout/ios26-native-metal.md).
  */
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -52,6 +52,12 @@ static int known(const char *name)
 	}
 	snprintf(p, sizeof(p), "%s/options/%s/NegroniMetal", g_bundle, name);
 	return access(p, R_OK) == 0;
+}
+
+/* the tag of a failure line: an owner greps the stack's own word */
+static const char *tag_of(const char *name)
+{
+	return strcmp(name, "native") == 0 ? "LAUREL METAL NATIVE" : "LAUREL METAL";
 }
 
 static bool read_word(const char *path, char *out, size_t size)
@@ -112,7 +118,7 @@ static bool read_word(const char *path, char *out, size_t size)
 		}
 		char say[240];
 		if (why[0] != 0) {
-			snprintf(say, sizeof(say), "LAUREL METAL: off: %s: stack default", why);
+			snprintf(say, sizeof(say), "%s: off: %s: stack default", tag_of(wanted), why);
 			line(say);
 		} else if (compositor) {
 			snprintf(say, sizeof(say), "LAUREL METAL: on: stack %s (setting %s)", pick, wanted[0] ? wanted : "absent");
@@ -128,7 +134,7 @@ static bool read_word(const char *path, char *out, size_t size)
 		void *image = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 		if (image == NULL && strcmp(pick, NMTL_OPTION_DEFAULT) != 0) {
 			/* nothing of the other stack came in: the default can still load in this process */
-			snprintf(say, sizeof(say), "LAUREL METAL: off: option %s does not load: %.160s: stack default", pick, dlerror());
+			snprintf(say, sizeof(say), "%s: off: option %s does not load: %.160s: stack default", tag_of(pick), pick, dlerror());
 			line(say);
 			pick = NMTL_OPTION_DEFAULT;
 			setenv("NEGRONIMETAL_OPTION", pick, 1);
@@ -153,7 +159,7 @@ static bool read_word(const char *path, char *out, size_t size)
 				fprintf(f, "no device\n");
 				fclose(f);
 			}
-			snprintf(say, sizeof(say), "LAUREL METAL: off: stack %s gave no device: restart on stack default", pick);
+			snprintf(say, sizeof(say), "%s: off: stack %s gave no device: restart on stack default", tag_of(pick), pick);
 			line(say);
 			_exit(0);
 		}

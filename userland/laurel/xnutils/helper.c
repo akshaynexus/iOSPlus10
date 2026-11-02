@@ -237,7 +237,7 @@ main(int argc, char **argv)
 		plain_ok |= !strcmp(verb, plain[i]);
 	}
 #ifdef XT_IOS26
-	int option = arg != NULL && !strcmp(verb, "metaloption") && (!strcmp(arg, "default") || !strcmp(arg, "hot"));
+	int option = arg != NULL && !strcmp(verb, "metaloption") && (!strcmp(arg, "default") || !strcmp(arg, "hot") || !strcmp(arg, "native"));
 	int tumode = arg != NULL && !strcmp(verb, "tumode") && (!strcmp(arg, "auto") || !strcmp(arg, "sysmem") || !strcmp(arg, "gmem"));
 	int glass = arg != NULL && !strcmp(verb, "liveglass") && (!strcmp(arg, "on") || !strcmp(arg, "off"));
 	int state = arg == NULL && (!strcmp(verb, "metalstate") || !strcmp(verb, "bench-begin") || !strcmp(verb, "bench-end"));

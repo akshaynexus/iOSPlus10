@@ -818,6 +818,14 @@ static void surface_hook(const void *base, uint64_t bytes, uint32_t surface)
 {
 	note_surface(base, bytes, surface);
 }
+#ifdef NMTL_NATIVE
+extern "C" void nmn_note_surface(const void *base, uint64_t bytes, uint32_t surface);
+static void hook_surfaces(const char *turnip)
+{
+	(void)turnip;
+	native_bridge_metal_set_surface_hook(nmn_note_surface);
+}
+#else
 static void hook_surfaces(const char *turnip)
 {
 	void *h = dlopen(turnip, RTLD_NOW | RTLD_NOLOAD);
@@ -827,6 +835,7 @@ static void hook_surfaces(const char *turnip)
 	else
 		nlog("Turnip has no redwood_drm_note_surface: IOSurface textures need the kernel's user-page import");
 }
+#endif
 
 /*
  * Self-test before the device is handed out (a device that registers but cannot draw makes CoreAnimation draw nothing):
@@ -1038,7 +1047,11 @@ static void option_failed(const char *why)
 {
 	if (option_is_default())
 		return;
+#ifdef NMTL_NATIVE
+	nlog("LAUREL METAL NATIVE: off: %s: restart on stack default", why);
+#else
 	nlog("LAUREL METAL: off: stack %s: %s: restart on stack default", getenv("NEGRONIMETAL_OPTION"), why);
+#endif
 	option_mark("failed", why);
 	_exit(0);
 }
@@ -1452,7 +1465,12 @@ static void watchdog_start(void)
 		NSString *turnip = [bundlePath stringByAppendingPathComponent:@"libvulkan_freedreno.dylib"];
 		if (const char *t = getenv("NEGRONI_TURNIP"))
 			turnip = @(t);
+#ifdef NMTL_NATIVE
+		/* -DNMTL_NATIVE=1, the native stack (docs/laurel_sprout/ios26-native-metal.md): no Turnip, no Vulkan in this image */
+		if (false) {
+#else
 		if (access(turnip.UTF8String, R_OK) != 0) {
+#endif
 			nlog("no Turnip at %s: no Metal device", turnip.UTF8String);
 			return;
 		}
@@ -1545,8 +1563,12 @@ static void watchdog_start(void)
 				@try {
 					/* the same image metal2vulkan's loader opens next: this call times dyld alone */
 					double loading = CFAbsoluteTimeGetCurrent();
+#ifndef NMTL_NATIVE
 					(void)dlopen(c->turnip, RTLD_LAZY | RTLD_LOCAL);
 					g_turnip_ms = (CFAbsoluteTimeGetCurrent() - loading) * 1000;
+#else
+					(void)loading;
+#endif
 					dev = native_bridge_metal_open(c->turnip, c->cache, c->registryID, missing);
 					if (!dev)
 						why = [NSString stringWithFormat:@"open refused: %s", nmb_last_error()];
