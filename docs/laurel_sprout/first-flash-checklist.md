@@ -20,7 +20,7 @@ Short form of `dual-boot.md` section 1, which holds all detail and the recovery 
 | 4 | Recovery: Format data. Android setup, Build number x7, USB debugging, RSA dialog, Rooted debugging | **all of `userdata`, `metadata`** | **yes, at the phone** |
 | 5 | `adb root`; `dual-boot.sh android-check` | Updater off | |
 | 6 | `dual-boot.sh prepare-root`; `adb reboot bootloader`; `CONFIRM=install dual-boot.sh install` | `iosroot` | **yes** |
-| 6b | `adb root`; `dual-boot.sh verify-root` | nothing | |
+| 6b | `adb root`; `dual-boot.sh verify-root` | helper and list in `/data/local/tmp`; `iosroot` gets no write | |
 | 7 | `dual-boot.sh image` | nothing | |
 | 8 | `adb reboot bootloader`; `CONFIRM=flash-slot-b dual-boot.sh flash-slot-b`; Android must start | `boot_b`, `dtbo_b` | **yes** |
 | 9 | `CONFIRM=switch dual-boot.sh switch` | slot flags | **yes** |
@@ -29,6 +29,12 @@ Short form of `dual-boot.md` section 1, which holds all detail and the recovery 
 | 12 | `dual-boot.sh image rw`; `CONFIRM=flash-slot-b dual-boot.sh flash-slot-b rw`; `CONFIRM=switch dual-boot.sh switch rw` | `boot_b`, slot flags; Mu's menu can write slot flags | **yes** |
 
 Step 2's guard needs a rehearsal result. With `recovery no-root` on record it also needs `NO_RECOVERY_ROOT=lun-erase-accepted`.
+
+## Rules
+
+- Flash `iosroot` only through `dual-boot.sh install`. A flash by hand or from another checkout does not void an old read-back.
+- A `fastboot` call has no time limit except the last reboot. If a flash step shows no progress for many minutes, restart the phone by hand and run the step again. The record stays safe.
+- No patch changes between now and step 7 without a new kernel build: the iOS 26 image has no series check. Do not skip step 7.
 
 ## Risks to accept before step 2
 
