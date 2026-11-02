@@ -5317,3 +5317,6 @@ Full text: `docs/laurel_sprout/ios26-native-metal.md`. Not merged. Never drew a 
 - Do not run `cd` into `out/` in a tool call: the tool shell keeps it. zsh does not split `$F`: use `bash -c` for a flag list.
 - `compute_apl` asks 32 x 32 threads a group: the host profile's floor refuses it; real value 1024 (`threadsize_base` 64 x `max_waves` 16) [V source].
 - Existing FD610 GL binaries (`libOSMesa`, `libtopaz-gl`, `libtopaz-inject`): 0 missing imports against 23F84 [V].
+
+## 2026-11-03: boot 18 flashes previous and current state
+[V owner] Each update flashes the previous state, then the current. [V log] With `/var/db/negronimetal/sync` (CPU wait back on): 4-6 fps, flash stays per the owner, so 8a25c38 is not the cause, and the wait costs much. Next test: `NEGRONIMETAL_TEXTURE_POOL=0` in `/var/db/negronimetal/env` (texture pool of flame-ios26/0004) [I suspect].
