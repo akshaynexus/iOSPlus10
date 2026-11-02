@@ -115,9 +115,56 @@ same `TopazGPU: zap` lines; only three error reason texts changed wording [V cod
 
 2150 reads ADT `/chosen laurel-ram-reserved` and `laurel-ram-banks` (mkadt.py, area A). It takes the largest reserved range
 that is >= 128 MiB, 64 MiB aligned, below 4 GiB, inside one bank, outside the kernel's RAM (boot_args physBase/memSize)
-and outside TopazModem's pool (0xE0000000 + 16 MiB). Area A's map (`uefi-boot.md` "Memory map"): **0xC0000000 + 512 MiB**,
-kernel window 0xE1004000-0x1AD004000. No such range (old ADT): `gpu_midmem`, GPU memory from the kernel below 4 GiB (495 MiB
-there), line `TopazGPU: kernel RAM ...; no GPU pool (<reason>): GPU memory from the kernel below 4 GiB (midmem)`.
+and outside TopazModem's pool (0xC0000000 + 16 MiB, 2974). Map (`uefi-boot.md` "Memory map", section "Pool size" below): **0x80000000 + 1 GiB**,
+kernel window 0xC1004000-0x1B5004000. No such range (old ADT): `gpu_midmem`, GPU memory from the kernel below 4 GiB,
+line `TopazGPU: kernel RAM ...; no GPU pool (<reason>): GPU memory from the kernel below 4 GiB (midmem)`.
+
+### Pool size and pool pressure (2974; host only, NOT BOOTED)
+
+Log `logs/usblog-20261103-000638.txt` 02:54:49-02:55:00 [V]: `GPU pool 0 of 512 MB free`, 91-119 MB kept, 3-7 submissions in 5.2-5.8 s, GPU busy
+6-38 %, window server 0.45-4.2 s of each window inside requests, 68-72 MB per window pushed out of the CPU cache.
+
+**The old pool was empty and kept buffers stayed.** [V source] (1) 2916: `giveBackKept` returns 0 for the window server; it holds most of the kept
+bytes. (2) The give-back ran only for other clients under the 64 MiB floor, at most twice a second. (3) `keep()` kept a pool buffer with no regard to
+the free pool, so frees did not refill it.
+**No request waits for pool memory.** [V source] The claim "frames wait for pool memory" does not hold as such: `gemNew` with an empty pool goes to scattered pages
+(`goto scattered`). What slows the frames [I]: those pages are cached (`gGPUCached`), so each submission pushes them out of the cache (the 26-28 ms per submission above),
+and they cost a map and an unmap each. [U] How much of the 4.2 s the pool explains: only a boot shows it.
+
+Fix: `keep()` refuses a pool buffer when under 64 MiB of the pool is free. `redwood_gpu_pool_take`: when the pool has no room, kept pool buffers go back, the longest kept
+first, until the buffer fits. The window server's own request and pass-through take from every client; other clients and IOSurfaces only from clients that are not the window
+server. It runs only after the allocation failed, so the window server's kept buffers (6.8 ms against 9.3-10) stay in normal use. Locks: gGPULock outside, the pool's mutex inside, as in 2156.
+
+What user space sees when memory is short:
+| Case | Kernel | User space |
+| --- | --- | --- |
+| pool empty, kept buffers there | they go back, line `LAUREL GPU KEPT: the pool is empty: N MiB of kept buffers gave way for one of B bytes (it fits now)` | nothing |
+| pool empty, none kept, stage 1 | `gemNew` takes scattered pages | slower frames, no failure, no stall |
+| pool empty, pass-through (`gpu_smmu=0`, or stage 1 turned itself off) | `RedwoodGPU: the GPU pool has no N bytes left`, `kIOReturnNoMemory` | Mesa gets no buffer: a Metal texture or buffer is nil, a GL error [I] |
+| kernel RAM out too | `RedwoodGPU: no memory for a buffer`, `kIOReturnNoMemory` | same |
+| IOSurface, pool empty | the next path of `create`: scanout pool, then wired pages | no failure until the wired guard (2906) refuses |
+
+**Size: every number.** All in code at this commit:
+| Limit | Value | Result |
+| --- | --- | --- |
+| `GPU_POOL_MAX`, `gpu_chunk_va[16]`, `lgp.len[16384]` | 1 GiB (from topaz) | nothing was sized for 512 MiB; a pool above 1 GiB needs them changed |
+| `LGP_RANGES` | 2048 | seen at most 225 ranges at 512 MiB [V log]; past 2048 a free is `lost` and counted (host test: every other unit free loses 6136 units) |
+| GPU reach | 0x80000000-0xFFFFFFFF VA = PA (`IDENT_*`), scattered VA below it | the pool starts exactly at the window's first address; the allocator ends there. Host check only |
+| Bit 31 | the old pool had it set too | a GPU address at 0x8xxxxxxx is no new case for the 32-bit address paths [I] |
+| GMEM | internal, 0x100000 + 0x21000 (`GMEM_BASE`) | no overlap |
+| MDP scanout | below 4 GiB, display SMMU bypassed | 0x80000000+ fits |
+| SMMU tables (2895) | all 4 GiB made at once | no change |
+| Kernel maps | 64 MiB per chunk, on first use, kernel_map | 1 GiB of KVA at the most; 512 MiB reached [V], 1 GiB [I] |
+
+**What else is in the window** (0x80000000-0xC1000000):
+- Lineage `boot.img` DTB (`~/laurel-backup/lineage-24.0-20261027`, `dtc`) [V]: every `reg` region of `/reserved-memory` ends at or below 0x62100000 (wt_share_mem 0x62000000 + 1 MiB; ramoops 0x61600000). Modem 0x4B000000, ADSP 0x55300000, CDSP 0x53500000, hyp 0x45700000, smem, qseecom: all in bank A. The `alloc-ranges` regions (secure_display 140 MiB, adsp, sdsp, linux,cma, qseecom_ta, user_contig) are `reusable` CMA that the Android kernel places at its own start, with no fixed address: nothing of them lives across a reboot [I].
+- Nothing that Android needs at its next boot lies above bank A [I from the DTB]: ramoops is in bank A. XNU already overwrites bank B and C.
+- Mu [V patch]: "Pool RAM" reserved, UEFI never allocates there. FD 0x5FC00000, DXE heap 0x62100000: bank A.
+- It is RAM [V earlier boots]: 0x81004000-0xB1004000 was XNU's window (boots of 2026-11-01), UEFI allocated below 0xC0000000 then, 0xC0000000-0xE0000000 was the GPU pool (reached 0 free), 0xE0000000-0xE1000000 the modem pool. [I] 0x80000000-0x81000000: a NEGRONIMEM hole of the early boots, no proof that anything wrote it; the chunk check below covers only the pool above 512 MiB, so chunk 0 gets its first test as a live buffer.
+
+Self-check: `lgp_place` (host test). At the first allocation each chunk above 512 MiB must map and hold a pattern at both ends; the first that fails ends the pool there (`LAUREL GPU POOL: chunk N at 0x.. failed its check: M MiB instead of 1024 MiB`). Normal line: `LAUREL GPU POOL: on: 1024 MiB at 0x80000000, 16 chunks of 64 MiB`. Kill switch `gpu_poolbig=0`: 512 MiB. [U] A TrustZone-protected address does not fail this check: the access resets the phone. Nothing in the DTB says that any such address exists here.
+
+Tests [V host]: `scripts/laurel/gpu-pool-test.sh` part 4 (1 GiB pool, 16 chunks, `lgp_place`), `scripts/laurel/ram-map-test.sh`. No test here runs the kept-buffer path: it needs IOKit.
 
 ### SMMU pass-through risk (review M1)
 

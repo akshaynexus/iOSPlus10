@@ -21,12 +21,12 @@ UFS, buttons, D22AP /product) and changes what differs on the Mi A3:
   * --darwinboot: /chosen darwinboot-memory-size = dram SIZE (UniXNU DarwinBoot allocates a window of that size
     in the first UEFI conventional-memory run that fits: Mu "Kernel RAM", patches/laurel/mu/0001 + 0101);
     firmware-version "laurel-uefi".
-  * --dram auto --mu-fd FD (UEFI path, kernel patch 2100): the window size from the Mu FD's "Kernel RAM" entry
+  * --dram auto --mu-fd FD (UEFI path, kernel patches 2100, 2974): the window size from the Mu FD's "Kernel RAM" entry
     (PrePi memory map table, uncompressed in the FD); a late-layout FD (mu late/0101: "UEFI RAM" + "Pool RAM", no
-    "Kernel RAM") gives the bank run above "Pool RAM", which RamManagerDxe adds late. Mu 0101 ("Kernel RAM" 0xE1000000 + 0xDF000000, to 0x1C0000000):
-    3264 MiB (window 0xE1004000..0x1AD004000; the largest 64 MiB multiple that leaves 256 MiB for UEFI, at most 4608 MiB,
-    the TOPAZ_4K bootstrap page-table limit). An older FD (Kernel RAM to 0xC0000000): 768 MiB, as before, with a
-    "LAUREL RAM: off:" line.
+    "Kernel RAM") gives the bank run above "Pool RAM", which RamManagerDxe adds late. Mu 0101 ("Kernel RAM" 0xC1000000 + 0xFF000000, to 0x1C0000000):
+    3904 MiB (window 0xC1004000..0x1B5004000; the largest 64 MiB multiple that leaves 128 MiB for UEFI, at most 4608 MiB,
+    the TOPAZ_4K bootstrap page-table limit). An FD of the map before 2974 (Kernel RAM 0xE1000000): 3392 MiB. An older FD
+    (Kernel RAM to 0xC0000000): 768 MiB, as before, with a "LAUREL RAM: off:" line.
   * /arm-io/bluetooth (kernel patch 2600): local-mac-address (fallback 02:4c:41:33:42:54, synthetic),
     transport-encoding 3 (H4BC), transport-speed 3000000, as the negroni [adt.bluetooth] node.
   * /chosen mac-address-wifi0 / -bluetooth0 / -ethernet0 (locally administered, not the phone's): MobileGestalt
@@ -38,8 +38,8 @@ UFS, buttons, D22AP /product) and changes what differs on the Mi A3:
     negroni 1697e28 scripts/ios16/adt-extra.py, ios-flame tools/mkadt.py). bluetooth0 = the /arm-io/bluetooth fallback.
   * /chosen laurel-ram-banks (u64 base/size pairs): the DDR banks XNU may manage, B 0x80000000 + 1 GiB and
     C 0xC0000000 + 4 GiB (they touch; bank A 0x40000000-0x7CC00000 holds every fixed carve-out). /chosen
-    laurel-ram-reserved: device pools that must stay out of kernel RAM: 0xC0000000 + 512 MiB (Adreno GPU pool) and
-    0xE0000000 + 16 MiB (TopazModem pool). Kernel patch 2100 checks the boot window against both.
+    laurel-ram-reserved: device pools that must stay out of kernel RAM: 0x80000000 + 1 GiB (Adreno GPU pool, 768 MiB at
+    0x90000000 with a late-layout FD) and 0xC0000000 + 16 MiB (TopazModem pool). Kernel patch 2100 checks the boot window against both.
 Usage: mkadt.py OUT.adt [--cores 8|4] [--boot gold|silver] [--dram BASE:SIZE|auto] [--mu-fd FD] [--darwinboot] [--dump] [--donor d22ap|n104ap]
 The D22AP /product node needs the iPhone X device tree $APPLE/d22ap.adt (default ~/op10-apple; Apple file,
 never in git; get it with scripts/ios16/fetch-d22ap-adt.sh). Without it the node is left out (warning).
@@ -65,12 +65,13 @@ import mkadt as topaz  # noqa: E402
 # Mi A3 values (docs/laurel_sprout/hardware-map.md)
 # DDR banks XNU may manage (docs/laurel_sprout/uefi-boot.md "RAM layout"; kernel patch 2100)
 RAM_BANKS = ((0x80000000, 0x40000000), (0xC0000000, 0x100000000))
-# device pools outside kernel RAM (Mu 0101 "Pool RAM" 0x80000000-0xE1000000 holds them): GPU, modem
-RAM_RESERVED = ((0xC0000000, 0x20000000), (0xE0000000, 0x01000000))
+# device pools outside kernel RAM (Mu 0101 "Pool RAM" 0x80000000-0xC1000000 holds them): GPU, modem (kernel patch 2974)
+RAM_RESERVED = ((0x80000000, 0x40000000), (0xC0000000, 0x01000000))
+RAM_RESERVED_LATE = ((0x90000000, 0x30000000), (0xC0000000, 0x01000000))   # mu late/0101: "UEFI RAM" holds 0x81000000-0x90000000
 RAM_STEP = 64 << 20              # --dram auto window granularity
 RAM_MAX = 4608 << 20             # laurel 2100 LAUREL_RAM_MAX (TOPAZ_4K BOOTSTRAP_TABLE_SIZE)
 RAM_FALLBACK = 768 << 20         # the window before 2100 (Mu "Kernel RAM" to 0xC0000000)
-UEFI_HEADROOM = 256 << 20        # room left in "Kernel RAM" above the window for UEFI's own allocations
+UEFI_HEADROOM = 128 << 20        # room left in "Kernel RAM" above the window for UEFI's own allocations; UEFI needs more: DarwinBoot 0102 makes the window smaller
 DARWINBOOT_BLOCK, KERNEL_BLOCK_OFFSET = 2 << 20, 0x4000   # DarwinBoot.c BLOCK_SIZE; VM_KERNEL_LINK_ADDRESS & 0x1FFFFF
 FB_W, FB_H = 720, 1560
 LAUREL_ECID = 0x4C415552454C0001       # 'LAUREL' + 1, synthetic (not the phone's)
@@ -161,7 +162,7 @@ _topaz_product = topaz.d22ap_product
 topaz.d22ap_product = lambda: _topaz_product(DONOR['adt'])   # its default path is bound at import
 
 
-def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwinboot=False):
+def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwinboot=False, reserved=RAM_RESERVED):
     topaz.FB_W, topaz.FB_H, topaz.FB_STRIDE = FB_W, FB_H, FB_W * 4
     topaz.SWEET_ECID = LAUREL_ECID
     # xnu-12377 on arm64 asks 4 x SHA512 = 256 seed bytes (prng_random.c BOOTLOADER_ENTROPY_REQUEST_SIZE) and panics with less [V phone 2026-11-02]; topaz gives 64.
@@ -191,7 +192,7 @@ def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwin
                 chosen.children.append(topaz.node(child))
     setprop(chosen, 'display-scale', u32(2))
     setprop(chosen, 'laurel-ram-banks', b''.join(u64(b, sz) for b, sz in RAM_BANKS))   # laurel 2100 self-check
-    setprop(chosen, 'laurel-ram-reserved', b''.join(u64(b, sz) for b, sz in RAM_RESERVED))
+    setprop(chosen, 'laurel-ram-reserved', b''.join(u64(b, sz) for b, sz in reserved))
     # MobileGestalt's network addresses (see the module docstring): no 5 s IONetworkController wait per answer
     setprop(chosen, 'mac-address-wifi0', WIFI_ADDR)
     setprop(chosen, 'mac-address-bluetooth0', BT_ADDR)
@@ -279,6 +280,11 @@ def mu_kernel_ram(fd_path):
     return (base, end - base, 'late') if end else None
 
 
+def ram_reserved(fd_path):
+    """laurel-ram-reserved for this FD: the late layout keeps 0x81000000-0x90000000 for UEFI."""
+    return RAM_RESERVED_LATE if fd_path and mu_entry(fd_path, 'UEFI RAM') is not None else RAM_RESERVED
+
+
 def auto_dram(fd_path):
     """(dram base, window size) for --dram auto, and the LAUREL RAM line for the build log."""
     mu = mu_kernel_ram(fd_path)
@@ -293,7 +299,7 @@ def auto_dram(fd_path):
             if b == run[1]:
                 run = (run[0], b + s)
     win = min(RAM_MAX, max(room, 0) // RAM_STEP * RAM_STEP)
-    clash = next(((b, b + s) for b, s in RAM_RESERVED if b < start + win and start < b + s), None)
+    clash = next(((b, b + s) for b, s in ram_reserved(fd_path) if b < start + win and start < b + s), None)
     if win > RAM_FALLBACK and run is not None and start + win <= run[1] and clash is None:
         src = ('"Kernel RAM"' if layout == 'static' else 'the run RamManagerDxe adds late (late layout)')
         return (base, win), (f'LAUREL RAM: on: {win >> 20} MiB window 0x{start:x}..0x{start + win:x} in Mu {src} '
@@ -359,7 +365,7 @@ if __name__ == '__main__':
         print(line, file=sys.stderr)
     else:
         b, s = (int(x, 0) for x in a.dram.split(':'))
-    root = build(a.cores, (b, s), boot=a.boot, darwinboot=a.darwinboot)
+    root = build(a.cores, (b, s), boot=a.boot, darwinboot=a.darwinboot, reserved=ram_reserved(a.mu_fd))
     check(root, a.cores, a.boot, a.darwinboot)
     if a.build_stamp:
         setprop(find(root, 'chosen'), 'laurel-image-build', cstr(a.build_stamp))

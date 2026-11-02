@@ -5,10 +5,10 @@
 #   SETUP=0: skip the submodule setup (scripts/uefi/setup-mu.sh) when the tree is already prepared
 #   CLEAN=1: empty Build/laurel_sproutPkg first
 #   MU_RAM_LAYOUT=static (default) | late: memory map for the XNU window (docs/laurel_sprout/uefi-boot.md "RAM").
-#     static = mu 0101: "Kernel RAM" 0xE1000000-0x1C0000000 in the static map (6 GB Mi A3 only; UEFI allocates
+#     static = mu 0101: "Kernel RAM" 0xC1000000-0x1C0000000 in the static map (6 GB Mi A3 only; UEFI allocates
 #     above 4 GiB from its first DXE). late = mu late/0101 instead (applied last): 240 MiB "UEFI RAM" 0x81000000
-#     for early UEFI, RamManagerDxe adds 0xE1000000-0x1C0000000 late. Use late when Mu dies with the static map.
-#     The ADT follows the FD (mkadt.py --dram auto); both give the window 0xE1004000 + 3264 MiB.
+#     for early UEFI, RamManagerDxe adds 0xC1000000-0x1C0000000 late. Use late when Mu dies with the static map.
+#     The ADT follows the FD (mkadt.py --dram auto); both give the window 0xC1004000 + 3904 MiB.
 # Base: external/Mu-Silicium-negroni (akshaynexus fork of Project-Silicium/Mu-Silicium; it carries the UniXNU/DarwinBoot
 # pieces negroni uses: SEC entry-argument HOB, NegroniBootMemoryDxe, Mu_Basecore boot-menu/timer patches). Its
 # Platforms/Xiaomi/laurel_sproutPkg is identical to upstream Mu-Silicium 4bd8ae83 (checked 2026-11-01); our

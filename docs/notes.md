@@ -5247,3 +5247,13 @@ Full text: `docs/laurel_sprout/gpu.md` section "All stock levels". Patch 2961, b
 - 900 and 950 MHz need the CX iPeak feature bit: no feature (`ENABLE` 0) = those levels stay out, with the note `N: no CX iPeak in this boot`. [I] Unless boot firmware sets the bit it reads 0, because on stock the HLOS driver `cx_ipeak_cdev.c` sets it; then the top level is 820 MHz. The bit alone is not the fix: stock sets bypass and thermal clients with it.
 - A tick with a bad counter still runs the thermal rule.
 - Open before long-load tests [V trinket-thermal.dtsi]: stock has `quiet-therm` skin limits (48 C, 52 C to the lowest level) and six other zones that send the GPU to its lowest level; this patch reads sensor 15 only, once a second. See the review in the owner's thread.
+
+
+## 2026-11-03: Mi A3 RAM map 2974: GPU pool 1 GiB, kernel 3904 MiB (host only, NOT BOOTED)
+- XNU stopped at 3264 MiB because of the map, not a limit: Mu "Kernel RAM" started at 0xE1000000 and mkadt left 256 MiB for UEFI. The 1 GiB at 0x80000000 was idle. New: GPU 0x80000000 + 1 GiB, modem 0xC0000000 + 16 MiB, window 0xC1004000 + 3904 MiB. Table of the whole 6 GB: `docs/laurel_sprout/uefi-boot.md` "Memory map".
+- No table was sized for 512 MiB: `GPU_POOL_MAX` is 1 GiB from topaz. A pool above 1 GiB means changing it, and the modem pool stands in the way.
+- Reading a Lineage DTB: the one in `boot.img` is one FDT; every `reg` region of `/reserved-memory` ends at or below 0x62100000.
+- An empty pool does not stall a request: `gemNew` goes to scattered pages. Kept buffers did not come back because 2916 exempts the window server. Fixed in 2974: `gpu.md` "Pool size and pool pressure".
+- `MODEM_POOL_BASE` is compile-time and is written in three places (TopazModem, TopazAdreno, mkadt). A move changes all three; `ram-map-test.sh` checks only mkadt's copy.
+- In a worktree, `kernel-linux.sh` needs `external/ios-sweet-linux` and `external/ios-topaz`: symlink them from the main checkout (they show as untracked: do not add them).
+- No script starts XNU in QEMU: `boot-menu-qemu.sh` stops at the UEFI menu. start.s and arm_vm_init with the new map run first on the phone.

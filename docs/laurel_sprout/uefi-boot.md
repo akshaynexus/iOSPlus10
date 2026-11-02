@@ -96,7 +96,36 @@ physically contiguous (`IOBufferMemoryDescriptor.cpp`: `if (alignment > page_siz
 So even surfaces that no hardware reads needed a contiguous run (the scanout attempt with a mask below 4 GiB and the generic
 attempt each gave two `vm_page_find_contiguous` lines per create).
 
-### Memory map (final; areas B and E place their pools by it)
+### Memory map (kernel 2974: larger pool and window; host only, NOT BOOTED)
+
+Why XNU stopped at 3264 MiB [V code]: not a kernel limit. Mu "Kernel RAM" started at 0xE1000000 because the pools sat below it, and mkadt.py left 256 MiB for UEFI, then rounded down to a 64 MiB multiple (304 MiB left).
+Limits that are far off: XNU `LAUREL_RAM_MAX` and DarwinBoot `DARWINBOOT_MAX_WINDOW` 4608 MiB (start.s: 16 bootstrap table pages; 3904 MiB at 0xC1004000 needs 11, `ram-map-test.py`), DarwinBoot parser 8 GiB.
+No bank above 0x1C0000000 [I from RamManagerDxe's lists, see below; the sum is 5.95 GiB]. All of the 6 GB (6144 MiB of addresses):
+
+| Range | Size | Owner | Why not kernel RAM |
+| --- | --- | --- | --- |
+| 0x40000000-0x7CC00000 | 972 MiB | firmware carve-outs, Mu FD and heap; 0x65E00000-0x7CC00000 (366 MiB) is free | not next to the window: XNU manages one range. [U] free RAM there is unused by anything |
+| 0x7CC00000-0x80000000 | 52 MiB | outside every bank [I] | no RAM |
+| 0x80000000-0xC0000000 | 1024 MiB | Adreno GPU pool | must be contiguous, below 4 GiB, and with no cacheable alias |
+| 0xC0000000-0xC1000000 | 16 MiB | TopazModem pool | no cacheable alias; below 0xF0000000 |
+| 0xC1000000-0xC1004000 | 16 KiB | Mu "Kernel RAM" start | DarwinBoot keeps the kernel's 2 MiB offset |
+| 0xC1004000-0x1B5004000 | 3904 MiB | XNU window, 1007 MiB below 4 GiB | `hw.memsize` 4093640704 |
+| 0x1B5004000-0x1C0000000 | 176 MiB | UEFI's allocations, top-down from 0x1C0000000 | they live until ExitBootServices. [U] how much UEFI really takes: no boot logged it. Known good: 240 MiB in the first layout, 304 MiB since. The window stays under 4 GiB on purpose (a round number nothing has tried) |
+
+Balance: pool memory serves only the GPU, and scattered pages from kernel RAM take over when it is empty, so the pool stops at the 1 GiB target and the rest goes to the kernel. Below-4-GiB kernel RAM doubles (495 to 1007 MiB).
+
+Failure at boot:
+| Failure | Result | Line |
+| --- | --- | --- |
+| UEFI took more than 176 MiB | DarwinBoot 0102 takes the biggest run (window smaller, same base) | screen `WINDOW <size> OF <asked> @ <base>`, `LAUREL RAM: on: ...; DarwinBoot gave N of the M MiB the ADT asks` |
+| window past the ADT banks | 3264 MiB at the same base | `LAUREL RAM: on: 3264 MiB ...; window end 0x.. is past the banks: 3264 MiB` |
+| `laurelramgrow=0` | 3264 MiB | `...; kill switch laurelramgrow=0: 3264 MiB` |
+| no bank table, base in a pool, `laurelram=0` | 768 MiB (2100, only with a broken ADT) | `LAUREL RAM: off: ...` |
+| Mu or the kernel dies before a log | no automatic path: flash the previous boot image, or `MU_RAM_LAYOUT=late` (GPU pool 768 MiB) | none |
+
+The base moves from 0xE1004000 to 0xC1004000, so "the current window" comes back at its old place only with the old FD. An FD of before 2974 with the new kernel and ADT works: 3392 MiB at 0xE1004000 (host test).
+
+### Memory map before 2974 (for the logs of before; areas B and E placed their pools by it)
 
 | Range | Size | Owner | Notes |
 | --- | --- | --- | --- |
@@ -120,7 +149,7 @@ with a window from 0x81004000 that passes over the pools (a hole in XNU's range:
 
 | Piece | Change |
 | --- | --- |
-| Mu 0101 | "Pool RAM" 0x80000000 + 0x61000000 reserved, "Kernel RAM" 0xE1000000 + 0xDF000000 (was 0x81000000 + 0x3F000000). UEFI now allocates top-down from 0x1C0000000 (before: from 0xC0000000, and RamManagerDxe added bank C late, so no run crossed 0xC0000000). |
+| Mu 0101 | "Pool RAM" 0x80000000 + 0x41000000 reserved, "Kernel RAM" 0xC1000000 + 0xFF000000 (2974; first 0x61000000 and 0xE1000000 + 0xDF000000; before that 0x81000000 + 0x3F000000). UEFI now allocates top-down from 0x1C0000000 (before: from 0xC0000000, and RamManagerDxe added bank C late, so no run crossed 0xC0000000). |
 | Mu 0102 (DarwinBoot) | no run holds the asked window: take the biggest usable run (2 MiB multiple, >= 256 MiB), screen line `WINDOW <size> OF <asked> @ <base>`; boot_args memSize = that size. With the laurel defines (0103) a run is usable only when the window starts below 4 GiB with >= 256 MiB below 4 GiB, and the window is capped at 4608 MiB; no usable run: `NO WINDOW` + the FREE list. Without the defines (negroni) DarwinBoot behaves as before. |
 | Mu 0103 (laurel dsc) | `PcdSmbiosEntryPointProvideMethod 0x2` (SMBIOS 3.8, 64-bit entry point only): SmbiosDxe allocates the 32-bit table `AllocateMaxAddress 0xFFFFFFFF`, which would land at about 0xFFFFF000 inside the window run and split it. DarwinBoot BuildOptions `DARWINBOOT_MAX_WINDOW=0x120000000`, `DARWINBOOT_LOW4G_MIN=0x10000000`. |
 | Mu late/0101 (`MU_RAM_LAYOUT=late`) | the fallback layout, see below. |
@@ -140,11 +169,11 @@ binary DMA buffer above 4 GiB hangs Mu or the panel before UniXNU, build `MU_RAM
 | --- | --- | --- |
 | 0x80000000-0x81000000 | "Pool RAM Guard", reserved | |
 | 0x81000000-0x90000000 | "UEFI RAM", conventional, 240 MiB | the highest RAM until RamManagerDxe runs: every early UEFI allocation stays below 4 GiB |
-| 0x90000000-0xE1000000 | "Pool RAM", reserved | GPU pool 0xC0000000 + 512 MiB, modem pool 0xE0000000 + 16 MiB |
-| 0xE1000000-0x1C0000000 | none: RamManagerDxe adds the bank C hole late (one run) | DarwinBoot window 0xE1004000 + 3264 MiB; later UEFI allocations top-down from 0x1C0000000 |
+| 0x90000000-0xC1000000 | "Pool RAM", reserved | GPU pool 0x90000000 + 768 MiB, modem pool 0xC0000000 + 16 MiB |
+| 0xC1000000-0x1C0000000 | none: RamManagerDxe adds the bank C hole late (one run) | DarwinBoot window 0xC1004000 + 3904 MiB; later UEFI allocations top-down from 0x1C0000000 |
 
-NegroniBootMemoryDxe gets `NEGRONIMEM_ADD_BELOW=0xE1000000` from the dsc (a no-op define for other platforms): without it, it would
-add 0xE1000000-0x100000000 early as a DT hole below 4 GiB, and UEFI's early allocations would cut the window run. The late layout
+NegroniBootMemoryDxe gets `NEGRONIMEM_ADD_BELOW=0xC1000000` from the dsc (a no-op define for other platforms): without it, it would
+add 0xC1000000-0x100000000 early as a DT hole below 4 GiB, and UEFI's early allocations would cut the window run. The late layout
 works on any RAM size. mkadt.py `--dram auto` recognises the FD by its "UEFI RAM" entry and plans the same window.
 Test note: this ABL refuses `fastboot boot`, so every test is a `boot_b` flash (`scripts/laurel/flash-boot.sh`); keep the previous
 image to flash back. Images of 2026-11-01 05:15 (area A worktree): `out/laurel/uefi/laurel-uefi-boot.img` (static) and
@@ -159,12 +188,12 @@ Display path without a GPU (topaz 0092-0103, 0945, unchanged): backboardd swaps 
 flips to it); several layers -> copy path (composed into the back buffer). The first swap hides the kernel console
 (`fConsShown = false`; `sweetfb_console=1` keeps it).
 
-Expected boot lines: `LAUREL RAM: on: 3264 MiB at 0xe1004000..0x1ad004000 (banks 0x80000000..0x1c0000000; 495 MiB below 4 GiB, used
-last)`, `LAUREL SPOOL: on: 6 x 12 MiB contiguous below 4 GiB at 0x..-0x.. for screen surfaces; below-4G free N MiB` (N should be
+Expected boot lines: `LAUREL RAM: on: 3904 MiB at 0xc1004000..0x1b5004000 (banks 0x80000000..0x1c0000000; 1007 MiB below 4 GiB, used
+last)`, `TopazGPU: kernel RAM 0xc1004000+0xf4000000, GPU pool 0x80000000+0x40000000 (ADT laurel-ram-reserved)`, `LAUREL GPU POOL: on: 1024 MiB at 0x80000000, 16 chunks of 64 MiB`, `TopazGPU: zap: ... metadata 6860 bytes at 0xc0008000 (modem pool)`, `LAUREL SPOOL: on: 6 x 12 MiB contiguous below 4 GiB at 0x..-0x.. for screen surfaces; below-4G free N MiB` (N should be
 several hundred; both lines again at the first surface, so they are in the USB log), `LAUREL FB CANVAS: on: native 720x1560 at display-scale 2 (360x780 points)`, `SWEET FB: modes published: 720x1560
 at 60 Hz`, `LAUREL SURF: on: surfaces from wired pages (no contiguous RAM needed), first N bytes`, `SWEET SURF: backboardd create id
 N 720x1560 ... -> 0x0`, no `vm_page_find_contiguous` lines, `LAUREL FB CANVAS: first frame on the panel: swap N, ...`, `SWEET FB: swap
-...` (copy path, first 16) or `SWEET FB: 1000 swaps`. `hw.memsize` 3422552064.
+...` (copy path, first 16) or `SWEET FB: 1000 swaps`. `hw.memsize` 4093640704.
 Failure signs: no UniXNU menu (Mu 0101: a UEFI driver that cannot use RAM above 4 GiB; flash the previous image, then try the late
 layout),
 `WINDOW ... OF ...` on the screen (DarwinBoot shrank the window), `LAUREL RAM: off: ...`, a red status bar (no iOS layout for

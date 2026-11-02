@@ -334,6 +334,8 @@
 2971-laurel-ufs-read-queue.patch                               applied
 2972-laurel-cpu-full-response.patch                            applied
 2973-laurel-spmi-wait-with-interrupts.patch                    applied
+2974-laurel-gpu-pool-1g-kernel-ram.patch                       applied
+2974-laurel-gpu-pool-1g-kernel-ram.patch                       applied
 9000-series-12377-api.patch                                    post
 9001-laurel-release-only-initialized-pages.patch               post
 9002-laurel-no-panic-region.patch                              post
@@ -343,4 +345,5 @@
 9006-laurel-hid-2238.patch                                     post
 9007-laurel-stackshot-late-cpu.patch                           post
 9008-laurel-vsync-refresh-period.patch                         post
-== series: 219 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
+9009-laurel-backlight-retry.patch                              post
+== series: 220 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors

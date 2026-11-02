@@ -1163,3 +1163,8 @@ Done: patch 2961 (`gpu.md` section "All stock levels"): PLL1 320/465, GPLL0 300/
 Results [V host]: `scripts/laurel/test-gpu-opp.sh` PASS (table against source and the phone's DTB; 1904 level changes with failures; 4 controls). Series 0 errors. Kernel built (see the branch report).
 Next: a boot. Read `LAUREL GPU CLOCK: on: MHz=GCC/CP` and `LAUREL DDR`. If DDR does not follow: owner decision on `Enab`. Guess [I]: 39 ms a long submission -> 25 to 28 ms.
 
+
+## Mi A3 iOS 26: GPU pool 1 GiB, kernel RAM 3904 MiB (2026-11-03, branch t3/laurel-gpu-pool-expand; host only, NOTHING RUN ON THE PHONE)
+Done: patch 2974 + Mu 0101, late/0101, mkadt.py: GPU pool 0x80000000 + 1 GiB (was 0xC0000000 + 512 MiB), modem pool 0xC0000000 + 16 MiB, window 0xC1004000 + 3904 MiB (was 0xE1004000 + 3264 MiB; `hw.memsize` 4093640704). Kept pool buffers give way when the pool has no room, the window server's too for its own request; `keep()` keeps no pool buffer under 64 MiB free.
+Results [V host]: `gpu-pool-test.sh` ok, `ram-map-test.sh` ok; iOS 26 kernel 220 applied, 0 errors, exit 0; iOS 16 kernel exit 0, 0 LSE; Mu FD holds the new entries; mkadt on that FD gives the new window.
+Open: flash (needs a new boot image, ask the owner). Read the expected lines in `docs/laurel_sprout/uefi-boot.md`; [U] the real UEFI use, and the frame gain. Doc: `docs/laurel_sprout/gpu.md` "Pool size and pool pressure".
