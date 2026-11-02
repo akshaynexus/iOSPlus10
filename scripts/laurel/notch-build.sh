@@ -23,11 +23,16 @@ gpu_cc "$R/usr/local/lib/liblaurel-notch.dylib" -dynamiclib -install_name /usr/l
   { cat "$N/obj/notch.log"; gpu_die "liblaurel-notch did not build"; }
 gpu_cc "$R/usr/local/libexec/laurel-springboard" -Wextra "$S/sb_wrap.c" 2> "$N/obj/wrap.log" ||
   { cat "$N/obj/wrap.log"; gpu_die "laurel-springboard did not build"; }
-for l in "$N/obj/notch.log" "$N/obj/wrap.log"; do
+# the iOS 26 root's mute-switch answer (not in out/laurel/notch/root: root-statusbar.py of iOS 16 installs that tree, and iOS 16 does not get this file)
+RG=$OUT/ios26/ringer
+mkdir -p "$RG/usr/local/lib"
+gpu_cc "$RG/usr/local/lib/liblaurel-ringer.dylib" -dynamiclib -install_name /usr/local/lib/liblaurel-ringer.dylib -Wextra -Wno-unused-parameter -lobjc "$S/laurel_ringer.c" 2> "$N/obj/ringer.log" ||
+  { cat "$N/obj/ringer.log"; gpu_die "liblaurel-ringer did not build"; }
+for l in "$N/obj/notch.log" "$N/obj/wrap.log" "$N/obj/ringer.log"; do
   [ -s "$l" ] && { cat "$l"; gpu_die "compiler warnings in $(basename "$l" .log)"; }
 done
 
-for f in "$R/usr/local/lib/liblaurel-notch.dylib" "$R/usr/local/libexec/laurel-springboard"; do
+for f in "$R/usr/local/lib/liblaurel-notch.dylib" "$R/usr/local/libexec/laurel-springboard" "$RG/usr/local/lib/liblaurel-ringer.dylib"; do
   gpu_dsym "$f"
   "$LDID" -S "$f"                 # ad-hoc signature (the kernel's AMFI stand-in accepts it)
   gpu_check_v80 "$f" || gpu_die "$(basename "$f") has ARMv8.1+ instructions"

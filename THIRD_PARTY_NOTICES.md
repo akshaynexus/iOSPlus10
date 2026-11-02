@@ -20,6 +20,7 @@ This repository, **iOSPlus10**, incorporates, links against, or builds with comp
 | `external/ios-flame` | NWylynko, dipa-studio | MIT |
 | `external/IOS-26-Hot` (reference, read-only, d249939); ideas and short ports in `patches/laurel/xnu-12377` (patches 0129, 0136, 0137, 0140, 0148; ideas only: 0141, 0142, 0145, 0146) | dipa-studio | MIT (its patches are derived from APSL xnu) |
 | `external/metal2vulkan` | steelbrain | GPL-2.0-or-later OR LGPL-3.0-or-later |
+| `external/IOS-26-Hot` (d249939, reference, ideas only: the five audio devices and four microphone sources in `userland/laurel/audio/ios26-devices.patch`, the mute answer in `userland/laurel/notch/laurel_ringer.c`; own code) | Nithin Amaraboina, IOS-26-Hot contributors | MIT |
 | `external/IOS-26-Hot` (d249939, reference; the `hot` stack: `scripts/laurel/ios26-metal-hot-build.sh` exports its `phone/metal2` frontend and metal2vulkan patch series at build time; ported frontend fixes in `userland/metal/patches/flame-ios26/`, `CABackdropLayer` bypass in `userland/metal/plugin/NegroniMetal.mm`) | dipa-studio (its `LICENSE`) | MIT |
 | `external/ios-sweet` & `external/ios-sweet-upstream` | dipa-studio | MIT |
 | `external/Chlorophyll` & `userland/metal/probes` | ry-diffusion / Chlorophyll authors | MIT |

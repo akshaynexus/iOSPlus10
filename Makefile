@@ -5,7 +5,7 @@
 BG := scripts/bg.sh
 OS := $(shell uname -s)
 
-.PHONY: ipsw-cli laurel-ios26-diag laurel-ios26-kernel laurel-ios26-image laurel-ios26-root laurel-a64emu-test laurel-a80211-test laurel-mu laurel-kernel laurel-uefi-image laurel-flash-uefi laurel-update help status tools op10tool colima image references backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
+.PHONY: ipsw-cli laurel-ios26-parity laurel-ios26-diag laurel-ios26-kernel laurel-ios26-image laurel-ios26-root laurel-a64emu-test laurel-a80211-test laurel-mu laurel-kernel laurel-uefi-image laurel-flash-uefi laurel-update help status tools op10tool colima image references backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
         kernel kernel-local kernel-ci xcode15 ssh devicetree dmgs boot root simg ios16 flash flash-boot flash-restore boot-debug flash-boot-debug usblog bootlog
 
 help:
@@ -22,6 +22,7 @@ help:
 	@echo "laurel:  make laurel-mu | laurel-kernel | laurel-uefi-image [MU_ONLY=1] | laurel-flash-uefi | laurel-update  (Mi A3, docs/laurel_sprout/uefi-boot.md, root-update.md)"
 	@echo "         make laurel-ios26-kernel | laurel-ios26-image  (Mi A3 iOS 26 kernel, Linux native, docs/laurel_sprout/ios26-kernel.md; nothing is flashed)"
 	@echo "         make laurel-ios26-diag   (Mi A3 iOS 26, no picture: kernel log, processes, crashes, GPU, panic over USB, one state line; docs/laurel_sprout/ios26-first-boot.md)"
+	@echo "         make laurel-ios26-parity (Mi A3 iOS 26: the binaries of the parity hooks + check against 23F84, docs/laurel_sprout/ios26-parity.md)"
 	@echo "         make laurel-ios26-root | laurel-a64emu-test    (Mi A3 iOS 26 root image, no root access; EL0 emulator truth test; nothing is flashed)"
 	@echo "status:  make status"
 
@@ -132,6 +133,8 @@ laurel-ios26-kernel:
 
 laurel-ios26-root:
 	scripts/bg.sh ios26-root scripts/laurel/ios26-root.sh
+laurel-ios26-parity:
+	scripts/bg.sh ios26-parity scripts/laurel/ios26-parity-build.sh
 laurel-ios26-diag:
 	scripts/bg.sh ios26-diag python3 -I scripts/laurel/ios26-diag.py
 laurel-a64emu-test:

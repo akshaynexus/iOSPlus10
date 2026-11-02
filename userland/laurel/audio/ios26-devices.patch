@@ -1,0 +1,102 @@
+--- a/audio_plugin.c
++++ b/audio_plugin.c
+@@ -200,12 +200,15 @@
+ 	OBJECT_SPEAKER_VOLUME,          /* the speaker output's volume control */
+ 	OBJECT_CODEC_SOURCE,            /* the codec input's data source control: its microphones */
+ 	OBJECT_CODEC_VOLUME,            /* the codec input's volume control: the kernel's capture gain */
+-	OBJECT_LAST = OBJECT_CODEC_VOLUME
++	OBJECT_BASEBAND_VOICE, OBJECT_BASEBAND_VOICE_OUTPUT, OBJECT_BASEBAND_VOICE_INPUT,       /* iOS 26: below */
++	OBJECT_LAST = OBJECT_BASEBAND_VOICE_INPUT
+ };
+ 
+ #define VOLUME_RANGE_DB         48.0    /* from the loudest the kernel allows down to the quietest step above 0 */
+ #define MIC_RANGE_DB            24.0    /* the capture gain: 0 dB (Android's level) down to this; no mute */
+ 
++#define CODEC_CHANNELS          4       /* iOS 26: what the routing asks of "Codec"; the one microphone is in each */
++
+ struct device {
+ 	AudioObjectID object;
+ 	CFStringRef uid;                /* the name the virtual audio device knows it by */
+@@ -222,7 +225,13 @@
+ 	  .output_channels = REDWOOD_AUDIO_CHANNELS, .input_channels = 2 },
+ 	{ .object = OBJECT_HAWKING, .uid = CFSTR("Hawking"), .input = OBJECT_HAWKING_INPUT, .input_channels = 1 },
+ 	{ .object = OBJECT_ACTUATOR, .uid = CFSTR("Actuator"), .output = OBJECT_ACTUATOR_OUTPUT, .output_channels = 1 },
+-	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .input = OBJECT_CODEC_INPUT, .input_channels = 1 },
++	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .input = OBJECT_CODEC_INPUT, .input_channels = CODEC_CHANNELS },
++	/*
++	 * iOS 26.5.2 23F84: VirtualAudio.plugin names "Baseband Voice" next to the others [V strings] and IOS-26-Hot's D421AP plug-in (MIT, self-reported, phone/audio/audio_plugin.c, commit 504d74c) has this
++	 * device and four microphone channels, with data sources mc01..mc04. Nothing routes a call here: the output goes nowhere, the input is silence. It exists so that the routing tables can be built.
++	 */
++	{ .object = OBJECT_BASEBAND_VOICE, .uid = CFSTR("Baseband Voice"), .output = OBJECT_BASEBAND_VOICE_OUTPUT, .input = OBJECT_BASEBAND_VOICE_INPUT,
++	  .output_channels = 1, .input_channels = 1 },
+ };
+ #define DEVICES                 (sizeof(devices) / sizeof(devices[0]))
+ 
+@@ -234,7 +243,12 @@
+  * has them as a data source control on the input, which the HAL answers those properties from. There
+  * is one microphone here, at the bottom: 'imic', the iPhone's internal (bottom) one.
+  */
+-#define MIC_SOURCE              'imic'
++#define MIC_SOURCE              'mc01'
++#define MIC_SOURCE_2            'mc02'
++#define MIC_SOURCE_3            'mc03'
++#define MIC_SOURCE_4            'mc04'
++#define MIC_SOURCE_OLD          'imic'
++#define MIC_SOURCE_KNOWN(x)     ((x) == MIC_SOURCE || (x) == MIC_SOURCE_2 || (x) == MIC_SOURCE_3 || (x) == MIC_SOURCE_4 || (x) == MIC_SOURCE_OLD)
+ #define MANUFACTURER            CFSTR("redwood")
+ /* how often a device says where its clock is, in frames: also the largest I/O buffer the HAL will use */
+ #define TIMESTAMP_PERIOD        16384
+@@ -494,11 +508,16 @@
+ 			WORD(0);
+ 			break;
+ 		case kAudioSelectorControlPropertyCurrentItem:
+-		case kAudioSelectorControlPropertyAvailableItems:
+ 			WORD(MIC_SOURCE);
+ 			break;
++		case kAudioSelectorControlPropertyAvailableItems:
++			LIST(MIC_SOURCE);
++			LIST(MIC_SOURCE_2);
++			LIST(MIC_SOURCE_3);
++			LIST(MIC_SOURCE_4);
++			break;
+ 		case kAudioSelectorControlPropertyItemName:
+-			if (qualifier_size == sizeof(UInt32) && qualifier != NULL && *(const UInt32 *)qualifier == MIC_SOURCE) {
++			if (qualifier_size == sizeof(UInt32) && qualifier != NULL && MIC_SOURCE_KNOWN(*(const UInt32 *)qualifier)) {
+ 				STRING(CFSTR("Bottom"));
+ 			} else {
+ 				STRING(CFSTR(""));
+@@ -853,8 +872,8 @@
+ 		return 0;
+ 	}
+ 	if (object == OBJECT_CODEC_SOURCE) {
+-		/* the one microphone there is */
+-		return size == sizeof(UInt32) ? (*(const UInt32 *)data == MIC_SOURCE ? 0 : kAudioHardwareIllegalOperationError) :
++		/* the one microphone there is, under each name */
++		return size == sizeof(UInt32) ? (MIC_SOURCE_KNOWN(*(const UInt32 *)data) ? 0 : kAudioHardwareIllegalOperationError) :
+ 		       kAudioHardwareBadPropertySizeError;
+ 	}
+ 	if (address->mSelector == kAudioStreamPropertyIsActive) {
+@@ -951,6 +970,14 @@
+ 	}
+ 	mic_frames += frames;
+ 	mic_heard += have;
++	/* the kernel gives one channel: from the end, so that the buffer can be the same */
++	for (UInt32 i = frames; i-- > 0;) {
++		int16_t one = samples[i];
++
++		for (unsigned c = 0; c < CODEC_CHANNELS; c++) {
++			samples[i * CODEC_CHANNELS + c] = one;
++		}
++	}
+ }
+ 
+ static OSStatus
+@@ -1089,6 +1116,8 @@
+ 		memset(buffer, 0, (size_t)frames * 2 * d->input_channels);
+ 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
+ 		actuator_write(buffer, frames);
++	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_BASEBAND_VOICE_OUTPUT) {
++		/* no call path: not the speaker's sink */
+ 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
+ 		/* the kernel takes it all or leaves it: this thread must not wait */
+ 		if (sink < 0 || write(sink, buffer, (size_t)frames * REDWOOD_AUDIO_FRAME) < 0) {

@@ -15,6 +15,7 @@
  *   - if the exec fails, wait 10 s and exit (launchd does not spin).
  * Docs: docs/laurel_sprout/rtc-statusbar.md "C".
  * Also inserts liblaurel-cellbar.dylib when it is on the root (no boot-arg cell=0); the crash guard covers both.
+ * Also inserts liblaurel-ringer.dylib when it is on the root (the iOS 26 root only; no boot-arg ringer=0).
  */
 #include <errno.h>
 #include <stdio.h>
@@ -28,6 +29,7 @@
 #define REAL      "/System/Library/CoreServices/SpringBoard.app/SpringBoard"
 #define DYLIB     "/usr/local/lib/liblaurel-notch.dylib"
 #define CELLBAR   "/usr/local/lib/liblaurel-cellbar.dylib"      /* SIM, bars, network name: docs/laurel_sprout/cellular.md section 9 */
+#define RINGER    "/usr/local/lib/liblaurel-ringer.dylib"       /* iOS 26 root: docs/laurel_sprout/ios26-parity.md "Audio" */
 #define STATE     "/var/tmp/laurel-sb.state"
 #define LOG       "/var/tmp/laurel-notch.log"
 #define FAST_S    30
@@ -71,7 +73,7 @@ bootarg_zero(const char *args, const char *name)
 int
 main(int argc, char *argv[])
 {
-	char args[1024] = "", session[64] = "", old[64] = "", n[16], list[128] = "";
+	char args[1024] = "", session[64] = "", old[64] = "", n[16], list[192] = "";
 	size_t len = sizeof(args) - 1;
 	long now = (long)time(NULL), then = 0;
 	int fast = 0, use = 1, cellbar;
@@ -122,6 +124,13 @@ main(int argc, char *argv[])
 		}
 		strcat(list, CELLBAR);
 		say("%s inserted into SpringBoard (its own line: LAUREL CELLBAR)", CELLBAR);
+	}
+	if (fast < MAX_FAST && !bootarg_zero(args, "ringer") && access(RINGER, R_OK) == 0) {
+		if (list[0] != 0) {
+			strcat(list, ":");
+		}
+		strcat(list, RINGER);
+		say("%s inserted into SpringBoard (its own line: LAUREL RINGER)", RINGER);
 	}
 	if (list[0] != 0) {
 		setenv("DYLD_INSERT_LIBRARIES", list, 1);
