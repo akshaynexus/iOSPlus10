@@ -189,14 +189,42 @@ No disassembly was needed yet. If a stage needs one, the doc will list file and 
 
 ## 6. Stages and state
 
-| Stage | State |
-|---|---|
-| 1 This doc | Done |
-| 2 Winsys + PM4 | In progress: see below |
-| 3 Shader path | Not started |
-| 4 Metal objects | Not started |
-| 5 Third option | Not started |
-| 6 GL ES | Not started |
+| Stage | State | Proof |
+|---|---|---|
+| 1 This doc | Done | |
+| 2 Winsys + PM4 | Winsys done; PM4 in progress | `scripts/laurel/native/test.sh winsys`: PASS under ASan and UBSan, against a fake kernel with the real kernel's submit rules [V host]. Not run on the phone |
+| 3 Shader path | **Done on the host** | Section 6.3 [V host]. Pixels: [U] |
+| 4 Metal objects | Compile objects only | |
+| 5 Third option | Not started | |
+| 6 GL ES | Not started | |
+
+### 6.3 Stage 3: the shader path, with no Vulkan
+
+`scripts/laurel/native/ir3-native.sh` links the **same harness** as `ir3-check.sh` (`userland/laurel/metal/tests/ca-pipelines.c`) against `bridge/` + `shader/nmn_shader.c`. No Turnip, no drm-shim, no Vulkan loader. Output [ios26-evidence/native-ir3-fd610.txt](ios26-evidence/native-ir3-fd610.txt) [V host]:
+
+| Set | Default stack | `native` |
+|---|---:|---:|
+| 154-row plan of `ir3-check.sh` | 141 made, 13 `tile_*` refused | **141 made, the same 13 refused** |
+| 218 rows with the phone's real keys | 128 made, 90 refused | **218 made**: the 90 are the plan's own: it names a vertex function `fixed_vert_lph`, which the library does not have; `ir3-native.sh` gives those rows `fixed_vert_lph_spc`, so that the fragment keys count. Not a gain of the driver |
+| Fragment instructions, median of 126 | 92 | **80** (21 smaller, 92 same, 13 larger) |
+
+| Shader | Default | `native` |
+|---|---:|---:|
+| `glass_background_lph` | 837 | 841 |
+| `glass_background_sdf_lph` | 1,703 | 1,707 |
+| `glass_foreground_sdf_lph` | 686 | 686 |
+| `narrow_blur_27_frag_lph` | 150 | 150 |
+| `variable_blur_frag_lph` | 147 | 147 |
+| `simple_rim_lph` | 6,066 | 6,570 |
+
+What this says:
+
+- **All the glass shaders compile for FD610 through this path** [V]. Code exists; the pixels are [U].
+- **There is no shader gain to expect from this stack:** same ir3, same SPIR-V. `NMN_POLICY=safe` (the translator's containment on) gives the same counts for the 8 shaders above [V], so "off" gains nothing here: the default stays off only because of the other policy checks; I keep the switch.
+- `simple_rim_lph` is 8 % larger, cause not found [U]. [I] the default stack's number came with another build of the tables. A real fix only if CA asks that shader often.
+- **Only 78 of the 218 real rows read the framebuffer** [V: `nir_lower_input_attachments` made progress]. Glass and blur do not read it. On the default stack all of them take the flush state and GMEM (section 3.3), because the decision is by the fetch state and not by the code. `native` decides per program.
+
+What was reused [V]: `tu_shader.cc`'s order of passes, `build_bindless`, `gather_push_constants`, ported in `nmn_shader.c` with credit. Set 0 and set 1 of m2v map to bindless bases 0 and 1.
 
 ## 7. Time [I]
 
