@@ -67,7 +67,7 @@ no WLFW service in 30 s, WLFW stuck at a step (60 s), no WMI READY 30 s after mi
 | RPM | rpm-glink, msg RAM 0x45F0000 (0x7000), "rpm_requests" | same | none |
 | PAS id | 4 (pil-tz-generic, qcom,mss@6080000) | 4 | none |
 | rmtfs | modemst1, modemst2, fsc, fsg (no slot suffix); sharedmem 0x200000 + guard | buffer 0x300000 | none (bigger buffer is fine) |
-| Modem pool | 0xE0000000-0xE1000000 (area A map, uefi-boot.md "Memory map": GPU 0xC0000000-0xE0000000, Mu reserves 0x80000000-0xE1000000, XNU 0xE1004000-0x1AD004000); one define, static_asserts (no GPU pool overlap, below 0xF0000000), boot check against [gPhysBase, +gPhysSize) | same base | 2401, 2404 |
+| Modem pool | 0xC0000000-0xC1000000 (2974; uefi-boot.md "Memory map": GPU 0x80000000-0xC0000000, Mu reserves 0x80000000-0xC1000000, XNU 0xC1004000-0x1B5004000); one define, static_asserts (no GPU pool overlap, below 0xF0000000), boot check against [gPhysBase, +gPhysSize) | same base | 2401, 2404 |
 
 ## Firmware HL3.0 vs topaz [V source, I behaviour]
 

@@ -271,6 +271,66 @@ refused(struct lgp *p, uint64_t pa, uint64_t size, const char *what)
 	    why ? why : "(taken!)");
 }
 
+/* laurel 2974: the 1 GiB pool at the bottom of the identity window, and where lgp_place puts it */
+static void
+big_pool(void)
+{
+	static struct lgp p;
+	static uint64_t got[GPU_POOL_MAX / GPU_POOL_UNIT];
+	const uint64_t base = 0x80000000ull, whole = GPU_POOL_MAX, chunks = whole / GPU_POOL_CHUNK;
+	const uint64_t banks[2][2] = { { 0x80000000ull, 0x40000000ull }, { 0xC0000000ull, 0x100000000ull } };
+	const uint64_t res[2][2] = { { 0x80000000ull, 0x40000000ull }, { 0xC0000000ull, 0x01000000ull } };
+	const uint64_t kbase = 0xC1004000ull, kend = 0x1B5004000ull, mb = 0xC0000000ull, me = 0xC1000000ull;
+	uint64_t b, s, n = 0;
+
+	lgp_init(&p, base, whole);
+	CHECK(p.count == chunks && p.free_bytes == chunks * (GPU_POOL_CHUNK - GPU_POOL_UNIT));
+	/* every unit of every chunk but the guard, once; nothing above the pool, none across a chunk */
+	for (;;) {
+		uint64_t pa = lgp_alloc(&p, GPU_POOL_UNIT);
+		if (pa == 0) {
+			break;
+		}
+		CHECK(pa >= base && pa + GPU_POOL_UNIT <= base + whole && (pa & (GPU_POOL_CHUNK - 1)) != GPU_POOL_CHUNK - GPU_POOL_UNIT);
+		got[n++] = pa;
+	}
+	CHECK(n == chunks * (GPU_POOL_CHUNK / GPU_POOL_UNIT - 1) && p.free_bytes == 0 && p.count == 0);
+	CHECK(lgp_alloc(&p, GPU_POOL_UNIT) == 0);       /* empty: 0, the caller's kept buffers go next (RedwoodGPU redwood_gpu_pool_take) */
+	/* every other unit back: more ranges than the table holds: the rest is lost and counted, nothing else breaks */
+	for (uint64_t i = 0; i < n; i += 2) {
+		CHECK(lgp_free(&p, got[i], GPU_POOL_UNIT) == NULL);
+	}
+	CHECK(p.count == LGP_RANGES && p.lost != 0 && p.refused == 0);
+	printf("4 big pool: %llu MiB at %#llx: %llu units, %u of them lost when free ranges pass %u\n", (unsigned long long)(whole >> 20),
+	    (unsigned long long)base, (unsigned long long)n, p.lost, LGP_RANGES);
+	/* the merge rule still holds across all 16 chunks */
+	lgp_init(&p, base, whole);
+	for (uint64_t c = 0; c < chunks; c++) {
+		uint64_t pa = lgp_alloc(&p, GPU_POOL_CHUNK - GPU_POOL_UNIT);
+		CHECK(pa == base + c * GPU_POOL_CHUNK);
+	}
+	for (uint64_t c = chunks; c-- > 0;) {
+		CHECK(lgp_free(&p, base + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK - GPU_POOL_UNIT) == NULL);
+	}
+	CHECK(p.count == chunks);
+
+	CHECK(lgp_place(res, 2, banks, 2, kbase, kend, mb, me, 0x08000000ull, GPU_POOL_MAX, &b, &s) && b == base && s == whole);
+	/* kill switch: 512 MiB, the same base */
+	CHECK(lgp_place(res, 2, banks, 2, kbase, kend, mb, me, 0x08000000ull, 0x20000000ull, &b, &s) && b == base && s == 0x20000000ull);
+	/* kernel RAM over the top of the range: cut in front of it */
+	CHECK(lgp_place(res, 2, banks, 2, 0xB1004000ull, kend, mb, me, 0x08000000ull, GPU_POOL_MAX, &b, &s) && b == base && s == 0x30000000ull);
+	/* kernel RAM at the bottom: none (midmem) */
+	CHECK(!lgp_place(res, 2, banks, 2, 0x81004000ull, 0xB1004000ull, mb, me, 0x08000000ull, GPU_POOL_MAX, &b, &s));
+	/* the map of before: the old ADT still gives 512 MiB */
+	const uint64_t old[2][2] = { { 0xC0000000ull, 0x20000000ull }, { 0xE0000000ull, 0x01000000ull } };
+	CHECK(lgp_place(old, 2, banks, 2, 0xE1004000ull, 0x1AD004000ull, 0xE0000000ull, 0xE1000000ull, 0x08000000ull, GPU_POOL_MAX, &b, &s) && b == 0xC0000000ull && s == 0x20000000ull);
+	/* a range across two banks: the modem pool cuts it to 768 MiB; with no pool at the bank edge it is refused */
+	const uint64_t across[1][2] = { { 0x90000000ull, 0x40000000ull } };
+	CHECK(lgp_place(across, 1, banks, 2, 0xE1004000ull, 0x1AD004000ull, mb, me, 0x08000000ull, GPU_POOL_MAX, &b, &s) && b == 0x90000000ull && s == 0x30000000ull);
+	CHECK(!lgp_place(across, 1, banks, 2, 0xE1004000ull, 0x1AD004000ull, 0xE0000000ull, 0xE1000000ull, 0x08000000ull, GPU_POOL_MAX, &b, &s));
+	printf("  lgp_place: 1 GiB at 0x80000000; kill switch 512 MiB; cut in front of kernel RAM; old ADT 512 MiB at 0xc0000000\n");
+}
+
 int
 main(void)
 {
@@ -367,6 +427,7 @@ main(void)
 	}
 	CHECK(pool_whole(&pool) && pool.refused == 0);
 
+	big_pool();
 	printf("%s\n", fails ? "gpu-pool-test: FAILED" : "gpu-pool-test: ok");
 	return fails != 0;
 }

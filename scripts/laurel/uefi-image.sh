@@ -7,8 +7,8 @@
 #     The default kernel must have its stamp and match the patches in the repo (build-stamp.py kernel-check), else no image. A KERNEL= by hand
 #     needs only its own stamp to be right: an older kernel on purpose (docs/laurel_sprout/build-honest.md).
 #   DRAM=BASE:SIZE or auto (default): the DarwinBoot window from the FD's Mu memory map (mkadt.py --dram auto):
-#     Mu 0101 ("Kernel RAM" 0xE1000000 + 0xDF000000) or the late layout (MU_RAM_LAYOUT=late) gives 3264 MiB at
-#     0xE1004000 (kernel patch 2100); an older FD (Kernel RAM 0x81000000 + 0x3F000000) 768 MiB at 0x81004000
+#     Mu 0101 ("Kernel RAM" 0xC1000000 + 0xFF000000) or the late layout (MU_RAM_LAYOUT=late) gives 3904 MiB at
+#     0xC1004000 (kernel patches 2100, 2974); an older FD (Kernel RAM 0x81000000 + 0x3F000000) 768 MiB at 0x81004000
 #   CPUS=N (XNU cpus= boot-arg, default 8)   SIZE_MIB=48 (payload FAT)
 #   BOOT_MENU=1 (default): UniXNU menu with iOS + Android, 5 s to iOS, panic reset after 30 s, boot_b marked for the Android app; BOOT_MENU=0: as before (docs/laurel_sprout/boot-menu.md).
 #   LAUREL_READONLY=1 (dual-boot.sh image): no ufsrw, no rootrw, and BOOT_MENU=0. IOSROOT_HEAD_SHA=sha256 of the first MiB of the installed root: the app's mark (dual-boot.sh image rw)
