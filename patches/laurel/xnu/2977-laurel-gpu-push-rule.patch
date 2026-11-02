@@ -1,0 +1,601 @@
+laurel 2977: own scattered buffers go out of the CPU cache only when a CPU write is possible, and are made write-combined when every page says so (pageable descriptor, page attributes checked, first page again each submission); the push of a submission runs outside gGPULock (each buffer retained for it; one submission of a client at a time). Log 2026-11-03: 28-127 MB a submission, 18-52 ms, under the lock. Kill switches gpudirty=0, gpuflushout=0. Lines: LAUREL GPU PUSH: on|off; LAUREL GPU WC: on|off: reason; "push us host H, surface S, own O" in the waits line. Rule and proof in laurel_gpu_push_core.h; host test scripts/laurel/gpu-push-test.sh. NOT BOOTED.
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index b5814df..0c61338 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -47,7 +47,9 @@
+ #include "SweetSurface.h"
+ #include "laurel_gpu_time_core.h"       /* laurel 2975 */
+ #include "laurel_gpu_kept_core.h"       /* laurel 2976 */
++#include "laurel_gpu_push_core.h"       /* laurel 2977 */
+ 
++extern "C" unsigned int pmap_cache_attributes(ppnum_t pn);     /* laurel 2977 */
+ extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
+ bool topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds);
+ 
+@@ -239,6 +241,15 @@ static uint32_t gWSCalls;
+ static uint64_t gWSSelTime[LGT_SLOTS];          /* laurel 2975: LAUREL GPU TIME: the same time, per request (the window server has many threads: atomic) */
+ static uint32_t gWSSelCalls[LGT_SLOTS];
+ static TUNABLE(uint32_t, gGPUSeedRule, "gpuseed", 1);   /* kill switch gpuseed=0: the 4 ms rule above for every surface */
++/*
++ * laurel 2977: own scattered buffers: push only when a CPU write is possible (laurel_gpu_push_core.h), and made write-combined when the phone allows it, so that a
++ * persistently mapped block needs no push at all. Kill switch gpudirty=0: every mapped one at every submission, cached, as before.
++ * Log 2026-11-03 02:54:49-02:55:16: 28-127 MB a submission, 18-52 ms, about 530 MB/s, followed the pool: 4 MB at 50 MB free, 72 MB at 0.
++ */
++static TUNABLE(uint32_t, gGPUDirtyRule, "gpudirty", 1);
++/* laurel 2977: the push of a submission outside gGPULock (rule at gpu_push below). Kill switch gpuflushout=0: under the lock, as before. */
++static TUNABLE(uint32_t, gGPUFlushOut, "gpuflushout", 1);
++static bool gGPUScatteredWCOff;                 /* laurel 2977: a made buffer failed the page check (or could not be made): cached from then on */
+ 
+ static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
+ static bool gGPUReported;
+@@ -252,7 +263,9 @@ static struct {
+ 	uint32_t made, given_again;             /* buffers of their own made for programs, and of those kept ones given again */
+ 	uint32_t pushes, clean;                 /* laurel 2158: surfaces pushed out of the cache, and passed over (no CPU write) */
+ 	uint64_t making;                        /* ... and the time it took to make the others */
++	uint64_t push_host, push_surface, push_own;     /* laurel 2977: where the push time went */
+ 	uint64_t lock_wait, held;               /* laurel 2913: a submission: before it had the lock, and with it */
++	uint64_t flush_out;                     /* laurel 2977: of `held` above: scan and push when the push was outside the lock */
+ } gGPUStat;
+ 
+ /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
+@@ -411,6 +424,8 @@ RedwoodGPUStart(void)
+ 	(void)PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached));
+ 	gGPUCached = cached != 0;
+ 	gGPULock = IOLockAlloc();
++	IOLog("LAUREL GPU PUSH: %s; %s\n", gGPUDirtyRule ? "on: own buffers only after a CPU map or write" : "off: gpudirty=0",
++	    gGPUFlushOut ? "outside the lock" : "under the lock: gpuflushout=0");
+ 	gpu = OSTypeAlloc(RedwoodGPU);
+ 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
+ 		OSSafeReleaseNULL(gpu);
+@@ -448,6 +463,9 @@ struct gpu_buffer {
+ 	bool                            seen;           /* by the program: mapped, and from then on written by it */
+ 	uint32_t                        fence;          /* the last submission that names it (0: none has) */
+ 	bool                            host;           /* laurel 2160: the client's own pages, wired by `memory` */
++	bool                            dirty;          /* laurel 2977: a map or a kernel write since the last push */
++	bool                            wc;             /* laurel 2977: made write-combined, all pages checked */
++	ppnum_t                         page0;          /* laurel 2977: its first page, looked at again each submission */
+ };
+ 
+ /*
+@@ -462,9 +480,27 @@ struct gpu_left {
+ 	SweetSurface *                  surface;
+ 	uint64_t                        address, size, span;
+ 	uint32_t                        fence, flags;
++	bool                            dirty, wc;      /* laurel 2977 */
++	ppnum_t                         page0;
+ };
+ #define GPU_LEFT                64
+ 
++/*
++ * laurel 2977: one buffer's push of a submission. The rule that lets it run outside gGPULock: the entry holds a retain of `memory` (and of `surface`), taken under the lock while
++ * the buffer is alive. Nothing frees its pages, or the kernel mapping `kernel` points into, until the release after the push, whatever happens to the handle meanwhile: GEM close, keep,
++ * a kept buffer given back for the pool (scattered memory only here: pool memory is never pushed). The GPU's tables may change meanwhile: the push does not use them. The order that makes it
++ * correct: the client's CPU writes are before its submit call; the push ends with a barrier before the commands go in the ring, with the lock again. Two submissions of one client: fSubmitLock,
++ * so that a second one cannot see "pushed" while the first is still at it. A map during the push: it sets dirty under the lock, after the scan: stays dirty.
++ */
++struct gpu_push {
++	IOMemoryDescriptor *            memory;
++	SweetSurface *                  surface;
++	uint8_t *                       kernel;
++	uint64_t                        size;
++	uint32_t                        handle;
++	uint8_t                         kind;           /* 0: host, 1: surface, 2: own */
++};
++
+ /*
+  * A buffer of the program's own given back, and done with: kept, memory and place in the GPU's
+  * address space, for the next one of the same size and kind. CoreAnimation makes a new texture to
+@@ -482,6 +518,8 @@ struct gpu_kept {
+ 	uint8_t *                       kernel;
+ 	uint64_t                        address, size, since;
+ 	uint32_t                        flags;
++	bool                            dirty, wc;      /* laurel 2977: goes with it: a dirty line given again would write over what the GPU draws */
++	ppnum_t                         page0;
+ };
+ #define GPU_KEPT                48
+ #define GPU_KEPT_BYTES          (160ull << 20)
+@@ -516,10 +554,14 @@ class RedwoodGPUUserClient : public IOUserClient
+ 	bool                    fWindowServer;          /* laurel 2895: this client is backboardd */
+ 
+ 	struct gpu_buffer * buffer(uint32_t handle);
++	IOLock *                fSubmitLock;            /* laurel 2977: one submission of this client at a time: the push is outside gGPULock */
++	struct gpu_push *       fPush;                  /* laurel 2977: under fSubmitLock: fPushPlaces places, as many as the largest submission asked for (twice that) */
++	uint32_t                fPushPlaces;
++
+ 	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle,
+ 	    bool samePlace = false, uint64_t guard = 0);
+ 	void freeBuffer(struct gpu_buffer * b);
+-	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
++	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags, bool dirty, bool wc, ppnum_t page0);
+ 	void dropKept(struct gpu_kept * k);
+ 	void reap(void);
+ 	IOReturn gemNew(struct msm_gem_new * request);
+@@ -589,6 +631,10 @@ RedwoodGPUUserClient::start(IOService * provider)
+ 		}
+ 	}
+ 	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
++	fSubmitLock = IOLockAlloc();            /* laurel 2977 */
++	if (fSubmitLock == NULL) {
++		return false;
++	}
+ 	fWindowServer = strcmp(name, "backboardd") == 0;
+ 	if (fBuffers != NULL && strcmp(name, "backboardd") == 0) {
+ 		topaz_gpu_gl_opened();                  /* only backboardd's Mesa opens the GPU: GL is loaded */
+@@ -695,6 +741,9 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 		left->span = b->span;
+ 		left->fence = b->fence;
+ 		left->flags = b->flags;
++		left->dirty = b->dirty;
++		left->wc = b->wc;
++		left->page0 = b->page0;
+ 	} else {
+ 		if (busy) {
+ 			static uint32_t said;
+@@ -707,7 +756,7 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 			if (said++ < 8) {
+ 				IOLog("RedwoodGPU: the GPU is not done with what it was given: a buffer of %llu bytes stays its own\n", b->size);
+ 			}
+-		} else if (b->surface == NULL && redwood_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
++		} else if (b->surface == NULL && redwood_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags, b->dirty, b->wc, b->page0)) {
+ 			b->memory = NULL;               /* (now the kept one's) */
+ 		} else if (redwood_gpu_ready()) {
+ 			redwood_gpu_unmap(b->address, b->span);
+@@ -748,7 +797,7 @@ RedwoodGPUUserClient::reap(void)
+ 			continue;
+ 		}
+ 		if (left->surface == NULL && redwood_gpu_ready() &&
+-		    keep(left->memory, NULL, left->address, left->size, left->flags)) {
++		    keep(left->memory, NULL, left->address, left->size, left->flags, left->dirty, left->wc, left->page0)) {
+ 			left->memory = NULL;
+ 		} else if (redwood_gpu_ready()) {
+ 			redwood_gpu_unmap(left->address, left->span);
+@@ -822,6 +871,14 @@ RedwoodGPUUserClient::free(void)
+ 		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
+ 		fBuffers = NULL;
+ 	}
++	if (fPush != NULL) {
++		IODelete(fPush, struct gpu_push, fPushPlaces);  /* laurel 2977 */
++		fPush = NULL;
++	}
++	if (fSubmitLock != NULL) {
++		IOLockFree(fSubmitLock);
++		fSubmitLock = NULL;
++	}
+ 	IOUserClient::free();
+ 	if (gGPULock != NULL) {
+ 		IOLockLock(gGPULock);           /* laurel 2976: this client's maps have gone with it */
+@@ -936,6 +993,9 @@ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
+ 	b->seed = 0;
+ 	b->pushed = 0;
+ 	b->seen = false;
++	b->dirty = false;
++	b->wc = false;
++	b->page0 = 0;
+ 	b->fence = 0;
+ 	b->surface = NULL;
+ 	b->host = false;
+@@ -1014,7 +1074,7 @@ RedwoodGPUUserClient::held(uint64_t * buffers, uint64_t * host, uint64_t * kept)
+ 
+ /* With the lock held, the GPU done with the buffer: kept if it is worth it (those kept longest make way). */
+ bool
+-RedwoodGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags)
++RedwoodGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags, bool dirty, bool wc, ppnum_t page0)
+ {
+ 	struct gpu_kept * place = NULL;
+ 	struct lgk_slot slots[GPU_KEPT];
+@@ -1040,17 +1100,76 @@ RedwoodGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64
+ 	place->address = address;
+ 	place->size = size;
+ 	place->flags = flags;
++	place->dirty = dirty;
++	place->wc = wc;
++	place->page0 = page0;
+ 	place->since = mach_absolute_time();
+ 	fKeptBytes += size;
+ 	return true;
+ }
+ 
++/*
++ * laurel 2977: scattered pages that are write-combined in every map. Only a pageable descriptor gets this: its VM object carries the mode (vm_object wimg_bits); wiring sets each page's
++ * attribute (vm_object_iopl_request: PMAP_BATCH_SET_CACHE_ATTR) and the kernel's own alias with it. Not an option of the map: on a kernel-memory descriptor the option alone does nothing, the
++ * pages stay cached (and a descriptor made with the option is contiguous, topaz: from the lower bank). So it is checked: every page's attribute after the wiring. One that is not write-combined
++ * turns this off for good, one line, and the buffer is made cached: then the dirty rule pushes it. The read cost: a CPU read of a mapped block is uncached, as for every pool buffer already (the pool is
++ * write-combined and this is what Mesa gets when the pool has room). Readback of a mapped scattered block: [I] about 10 times slower than cached; the Metal paths read rarely. *page0: its first page.
++ */
++static IOBufferMemoryDescriptor *
++gpuScatteredWC(uint64_t size, ppnum_t * page0)
++{
++	static uint32_t said;
++	const char * why = NULL;
++	IOBufferMemoryDescriptor * memory;
++
++	if (gGPUScatteredWCOff) {
++		return NULL;
++	}
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryPageable | kIOMapWriteCombineCache, (vm_size_t) size, PAGE_SIZE);
++	if (memory == NULL) {
++		return NULL;                    /* (no memory or no kernel addresses now: cached this once) */
++	}
++	if (memory->prepare(kIODirectionInOut) != kIOReturnSuccess) {
++		memory->release();
++		return NULL;
++	}
++	*page0 = 0;
++	for (uint64_t offset = 0; offset < size && why == NULL; offset += PAGE_SIZE) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++		unsigned attribute = phys != 0 ? pmap_cache_attributes((ppnum_t) atop_64(phys)) : 0;
++
++		if (phys == 0) {
++			why = "a page has no address";
++		} else if (!lgf_all_pages_wc(&attribute, 1, LGF_WIMG_WCOMB, LGF_WIMG_MASK)) {
++			why = "a page is not write-combined";
++		} else if (offset == 0) {
++			*page0 = (ppnum_t) atop_64(phys);
++		}
++		if (why == NULL) {
++			(void) *(volatile uint8_t *) ((uint8_t *) memory->getBytesNoCopy() + offset);   /* (its kernel map entry, before the push in gemNew) */
++		}
++	}
++	if (why != NULL) {
++		gGPUScatteredWCOff = true;
++		*page0 = 0;
++		memory->release();
++		IOLog("LAUREL GPU WC: off: %s: scattered buffers stay cached and go out of the cache while mapped\n", why);
++		return NULL;
++	}
++	if (said++ == 0) {
++		IOLog("LAUREL GPU WC: on: the first scattered buffer, %llu bytes, every page write-combined\n", size);
++	}
++	return memory;
++}
++
+ IOReturn
+ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ {
+ 	uint64_t size = round_page_64(request->size), began = mach_absolute_time();
+ 	struct gpu_buffer * b;
+ 	IOBufferMemoryDescriptor * memory;
++	ppnum_t wcPage0 = 0;
+ 
+ 	if (size == 0 || size > GPU_BUFFER_MAX) {
+ 		return kIOReturnBadArgument;
+@@ -1084,6 +1203,9 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 			b->size = found->size;
+ 			b->span = found->size;          /* laurel 2158: (own buffers have no scratch rows) */
+ 			b->flags = found->flags;
++			b->dirty = found->dirty || gGPUKeep == 2;       /* laurel 2977: (gpu_keep=2's bzero is a kernel write) */
++			b->wc = found->wc;
++			b->page0 = found->page0;
+ 			fNextBuffer = h + 1;
+ 			fBufferCount++;
+ 			fBufferBytes += size;
+@@ -1182,8 +1304,11 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		return kIOReturnSuccess;
+ 	}
+ scattered:
+-	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
+-	    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
++	memory = gGPUDirtyRule && gGPUCached ? gpuScatteredWC(size, &wcPage0) : NULL;   /* laurel 2977 */
++	if (memory == NULL) {
++		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++		    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
++	}
+ 	if (memory == NULL) {
+ 		IOLog("RedwoodGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client)\n", size, fBufferCount,
+ 		    fBufferBytes >> 20);
+@@ -1198,6 +1323,8 @@ scattered:
+ 	if (b != NULL) {
+ 		b->memory = memory;
+ 		b->kernel = (uint8_t *) memory->getBytesNoCopy();
++		b->wc = wcPage0 != 0;
++		b->page0 = wcPage0;
+ 		gGPUStat.made++;
+ 		gGPUStat.making += mach_absolute_time() - began;
+ 	}
+@@ -1530,6 +1657,8 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
+ 	uint64_t began, nanos, again, lock_began;
+ 	IOReturn ret = kIOReturnBadArgument;
++	uint32_t pushing = 0;                   /* laurel 2977: places in fPush */
++	bool submitLocked = false;
+ 
+ 	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
+ 		IOLog("RedwoodGPU: a submission of %u command buffers in %u buffers: not taken\n", request->nr_cmds, request->nr_bos);
+@@ -1547,6 +1676,21 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		goto out;
+ 	}
+ 	lock_began = mach_absolute_time();              /* laurel 2913 */
++	IOLockLock(fSubmitLock);                        /* laurel 2977 */
++	submitLocked = true;
++	if (fPushPlaces < request->nr_bos) {
++		uint32_t places = request->nr_bos > GPU_SUBMIT_BOS / 2 ? GPU_SUBMIT_BOS : request->nr_bos * 2;
++
++		if (fPush != NULL) {
++			IODelete(fPush, struct gpu_push, fPushPlaces);
++		}
++		fPush = IONew(struct gpu_push, places);
++		fPushPlaces = fPush != NULL ? places : 0;
++		if (fPush == NULL) {
++			ret = kIOReturnNoMemory;
++			goto out;
++		}
++	}
+ 	IOLockLock(gGPULock);
+ 	gGPUStat.lock_wait += mach_absolute_time() - lock_began;
+ 	/*
+@@ -1568,26 +1712,25 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 	nanoseconds_to_absolutetime(GPU_PUSH_FRAME_MS * NSEC_PER_MSEC, &frame);
+ 	for (uint32_t i = 0; i < request->nr_bos; i++) {
+ 		struct gpu_buffer * b = buffer(bos[i].handle);
++		uint8_t kind;
+ 
+ 		if (b == NULL) {
+ 			continue;
+ 		}
+ 		if (b->host) {
+-			/* laurel 2160: the client's own cached pages: what the CPU wrote goes to memory (read-only pages: nothing) */
+-			if (!(b->flags & MSM_BO_GPU_READONLY)) {
+-				b->memory->performOperation(kIOMemoryIncoherentIOStore, 0, b->size);
+-				gGPUStat.flushed += b->size;
+-				gGPUStat.pushes++;
++			/*
++			 * laurel 2160: the client's own cached pages: what the CPU wrote goes to memory (read-only pages: nothing). laurel 2977: no dirty rule can hold here: the client's
++			 * own mapping is always there and no request tells of a write. So: always, outside the lock.
++			 */
++			if (b->flags & MSM_BO_GPU_READONLY) {
++				continue;
+ 			}
+-			continue;
+-		}
+-		if (b->surface != NULL && b->surface->gpuPool) {
++			kind = 0;
++		} else if (b->surface != NULL && b->surface->gpuPool) {
+ 			continue;                       /* topaz: GPU pool memory is write-combined: nothing in the cache */
+-		}
+-		if (b->surface != NULL && b->surface->noCache && gGPUSeedRule) {
++		} else if (b->surface != NULL && b->surface->noCache && gGPUSeedRule) {
+ 			continue;                       /* laurel 2158: the boot framebuffer: every map is write-combined */
+-		}
+-		if (b->surface != NULL) {
++		} else if (b->surface != NULL) {
+ 			/* laurel 2916: a seed moved by a client's GPU write (below) is no CPU write: nothing to push (boot 23:28: 34 MB a submission) */
+ 			uint32_t seed = *(volatile uint32_t *) ((uint8_t *) b->surface->state->getBytesNoCopy() + 0xc) - b->surface->gpuMoves;
+ 			uint64_t now = mach_absolute_time();
+@@ -1598,27 +1741,80 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 				continue;
+ 			}
+ 			b->seed = seed;
+-			redwood_gpu_to_memory(b->kernel, b->size);
+-			gGPUStat.flushed += b->size;
+-			gGPUStat.pushes++;
+-			b->pushed = gGPUSeedRule ? mach_absolute_time() : began;        /* laurel 2158: from the push's end */
+-			continue;
+-		} else if (!b->seen || !gGPUCached) {
+-			continue;
+-		} else if (gGPUSeedRule && b->address >= kSamePlaceBase) {
+-			/*
+-			 * laurel 2158: a VA = PA buffer is the GPU pool's (write-combined, nobody maps it cached). With the stage-1
+-			 * tables gpu_cached is 1 (for the scattered buffers), so 2154 pushed every buffer Mesa had mapped (its
+-			 * command streams and upload buffers, all from the pool) at every submission: most of the 13-16 MB.
+-			 */
+-			gGPUStat.clean++;
+-			continue;
++			kind = 1;
++		} else {
++			/* laurel 2977: the rule and the proof: laurel_gpu_push_core.h */
++			struct lgf_own own;
++			bool dirty_after = false;
++
++			own.rule_on = gGPUDirtyRule != 0;
++			own.seed_rule = gGPUSeedRule != 0;
++			own.gpu_cached = gGPUCached;
++			own.seen = b->seen;
++			own.same_place = b->address >= kSamePlaceBase;
++			own.dirty = b->dirty;
++			own.mapped_now = b->memory->getRetainCount() > 1;
++			own.wc_now = b->wc && (pmap_cache_attributes(b->page0) & LGF_WIMG_MASK) == LGF_WIMG_WCOMB;
++			enum lgf_what what = lgf_own_buffer(&own, &dirty_after);
++
++			b->dirty = dirty_after;
++			if (what == LGF_CLEAN) {
++				gGPUStat.clean++;
++			}
++			if (what != LGF_PUSH) {
++				continue;
++			}
++			kind = 2;
+ 		}
+-		redwood_gpu_to_memory(b->kernel, b->size);
++		fPush[pushing].memory = b->memory;
++		fPush[pushing].surface = b->surface;
++		fPush[pushing].kernel = b->kernel;
++		fPush[pushing].size = b->size;
++		fPush[pushing].handle = bos[i].handle;
++		fPush[pushing].kind = kind;
++		b->memory->retain();
++		if (b->surface != NULL) {
++			b->surface->retain();
++		}
++		pushing++;
+ 		gGPUStat.flushed += b->size;
+ 		gGPUStat.pushes++;
+ 	}
+-	redwood_gpu_to_memory(NULL, 0);                 /* (and what was written last is in memory: a barrier) */
++	if (pushing != 0) {
++		uint64_t spent[3] = { 0, 0, 0 };
++
++		if (gGPUFlushOut) {
++			IOLockUnlock(gGPULock);
++		}
++		for (uint32_t i = 0; i < pushing; i++) {
++			uint64_t t0 = mach_absolute_time();
++
++			if (fPush[i].kind == 0) {
++				fPush[i].memory->performOperation(kIOMemoryIncoherentIOStore, 0, fPush[i].size);
++			} else {
++				redwood_gpu_to_memory(fPush[i].kernel, fPush[i].size);
++			}
++			spent[fPush[i].kind] += mach_absolute_time() - t0;
++		}
++		redwood_gpu_to_memory(NULL, 0);         /* (and what was written last is in memory: a barrier) */
++		uint64_t ended = mach_absolute_time();
++
++		if (gGPUFlushOut) {
++			IOLockLock(gGPULock);
++			gGPUStat.flush_out += ended - began;
++		}
++		gGPUStat.push_host += spent[0];
++		gGPUStat.push_surface += spent[1];
++		gGPUStat.push_own += spent[2];
++		for (uint32_t i = 0; i < pushing; i++) {
++			/* (the handle may be gone or be another buffer by now: only if it is still this memory) */
++			struct gpu_buffer * b = fPush[i].kind == 1 && fPush[i].handle <= GPU_BUFFERS ? &fBuffers[fPush[i].handle - 1] : NULL;
++
++			if (b != NULL && b->memory == fPush[i].memory) {
++				b->pushed = gGPUSeedRule ? ended : began;       /* laurel 2158: from the push's end */
++			}
++		}
++	}
+ 	gGPUStat.flushing += mach_absolute_time() - began;
+ 	gGPUStat.buffers += request->nr_bos;
+ 	for (uint32_t i = 0; i < request->nr_cmds; i++) {
+@@ -1724,16 +1920,21 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		IOLog("RedwoodGPU: the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
+ 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all)\n",
+ 		    timed ? worked / timed : 0, timed, by[0], by[1], by[2], by[3], by[4], by[5], by[6], worked / 1000);
++		uint64_t push_host, push_surface, push_own;
++
++		absolutetime_to_nanoseconds(gGPUStat.push_host, &push_host);
++		absolutetime_to_nanoseconds(gGPUStat.push_surface, &push_surface);
++		absolutetime_to_nanoseconds(gGPUStat.push_own, &push_own);
+ 		IOLog("RedwoodGPU: %u waits of %llu us, %u over before they began; %u IOSurfaces taken as buffers in %llu us each; "
+-		    "%u buffers, %llu MB; %u surface pushes, %u passed over\n",
++		    "%u buffers, %llu MB; %u pushes, %u passed over; push us host %llu, surface %llu, own %llu\n",
+ 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
+ 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
+-		    fBufferBytes >> 20, gGPUStat.pushes, gGPUStat.clean);
++		    fBufferBytes >> 20, gGPUStat.pushes, gGPUStat.clean, push_host / NSEC_PER_USEC, push_surface / NSEC_PER_USEC, push_own / NSEC_PER_USEC);
+ 		uint64_t lock_wait, held, ws_time;
+ 		uint32_t ws_calls = gWSCalls;
+ 
+ 		absolutetime_to_nanoseconds(gGPUStat.lock_wait, &lock_wait);
+-		absolutetime_to_nanoseconds(gGPUStat.held, &held);
++		absolutetime_to_nanoseconds(gGPUStat.held > gGPUStat.flush_out ? gGPUStat.held - gGPUStat.flush_out : 0, &held);    /* laurel 2977: truly with the lock */
+ 		absolutetime_to_nanoseconds(gWSCallTime, &ws_time);
+ 		gWSCalls = 0;
+ 		gWSCallTime = 0;
+@@ -1758,6 +1959,16 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 	IOLockUnlock(gGPULock);
+ 	ret = request->fence != 0 ? kIOReturnSuccess : kIOReturnTimeout;
+ out:
++	/* laurel 2977: outside gGPULock: the last retain of a buffer closed meanwhile frees it here */
++	for (uint32_t i = 0; i < pushing; i++) {
++		fPush[i].memory->release();
++		if (fPush[i].surface != NULL) {
++			fPush[i].surface->release();
++		}
++	}
++	if (submitLocked) {
++		IOLockUnlock(fSubmitLock);
++	}
+ 	if (bos != NULL) {
+ 		IODelete(bos, struct msm_gem_submit_bo, request->nr_bos);
+ 	}
+@@ -1805,6 +2016,7 @@ RedwoodGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, I
+ 	} else if (b != NULL) {
+ 		b->memory->retain();
+ 		b->seen = true;
++		b->dirty = true;                /* laurel 2977: (IOConnectUnmapMemory64 comes here too: one push more, never one less) */
+ 		*memory = b->memory;
+ 		/* topaz: pool memory is not the kernel's: mapped write-combined, not as a device */
+ 		/* laurel 2154: with the stage-1 tables too: the pool's own buffers and pool surfaces (kernel RAM keeps its cache mode) */
+diff --git a/iokit/Kernel/arm/laurel_gpu_push_core.h b/iokit/Kernel/arm/laurel_gpu_push_core.h
+new file mode 100644
+index 0000000..5a6b9c7
+--- /dev/null
++++ b/iokit/Kernel/arm/laurel_gpu_push_core.h
+@@ -0,0 +1,81 @@
++/*
++ * laurel 2977: which own (not IOSurface, not host) buffer goes out of the CPU's cache at a submission, plain C, so that a host test runs exactly this
++ * (scripts/laurel/gpu-push-test.sh, tools/gpu-push-test/). The missed push is the failure that matters (visible corruption), so the rule only skips when the CPU
++ * cannot have a dirty line of the buffer:
++ *   pool buffer                write-combined, every map of it: nothing in the cache. Skip.
++ *   wc_now                     every page's attribute is write-combined (checked page by page when it is made; first page again each submission): skip.
++ *   mapped_now                 a user mapping (cached) is there: the CPU may write at any moment and says nothing: push, always. Stays dirty.
++ *   dirty                      was mapped (or written by the kernel) since the last push: push once; when no map is left it is clean after that push.
++ *   else                       no map since the last push: no CPU write can have happened. Skip.
++ * Every way to a CPU write: a user map = clientMemoryForType (sets dirty under the lock; retain count > 1 while it lives: mapped_now); kernel write through b->kernel = only
++ * gpu_keep=2's bzero (sets dirty); kept and given again: dirty goes with it. Host pages and surfaces have their own rules in submit().
++ * rule_on false (kill switch gpudirty=0): the old rule, exactly.
++ */
++#ifndef LAUREL_GPU_PUSH_CORE_H
++#define LAUREL_GPU_PUSH_CORE_H
++
++/* osfmk/arm/memory_types.h, the same on both kernels (test: the script greps both trees). A wrong value fails the page check: feature off, cached, pushed: safe. */
++#define LGF_WIMG_WCOMB  0x6u
++#define LGF_WIMG_MASK   0xFFu
++
++enum lgf_what {
++	LGF_SKIP,                       /* nothing, not counted */
++	LGF_CLEAN,                      /* nothing, counted as passed over */
++	LGF_PUSH,
++};
++
++struct lgf_own {
++	bool rule_on;                   /* gpudirty */
++	bool seed_rule;                 /* gpuseed */
++	bool gpu_cached;                /* gpu_cached */
++	bool seen;                      /* the old flag: mapped once */
++	bool same_place;                /* VA = PA: the pool */
++	bool dirty;                     /* a map or a kernel write since the last push */
++	bool mapped_now;                /* a user mapping lives */
++	bool wc_now;                    /* its pages are write-combined, checked now */
++};
++
++/* *dirty_after: the buffer's new dirty flag */
++static inline enum lgf_what
++lgf_own_buffer(const struct lgf_own *b, bool *dirty_after)
++{
++	*dirty_after = b->dirty;
++	if (!b->rule_on) {
++		if (!b->seen || !b->gpu_cached) {
++			return LGF_SKIP;
++		}
++		return b->seed_rule && b->same_place ? LGF_CLEAN : LGF_PUSH;
++	}
++	if (!b->gpu_cached) {
++		return LGF_SKIP;
++	}
++	if (b->same_place && b->seed_rule) {
++		return LGF_CLEAN;
++	}
++	if (b->wc_now) {
++		*dirty_after = false;
++		return LGF_CLEAN;
++	}
++	if (b->mapped_now || b->dirty) {
++		*dirty_after = b->mapped_now;
++		return LGF_PUSH;
++	}
++	return LGF_SKIP;
++}
++
++/* what a page's attribute must be for a buffer to count as write-combined: all pages, and at least one */
++static inline bool
++lgf_all_pages_wc(const unsigned *attributes, unsigned pages, unsigned wc, unsigned mask)
++{
++	if (pages == 0) {
++		return false;
++	}
++	for (unsigned i = 0; i < pages; i++) {
++		if ((attributes[i] & mask) != wc) {
++			return false;
++		}
++	}
++	return true;
++}
++
++#endif /* LAUREL_GPU_PUSH_CORE_H */

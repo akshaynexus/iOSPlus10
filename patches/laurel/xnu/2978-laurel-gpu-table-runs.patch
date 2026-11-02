@@ -1,0 +1,288 @@
+laurel 2978: same class of cost under gGPULock: GPU table entries of a buffer cleaned as ranges, not one by one with 2 barriers each (kill switch gpuptebatch=0); a client's surface buffers in a short list, not a search through 8192 places at each surface request. laurel_gpu_table_core.h; host test scripts/laurel/gpu-push-test.sh.
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 0c61338..3ec296b 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -48,6 +48,7 @@
+ #include "laurel_gpu_time_core.h"       /* laurel 2975 */
+ #include "laurel_gpu_kept_core.h"       /* laurel 2976 */
+ #include "laurel_gpu_push_core.h"       /* laurel 2977 */
++#include "laurel_gpu_table_core.h"      /* laurel 2978 */
+ 
+ extern "C" unsigned int pmap_cache_attributes(ppnum_t pn);     /* laurel 2977 */
+ extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
+@@ -554,9 +555,13 @@ class RedwoodGPUUserClient : public IOUserClient
+ 	bool                    fWindowServer;          /* laurel 2895: this client is backboardd */
+ 
+ 	struct gpu_buffer * buffer(uint32_t handle);
++	uint32_t surfaceHandle(SweetSurface * s);       /* laurel 2978: with the lock held; 0: none */
+ 	IOLock *                fSubmitLock;            /* laurel 2977: one submission of this client at a time: the push is outside gGPULock */
+ 	struct gpu_push *       fPush;                  /* laurel 2977: under fSubmitLock: fPushPlaces places, as many as the largest submission asked for (twice that) */
+ 	uint32_t                fPushPlaces;
++	uint16_t *              fSurfaceHandles;        /* laurel 2978: under gGPULock: the handles that are surfaces, fSurfaceCount of them */
++	uint16_t *              fSurfaceAt;             /* ... and each handle's place there */
++	uint32_t                fSurfaceCount;
+ 
+ 	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle,
+ 	    bool samePlace = false, uint64_t guard = 0);
+@@ -632,7 +637,9 @@ RedwoodGPUUserClient::start(IOService * provider)
+ 	}
+ 	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
+ 	fSubmitLock = IOLockAlloc();            /* laurel 2977 */
+-	if (fSubmitLock == NULL) {
++	fSurfaceHandles = IONew(uint16_t, GPU_BUFFERS); /* laurel 2978 */
++	fSurfaceAt = IONew(uint16_t, GPU_BUFFERS);
++	if (fSubmitLock == NULL || fSurfaceHandles == NULL || fSurfaceAt == NULL) {
+ 		return false;
+ 	}
+ 	fWindowServer = strcmp(name, "backboardd") == 0;
+@@ -728,6 +735,9 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ {
+ 	bool busy = redwood_gpu_ready() && b->fence != 0 && !redwood_gpu_done(b->fence);
+ 
++	if (b->surface != NULL) {
++		lgt_list_remove(fSurfaceHandles, fSurfaceAt, &fSurfaceCount, (uint32_t) (b - fBuffers) + 1);    /* laurel 2978 */
++	}
+ 	if (busy && fLeftCount == GPU_LEFT) {
+ 		busy = !gpuWait(b->fence, 1000);        /* (nowhere to keep it: this one is waited for) */
+ 	}
+@@ -875,6 +885,14 @@ RedwoodGPUUserClient::free(void)
+ 		IODelete(fPush, struct gpu_push, fPushPlaces);  /* laurel 2977 */
+ 		fPush = NULL;
+ 	}
++	if (fSurfaceHandles != NULL) {
++		IODelete(fSurfaceHandles, uint16_t, GPU_BUFFERS);       /* laurel 2978 */
++		fSurfaceHandles = NULL;
++	}
++	if (fSurfaceAt != NULL) {
++		IODelete(fSurfaceAt, uint16_t, GPU_BUFFERS);
++		fSurfaceAt = NULL;
++	}
+ 	if (fSubmitLock != NULL) {
+ 		IOLockFree(fSubmitLock);
+ 		fSubmitLock = NULL;
+@@ -887,6 +905,18 @@ RedwoodGPUUserClient::free(void)
+ 	}
+ }
+ 
++/* laurel 2978: with the lock held */
++uint32_t
++RedwoodGPUUserClient::surfaceHandle(SweetSurface * s)
++{
++	for (uint32_t i = 0; i < fSurfaceCount; i++) {
++		if (fBuffers[fSurfaceHandles[i] - 1].surface == s) {
++			return fSurfaceHandles[i];
++		}
++	}
++	return 0;
++}
++
+ struct gpu_buffer *
+ RedwoodGPUUserClient::buffer(uint32_t handle)
+ {
+@@ -1506,11 +1536,12 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 	}
+ 
+ 	IOLockLock(gGPULock);
+-	for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
+-		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
+-			b = &fBuffers[i];
+-			request->handle = i + 1;
+-			break;
++	{
++		uint32_t have = surfaceHandle(s);       /* laurel 2978 */
++
++		if (have != 0) {
++			b = &fBuffers[have - 1];
++			request->handle = have;
+ 		}
+ 	}
+ 	if (b != NULL) {
+@@ -1520,6 +1551,7 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		b->memory = memory;
+ 		b->kernel = (uint8_t *) s->kernelAddress();
+ 		b->surface = s;
++		lgt_list_add(fSurfaceHandles, fSurfaceAt, &fSurfaceCount, request->handle);     /* laurel 2978 */
+ 		gGPUStat.surfaces++;
+ 	}
+ 	gGPUStat.taking += mach_absolute_time() - began;
+@@ -1602,11 +1634,10 @@ RedwoodGPUUserClient::surfaceDrawn(struct redwood_drawn * request)
+ 	struct gpu_buffer * b = NULL;
+ 
+ 	IOLockLock(gGPULock);
+-	for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
+-		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
+-			b = &fBuffers[i];
+-			break;
+-		}
++	{
++		uint32_t have = surfaceHandle(s);       /* laurel 2978 */
++
++		b = have != 0 ? &fBuffers[have - 1] : NULL;
+ 	}
+ 	if (b == NULL) {
+ 		IOLockUnlock(gGPULock);
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 6644360..64a20ae 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -220,6 +220,7 @@ static bool gpu_pool_ready;
+  */
+ #include "laurel_gpu_pool_core.h"
+ #include "laurel_gpu_kept_core.h"       /* laurel 2976 */
++#include "laurel_gpu_table_core.h"      /* laurel 2978 */
+ static struct lgp gpu_pool;
+ LCK_GRP_DECLARE(laurel_gpu_pool_grp, "laurel_gpu_pool");
+ LCK_MTX_DECLARE(laurel_gpu_pool_lock, &laurel_gpu_pool_grp);  /* gpu_pool, gpu_chunk_va, gpu_pool_ready; nothing else taken inside */
+@@ -1764,13 +1765,40 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
+ 	}
+ }
+ 
++/*
++ * laurel 2978: entries of one buffer are cleaned as ranges, not one by one (laurel_gpu_table_core.h). Under gGPULock, as every table write. The last range goes at redwood_gpu_mapped, which
++ * every caller runs before it may submit (newBuffer: also on failure). Only this path: mmu_map itself stays as it is for the callers that clean nothing later. Kill switch gpuptebatch=0.
++ */
++static TUNABLE(uint32_t, gGPUTableBatch, "gpuptebatch", 1);
++static struct lgt_run gpu_pte_run;
++
++static void
++gpu_pte_clean(uint64_t from, uint64_t to)
++{
++	sweet_dcache_clean((vm_offset_t)from, (unsigned)(to - from));
++}
++
+ bool
+ redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+ {
++	uint64_t *t, from, to;
++
+ 	if (gpu_identity) {
+ 		return true;
+ 	}
+-	return mmu_map(address, phys, read_only);
++	if (!gGPUTableBatch) {
++		return mmu_map(address, phys, read_only);
++	}
++	t = l3_for(address, true);
++	if (t == NULL || (phys >> 36) != 0) {
++		return false;
++	}
++	t[(address >> 12) & 511] = phys | PTE_PAGE | (read_only ? PTE_AP_RO : 0);
++	if (lgt_run_add(&gpu_pte_run, (uint64_t)&t[(address >> 12) & 511], 8, &from, &to)) {
++		gpu_pte_clean(from, to);
++	}
++	tables_dirty = true;
++	return true;
+ }
+ 
+ /*
+@@ -1805,6 +1833,11 @@ redwood_gpu_mapped(void)
+ 	 * SMMU caches no invalid entry: only a barrier, so that the table writes are in memory before the next submit
+ 	 * (HakiOS hakios.adreno.c: no TLBI on map). Saves a TLBIALL + sync + poll per buffer made.
+ 	 */
++	uint64_t from, to;
++
++	if (lgt_run_end(&gpu_pte_run, &from, &to)) {
++		gpu_pte_clean(from, to);        /* laurel 2978 */
++	}
+ 	if (tables_dirty) {
+ 		tables_dirty = false;
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+@@ -1817,13 +1850,23 @@ redwood_gpu_unmap(uint64_t address, uint64_t size)
+ 	if (gpu_identity) {
+ 		return;
+ 	}
++	struct lgt_run run = { 0, 0 };
++	uint64_t from, to;
++
+ 	for (uint64_t off = 0; off < size; off += 4096) {
+ 		uint64_t *t = l3_for(address + off, false);
+ 		if (t != NULL) {
+ 			t[((address + off) >> 12) & 511] = 0;
+-			sweet_dcache_clean((vm_offset_t)&t[((address + off) >> 12) & 511], 8);
++			if (!gGPUTableBatch) {
++				sweet_dcache_clean((vm_offset_t)&t[((address + off) >> 12) & 511], 8);
++			} else if (lgt_run_add(&run, (uint64_t)&t[((address + off) >> 12) & 511], 8, &from, &to)) {
++				gpu_pte_clean(from, to);        /* laurel 2978 */
++			}
+ 		}
+ 	}
++	if (lgt_run_end(&run, &from, &to)) {
++		gpu_pte_clean(from, to);
++	}
+ 	tlb_flush();
+ }
+ 
+diff --git a/iokit/Kernel/arm/laurel_gpu_table_core.h b/iokit/Kernel/arm/laurel_gpu_table_core.h
+new file mode 100644
+index 0000000..f4ed841
+--- /dev/null
++++ b/iokit/Kernel/arm/laurel_gpu_table_core.h
+@@ -0,0 +1,66 @@
++/*
++ * laurel 2978: small rules of RedwoodGPU's cost, plain C, for the host test (scripts/laurel/gpu-push-test.sh, tools/gpu-push-test/).
++ * (1) GPU table entries: the SMMU walks with no cache (TCR NC walks), so each written entry must reach memory before the GPU may use it. sweet_dcache_clean is
++ *     dsb + dc cvac + dsb: per entry, 2048 barriers x 2 for an 8 MiB buffer, under gGPULock, at each buffer made and freed. Adjacent entries of a run are cleaned as one range.
++ *     lgt_run_add says what to clean now; the last range at lgt_run_end. Every entry is in exactly one cleaned range, before redwood_gpu_mapped's barrier.
++ * (2) A client's surface buffers in a short list of handles: "is this surface a buffer here" looked through all 8192 places under gGPULock (surfaceBuffer, surfaceDrawn).
++ */
++#ifndef LAUREL_GPU_TABLE_CORE_H
++#define LAUREL_GPU_TABLE_CORE_H
++
++struct lgt_run {
++	uint64_t start, end;    /* start == end: empty */
++};
++
++/* An entry of `len` bytes at address: true: clean [*from, *to) first (it does not join the run) */
++static inline bool
++lgt_run_add(struct lgt_run *r, uint64_t address, uint64_t len, uint64_t *from, uint64_t *to)
++{
++	bool out = false;
++
++	if (r->start != r->end && address == r->end) {
++		r->end = address + len;
++		return false;
++	}
++	if (r->start != r->end) {
++		*from = r->start;
++		*to = r->end;
++		out = true;
++	}
++	r->start = address;
++	r->end = address + len;
++	return out;
++}
++
++/* true: clean [*from, *to); the run is empty after it */
++static inline bool
++lgt_run_end(struct lgt_run *r, uint64_t *from, uint64_t *to)
++{
++	if (r->start == r->end) {
++		return false;
++	}
++	*from = r->start;
++	*to = r->end;
++	r->start = r->end = 0;
++	return true;
++}
++
++/* handles[count]: unordered; at[handle - 1]: the place of that handle in the list */
++static inline void
++lgt_list_add(uint16_t *handles, uint16_t *at, uint32_t *count, uint32_t handle)
++{
++	handles[*count] = (uint16_t)handle;
++	at[handle - 1] = (uint16_t)*count;
++	(*count)++;
++}
++
++static inline void
++lgt_list_remove(uint16_t *handles, uint16_t *at, uint32_t *count, uint32_t handle)
++{
++	uint32_t place = at[handle - 1], last = --(*count);
++
++	handles[place] = handles[last];
++	at[handles[place] - 1] = (uint16_t)place;
++}
++
++#endif /* LAUREL_GPU_TABLE_CORE_H */

@@ -5288,3 +5288,13 @@ Details: `docs/laurel_sprout/ios26-wallpaper-widgets.md`.
 - [V] objc_msgSend's bucket: `stp`/`ldp` of imp and sel, no lock. Not atomic as a pair on ARMv8.0: pc 0 with lr after a send. Any such crash in any framework is this first. Rule in `a64-lower`, 4 sites.
 - A64 rule: `lower.rs` can edit 2 words in place when PAC left them dead; no trampoline, no range change.
 
+
+## 2026-11-03: Mi A3 RedwoodGPU cost: 2975-2978 (branch t3/laurel-gpu-dirty-flush-outside-lock; host only, NOT BOOTED)
+- `IOConnectUnmapMemory64` goes through `clientMemoryForType` too: a flag set there means "map or unmap". Use it as "one push more", never as a count.
+- [V] An `IOMemoryMap` holds a retain of its descriptor: `getRetainCount() > 1` under the lock that takes every retain = a map lives. It does not depend on what the client does.
+- [V] A map option alone does not make kernel pages write-combined; a non-pageable IOBMD with the option is contiguous. Only pageable + `prepare()` gives scattered write-combined pages (object `wimg_bits`, `vm_object_iopl_request` sets the attribute). `pmap_cache_attributes` reads it back, per page. `VM_WIMG_*` is not visible from iokit: 0x6 and 0xFF are in `laurel_gpu_push_core.h`.
+- [V] Turnip: `tu_drm_bo_finish` unmaps through IOKit, then GEM_CLOSE; `bo_mutex` is held across GEM_SUBMIT. `bo->map` lives until finish: persistent, so a dirty rule alone saves little.
+- `sweet_dcache_clean` has a dsb before and after: never per entry in a loop.
+- A kernel log line ends at 255 bytes: test it in the host test with the largest numbers (112 bytes of text was too long).
+- Mutation run of `gpu-push-test`: 14 of 15 caught. Not caught: the chunk test in `lgk_plan_fit`: the guard unit breaks adjacency already, so it is a second guard.
+- Patches from a series tree: `git -C out/laurel-kernel-ios26/src/xnu diff C~1 C -- iokit`, one commit per patch; `bsd/dev/laurel_build_stamp.h` changes at each build: keep it out. zsh does not split `set -- $C`: use bash for such a step. Never `cat > file` with no input in a tool call: it waits.

@@ -1171,3 +1171,7 @@ Done on the host: `LAUREL ICONS`, live glass default, `LAUREL TEXTURE POOL`, Tur
 Done: patch 2974 + Mu 0101, late/0101, mkadt.py: GPU pool 0x80000000 + 1 GiB (was 0xC0000000 + 512 MiB), modem pool 0xC0000000 + 16 MiB, window 0xC1004000 + 3904 MiB (was 0xE1004000 + 3264 MiB; `hw.memsize` 4093640704). Kept pool buffers give way when the pool has no room, the window server's too for its own request; `keep()` keeps no pool buffer under 64 MiB free.
 Results [V host]: `gpu-pool-test.sh` ok, `ram-map-test.sh` ok; iOS 26 kernel 220 applied, 0 errors, exit 0; iOS 16 kernel exit 0, 0 LSE; Mu FD holds the new entries; mkadt on that FD gives the new window.
 Open: flash (needs a new boot image, ask the owner). Read the expected lines in `docs/laurel_sprout/uefi-boot.md`; [U] the real UEFI use, and the frame gain. Doc: `docs/laurel_sprout/gpu.md` "Pool size and pool pressure".
+
+## Mi A3 iOS 26: RedwoodGPU cost: LAUREL GPU TIME, push rule, kept buffers (2026-11-03, branch t3/laurel-gpu-dirty-flush-outside-lock; host only, NOTHING RUN ON THE PHONE)
+Done: patches 2975 (`LAUREL GPU TIME`), 2976 (kept buffers go back only if they help; a pool buffer with a live user map waits), 2977 (dirty rule, write-combined scattered, push outside `gGPULock`), 2978 (table runs, surface list). Doc: `docs/laurel_sprout/gpu.md` "Cost in RedwoodGPU requests".
+Next: boot. Read `LAUREL GPU PUSH`, `LAUREL GPU WC`, `LAUREL GPU TIME`, `push us`, `LAUREL GPU POOL: ... waits`. [U] the frame gain; [U] pageable write-combined pages on the phone.
