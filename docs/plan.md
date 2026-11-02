@@ -1,6 +1,7 @@
 # Plan and status
 
 ## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
+State 2026-11-02 09:15: ready for the owner's go on the Mi A3 first flash: `docs/laurel_sprout/first-flash-checklist.md`. Host results at laurel-sprout: both kernels build; test-dualboot, 63 of 63 build checks, boot-menu-test, qemu 12 scenarios; iOS 26 root same bytes in repeat builds. Nothing has run on the phone.
 Mi A3 iOS 16 LSE emulation fixes (2026-11-02, branch t3/laurel-ios16-lse, pushed, not merged; HOST ONLY, NOTHING RUN ON THE PHONE: no flash, no reboot, no adb, no fastboot): owner decision on the 0081 findings. `docs/laurel_sprout/ios16-lse.md`.
 Done: laurel 2960 on the iOS 16 kernel: recovery table end after the 0081 ranges (a fault in an emulated LSE word was a panic), LDUMIN flags; from the truth test: bad pointer EXC_BAD_ACCESS with a second vm_fault, top byte, LDAPR A and R bits. Skipped on iOS 26 (`skip.txt`). New `test-lse0081.sh`, `copyio-table-check.py` in both kernel builds.
 Results [V host]: truth test 2,000,010 cases, 0 mismatches, 0 table misses, rules 138 of 138; the same test on the old text: 200,010 cases, 79,810 mismatches, 33,244 table misses. Kernels: iOS 16 and iOS 26: 0 errors, 0 LSE, printf OK, armv80 0. iOS 26 output against f1f8216: source trees differ only in the stamp header; 102 bytes differ in 10 runs (df778ff), all stamp, UUID and build date.
