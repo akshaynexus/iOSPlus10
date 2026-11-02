@@ -1238,6 +1238,48 @@ static void glass_bypass_start(void)
 	g_cabd_init = method_setImplementation(init, (IMP)glass_init);
 	nlog("LAUREL GLASS: on: live CABackdropLayer capture off in %s (touch %s/live-glass to bring it back)", name, NMTL_DIR);
 }
+extern "C" void native_bridge_metal_loss_counts(uint64_t out[8]);
+extern "C" void native_bridge_metal_texture_pool_limit(uint64_t bytes);
+extern "C" void native_bridge_metal_texture_pool_trim(bool all, uint64_t *held);
+/*
+ * Lost work and what is made, per process: one line each 30 s when a number moved: `LAUREL METAL COUNT`. A 1 s timer gives back pooled textures nobody asked for in 2 s.
+ * Pool sizes: IOS-26-Hot's 192 MiB / 64 MiB at 2.81 M pixels (self-reported, A640), x 0.4 for our 1.12 M pixels, rounded up. Kill switch NEGRONIMETAL_TEXTURE_POOL=0.
+ */
+static void metal_count_start(void)
+{
+	const char *name = getprogname() ?: "";
+	const char *kill = getenv("NEGRONIMETAL_TEXTURE_POOL");
+	const uint64_t cap = kill != NULL && kill[0] == '0' ? 0 : !strcmp(name, "backboardd") ? 96ull << 20 : !strcmp(name, "SpringBoard") ? 32ull << 20 : 0;
+	if (!strcmp(name, "backboardd") || !strcmp(name, "SpringBoard")) {
+		native_bridge_metal_texture_pool_limit(cap);
+		if (cap)
+			nlog("LAUREL TEXTURE POOL: on: up to %llu MiB of transient render targets reused in %s, 2 s at most", (unsigned long long)(cap >> 20), name);
+		else
+			nlog("LAUREL TEXTURE POOL: off: NEGRONIMETAL_TEXTURE_POOL=0");
+	}
+	dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+	if (!t)
+		return;
+	dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, 200 * NSEC_PER_MSEC);
+	static uint64_t last[8];
+	__block unsigned tick = 0;
+	dispatch_source_set_event_handler(t, ^{
+		uint64_t held = 0;
+		if (cap)
+			native_bridge_metal_texture_pool_trim(false, &held);
+		if (++tick % 30)
+			return;
+		uint64_t c[8];
+		native_bridge_metal_loss_counts(c);
+		if (memcmp(c, last, sizeof(c)) == 0)
+			return;
+		nlog("LAUREL METAL COUNT: draws skipped %llu, pipeline sets refused %llu, textures refused %llu, heap misses %llu, no-copy refused %llu; last 30 s: textures made %llu (%llu MiB), taken from the pool %llu; pool holds %llu MiB",
+		     (unsigned long long)c[0], (unsigned long long)c[1], (unsigned long long)c[2], (unsigned long long)c[3], (unsigned long long)c[4], (unsigned long long)(c[5] - last[5]),
+		     (unsigned long long)((c[6] - last[6]) >> 20), (unsigned long long)(c[7] - last[7]), (unsigned long long)(held >> 20));
+		memcpy(last, c, sizeof(c));
+	});
+	dispatch_resume(t);
+}
 #endif
 
 /*
@@ -1655,6 +1697,9 @@ static void watchdog_start(void)
 			deadman_clear_later(strike);
 			first_completion_watch(strike, CFAbsoluteTimeGetCurrent());
 			memory_watch();
+#ifdef NMTL_IOS26
+			metal_count_start();
+#endif
 			const long wd = env_num("NEGRONIMETAL_WATCHDOG", -1); /* 1 / 0 force it on / off; default: backboardd only */
 			if (!strcmp(getprogname(), "backboardd"))
 				telemetry_loop();

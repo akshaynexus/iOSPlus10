@@ -1,0 +1,202 @@
+laurel iOS 26 frontend: reuse transient render targets (RT without ShaderWrite, private, 2D, one level): live glass makes them per frame, and each new one is a kernel buffer or a share of one. Idea: IOS-26-Hot canPoolTextureDesc (MIT; self-reported on an A640). Counters of textures made.
+
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+index 0da1563..016af2e 100644
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -86,11 +86,12 @@ static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint
+ static std::atomic<uint64_t> gDrawsSkipped,gPipelineSetsRefused;
+ // laurel: what the plug-in's `LAUREL METAL COUNT` line reads: the refusals that lose nothing (heap misses: the caller's next heap or its own texture; no-copy textures: RenderBox's IOSurface path) beside the ones that lose a draw.
+ static std::atomic<uint64_t> gHeapMisses,gNoCopyRefused;
++static std::atomic<uint64_t> gTexturesMade,gTextureBytesMade,gPoolHits;
+ static bool gSeedBump=true;
+ static std::mutex gSkipLock;
+ static NSMutableSet<NSString *> *gSkipSeen;
+ #include "laurel_rules.h"
+-extern "C" void native_bridge_metal_loss_counts(uint64_t out[5]);
++extern "C" void native_bridge_metal_loss_counts(uint64_t out[8]);
+ static void noteSkipped(NSString *what,bool draw) {
+  if(draw)gDrawsSkipped++;else gPipelineSetsRefused++;
+  std::lock_guard<std::mutex> lock(gSkipLock);
+@@ -100,8 +101,9 @@ static void noteSkipped(NSString *what,bool draw) {
+  [gSkipSeen addObject:what];
+  NBLOG(@"native-metal: %@ skipped, the command buffer goes on (logged once): %@",draw?@"draw":@"render pipeline",what);
+ }
+-extern "C" void native_bridge_metal_loss_counts(uint64_t out[5]) {
++extern "C" void native_bridge_metal_loss_counts(uint64_t out[8]) {
+  out[0]=gDrawsSkipped.load();out[1]=gPipelineSetsRefused.load();out[2]=gTextureRefusals.load();out[3]=gHeapMisses.load();out[4]=gNoCopyRefused.load();
++ out[5]=gTexturesMade.load();out[6]=gTextureBytesMade.load();out[7]=gPoolHits.load();
+ }
+ static void noteFormat(uint32_t format,bool made) {
+  std::lock_guard<std::mutex> lock(gProblemLock);
+@@ -224,6 +226,9 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer);
+ @property(nonatomic,strong) id<MTLTexture> parent;
+ @property(nonatomic,strong) id<MTLHeap> parentHeap;
+ @property(nonatomic) NSUInteger heapOffset;
++@property(nonatomic) BOOL poolable;   // laurel (flame-ios26/0004)
++@property(nonatomic) uint64_t poolBytes;
++- (uint64_t *)poolKeyWords;
+ @end
+ @implementation NBBuffer
+ - (MTLTextureCompressionType)compressionType {return MTLTextureCompressionTypeLossless;}   // iOS 26 QuartzCore: a buffer holds no compressed texture
+@@ -303,7 +308,33 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
+  *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
+  return true;
+ }
+-@implementation NBTexture
++// laurel (flame-ios26/0004): live glass makes its capture and blur targets each frame: new textures -> new GPU memory, zeroed by the kernel, from a pool that runs out (02:54:49: 0 of 512 MB, 7 submissions in 5 s).
++// A plain render target nobody writes from a shader goes back here at its dealloc (the command buffers that named it hold it till they complete, flame/0006) and the next asker of the same descriptor takes it.
++// Contents are not kept for anyone: Metal promises none at a new texture. A texture with any other use goes the old way. Limits: laurel_rules.h. Kill switch NEGRONIMETAL_TEXTURE_POOL=0.
++static std::mutex gPoolLock;
++static struct laurel_pool gPool;
++static uint64_t gPoolCapBytes;      // 0: off in this process
++static bool poolAsked(const NmbTextureDescriptor &r) {
++ if(!gPoolCapBytes || r.type!=MTLTextureType2D || r.depth!=1 || r.levels!=1 || r.samples!=1 || r.array_length!=1 || r.width<64 || r.height<64)return false;
++ if(((r.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift)!=MTLStorageModePrivate)return false;
++ return (r.usage&MTLTextureUsageRenderTarget)!=0 && (r.usage&MTLTextureUsageShaderWrite)==0;
++}
++static void poolKey(const NmbTextureDescriptor &r,uint64_t key[8]) {
++ key[0]=r.format;key[1]=r.width;key[2]=r.height;key[3]=r.usage;key[4]=r.options;key[5]=0;key[6]=0;key[7]=0;
++}
++static void poolRelease(void *h) {nmb_texture_release((NmbTexture *)h);}
++extern "C" void native_bridge_metal_texture_pool_limit(uint64_t bytes) {gPoolCapBytes=bytes;}
++// What nobody asked for in 2 s goes back; bytes held now in *held. The plug-in's 1 s timer. all: everything (a refused allocation).
++extern "C" void native_bridge_metal_texture_pool_trim(bool all,uint64_t *held) {
++ void *out[LAUREL_POOL_SLOTS];unsigned n=0;const uint64_t now=nowUs();
++ {std::lock_guard<std::mutex> lock(gPoolLock);
++  while(n<LAUREL_POOL_SLOTS && (all?gPool.count>0:laurel_pool_oldest_stale(&gPool,now)))out[n++]=laurel_pool_drop_oldest(&gPool);
++  if(held)*held=gPool.bytes;}
++ for(unsigned i=0;i<n;i++)poolRelease(out[i]);
++}
++@implementation NBTexture {
++ uint64_t _poolKey[8];
++}
+ // iOS 26 (23F84): what a texture holds. A view holds nothing of its own; a surface its allocation; a buffer texture its rows; a private texture its extent at 4 bytes a sample.
+ - (NSUInteger)allocatedSize {
+  if(_parent)return 0;
+@@ -325,7 +356,19 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
+ - (void)setHandle:(NmbTexture *)handle {if(!_handle && handle)gLiveTextures++;_handle=handle;}
+ - (void)setSurface:(IOSurfaceRef)surface {if(!_surface && surface)gLiveSurfaceTextures++;_surface=surface;}
+ - (void)makeAliasable {if(_parentHeap && !nmb_texture_make_aliasable(_handle))noteRefused(@"heap texture makeAliasable",lastError());}
+-- (void)dealloc {if(_handle)gLiveTextures--;if(_surface)gLiveSurfaceTextures--;nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}
++- (uint64_t *)poolKeyWords {static_assert(sizeof(_poolKey)==8*sizeof(uint64_t),"key");return _poolKey;}
++- (void)dealloc {
++ if(_handle)gLiveTextures--;
++ if(_surface)gLiveSurfaceTextures--;
++ if(_poolable && _handle && gPoolCapBytes && !_surface && !_parent && !_parentHeap && !_buffer && _poolBytes<=gPoolCapBytes){
++  void *out[LAUREL_POOL_SLOTS];unsigned n=0;
++  {std::lock_guard<std::mutex> lock(gPoolLock);
++   while(!laurel_pool_fits(&gPool,_poolBytes,gPoolCapBytes,LAUREL_POOL_SLOTS) && n<LAUREL_POOL_SLOTS)out[n++]=laurel_pool_drop_oldest(&gPool);
++   laurel_pool_put(&gPool,_handle,_poolKey,_poolBytes,nowUs());}
++  for(unsigned i=0;i<n;i++)poolRelease(out[i]);
++ } else nmb_texture_release(_handle);
++ if(_surface)CFRelease(_surface);
++}
+ - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
+ - (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)_descriptor.format;}
+ - (NSUInteger)width {return _descriptor.width;}
+@@ -351,6 +394,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
+ - (BOOL)isCompressed {return NO;}
+ - (NSString *)formattedDescription:(NSUInteger)indent {(void)indent;return [self description];}
+ - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
++ _poolable=NO;   // laurel (flame-ios26/0004)
+  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
+  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
+  return (MTLPurgeableState)answer;
+@@ -2315,11 +2359,29 @@ static bool pipelinesStopped(NSError **error) {
+ }
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
+  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+- NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
++ // laurel (flame-ios26/0004): a transient render target of the same descriptor, when one went back
++ const bool poolable=poolAsked(descriptor);uint64_t key[8]={},poolBytes=0;
++ NmbTexture *handle=nullptr;
++ if(poolable){
++  poolKey(descriptor,key);
++  std::lock_guard<std::mutex> lock(gPoolLock);
++  handle=(NmbTexture *)laurel_pool_take(&gPool,key);
++ }
++ uint64_t real=0,realAlign=0;
++ if(gDevice && nmb_device_heap_texture_size(gDevice,&descriptor,&real,&realAlign))poolBytes=real;
++ if(handle)gPoolHits++;
++ else{
++  handle=nmb_texture_new(gDevice,&descriptor);
++  if(!handle && poolable){native_bridge_metal_texture_pool_trim(true,nullptr);handle=nmb_texture_new(gDevice,&descriptor);}   // the pool's memory first, before a refusal
++  if(handle){gTexturesMade++;gTextureBytesMade+=poolBytes;}
++ }
++ noteFormat((uint32_t)descriptor.format,handle!=nullptr);
+  if(!handle){noteRefused([NSString stringWithFormat:@"texture type %lu fmt %lu %lux%lux%lu levels %lu samples %lu array %lu usage 0x%lx options 0x%lx",
+    (unsigned long)d.textureType,(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.depth,(unsigned long)d.mipmapLevelCount,
+    (unsigned long)d.sampleCount,(unsigned long)d.arrayLength,(unsigned long)d.usage,(unsigned long)d.resourceOptions],lastError());return nil;}
+- NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
++ NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
++ if(poolable){texture.poolable=poolBytes!=0;texture.poolBytes=poolBytes;memcpy([texture poolKeyWords],key,sizeof(key));}
++ return (id<MTLTexture>)texture;
+ }
+ // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
+ // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
+diff --git a/phone/metal2/laurel_rules.h b/phone/metal2/laurel_rules.h
+index 1bcc8e4..4369f39 100644
+--- a/phone/metal2/laurel_rules.h
++++ b/phone/metal2/laurel_rules.h
+@@ -20,4 +20,60 @@ static inline uint64_t laurel_kernel_max_threads(uint64_t runtime_max, uint64_t
+ 		answer *= 2;
+ 	return answer >= width ? answer : runtime_max;
+ }
++
++/* The transient-texture pool (flame-ios26/0004; idea: IOS-26-Hot canPoolTextureDesc, MIT, self-reported on an A640). Plain data, one lock outside. */
++#define LAUREL_POOL_SLOTS 32
++#define LAUREL_POOL_MAX_AGE_US 2000000ull   /* a pooled texture nobody asked for in 2 s goes back: the GPU pool is the phone's short resource */
++struct laurel_pool_slot { void *handle; uint64_t key[8]; uint64_t bytes, stamp_us; };
++struct laurel_pool { struct laurel_pool_slot slot[LAUREL_POOL_SLOTS]; unsigned count; uint64_t bytes; };
++/* Newest first: a texture of the same key. NULL: none. */
++static inline void *laurel_pool_take(struct laurel_pool *p, const uint64_t key[8])
++{
++	for (unsigned i = p->count; i > 0; i--) {
++		struct laurel_pool_slot *s = &p->slot[i - 1];
++		int same = 1;
++		for (unsigned k = 0; k < 8; k++)
++			same &= s->key[k] == key[k];
++		if (same) {
++			void *h = s->handle;
++			p->bytes -= s->bytes;
++			for (unsigned j = i; j < p->count; j++)
++				p->slot[j - 1] = p->slot[j];
++			p->count--;
++			return h;
++		}
++	}
++	return (void *)0;
++}
++/* Takes the oldest slot out and gives its handle. For the caller's release, outside the lock. */
++static inline void *laurel_pool_drop_oldest(struct laurel_pool *p)
++{
++	if (!p->count)
++		return (void *)0;
++	void *h = p->slot[0].handle;
++	p->bytes -= p->slot[0].bytes;
++	for (unsigned j = 1; j < p->count; j++)
++		p->slot[j - 1] = p->slot[j];
++	p->count--;
++	return h;
++}
++/* Room for bytes within cap_bytes and cap_count? The caller drops the oldest until this says yes. */
++static inline int laurel_pool_fits(const struct laurel_pool *p, uint64_t bytes, uint64_t cap_bytes, unsigned cap_count)
++{
++	return p->bytes + bytes <= cap_bytes && p->count < cap_count && p->count < LAUREL_POOL_SLOTS;
++}
++static inline void laurel_pool_put(struct laurel_pool *p, void *handle, const uint64_t key[8], uint64_t bytes, uint64_t now_us)
++{
++	struct laurel_pool_slot *s = &p->slot[p->count++];
++	s->handle = handle;
++	for (unsigned k = 0; k < 8; k++)
++		s->key[k] = key[k];
++	s->bytes = bytes;
++	s->stamp_us = now_us;
++	p->bytes += bytes;
++}
++static inline int laurel_pool_oldest_stale(const struct laurel_pool *p, uint64_t now_us)
++{
++	return p->count && now_us - p->slot[0].stamp_us > LAUREL_POOL_MAX_AGE_US;
++}
+ #endif
