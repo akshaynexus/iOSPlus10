@@ -674,7 +674,9 @@ to-android)
   _try=0
   until fastboot -s "$FB_S" set_active a; do
     _try=$((_try + 1))
-    [ "$_try" -lt 4 ] || die "set_active a failed 4 times: nothing changed. Run: fastboot reboot bootloader, then this step again. (From slot b that command can start iOS once: then hold Power + Vol Down)"
+    [ "$_try" -lt 10 ] || die "set_active a failed 10 times: nothing changed. Run: fastboot reboot bootloader, then this step again. (From slot b that command can start iOS once: then hold Power + Vol Down)"
+    sleep 3   # [V phone] 'Invalid Slot' went away after some tries with pauses
+    fastboot -s "$FB_S" getvar slot-count >/dev/null 2>&1 || true
     sleep 1
   done
   fastboot -s "$FB_S" reboot || die "slot a is active, but ABL did not take reboot: hold Power for a restart"

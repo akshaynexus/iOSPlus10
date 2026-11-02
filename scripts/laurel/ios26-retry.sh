@@ -11,6 +11,7 @@ cd "$(dirname "$0")/../.."
 M=${1:-}
 [ "$M" != ro ] || M=
 DB="sh scripts/laurel/dual-boot.sh"
+run() { "$@" > /tmp/ios26-retry.$$ 2>&1 || { cat /tmp/ios26-retry.$$; rm -f /tmp/ios26-retry.$$; die "failed: $*"; }; tail -n 1 /tmp/ios26-retry.$$; rm -f /tmp/ios26-retry.$$; }
 say() { echo "$(date +%H:%M:%S) ios26-retry: $*"; }
 die() { say "STOP: $*"; exit 1; }
 fb_ok() { timeout 3 fastboot devices 2>/dev/null | grep -q fastboot; }
@@ -26,7 +27,7 @@ wait_android() {
 to_root() { timeout 15 adb root >/dev/null 2>&1 || true; sleep 3; c=0; until [ "$(timeout 3 adb get-state 2>/dev/null)" = device ]; do [ "$c" -lt 20 ] || return 1; sleep 2; c=$((c + 1)); done; }
 
 say "building the image"
-$DB image $M 2>&1 | tail -n 1
+run $DB image $M
 if [ "$(timeout 3 adb get-state 2>/dev/null || true)" = device ] && [ "$(timeout 5 adb shell getprop ro.boot.slot_suffix 2>/dev/null | tr -d '\r')" = _a ]; then
   say "Android is already on slot a"
 else
@@ -39,18 +40,18 @@ else
     say "the fastboot session answers wrongly, try $i"; sleep 2
   done
   [ "$ok" = 1 ] || die "the fastboot session stays wrong: run fastboot reboot bootloader, or hold Power + Vol Down again, then run this again"
-  CONFIRM=to-android $DB to-android 2>&1 | tail -n 1
+  CONFIRM=to-android; export CONFIRM; run $DB to-android
 fi
 wait_android || die "Android did not finish booting: read the screen; do not accept a reset"
 to_root || die "no adb root"
-$DB android-check 2>&1 | tail -n 1
+run $DB android-check
 timeout 20 adb reboot bootloader
 wait_fb 40 || die "no fastboot after adb reboot bootloader"
 sleep 2
-CONFIRM=flash-slot-b $DB flash-slot-b $M 2>&1 | tail -n 1
+CONFIRM=flash-slot-b; export CONFIRM; run $DB flash-slot-b $M
 timeout 15 fastboot reboot >/dev/null 2>&1 || say "ABL did not take reboot: hold Power"
 wait_android || die "Android did not start after flash-slot-b"
 to_root || die "no adb root"
 say "switching to iOS at $(date +%H:%M:%S)"
-CONFIRM=switch $DB switch $M 2>&1 | tail -n 1
+CONFIRM=switch; export CONFIRM; run $DB switch $M
 say "done: iOS 26 is booting. Read the panel; USB log: logs/usblog-*.txt"
