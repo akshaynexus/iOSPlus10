@@ -1,0 +1,28 @@
+laurel 9009 (iOS 26): the panel command self-check tries for up to 10 s
+
+[V boots 14, 15] LAUREL BACKLIGHT: off: DSI command DMA does not complete, twice in a row, panel black. [I] It runs at the same moment as the GPU self-check of 2961. [U] the cause; the new line gives the number of tries.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-03 02:12:16.456462149 +0530
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-03 02:12:16.481086211 +0530
+@@ -782,7 +782,20 @@
+ 		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
+ 		/* self-check: the default level through the command DMA (also leaves the panel at the DT default) */
+ 		fBlSent = fBlLevel;
+-		fDcsOk = fDsiBuf != NULL && fBlLock != NULL && dsiSelfCheck(fBlLevel);
++		/*
++		 * laurel 9009: [V boots 14, 15] "DSI command DMA does not complete" twice in a row, with the panel black, while the boot that passed had no GPU
++		 * self-check yet. One failed try must not end the feature: [I] the GPU self-check (clock, rail, bus votes) can run at the same moment. Up to 10 s.
++		 */
++		fDcsOk = false;
++		if (fDsiBuf != NULL && fBlLock != NULL) {
++			uint32_t tries = 0;
++			while (tries++ < 20 && !(fDcsOk = dsiSelfCheck(fBlLevel))) {
++				IOSleep(500);
++			}
++			if (tries > 1) {
++				IOLog("LAUREL BACKLIGHT: self-check: %s after %u tries\n", fDcsOk ? "passed" : "failed", tries - 1);
++			}
++		}
+ 	}
+ 	fHsync = hsync;
+ 	fPwrLock = IOLockAlloc();
