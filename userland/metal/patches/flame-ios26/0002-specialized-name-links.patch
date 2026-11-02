@@ -1,0 +1,133 @@
+iOS 26 frontend + bridge: newFunctionWithDescriptor: keeps specializedName, so a stage's MTLLinkedFunctions links the function under that name (m2v-ios26/0001).
+[V 23F84] RB::Device::RenderPipelineEntry::Loader::load_custom_fn and RB::Function::load_function: setName: <effect>, setSpecializedName: @"custom_fn". The first patch of this series dropped the name ("only labels"): that was wrong.
+Without it RenderBox custom effects and shape masks have no pipeline: boot 11: custom_effect:clampToEdges_v1, primitive_custom:glow_v1, primitive_custom:simplifiedShapeAwareGradientMask_v1.
+
+diff -ruN a/phone/metal2/bridge/NativeMetalObjects.h b/phone/metal2/bridge/NativeMetalObjects.h
+--- a/phone/metal2/bridge/NativeMetalObjects.h	2026-11-03 00:26:07.651123728 +0530
++++ b/phone/metal2/bridge/NativeMetalObjects.h	2026-11-03 00:26:07.654142904 +0530
+@@ -117,6 +117,8 @@
+  * indexed value; bytes holds the value's bytes. */
+ struct NmbConstant {uint64_t type, index; const char *name; const void *bytes; uint64_t length;};
+ NmbFunction *nmb_function_new_specialized(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
++/* newFunctionWithDescriptor: specialized_name (null or empty: none) is the name a stage links it under; has_constants: constants holds count entries */
++NmbFunction *nmb_function_new_with_descriptor(NmbLibrary *, const char *name, const char *specialized_name, const struct NmbConstant *constants, uint32_t count, bool has_constants);
+ void nmb_function_release(NmbFunction *);
+ /* Metal's MTLFunctionType (1 vertex, 2 fragment, 3 kernel, ...). */
+ uint64_t nmb_function_type(const NmbFunction *);
+diff -ruN a/phone/metal2/bridge/NativeMetalObjects.rs b/phone/metal2/bridge/NativeMetalObjects.rs
+--- a/phone/metal2/bridge/NativeMetalObjects.rs	2026-11-03 00:26:07.639123579 +0530
++++ b/phone/metal2/bridge/NativeMetalObjects.rs	2026-11-03 00:26:07.642123616 +0530
+@@ -1040,6 +1040,53 @@
+     })
+ }
+ 
++/// `newFunctionWithDescriptor:`: `specialized_name` is the name a stage links this function under (MTLFunctionDescriptor.specializedName: RenderBox's custom_fn);
++/// null or empty keeps `name`. When `has_constants`, `constants` holds `count` entries, as `nmb_function_new_specialized`.
++///
++/// # Safety
++/// `name` is a C string; `specialized_name` is null or a C string; `constants` as `nmb_function_new_specialized`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_function_new_with_descriptor(library: *mut NmbLibrary, name: *const c_char, specialized_name: *const c_char,
++                                                          constants: *const NmbConstant, count: u32, has_constants: bool) -> *mut NmbFunction {
++    guard(std::ptr::null_mut(), || {
++        if name.is_null() || (constants.is_null() && count > 0) {
++            return Err("null function name or constants".into());
++        }
++        // SAFETY: the caller's contract.
++        let name = unsafe { CStr::from_ptr(name) }.to_str().map_err(e("function name"))?;
++        let mut descriptor = metal2vulkan_runtime::FunctionDescriptor::new(name);
++        if !specialized_name.is_null() {
++            // SAFETY: the caller's contract.
++            let link_name = unsafe { CStr::from_ptr(specialized_name) }.to_str().map_err(e("specialized function name"))?;
++            if !link_name.is_empty() {
++                descriptor.specialized_name = Some(link_name.to_owned());
++            }
++        }
++        if has_constants {
++            let list = if count == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(constants, count as usize) } };
++            let mut values = FunctionConstantValues::defaults();
++            for c in list {
++                if c.bytes.is_null() {
++                    return Err("constant without bytes".into());
++                }
++                // SAFETY: the caller's contract.
++                let bytes = unsafe { std::slice::from_raw_parts(c.bytes as *const u8, c.length as usize) };
++                let value = FunctionConstantValue::new(raw::<DataType>(c.kind, "constant type")?, bytes.to_vec());
++                if c.name.is_null() {
++                    values.by_index.insert(u32::try_from(c.index).map_err(e("constant index"))?, value);
++                } else {
++                    // SAFETY: the caller's contract.
++                    let key = unsafe { CStr::from_ptr(c.name) }.to_str().map_err(e("constant name"))?;
++                    values.by_name.insert(key.to_string(), value);
++                }
++            }
++            descriptor.constant_values = Some(values);
++        }
++        let function = get(library)?.0.new_function_with_descriptor(&descriptor).map_err(e("function descriptor"))?;
++        Ok(boxed(NmbFunction(function)))
++    })
++}
++
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_function_release(function: *mut NmbFunction) {
+     release(function)
+diff -ruN a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm	2026-11-03 00:26:07.628123442 +0530
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm	2026-11-03 00:26:07.631123480 +0530
+@@ -557,6 +557,11 @@
+ - (NSData *)bitCodeWithHash:(const void *)hash {(void)hash;return nil;}
+ - (void)dealloc {nmb_library_release(_handle);}
+ - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
++ return [self newFunctionWithName:name linkName:nil constantValues:values error:error];
++}
++// linkName: MTLFunctionDescriptor.specializedName, the name a stage's MTLLinkedFunctions links it under. RenderBox names every custom effect "custom_fn"
++// (RB::Device::RenderPipelineEntry::Loader::load_custom_fn, RB::Function::load_function, 23F84): custom_effect_fragment and primitive_custom_fragment call that symbol.
++- (id<MTLFunction>)newFunctionWithName:(NSString *)name linkName:(NSString *)linkName constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
+  if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
+   NBLOG(@"native-metal: %@: unqualified function constant values (%s)",name,values?object_getClassName(values):"nil");
+   if(error)*error=nbError(@"unqualified function constant values");return nil;
+@@ -583,7 +588,7 @@
+   for(uint64_t i=0;i<c.length;i++){snprintf(head,sizeof head,"%02x",((const uint8_t *)c.bytes)[i]);text+=head;}
+  }
+  const uint64_t functionBegan=nowUs();
+- NmbFunction *handle=nmb_function_new_specialized(_handle,name.UTF8String,constants.data(),(uint32_t)constants.size());gTimeFunction.add(functionBegan);
++ NmbFunction *handle=nmb_function_new_with_descriptor(_handle,name.UTF8String,linkName.UTF8String,constants.data(),(uint32_t)constants.size(),true);gTimeFunction.add(functionBegan);
+  // One S line per specialization (int-155: every QuartzCore pipeline was made on its draw, and a refused generic function would leave its
+  // generic pipeline unmade without a word): the function, its constants, the time, the refusal and QuartzCore's callers.
+  if(!gJournalPath.empty()) {
+@@ -595,7 +600,7 @@
+   noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
+   if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
+  }
+- NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
++ NBFunction *function=[NBFunction new];function.handle=handle;function.name=linkName.length?linkName:name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+  function.constantsText=text;[function hashWithLibrary:_libraryHash];if(error)*error=nil;return (id<MTLFunction>)function;
+ }
+ - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
+@@ -607,8 +612,7 @@
+  return [self newFunctionWithName:name constantValues:values error:error];
+ }
+ - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
+-// The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
+-// runtime does when the function is made.
++// The descriptor's name, specialized name and constants; its options ask for compile-time work the runtime does when the function is made.
+ - (NSArray *)externFunctionNames {return @[];}
+ - (id)newExternFunctionWithName:(NSString *)name {(void)name;return nil;}
+ - (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error {(void)url;if(error)*error=nbError(@"serializing a library is not supported");return NO;}
+@@ -618,7 +622,15 @@
+ }
+ - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error {
+  if(!d.name){if(error)*error=nbError(@"a function name is required");return nil;}
+- if(d.constantValues)return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
++ if(d.constantValues)return [self newFunctionWithName:d.name linkName:d.specializedName constantValues:d.constantValues error:error];
++ if(d.specializedName.length) {
++  const uint64_t functionBegan=nowUs();
++  NmbFunction *handle=nmb_function_new_with_descriptor(_handle,d.name.UTF8String,d.specializedName.UTF8String,nullptr,0,false);gTimeFunction.add(functionBegan);
++  if(!handle){if(error)*error=nbError([NSString stringWithFormat:@"function %@ as %@: %@",d.name,d.specializedName,lastError()]);return nil;}
++  NBFunction *linked=[NBFunction new];linked.handle=handle;linked.name=d.specializedName;linked.functionType=(MTLFunctionType)nmb_function_type(handle);
++  [linked hashWithLibrary:_libraryHash];
++  if(error)*error=nil;return (id<MTLFunction>)linked;
++ }
+  id<MTLFunction> function=[self newFunctionWithName:d.name];
+  if(!function){if(error)*error=nbError([NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);return nil;}
+  if(error)*error=nil;return function;
