@@ -1,0 +1,792 @@
+laurel 2976: kept pool buffers go back only when that helps, and only what the request needs (laurel_gpu_kept_core.h). Fixes 2974: a request over the chunk room or a fragmented pool gave back all kept buffers, the window server's too, and the log said "the pool is empty"; fixes 2916 at gemNew: under the 64 MiB floor each ask gave back all kept buffers of all clients. A pool buffer with a live user mapping waits off the GPU tables until the descriptor has no other retain: its bytes never go to another client (Turnip unmaps before GEM close [V], the kernel does not rely on that). Lines: LAUREL GPU KEPT: no free range holds B bytes: K KiB of kept buffers gave way; LAUREL GPU KEPT: under the 64 MiB floor: ...; LAUREL GPU POOL: a buffer of B bytes at A waits: a user mapping is still there. Host test scripts/laurel/gpu-push-test.sh.
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index b55287e..b5814df 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -46,6 +46,7 @@
+ 
+ #include "SweetSurface.h"
+ #include "laurel_gpu_time_core.h"       /* laurel 2975 */
++#include "laurel_gpu_kept_core.h"       /* laurel 2976 */
+ 
+ extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
+ bool topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds);
+@@ -490,6 +491,7 @@ static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (
+ 
+ class RedwoodGPUUserClient;
+ extern "C" uint64_t redwood_gpu_pool_take(uint64_t size, void ** va, bool all);        /* laurel 2974 */
++extern "C" uint64_t redwood_gpu_pool_floor(uint64_t size, uint64_t floor);              /* laurel 2976 */
+ extern "C" uint64_t redwood_gpu_give_back_kept(void);          /* laurel 2916 */
+ extern "C" void redwood_gpu_held(uint64_t * buffers, uint64_t * host, uint64_t * kept, uint32_t * clients);
+ #define GPU_CLIENTS 64
+@@ -532,8 +534,9 @@ class RedwoodGPUUserClient : public IOUserClient
+ 
+ public:
+ 	uint64_t giveBackKept(void);    /* laurel 2916: with the lock held */
+-	struct gpu_kept * oldestPoolKept(bool all);     /* laurel 2974: with the lock held */
+-	void dropKeptOne(struct gpu_kept * k) { dropKept(k); }
++	unsigned poolKeptItems(struct lgk_item * items, unsigned most, uint16_t client);        /* laurel 2976: with the lock held */
++	void dropKeptSlot(uint32_t slot) { dropKept(&fKept[slot]); }
++	bool isWindowServer(void) const { return fWindowServer; }
+ 	void held(uint64_t * buffers, uint64_t * host, uint64_t * kept);
+ 	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
+ 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+@@ -604,6 +607,71 @@ RedwoodGPUUserClient::start(IOService * provider)
+ 	return fBuffers != NULL;
+ }
+ 
++/*
++ * laurel 2976: a pool buffer goes back to the pool only when no user mapping of it is left. A pool descriptor is memory by address: a user mapping (an
++ * IOMemoryMap, which holds a retain of the descriptor) does not keep the pool from giving these bytes to another client, and then it reads and writes that
++ * client's buffer. Turnip gives its mapping back before GEM close [V tu_drm_bo_finish: redwood_drm_unmap, then GEM_CLOSE], so in normal use the count is 1 here.
++ * No trust in that: a client that closes or exits with the map still there (IOUserClient keeps maps with the connection, or with the task when the
++ * connection has gone: destroyUserReferences). Every retain of the descriptor is taken under gGPULock (clientMemoryForType) or held by a map: count 1 under the
++ * lock means no map, and none can come (the handle is gone). The buffer waits here, off the GPU's tables, until the count is 1; the next submission or a
++ * short pool looks again. Bounded by what the client had mapped; it holds only pool bytes, and a short pool sends others to scattered pages.
++ */
++#define kSamePlaceBase          0x80000000ull
++static struct lgk_mapped * gGPUMapped;          /* under gGPULock */
++static uint32_t gGPUMappedCount;
++static uint64_t gGPUMappedBytes;
++
++static bool
++gpuHeldByMap(IOMemoryDescriptor * memory, uint64_t address)
++{
++	return lgk_held_by_map(address >= kSamePlaceBase || redwood_gpu_identity(), OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL, memory->getRetainCount());
++}
++
++/* With the lock held; the buffer is off the GPU's tables. Takes over the caller's reference. */
++static void
++gpuMappedWait(IOMemoryDescriptor * memory, uint64_t address, uint64_t span)
++{
++	static uint32_t times;
++	struct lgk_mapped * m = IONew(struct lgk_mapped, 1);
++
++	if (m != NULL) {
++		m->next = gGPUMapped;
++		m->memory = memory;
++		m->address = address;
++		m->span = span;
++		gGPUMapped = m;
++		gGPUMappedCount++;
++		gGPUMappedBytes += span;
++	}                                       /* (no memory for the entry: the bytes stay out of the pool for good, and the descriptor with them) */
++	if (times++ < 8 || (times & 255) == 0) {
++		IOLog("LAUREL GPU POOL: a buffer of %llu bytes at %#llx waits: a user mapping is still there (%u waiting, %llu MiB, case %u)\n", span, address,
++		    gGPUMappedCount, gGPUMappedBytes >> 20, times);
++	}
++}
++
++static int
++gpuMappedRetains(void * memory)
++{
++	return ((IOMemoryDescriptor *) memory)->getRetainCount();
++}
++
++static void
++gpuMappedBack(struct lgk_mapped * m)
++{
++	gGPUMappedCount--;
++	gGPUMappedBytes -= m->span;
++	redwood_gpu_address_free(m->address, m->span);
++	((IOMemoryDescriptor *) m->memory)->release();
++	IODelete(m, struct lgk_mapped, 1);
++}
++
++/* With the lock held: what no user mapping holds now goes back. */
++static void
++gpuMappedSweep(void)
++{
++	(void) lgk_mapped_sweep(&gGPUMapped, gpuMappedRetains, gpuMappedBack);
++}
++
+ /*
+  * With the lock held, and the GPU done with everything it has been given (`idle`). If it is
+  * not -- it has stopped answering -- the buffer's memory stays the GPU's for good: it may yet be
+@@ -644,7 +712,10 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 		} else if (redwood_gpu_ready()) {
+ 			redwood_gpu_unmap(b->address, b->span);
+ 			/* topaz: in pass-through the address is the memory itself; a surface's is the surface's, not the pool's */
+-			if (!(redwood_gpu_identity() && b->surface != NULL)) {
++			if (b->surface == NULL && gpuHeldByMap(b->memory, b->address)) {
++				gpuMappedWait(b->memory, b->address, b->span);  /* laurel 2976 */
++				b->memory = NULL;
++			} else if (!(redwood_gpu_identity() && b->surface != NULL)) {
+ 				redwood_gpu_address_free(b->address, b->span);
+ 			}
+ 		}
+@@ -681,7 +752,10 @@ RedwoodGPUUserClient::reap(void)
+ 			left->memory = NULL;
+ 		} else if (redwood_gpu_ready()) {
+ 			redwood_gpu_unmap(left->address, left->span);
+-			if (!(redwood_gpu_identity() && left->surface != NULL)) {
++			if (left->surface == NULL && gpuHeldByMap(left->memory, left->address)) {
++				gpuMappedWait(left->memory, left->address, left->span); /* laurel 2976 */
++				left->memory = NULL;
++			} else if (!(redwood_gpu_identity() && left->surface != NULL)) {
+ 				redwood_gpu_address_free(left->address, left->span);
+ 			}
+ 		}
+@@ -693,6 +767,9 @@ RedwoodGPUUserClient::reap(void)
+ 		}
+ 		*left = fLeft[--fLeftCount];
+ 	}
++	if (gGPUMapped != NULL) {
++		gpuMappedSweep();               /* laurel 2976 */
++	}
+ }
+ 
+ IOReturn
+@@ -746,6 +823,11 @@ RedwoodGPUUserClient::free(void)
+ 		fBuffers = NULL;
+ 	}
+ 	IOUserClient::free();
++	if (gGPULock != NULL) {
++		IOLockLock(gGPULock);           /* laurel 2976: this client's maps have gone with it */
++		gpuMappedSweep();
++		IOLockUnlock(gGPULock);
++	}
+ }
+ 
+ struct gpu_buffer *
+@@ -766,7 +848,6 @@ RedwoodGPUUserClient::buffer(uint32_t handle)
+  * GPU VA = PA (TopazAdreno.cpp IDENT window 0x80000000-0xffffffff); the allocator's addresses are below it. So the
+  * pool's bookkeeping (address = physical) stays as in pass-through.
+  */
+-#define kSamePlaceBase          0x80000000ull
+ static bool
+ sameAddress(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint64_t * address)
+ {
+@@ -872,9 +953,16 @@ RedwoodGPUUserClient::dropKept(struct gpu_kept * k)
+ 	}
+ 	if (redwood_gpu_ready()) {
+ 		redwood_gpu_unmap(k->address, k->size);
+-		redwood_gpu_address_free(k->address, k->size);
++		if (gpuHeldByMap(k->memory, k->address)) {
++			gpuMappedWait(k->memory, k->address, k->size);  /* laurel 2976 */
++			k->memory = NULL;
++		} else {
++			redwood_gpu_address_free(k->address, k->size);
++		}
++	}
++	if (k->memory != NULL) {
++		k->memory->release();
+ 	}
+-	k->memory->release();
+ 	k->memory = NULL;
+ 	fKeptBytes -= k->size;
+ }
+@@ -894,21 +982,26 @@ RedwoodGPUUserClient::giveBackKept(void)
+ 	return bytes;
+ }
+ 
+-/* laurel 2974: with the lock held. The kept pool buffer that waited longest, or NULL. all: the window server's as well. */
+-struct gpu_kept *
+-RedwoodGPUUserClient::oldestPoolKept(bool all)
++/* laurel 2976: with the lock held. The kept pool buffers that can go back now: a live user mapping keeps the bytes in any case. The number put in items. */
++unsigned
++RedwoodGPUUserClient::poolKeptItems(struct lgk_item * items, unsigned most, uint16_t client)
+ {
+-	struct gpu_kept * oldest = NULL;
++	unsigned n = 0;
+ 
+-	if (fWindowServer && !all) {
+-		return NULL;
+-	}
+-	for (uint32_t i = 0; i < GPU_KEPT; i++) {
+-		if (fKept[i].memory != NULL && fKept[i].address >= kSamePlaceBase && (oldest == NULL || fKept[i].since < oldest->since)) {
+-			oldest = &fKept[i];
++	for (uint32_t i = 0; i < GPU_KEPT && n < most; i++) {
++		struct gpu_kept * k = &fKept[i];
++
++		if (k->memory != NULL && k->address >= kSamePlaceBase && !gpuHeldByMap(k->memory, k->address)) {
++			items[n].pa = k->address;
++			items[n].len = k->size;
++			items[n].since = k->since;
++			items[n].client = client;
++			items[n].slot = (uint16_t) i;
++			items[n].chosen = false;
++			n++;
+ 		}
+ 	}
+-	return oldest;
++	return n;
+ }
+ 
+ void
+@@ -924,30 +1017,23 @@ bool
+ RedwoodGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags)
+ {
+ 	struct gpu_kept * place = NULL;
++	struct lgk_slot slots[GPU_KEPT];
++	unsigned evict[GPU_KEPT], evicts = 0;
+ 
+-	if (gGPUKeep == 0 || size < GPU_KEEP_FROM || size > GPU_KEPT_BYTES / 4 || memory == NULL ||
+-	    (kernel == NULL && OSDynamicCast(IOBufferMemoryDescriptor, memory) == NULL)) {
+-		return false;
+-	}
+ 	/* laurel 2974: a short pool gets its buffer back: 91-119 MiB stayed kept with 0 of 512 MiB free (log 2026-11-03 02:54:49-02:55:00) */
+-	if (address >= kSamePlaceBase && !topaz_gpu_midmem() && !topaz_gpu_pool_room(0, 64ull << 20)) {
++	if (!lgk_may_keep(gGPUKeep != 0, size, GPU_KEEP_FROM, GPU_KEPT_BYTES / 4, memory != NULL && (kernel != NULL || OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL),
++	    address >= kSamePlaceBase, topaz_gpu_midmem(), address < kSamePlaceBase || topaz_gpu_pool_room(0, 64ull << 20))) {
+ 		return false;
+ 	}
+-	for (;;) {
+-		struct gpu_kept * oldest = NULL;
+-
+-		place = NULL;
+-		for (uint32_t i = 0; i < GPU_KEPT; i++) {
+-			if (fKept[i].memory == NULL) {
+-				place = place != NULL ? place : &fKept[i];
+-			} else if (oldest == NULL || fKept[i].since < oldest->since) {
+-				oldest = &fKept[i];
+-			}
+-		}
+-		if (place != NULL && fKeptBytes + size <= GPU_KEPT_BYTES) {
+-			break;
+-		}
+-		dropKept(oldest);
++	for (uint32_t i = 0; i < GPU_KEPT; i++) {
++		slots[i].used = fKept[i].memory != NULL;
++		slots[i].size = fKept[i].size;
++		slots[i].since = fKept[i].since;
++	}
++	/* laurel 2976: the rule is host tested */
++	place = &fKept[lgk_keep_pick(slots, GPU_KEPT, fKeptBytes, size, GPU_KEPT_BYTES, evict, &evicts)];
++	for (unsigned i = 0; i < evicts; i++) {
++		dropKept(&fKept[evict[i]]);
+ 	}
+ 	place->memory = memory;
+ 	place->kernel = kernel != NULL ? kernel : (uint8_t *) OSDynamicCast(IOBufferMemoryDescriptor, memory)->getBytesNoCopy();
+@@ -1045,9 +1131,12 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		/* laurel 2895: the last 64 MiB of the pool are the window server's: the desktop must draw when posters fill the rest */
+ 		uint64_t pa = 0;
+ 
+-		/* laurel 2916: kept buffers make way before a new one goes to wired pages (the lock is not held here) */
++		/*
++		 * laurel 2916: kept buffers make way before a new one goes to wired pages (the lock is not held here). laurel 2976: only what this request needs
++		 * (before: all kept buffers of all clients, at each ask, up to twice a second: `given again` near 0 while the pool was short).
++		 */
+ 		if (!ident && !fWindowServer && !topaz_gpu_pool_room(size, 64ull << 20)) {
+-			(void) redwood_gpu_give_back_kept();
++			(void) redwood_gpu_pool_floor(size, 64ull << 20);
+ 		}
+ 		if (ident || fWindowServer || topaz_gpu_pool_room(size, 64ull << 20)) {
+ 			pa = redwood_gpu_pool_take(size, &va, ident || fWindowServer);  /* laurel 2974: kept buffers give way first */
+@@ -1914,46 +2003,85 @@ redwood_gpu_give_back_kept(void)
+ }
+ 
+ /*
+- * laurel 2974: a pool buffer; when the pool has none, kept pool buffers go back, the longest kept first, until one fits. all: the window server's
+- * as well (only its own request, or the pass-through path where the pool is the only memory; at most GPU_KEPT_BYTES per client). 0: the pool has
+- * none even so: the caller goes to scattered pages (gemNew; user space sees slower frames, no failure) or fails only in pass-through.
+- * Takes gGPULock: not from under it. The pool's lock is taken inside it, as always (2156). No wait anywhere: a request never sleeps for pool memory.
++ * laurel 2974, laurel 2976: a pool buffer; when no free range holds it, kept pool buffers go back: only if they help, only what it needs (laurel_gpu_kept_core.h,
++ * host test). all: the window server's as well, when the others' cannot do it (only its own request, or pass-through where the pool is the only memory).
++ * 0: the pool has none even so: the caller goes to scattered pages (gemNew; user space sees slower frames, no failure) or fails only in pass-through.
++ * Takes gGPULock: not from under it. The pool's lock is taken inside it, as always (2156). A request never sleeps for pool memory.
+  */
++extern "C" uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
++extern "C" bool topaz_gpu_pool_can_hold(uint64_t size);
++extern "C" uint64_t topaz_gpu_pool_free_bytes(void);
++extern "C" bool topaz_gpu_pool_plan_fit(uint64_t size, struct lgk_item * items, unsigned n);
++
++static struct lgk_item gGPUKeptItems[LGK_ITEMS];        /* under gGPULock: too large for a stack */
++
++static bool gpuOpCanHold(void *, uint64_t size) { return topaz_gpu_pool_can_hold(size); }
++static uint64_t gpuOpAlloc(void *, uint64_t size, void ** va) { return topaz_gpu_pool_alloc(size, va); }
++static void gpuOpLock(void *) { IOLockLock(gGPULock); }
++static void gpuOpUnlock(void *) { IOLockUnlock(gGPULock); }
++static bool gpuOpPlanFit(void *, uint64_t size, struct lgk_item * items, unsigned n) { return topaz_gpu_pool_plan_fit(size, items, n); }
++static uint64_t gpuOpFreeBytes(void *) { return topaz_gpu_pool_free_bytes(); }
++static void gpuOpSweep(void *) { gpuMappedSweep(); }
++
++static unsigned
++gpuOpCollect(void *, struct lgk_item * items, unsigned most, bool window_server)
++{
++	unsigned n = 0;
++
++	/* (first pass: the others'; second pass: with the window server's) */
++	for (uint16_t i = 0; i < GPU_CLIENTS && n < most; i++) {
++		if (gGPUClients[i] != NULL && (window_server || !gGPUClients[i]->isWindowServer())) {
++			n += gGPUClients[i]->poolKeptItems(items + n, most - n, i);
++		}
++	}
++	return n;
++}
++
++static void
++gpuOpDrop(void *, const struct lgk_item * item)
++{
++	if (gGPUClients[item->client] != NULL) {
++		gGPUClients[item->client]->dropKeptSlot(item->slot);
++	}
++}
++
++static const struct lgk_ops gGPUKeptOps = {
++	NULL, gpuOpCanHold, gpuOpAlloc, gpuOpLock, gpuOpUnlock, gpuOpCollect, gpuOpPlanFit, gpuOpFreeBytes, gpuOpDrop, gpuOpSweep,
++};
++
+ extern "C" uint64_t
+ redwood_gpu_pool_take(uint64_t size, void ** va, bool all)
+ {
+ 	static uint32_t times;
+-	uint64_t pa = topaz_gpu_pool_alloc(size, va), bytes = 0;
++	struct lgk_result res;
++	uint64_t pa;
+ 
+-	if (pa != 0 || gGPULock == NULL || topaz_gpu_midmem()) {
+-		return pa;
++	if (gGPULock == NULL || topaz_gpu_midmem()) {
++		return topaz_gpu_pool_alloc(size, va);
+ 	}
+-	IOLockLock(gGPULock);
+-	while (pa == 0) {
+-		RedwoodGPUUserClient * who = NULL;
+-		struct gpu_kept * k = NULL;
++	pa = lgk_take(&gGPUKeptOps, gGPUKeptItems, size, va, all, &res);
++	if (res.bytes != 0 && (times++ < 4 || (times & 255) == 0)) {
++		IOLog("LAUREL GPU KEPT: no free range holds %llu bytes: %llu KiB of kept buffers gave way (%s, call %u)\n", size, res.bytes >> 10,
++		    pa != 0 ? "it fits now" : "still no room", times);
++	}
++	return pa;
++}
+ 
+-		for (uint32_t i = 0; i < GPU_CLIENTS; i++) {
+-			struct gpu_kept * one = gGPUClients[i] != NULL ? gGPUClients[i]->oldestPoolKept(all) : NULL;
++/* laurel 2976: a client under the floor: free bytes for it and the floor, the oldest of the others' kept buffers, nothing if they are not enough. Takes gGPULock. */
++extern "C" uint64_t
++redwood_gpu_pool_floor(uint64_t size, uint64_t floor)
++{
++	static uint32_t times;
++	uint64_t bytes;
+ 
+-			if (one != NULL && (k == NULL || one->since < k->since)) {
+-				k = one;
+-				who = gGPUClients[i];
+-			}
+-		}
+-		if (k == NULL) {
+-			break;
+-		}
+-		bytes += k->size;
+-		who->dropKeptOne(k);
+-		pa = topaz_gpu_pool_alloc(size, va);
++	if (gGPULock == NULL || topaz_gpu_midmem()) {
++		return 0;
+ 	}
+-	IOLockUnlock(gGPULock);
++	bytes = lgk_floor(&gGPUKeptOps, gGPUKeptItems, size, floor);
+ 	if (bytes != 0 && (times++ < 4 || (times & 255) == 0)) {
+-		IOLog("LAUREL GPU KEPT: the pool is empty: %llu MiB of kept buffers gave way for one of %llu bytes (%s, call %u)\n", bytes >> 20, size,
+-		    pa != 0 ? "it fits now" : "still no room", times);
++		IOLog("LAUREL GPU KEPT: under the 64 MiB floor: %llu KiB of kept buffers gave way for %llu bytes (call %u)\n", bytes >> 10, size, times);
+ 	}
+-	return pa;
++	return bytes;
+ }
+ 
+ extern "C" void
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 5c7574a..6644360 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -219,6 +219,7 @@ static bool gpu_pool_ready;
+  * that is out (else refused and counted), and an allocation never gives a buffer across a chunk.
+  */
+ #include "laurel_gpu_pool_core.h"
++#include "laurel_gpu_kept_core.h"       /* laurel 2976 */
+ static struct lgp gpu_pool;
+ LCK_GRP_DECLARE(laurel_gpu_pool_grp, "laurel_gpu_pool");
+ LCK_MTX_DECLARE(laurel_gpu_pool_lock, &laurel_gpu_pool_grp);  /* gpu_pool, gpu_chunk_va, gpu_pool_ready; nothing else taken inside */
+@@ -400,6 +401,43 @@ topaz_gpu_pool_room(uint64_t size, uint64_t keep)
+ 	return room;
+ }
+ 
++/* laurel 2976: can the pool ever hold it; its free bytes; which kept buffers to give back (laurel_gpu_kept_core.h). The lock is taken here (gGPULock outside, 2156). */
++extern "C" bool topaz_gpu_pool_can_hold(uint64_t size);
++bool
++topaz_gpu_pool_can_hold(uint64_t size)
++{
++	return lgk_pool_can_hold(gpu_pool_size, size);
++}
++
++extern "C" uint64_t topaz_gpu_pool_free_bytes(void);
++uint64_t
++topaz_gpu_pool_free_bytes(void)
++{
++	uint64_t bytes = gpu_pool_size;
++
++	if (gpu_pool_size != 0) {
++		lck_mtx_lock(&laurel_gpu_pool_lock);
++		bytes = gpu_pool_ready ? gpu_pool.free_bytes : gpu_pool_size;
++		lck_mtx_unlock(&laurel_gpu_pool_lock);
++	}
++	return bytes;
++}
++
++extern "C" bool topaz_gpu_pool_plan_fit(uint64_t size, struct lgk_item *items, unsigned n);
++bool
++topaz_gpu_pool_plan_fit(uint64_t size, struct lgk_item *items, unsigned n)
++{
++	static struct lgk_seg seg[LGK_SEGS];    /* under the lock: too large for a stack */
++	bool found = false;
++
++	if (gpu_pool_size != 0) {
++		lck_mtx_lock(&laurel_gpu_pool_lock);
++		found = gpu_pool_ready && lgk_plan_fit(&gpu_pool, size, items, n, seg);
++		lck_mtx_unlock(&laurel_gpu_pool_lock);
++	}
++	return found;
++}
++
+ /* laurel 2156: for RedwoodGPU's buffers line: free memory, ranges, frees refused/lost, ranges passed over */
+ extern "C" void topaz_gpu_pool_note(char *s, size_t n);
+ void
+diff --git a/iokit/Kernel/arm/laurel_gpu_kept_core.h b/iokit/Kernel/arm/laurel_gpu_kept_core.h
+new file mode 100644
+index 0000000..e5e944f
+--- /dev/null
++++ b/iokit/Kernel/arm/laurel_gpu_kept_core.h
+@@ -0,0 +1,340 @@
++/*
++ * laurel 2976: which kept pool buffers go back, plain C, so that a host test runs exactly this file against the real pool bookkeeping
++ * (scripts/laurel/gpu-push-test.sh, tools/gpu-push-test/). RedwoodGPU.cpp gives the ops; TopazAdreno.cpp holds the pool's lock around lgk_plan_fit.
++ * Rule: a kept buffer goes back only when that helps the request, and only as many as it needs:
++ *   - a request the pool can never hold (over a chunk's room, or no pool): none;
++ *   - room by bytes under the floor (lgk_plan_floor): the oldest, until the free bytes are enough; none at all when all of them would not be enough;
++ *   - no free range that fits (lgk_plan_fit): the cheapest run of adjacent free ranges and kept buffers in one chunk that gives one range of the size.
++ *     None when no such run exists (outside neighbours are live buffers): then a drop would only hurt the next frame.
++ *   - the window server's only for its own request or pass-through, and only when the others' cannot do it.
++ *   - a buffer with a live user mapping is not a candidate: its memory cannot go back (RedwoodGPU.cpp gpuMappedWait).
++ */
++#ifndef LAUREL_GPU_KEPT_CORE_H
++#define LAUREL_GPU_KEPT_CORE_H
++
++#define LGK_ITEMS       512     /* candidates looked at, at most; past it fewer go back (safe: the request goes to scattered pages) */
++
++struct lgk_item {
++	uint64_t pa, len, since;
++	uint16_t client, slot;          /* the caller's: where it is */
++	bool chosen;
++};
++
++/*
++ * A pool buffer with a user mapping waits off the GPU's tables until the mapping has gone: the descriptor's retain count is the only proof the kernel has that no client can still reach
++ * the bytes. retains: count of the descriptor under gGPULock; 1 is the buffer's own reference. Not for own kernel memory (IOBufferMemoryDescriptor): a map of it holds the pages.
++ */
++struct lgk_mapped {
++	struct lgk_mapped *next;
++	void *memory;
++	uint64_t address, span;
++};
++
++static inline bool
++lgk_held_by_map(bool pool_address, bool kernel_memory, int retains)
++{
++	return pool_address && !kernel_memory && retains > 1;
++}
++
++/* What no map holds now: unlinked and passed to give_back, which frees the entry. The number that went back. */
++static inline unsigned
++lgk_mapped_sweep(struct lgk_mapped **head, int (*retains)(void *memory), void (*give_back)(struct lgk_mapped *m))
++{
++	unsigned count = 0;
++
++	while (*head != NULL) {
++		struct lgk_mapped *m = *head;
++
++		if (retains(m->memory) > 1) {
++			head = &m->next;
++			continue;
++		}
++		*head = m->next;
++		give_back(m);
++		count++;
++	}
++	return count;
++}
++
++/* a kept buffer of `size` bytes may stay kept: everything but the pool's room is the caller's */
++static inline bool
++lgk_may_keep(bool keep_on, uint64_t size, uint64_t from, uint64_t most, bool own_memory, bool in_pool, bool midmem, bool pool_room)
++{
++	return keep_on && size >= from && size <= most && own_memory && !(in_pool && !midmem && !pool_room);
++}
++
++struct lgk_slot {
++	bool used;
++	uint64_t size, since;
++};
++
++/*
++ * Where a new kept buffer goes, and which go first (oldest first) so that the bytes stay under `most`. evict[]: slot numbers, *evicts of them.
++ * The result: the free slot. The caller has size <= most.
++ */
++static inline int
++lgk_keep_pick(const struct lgk_slot *slots, unsigned n, uint64_t kept, uint64_t size, uint64_t most, unsigned *evict, unsigned *evicts)
++{
++	bool gone[64] = { false };
++	int place = -1;
++
++	*evicts = 0;
++	for (;;) {
++		int oldest = -1;
++
++		place = -1;
++		for (unsigned i = 0; i < n; i++) {
++			if (!slots[i].used || gone[i]) {
++				place = place >= 0 ? place : (int)i;
++			} else if (oldest < 0 || slots[i].since < slots[oldest].since) {
++				oldest = (int)i;
++			}
++		}
++		if (place >= 0 && kept + size <= most) {
++			return place;
++		}
++		if (oldest < 0) {
++			return place;           /* (size <= most: not reached) */
++		}
++		gone[oldest] = true;
++		kept -= slots[oldest].size;
++		evict[(*evicts)++] = (unsigned)oldest;
++	}
++}
++
++/* `need` bytes: the oldest until they are enough. Nothing when all are not enough. The bytes chosen. */
++static inline uint64_t
++lgk_plan_floor(struct lgk_item *items, unsigned n, uint64_t need)
++{
++	uint64_t all = 0, got = 0;
++
++	for (unsigned i = 0; i < n; i++) {
++		all += items[i].len;
++		items[i].chosen = false;
++	}
++	if (need == 0 || all < need) {
++		return 0;
++	}
++	while (got < need) {
++		struct lgk_item *oldest = NULL;
++
++		for (unsigned i = 0; i < n; i++) {
++			if (!items[i].chosen && (oldest == NULL || items[i].since < oldest->since)) {
++				oldest = &items[i];
++			}
++		}
++		oldest->chosen = true;
++		got += oldest->len;
++	}
++	return got;
++}
++
++#ifdef LAUREL_GPU_POOL_CORE_H
++#define LGK_SEGS        (LGP_RANGES + LGK_ITEMS)
++struct lgk_seg {
++	uint64_t pa, len;
++	int item;                       /* -1: a free range */
++};
++
++/* the pool's whole-unit size of a kept buffer */
++static inline uint64_t
++lgk_units(uint64_t size)
++{
++	return (size + GPU_POOL_UNIT - 1) & ~(uint64_t)(GPU_POOL_UNIT - 1);
++}
++
++/* the pool could ever give `size` bytes as one buffer */
++static inline bool
++lgk_pool_can_hold(uint64_t pool_size, uint64_t size)
++{
++	uint64_t whole = lgk_units(size);
++
++	return pool_size != 0 && size != 0 && whole <= GPU_POOL_CHUNK - GPU_POOL_UNIT && whole <= pool_size;
++}
++
++/*
++ * items[n] are buffers that are out and could go back. Which of them, set `chosen`, leave one free range of `size` bytes in one chunk, with the fewest
++ * kept bytes given up (equal: the older ones)? seg[LGK_SEGS]: room of the caller's. items[] comes back sorted by address. false: no set does it, none chosen.
++ */
++static inline bool
++lgk_plan_fit(const struct lgp *p, uint64_t size, struct lgk_item *items, unsigned n, struct lgk_seg *seg)
++{
++	unsigned count = 0, i = 0, r = 0, l = 0;
++	uint64_t whole = lgk_units(size), have = 0, cost = 0, newest = 0;
++	uint64_t best_cost = 0, best_newest = 0;
++	unsigned best_l = 0, best_r = 0;
++	bool found = false;
++
++	for (unsigned a = 1; a < n; a++) {
++		struct lgk_item it = items[a];
++		unsigned b = a;
++
++		for (; b > 0 && items[b - 1].pa > it.pa; b--) {
++			items[b] = items[b - 1];
++		}
++		items[b] = it;
++	}
++	for (unsigned a = 0; a < n; a++) {
++		items[a].chosen = false;
++	}
++	while ((i < n || r < p->count) && count < LGK_SEGS) {
++		if (r < p->count && (i >= n || p->range[r].start < items[i].pa)) {
++			seg[count].pa = p->range[r].start;
++			seg[count].len = p->range[r].size;
++			seg[count].item = -1;
++			count++;
++			r++;
++		} else {
++			/* (not really out, or not this size: never a candidate) */
++			if (lgp_is_out(p, items[i].pa, lgk_units(items[i].len))) {
++				seg[count].pa = items[i].pa;
++				seg[count].len = lgk_units(items[i].len);
++				seg[count].item = (int)i;
++				count++;
++			}
++			i++;
++		}
++	}
++	/* a window of adjacent segments of one chunk, as short as it can be for its end: the two ends walk up once each */
++	for (unsigned e = 0; e < count; e++) {
++		if (e != 0 && (seg[e - 1].pa + seg[e - 1].len != seg[e].pa ||
++		    (seg[e - 1].pa - p->base) / GPU_POOL_CHUNK != (seg[e].pa - p->base) / GPU_POOL_CHUNK)) {
++			l = e;
++			have = 0;
++			cost = 0;
++		}
++		have += seg[e].len;
++		if (seg[e].item >= 0) {
++			cost += seg[e].len;
++		}
++		while (l < e && have - seg[l].len >= whole) {
++			have -= seg[l].len;
++			if (seg[l].item >= 0) {
++				cost -= seg[l].len;
++			}
++			l++;
++		}
++		if (have >= whole) {
++			newest = 0;
++			for (unsigned w = l; w <= e; w++) {
++				if (seg[w].item >= 0 && items[seg[w].item].since > newest) {
++					newest = items[seg[w].item].since;
++				}
++			}
++			if (!found || cost < best_cost || (cost == best_cost && newest < best_newest)) {
++				found = true;
++				best_cost = cost;
++				best_newest = newest;
++				best_l = l;
++				best_r = e;
++			}
++		}
++	}
++	if (!found) {
++		return false;
++	}
++	for (unsigned w = best_l; w <= best_r; w++) {
++		if (seg[w].item >= 0) {
++			items[seg[w].item].chosen = true;
++		}
++	}
++	return true;
++}
++#endif /* LAUREL_GPU_POOL_CORE_H */
++
++/*
++ * The take itself, the same code on the phone and in the host test. ops->lock is RedwoodGPU's gGPULock. A request that a drop cannot help loses no kept buffer.
++ */
++struct lgk_ops {
++	void *ctx;
++	bool (*can_hold)(void *ctx, uint64_t size);
++	uint64_t (*alloc)(void *ctx, uint64_t size, void **va);
++	void (*lock)(void *ctx);
++	void (*unlock)(void *ctx);
++	unsigned (*collect)(void *ctx, struct lgk_item *items, unsigned most, bool window_server);
++	bool (*plan_fit)(void *ctx, uint64_t size, struct lgk_item *items, unsigned n);
++	uint64_t (*free_bytes)(void *ctx);
++	void (*drop)(void *ctx, const struct lgk_item *item);
++	void (*sweep)(void *ctx);
++};
++
++struct lgk_result {
++	uint64_t bytes;         /* kept bytes given back */
++	bool too_big;           /* the pool can never hold it: nothing given back */
++	bool no_help;           /* no set of kept buffers helps: nothing given back */
++};
++
++static inline uint64_t
++lgk_drop_chosen(const struct lgk_ops *o, const struct lgk_item *items, unsigned n)
++{
++	uint64_t bytes = 0;
++
++	for (unsigned i = 0; i < n; i++) {
++		if (items[i].chosen) {
++			bytes += items[i].len;
++			o->drop(o->ctx, &items[i]);
++		}
++	}
++	return bytes;
++}
++
++/* all: the window server's as well, when the others' cannot do it. items[LGK_ITEMS]: under ops->lock, the caller's room. */
++static inline uint64_t
++lgk_take(const struct lgk_ops *o, struct lgk_item *items, uint64_t size, void **va, bool all, struct lgk_result *res)
++{
++	uint64_t pa;
++
++	res->bytes = 0;
++	res->too_big = false;
++	res->no_help = false;
++	if (!o->can_hold(o->ctx, size)) {
++		res->too_big = true;
++		return 0;
++	}
++	pa = o->alloc(o->ctx, size, va);
++	if (pa != 0) {
++		return pa;
++	}
++	o->lock(o->ctx);
++	o->sweep(o->ctx);                       /* what waited for a user mapping that has gone */
++	pa = o->alloc(o->ctx, size, va);
++	for (unsigned pass = 0; pa == 0 && pass < (all ? 2u : 1u); pass++) {
++		unsigned n = o->collect(o->ctx, items, LGK_ITEMS, pass == 1);
++
++		if (n != 0 && o->plan_fit(o->ctx, size, items, n)) {
++			res->bytes += lgk_drop_chosen(o, items, n);
++			pa = o->alloc(o->ctx, size, va);
++		}
++	}
++	res->no_help = pa == 0 && res->bytes == 0;
++	o->unlock(o->ctx);
++	return pa;
++}
++
++/* the floor (a client that is not the window server, under `floor` free): the others' kept buffers, oldest first, as much as the request needs */
++static inline uint64_t
++lgk_floor(const struct lgk_ops *o, struct lgk_item *items, uint64_t size, uint64_t floor)
++{
++	uint64_t bytes = 0;
++
++	if (!o->can_hold(o->ctx, size)) {
++		return 0;
++	}
++	o->lock(o->ctx);
++	o->sweep(o->ctx);
++	{
++		uint64_t free_now = o->free_bytes(o->ctx), want = size + floor;
++
++		if (free_now < want) {
++			unsigned n = o->collect(o->ctx, items, LGK_ITEMS, false);
++
++			if (lgk_plan_floor(items, n, want - free_now) != 0) {
++				bytes = lgk_drop_chosen(o, items, n);
++			}
++		}
++	}
++	o->unlock(o->ctx);
++	return bytes;
++}
++
++#endif /* LAUREL_GPU_KEPT_CORE_H */
