@@ -5247,3 +5247,11 @@ Full text: `docs/laurel_sprout/gpu.md` section "All stock levels". Patch 2961, b
 - 900 and 950 MHz need the CX iPeak feature bit: no feature (`ENABLE` 0) = those levels stay out, with the note `N: no CX iPeak in this boot`. [I] Unless boot firmware sets the bit it reads 0, because on stock the HLOS driver `cx_ipeak_cdev.c` sets it; then the top level is 820 MHz. The bit alone is not the fix: stock sets bypass and thermal clients with it.
 - A tick with a bad counter still runs the thermal rule.
 - Open before long-load tests [V trinket-thermal.dtsi]: stock has `quiet-therm` skin limits (48 C, 52 C to the lowest level) and six other zones that send the GPU to its lowest level; this patch reads sensor 15 only, once a second. See the review in the owner's thread.
+
+## Mi A3 iOS 26: red top bar: SpringBoard's bar is SystemStatusUI, not UIKit (2026-11-03, branch t3/laurel-notch-red-statusbar-fix; host only, not on the phone)
+- [V 23F84] `STUIStatusBarGetVisualProviderClassForScreen` (SystemStatusUI 0x276a0f8f4) does not read `UIStatusBarVisualProviderClassName`, only PTSettings `visualProviderSettings.visualProviderClassName`. So the iOS 16 pref does not reach SpringBoard on 26, and a hook on `_UIStatusBarVisualProvider_Split` never runs there.
+- [V] `+[STUIStatusBarVisualProvider_Split visualProviderSubclassForScreen:visualProviderInfo:]` 0x276a98010: 9 tables, then nil -> `STUIStatusBarVisualProvider_Fallback` (systemRedColor).
+- Fix: liblaurel-notch hooks that method: nil -> `STUIStatusBarVisualProvider_FixedSplit`. One line `top bar: on|off: reason`, also by a check 60 s after the start. Details: ios26-touch.md section 5.
+- Lesson: a class in UIKitCore can have a twin in SystemStatusUI (STUI prefix). Find which process uses which before a hook. `strings` of one image is not enough: read `dsc-image.py DIR images`.
+- [U] The look of FixedSplit on 26; apps (own process, UIKit path, the pref applies [I]).
+

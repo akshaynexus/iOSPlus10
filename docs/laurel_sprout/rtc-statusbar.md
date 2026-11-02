@@ -78,6 +78,8 @@ Host check: `out/bin/op10tool ctl time`. The `LAUREL SPMI: on: ... users: pon ke
 
 ## B. Status bar: red rdar:45025538 bar at 720x1560 @2x (root change)
 
+**iOS 26 (23F84):** SpringBoard's bar is `STUIStatusBar` of SystemStatusUI. It does not read this key. See `ios26-touch.md` section 5. The text below is iOS 16 (20H392).
+
 ### Cause [V binary: 20H392 iPhone10,3 UIKitCore and SpringBoard, read with `scripts/debug/statusbar-re.sh`]
 
 `_UIStatusBarGetVisualProviderClassForScreen` (UIKitCore 0x1891aaa80):

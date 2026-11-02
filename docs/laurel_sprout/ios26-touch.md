@@ -72,7 +72,34 @@ Kernel only. Nothing on the root changes.
 
 ## 5. Red top bar
 
-### [V] 23F84 UIKitCore
+### Settled 2026-11-03 [V 23F84 SystemStatusUI 0x276a0f8f4, phone boot 16]: the wrong stack was hooked
+
+**SpringBoard's bar is `STUIStatusBar` of SystemStatusUI, not `_UIStatusBar` of UIKitCore.** The analysis further down is correct for UIKitCore only, so the hook on `_UIStatusBarVisualProvider_Split` is never reached in SpringBoard.
+
+| Question | Answer |
+|---|---|
+| Is `UIStatusBarVisualProviderClassName` read? | By UIKitCore: yes. By `STUIStatusBarGetVisualProviderClassForScreen`: **no**. SystemStatusUI has no such string [V]. It reads PTSettings only: `STUIStatusBarSettingsDomain.rootSettings.visualProviderSettings.visualProviderClassName`, then `NSClassFromString` |
+| Who picks the provider? | `STUIStatusBarGetNativeVisualProviderClassForScreenWithVisualProviderInfo` 0x276a3c0c8 -> `+[STUI.._iOS]` -> `+[STUI.._Phone]` 0x276a3c7b8 (rect y <= 0: `_Split`, y > 0: `_DynamicSplit`) -> `+[STUI.._Split visualProviderSubclassForScreen:visualProviderInfo:]` 0x276a98010 |
+| Fallback in `_Split`? | None: 9 tables, then nil [V]. Nil -> `STUIStatusBarVisualProvider_Fallback`: `systemRedColor` background [V 0x276a58100] |
+| Is the class there? | `STUIStatusBarVisualProvider_FixedSplit` exists, complete [V]. Method type `#32@0:8@16@24` [V] |
+| Loaded in SpringBoard? | SpringBoard.framework links SystemStatusUI directly [V] |
+
+The phone agrees: the pref file holds the right bytes (`od -c`, 123 bytes) and the UIKit hook gave no line. [U] The text `rdar:45025538` on the bar is in no C string of the cache in that form; the source of the text is not read. The red color and the log string are.
+
+**Fix:** `liblaurel-notch.dylib` hooks `+[STUIStatusBarVisualProvider_Split ...]` too: nil on the embedded 360x780 @2 screen gives `STUIStatusBarVisualProvider_FixedSplit`. The UIKit hook stays with no line of its own.
+
+| The line says | Meaning, next |
+|---|---|
+| `top bar: on: SystemStatusUI has no provider for 720 px: STUIStatusBarVisualProvider_FixedSplit` | Hook reached. The bar must be split, not red |
+| `top bar: on: Apple's table gives ...` | Table matched |
+| `top bar: off: SystemStatusUI gives no provider, and the screen ...` | Not the 360x780 @2 embedded screen: Apple's nil stays |
+| `top bar: off: 60 s after the start SpringBoard did not ask ...` | Self-check. No bar asked for Split in 60 s. `UIKit asked: 1` says that the UIKit path ran |
+| `top bar: off: no STUIStatusBarVisualProvider_Split/_FixedSplit ...` | Class or type changed |
+| Crash at start | Crash guard of `laurel-springboard`: 2 fast exits, no dylib for this boot |
+
+Host only: 0 warnings, armv80 0, no new library. **Not run on any UIKit.** [U] The look of `_FixedSplit` on 26: clock, cellular, Wi-Fi, battery, tap and swipe. [U] An app draws its own bar in its own process: the hook is not there, and the UIKit default applies.
+
+### [V] 23F84 UIKitCore (not the bar of SpringBoard)
 
 `_UIStatusBarGetVisualProviderClassForScreen` at 0x18a7e95a0:
 
