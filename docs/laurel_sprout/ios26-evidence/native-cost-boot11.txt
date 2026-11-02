@@ -1,0 +1,29 @@
+windows 560; GPU busy >= 30 %: 127
+-- all windows
+submissions per window           min          2 p50       61.0 p90         85 max        218
+command buffers per window       min          7 p50      272.0 p90        751 max       1599
+buffers named per window         min         68 p50    92220.0 p90      93818 max     267794
+KB pushed out of the cache       min          0 p50    72576.0 p90      72704 max     196944
+surface pushes per window        min          0 p50      32717 p90      33265 max      40441
+us in the kernel per submission  min          5 p50    25569.5 p90      28617 max      73722
+us with the lock per submission  min        148 p50      25761 p90      28814 max      75539
+GPU us per submission            min         20 p50    17970.0 p90      49747 max     536611
+GPU busy %                       min        0.0 p50      21.25 p90       46.3 max       80.2
+clock MHz                        min        300 p50      563.0 p90        674 max        950
+pool MB free                     min          0 p50       60.0 p90        282 max        401
+-- busy >= 30 %
+submissions per window           min          6 p50         73 p90        127 max        218
+command buffers per window       min        103 p50        566 p90       1134 max       1599
+buffers named per window         min       5306 p50      39604 p90     174119 max     267794
+KB pushed out of the cache       min        321 p50       1649 p90      28053 max     154709
+surface pushes per window        min          1 p50       3000 p90       5308 max      25362
+us in the kernel per submission  min        157 p50        733 p90      11006 max      72977
+us with the lock per submission  min        185 p50      906.5 p90      10878 max      71557
+GPU us per submission            min         24 p50      33238 p90      84434 max     536611
+GPU busy %                       min       30.0 p50       44.3 p90       61.4 max       80.2
+clock MHz                        min        510 p50        600 p90        949 max        950
+pool MB free                     min          0 p50        134 p90        268 max        301
+per submission, busy windows: p50 881 buffers named, 11.6 command buffers
+busy windows: total 10360 submissions; 9002605 names; 1301 MB pushed; kernel 19.6 s of CPU in 649 s
+-- LAUREL CPU TOP (seconds per 60 s, 480 available)
+minutes 141; backboardd: p50 0.0 max 45.8 (76 % of one core); busy total p50 88.1
