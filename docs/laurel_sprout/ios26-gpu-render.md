@@ -76,11 +76,11 @@ Owner's window, RedwoodGPU's lines of boot 16, live glass on:
 | Other surface | when the seed moved, or each 250 ms / 16 ms | `surface pushes` |
 | **Scattered buffer the CPU mapped** (pool full) | **every submission, no check** | [I] the 70 to 127 MB: 8 MB blocks of metal2vulkan's pools |
 
-Turnip names every buffer of the device in every submission (521 to 1,537 here), so a scattered mapped block is pushed each time whether it changed or not. It follows the pool: 4 MB a submission at 50 MB free, 72 MB at 0. Under `gGPULock`: `a submission: ... 50010 us with it`. Everything else in the kernel waits behind it. Kernel steps, not done here (the owner has the pool): push a scattered buffer only after a CPU map or write; push outside the lock.
+Turnip names every buffer of the device in every submission (521 to 1,537 here), so a scattered mapped block is pushed each time whether it changed or not. It follows the pool: 4 MB a submission at 50 MB free, 72 MB at 0. Under `gGPULock`: `a submission: ... 50010 us with it`. Everything else in the kernel waits behind it. Kernel steps: done in 2975-2978, not booted: `gpu.md` "Cost in RedwoodGPU requests".
 
 ### Why buffers are not reused [V code]
 
-1. **Kernel keep:** `keep()` takes 256 KiB and up, same size and flags. Under 64 MiB free, each `gemNew` of a client that is not the window server first gives back **all kept buffers of all clients** (`RedwoodGPU.cpp` 1022). So when memory is short, the kept list empties at each ask, and the next frame makes them again: given again 0 to 24 in 13 to 683 made.
+1. **Kernel keep:** `keep()` takes 256 KiB and up, same size and flags. Under 64 MiB free, each `gemNew` of a client that is not the window server first gives back **all kept buffers of all clients** (`RedwoodGPU.cpp` 1022). (Fixed by 2976: only what a request needs.) So when memory is short, the kept list emptied at each ask, and the next frame makes them again: given again 0 to 24 in 13 to 683 made.
 2. **Command streams:** Turnip's `tu_cs_reset` frees all BOs but the last of each of 7 streams per command buffer; 16 KiB and growing, under the keep limit. With 8 to 14 command buffers per submission that fits about 130 made a second [I]. Fix: `0104-turnip-keep-cs-bos-over-reset.patch`: 8 per array are kept.
 3. **CoreAnimation's targets:** `create_surface_with_properties` tries the transient heap, then, `_heap-miss`, a new texture; surfaces go when their pass is done [V for the heap path, I for the rate]. Full-screen 722x1562 BGRA is 4.6 MB; capture and blur at RGBA16F 896x320 is 2.3 MB; RenderBox makes 8 MB heaps. Fix: frontend pool, below.
 4. **Pool share:** metal2vulkan keeps 2 empty 8 MB blocks a memory class a process for 1 s or more. 9 Metal processes: up to 16 MB x classes each [I]. Per-client figures: not in the log [U]; `redwood_gpu_held` has them.
@@ -96,7 +96,7 @@ Not done, and why:
 
 ### What is still [U]
 
-Why 3 to 7 submissions in 5 s with the GPU busy 6 to 38 %: `the window server: N requests, M us here in all` is 2.5 to 4.2 s of 5 s [V], at 1.6 to 2 ms a request, and which requests is not in the log. The lock is not it: `0 us before the lock`. A per-selector time is the next kernel line to add.
+Why 3 to 7 submissions in 5 s with the GPU busy 6 to 38 %: `the window server: N requests, M us here in all` is 2.5 to 4.2 s of 5 s [V], at 1.6 to 2 ms a request, and which requests is not in the log. The lock is not it: `0 us before the lock`. `LAUREL GPU TIME` (2975) names them at the next boot.
 
 ## 4. Expected result [I]
 

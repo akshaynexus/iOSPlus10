@@ -164,7 +164,57 @@ What user space sees when memory is short:
 
 Self-check: `lgp_place` (host test). At the first allocation each chunk above 512 MiB must map and hold a pattern at both ends; the first that fails ends the pool there (`LAUREL GPU POOL: chunk N at 0x.. failed its check: M MiB instead of 1024 MiB`). Normal line: `LAUREL GPU POOL: on: 1024 MiB at 0x80000000, 16 chunks of 64 MiB`. Kill switch `gpu_poolbig=0`: 512 MiB. [U] A TrustZone-protected address does not fail this check: the access resets the phone. Nothing in the DTB says that any such address exists here.
 
-Tests [V host]: `scripts/laurel/gpu-pool-test.sh` part 4 (1 GiB pool, 16 chunks, `lgp_place`), `scripts/laurel/ram-map-test.sh`. No test here runs the kept-buffer path: it needs IOKit.
+Tests [V host]: `scripts/laurel/gpu-pool-test.sh` part 4 (1 GiB pool, 16 chunks, `lgp_place`), `scripts/laurel/ram-map-test.sh`. `scripts/laurel/gpu-push-test.sh` runs the kept-buffer rules (2976).
+
+### Cost in RedwoodGPU requests: time per request, push rule, kept buffers (2975-2978; host only, NOT BOOTED)
+
+Rules live in small headers that the host test builds as they are: `laurel_gpu_time_core.h`, `laurel_gpu_kept_core.h`, `laurel_gpu_push_core.h`, `laurel_gpu_table_core.h`. Test: `scripts/laurel/gpu-push-test.sh`.
+
+**`LAUREL GPU TIME` (2975).** At the end of the existing line `RedwoodGPU: a submission: ...; the window server: N requests, M us here in all; LAUREL GPU TIME: fence 7/4200, new 683/950`: `name calls/ms` of the window server, largest time first, as many as fit (line under 255 bytes, host test). Cost: 2 relaxed atomic adds per window-server request; 20 exchanges per 5 s. `fence` and `prep` include the wait for the GPU. Mapping and unmapping do not go through `externalMethod`: not counted.
+
+**The push rule of an own buffer (2977), `lgf_own_buffer`:**
+
+| Buffer | Rule | Why it is safe |
+|---|---|---|
+| Pool (VA = PA) | never | write-combined in every map |
+| Scattered, made write-combined (`wc`) | never | every page's attribute checked at make, first page again at each submission; a client that changes the cache mode with its map fails that check and is pushed |
+| Scattered, cached, a user map lives | **every submission: stays dirty** | the CPU can write at any moment and says nothing. The kernel cannot see that |
+| Scattered, cached, no map, dirty | once, then clean | a write before the unmap goes out once |
+| Scattered, cached, no map, not dirty | never | nothing can have written |
+| Host pages | every submission unless GPU read-only, as before | the client's own map always lives. No rule is safe. Only moved outside the lock |
+| Surface | as before (seed, 250 ms / 16 ms) | not changed |
+
+Each way to a CPU write, and what covers it [V code]: user map: `clientMemoryForType` sets `dirty` under the lock, and retain count > 1 while the `IOMemoryMap` lives (`mapped_now`). Unmap passes the same function: one push more, never one less. Kernel write through `b->kernel`: only `gpu_keep=2`: sets `dirty`. Closed and kept with dirty lines: `dirty` goes through `gpu_left` and `gpu_kept` (before: `seen` restarted at given-again, so a dirty line could later write over GPU output). Closed with the map alive, given again: retain count, not `seen`, so it still pushes. Host test: a model of the cache over 2000 random runs: no dirty line at any submission.
+
+**Write-combined scattered buffers.** With persistent maps the dirty rule alone saves little: Turnip keeps `bo->map` until `tu_bo_finish` [V]. So the buffer must not be cached. An option of the map does nothing on kernel memory (`topaz_gpu_pool_md` comment [V]), and a non-pageable descriptor with the option is contiguous (topaz comment). A pageable one has a VM object with `wimg_bits`, and `vm_object_iopl_request` sets each page's attribute at wiring (`PMAP_BATCH_SET_CACHE_ATTR`) [V source]; SweetSurface already uses pageable + `prepare()` [V] but never with write-combine [U on the phone]. Every page is checked after the wiring; a failed check: `LAUREL GPU WC: off: reason`, cached from then on, and the rule above pushes it. **Read cost:** a CPU read of such a block is uncached: the same as every pool buffer today; [I] about 10 times slower than cached, not measured on this phone. Only a CPU read of a mapped scattered block pays.
+
+**Push outside `gGPULock` (2977).** Rule: each entry holds a retain of `memory` (and of `surface`), taken under the lock while the buffer is alive; nothing frees its pages or the kernel map behind `kernel` until the release after the push, whatever happens to the handle (close, keep, given back for the pool). Pool memory is never pushed, so the push never touches bytes that go back to the pool. The GPU tables may change meanwhile: the push does not use them. Order: the client's CPU writes are before its submit call; the push ends with a barrier; then the lock again and the ring. `fSubmitLock`: one submission of a client at a time, so that a second one cannot see "pushed" while the first is still at it. A map during the push sets `dirty` after the scan: it stays dirty. Time before `fSubmitLock` and `gGPULock` together is `us before the lock`. `us with it` no longer holds the push. Where the push went: `push us host H, surface S, own O` in the waits line.
+
+**Kept buffers go back only if that helps (2976), `lgk_take`, `lgk_floor`, `lgk_plan_fit`.**
+
+| Request | Before (2916, 2974) | Now |
+|---|---|---|
+| over a chunk's room (70 MiB), 800 MiB free | all kept pool buffers, the window server's too, `the pool is empty` | none, no line, scattered pages |
+| fragments: bytes free, no range fits | all kept | only a set that makes one range; none if no set does |
+| under the 64 MiB floor | all kept of all clients, up to twice a second | oldest first, only the bytes it needs; none if all are not enough |
+| window server's kept | for its request, by age | only after the others' cannot do it; never for other clients |
+
+`lgk_plan_fit` takes the run of adjacent free ranges and kept buffers in one chunk with the fewest kept bytes; 400 random pools against all subsets (host test). `redwood_gpu_give_back_kept` stays for the wired guard (2906) only.
+
+**A pool buffer and a user mapping (review finding 4).** Does Mesa unmap before GEM close? **Yes** [V `tu_knl_drm.cc` `tu_drm_bo_finish`: `redwood_drm_unmap`, then GEM_CLOSE; `sweetgpu.c` `sg_bo_free` too]. Not on all paths: a client that exits or closes with its maps alive, or a bad client: IOUserClient keeps maps with the connection, then with the task (`destroyUserReferences`), after `clientClose` has freed the buffers [V]. A pool descriptor is memory by address: the map then reaches bytes the pool gives to another client. 2974 made that sooner. Closed in all 3 free paths (`freeBuffer`, `reap`, `dropKept`): if the descriptor has another retain (every `IOMemoryMap` holds one [V], every retain is taken under `gGPULock`), the buffer leaves the GPU tables and waits in `gGPUMapped`; its bytes stay out of the pool until the count is 1. Looked at again at each submission, each short pool, each client free. No kept buffer with a live map counts as room. [I, not changed] pool surfaces: a client's view reference holds the surface, so `SweetSurface::free` runs after the view has gone.
+
+**Same class of cost (2978).** `sweet_dcache_clean` is 2 barriers + a line op [V]: per table entry, so 4096 barriers for an 8 MiB buffer, at each make and free, under the lock. Now one range for adjacent entries; the last range goes in `redwood_gpu_mapped` (kill switch `gpuptebatch=0`). "Is this surface a buffer here" searched all 8192 places per `surfaceBuffer` and `surfaceDrawn`: now a list of the client's surface handles.
+
+| Change | Saves | Failure it could cause | How the log shows it |
+|---|---|---|---|
+| 2975 time | nothing: it names the cost | wrong slot name | `other` large; host test |
+| 2976 take | [V host] 0 buffers lost on the 70 MiB and fragment cases; real rate [U] | fewer give-backs: more scattered | `given again` up, `GPU pool 0`, no `gave way` lines |
+| 2976 map wait | closes a cross-client write | a retain that stays: pool bytes never back | `LAUREL GPU POOL: ... waits` with the count going up, free falling |
+| 2977 rule + WC | [V log] 28-127 MB, 18-52 ms a submission are the cost; [I] most of it own scattered; 0 for WC buffers. With WC off: little (persistent maps) | a missed push: corruption. Pageable + WC on this kernel [U]: a panic at the first scattered buffer | Corruption that `gpudirty=0` cures. Crash file. `LAUREL GPU WC: off` |
+| 2977 outside lock | other requests stop waiting 18-52 ms [V as held time] | an error in the rule: a fault in the push. Slower `us before the lock` in a client | Crash file with `redwood_gpu_to_memory`. `gpuflushout=0` cures |
+| 2978 | [I] part of `us each` in made; number after a boot | a table entry not cleaned: SMMU fault | `TopazGPU: SMMU` lines; `gpuptebatch=0` cures |
+
+Kill switches: `gpudirty=0`, `gpuflushout=0`, `gpuptebatch=0`. Start line: `LAUREL GPU PUSH: on: own buffers only after a CPU map or write; outside the lock`.
 
 ### SMMU pass-through risk (review M1)
 
