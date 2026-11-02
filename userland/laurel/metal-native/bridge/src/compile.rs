@@ -108,10 +108,14 @@ pub fn render_program_spec(compiler: *mut NmnCompiler, p: &RenderPipeline, over:
 }
 
 pub fn compute_program(compiler: *mut NmnCompiler, p: &ComputePipeline) -> Result<Program, String> {
+    compute_program_spec(compiler, p, &[])
+}
+
+pub fn compute_program_spec(compiler: *mut NmnCompiler, p: &ComputePipeline, over: &[NmnSpec]) -> Result<Program, String> {
     let bindings = lay_out(&p.layout)?;
     let push = p.layout.push_constants.iter().map(|r| r.offset + r.size).max().unwrap_or(0);
     let layout = NmnLayout { bindings: bindings.as_ptr(), binding_count: bindings.len() as u32, push_bytes: push };
-    let stage = Stage::new(&p.stage, 2)?;
+    let stage = Stage::new(&p.stage, 2)?.with(over);
     let input = stage.input();
     let mut why = [0 as c_char; 256];
     let program = unsafe { nmn_program_compute(compiler, &layout, &input, 0, 0, 0, why.as_mut_ptr(), why.len()) };

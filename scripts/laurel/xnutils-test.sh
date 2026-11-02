@@ -86,6 +86,7 @@ if unshare -r true 2>/dev/null; then
   grep -q "$(printf '%s' "$W26" | sed 's/[*]/[*]/')" "$(dirname "$0")/root-add-metal-ios26.sh" || { echo "xnutils-test: FAIL: XT_METAL_WIDE differs from root-add-metal-ios26.sh" >&2; fail=1; }
   printf 'NEGRONIMETAL_OPEN_MS=60000\nTU_DEBUG=old\n' > "$DB/env"
   mkdir -p "$DB/stack"; echo "hot 2 0" > "$DB/stack/state"; : > "$DB/stack/failed"; : > "$DB/stack/ok"
+  h26 metaloption native; [ "$(cat "$DB/option")" = native ] || { echo "xnutils-test: FAIL: metaloption native"; exit 1; }
   h26 metaloption hot; [ "$(cat "$DB/option")" = hot ] && [ "$(cat "$L2")" = hot ] && [ ! -e "$DB/stack/state" ] && [ ! -e "$DB/stack/failed" ] && [ ! -e "$DB/stack/ok" ] || { echo "xnutils-test: FAIL: metaloption hot" >&2; fail=1; }
   h26 tumode sysmem; [ "$(grep -c '^TU_DEBUG=' "$DB/env")" = 1 ] && grep -qx TU_DEBUG=sysmem "$DB/env" && grep -qx NEGRONIMETAL_OPEN_MS=60000 "$DB/env" || { echo "xnutils-test: FAIL: tumode sysmem" >&2; fail=1; }
   h26 tumode auto; ! grep -q '^TU_DEBUG=' "$DB/env" && grep -qx NEGRONIMETAL_OPEN_MS=60000 "$DB/env" || { echo "xnutils-test: FAIL: tumode auto" >&2; fail=1; }

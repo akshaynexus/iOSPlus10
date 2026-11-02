@@ -28,7 +28,13 @@ DESIGN = {
 
 def last_draw(path):
     lines = open(path, errors="replace").read().split("\n")
-    at = [i for i, l in enumerate(lines) if re.match(r"\s*draw\[\d+\] register values", l)]
+    at = []
+    for i, l in enumerate(lines):
+        if re.match(r"\s*draw\[\d+\] register values", l):
+            # the packet this state belongs to: the last opcode before it. A blit has a draw number too.
+            before = [x for x in lines[max(0, i - 400):i] if "opcode:" in x]
+            if before and "CP_DRAW_INDX" in before[-1]:
+                at.append(i)
     if not at:
         return {}
     regs = {}

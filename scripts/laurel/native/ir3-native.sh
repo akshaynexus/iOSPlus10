@@ -15,7 +15,8 @@ OUTROOT=$OUT/ios26/native/ir3${NMN_POLICY:+-$NMN_POLICY}
 mkdir -p "$OUTROOT"
 M="$B/src/compiler/spirv/libvtn.a $B/src/compiler/nir/libnir.a $B/src/compiler/libcompiler.a $B/src/freedreno/ir3/libfreedreno_ir3.a $B/src/freedreno/isa/libir3decode.a $B/src/freedreno/isa/libir3encode.a $B/src/compiler/isaspec/libisaspec.a $B/src/freedreno/common/libfreedreno_common.a $B/src/freedreno/fdl/libfreedreno_layout.a $B/src/util/libmesa_util.a $B/src/util/blake3/libblake3.a $B/src/c11/impl/libmesa_util_c11.a $B/src/util/libmesa_util_sse41.a"
 EX=$OUTROOT/ca-pipelines
-clang -O1 -g -Wall -I "$FLAME" "$REPO/userland/laurel/metal/tests/ca-pipelines.c" "$H/libnative_metal_native.a" "$H/libnmn_c.a" -Wl,--start-group $M -Wl,--end-group $(pkg-config --libs SPIRV-Tools-shared 2>/dev/null || echo -lSPIRV-Tools-shared) -lm -ldl -lpthread -lstdc++ -lz -o "$EX"
+N=$REPO/userland/laurel/metal-native; S=$OUT/ios26/turnip-host/mesa; clang -std=gnu11 -O1 -I"$N/winsys" -I"$N/tests" -I"$S/include" -I"$S/src/freedreno/common" -c "$N/tests/fake_platform.c" -o "$OUTROOT/fake_platform.o"; clang -std=gnu11 -O1 -I"$N/winsys" -I"$N/tests" -I"$S/include" -I"$S/src/freedreno/common" -c "$N/tests/fake_kernel.c" -o "$OUTROOT/fake_kernel.o"
+clang -O1 -g -Wall -I "$FLAME" "$REPO/userland/laurel/metal/tests/ca-pipelines.c" "$OUTROOT/fake_platform.o" "$OUTROOT/fake_kernel.o" "$H/libnative_metal_native.a" "$H/libnmn_c.a" -Wl,--start-group $M -Wl,--end-group $(pkg-config --libs SPIRV-Tools-shared 2>/dev/null || echo -lSPIRV-Tools-shared) -lm -ldl -lpthread -lstdc++ -lz -o "$EX"
 plans=${*:-$OUT/ios26/native/plans/ca-154.txt $OUT/ios26/native/plans/ca-real.txt}
 export LIB EX NMN_STATS=1
 one() {

@@ -105,22 +105,6 @@ pub extern "C" fn nmb_device_release(d: *mut NmbDevice) {
     release(d)
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn nmb_device_answer(_d: *const NmbDevice, selector: *const c_char, arg: u64, out: *mut u64) -> bool {
-    // The answers of the default stack on FD610 (ios26-evidence/metal-fd610-answers.txt), with memoryless kept: stage 4 gives each attachment its real use.
-    guard(false, || {
-        let selector = unsafe { CStr::from_ptr(selector) }.to_str().map_err(e("selector"))?;
-        let v = match selector {
-            "supportsFamily:" => u64::from((1001..=1003).contains(&arg)),
-            "supportsRasterOrderGroups" | "supportsTileShaders" | "supportsSIMDGroup" | "supportsSIMDReduction" | "supportsSIMDShuffleAndFill" | "supportsYCBCRFormats12" | "supportsYCBCRPackedFormats12" | "supportsLossyCompression" => 0,
-            "supportsNativeHardwareFP16" | "supportsMemorylessRenderTargets" => 1,
-            other => return Err(format!("no answer for {other}")),
-        };
-        unsafe { *out = v };
-        Ok(true)
-    })
-}
-
 pub struct NmbLibrary(pub(crate) Library, Vec<String>);
 pub struct NmbFunction(pub(crate) FunctionDescriptor, pub(crate) Option<String>);
 
@@ -157,6 +141,28 @@ pub unsafe extern "C" fn nmb_library_new(_d: *mut NmbDevice, bytes: *const c_voi
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_library_release(l: *mut NmbLibrary) {
     release(l)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_library_function_name(l: *const NmbLibrary, index: u32, out: *mut c_char, size: usize) -> usize {
+    guard(0, || {
+        let name = get(l)?.1.get(index as usize).ok_or("function index")?;
+        Ok(crate::misc::copy_out(name, out, size))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_type(f: *const NmbFunction) -> u64 {
+    guard(0, || {
+        let n = get(f)?;
+        // MTLFunctionType: 1 vertex, 2 fragment, 3 kernel
+        Ok(match n.0.function.info().stage {
+            metal2vulkan::library::FunctionStage::Vertex => 1,
+            metal2vulkan::library::FunctionStage::Fragment => 2,
+            metal2vulkan::library::FunctionStage::Kernel => 3,
+            _ => 0,
+        })
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -236,7 +242,12 @@ pub extern "C" fn nmb_function_release(f: *mut NmbFunction) {
 
 // ---- pipelines ----
 
-pub struct NmbComputePipeline(pub(crate) Program, pub(crate) std::sync::Arc<metal2vulkan::pipeline::ComputePipeline>);
+pub struct NmbComputePipeline {
+    pub(crate) first: Program,
+    pub(crate) pipeline: std::sync::Arc<metal2vulkan::pipeline::ComputePipeline>,
+    pub(crate) device: *const NmbDevice,
+    pub(crate) baked: std::sync::Mutex<std::collections::HashMap<Vec<u8>, std::sync::Arc<crate::misc::ComputeBaked>>>,
+}
 /// The translator's pipeline; the fixed state of its descriptor; its programs per bind shape (a plan and a specialization: the second use is a lookup).
 pub struct NmbRenderPipeline {
     pub(crate) first: Program,
@@ -277,8 +288,13 @@ pub extern "C" fn nmb_compute_pipeline_new(d: *mut NmbDevice, f: *mut NmbFunctio
                 print_stage(&std::env::var("NMN_STAT_NAME").unwrap_or_default(), "compute", &i);
             }
         }
-        Ok(boxed(NmbComputePipeline(program, std::sync::Arc::new(pipeline))))
+        Ok(boxed(NmbComputePipeline { first: program, pipeline: std::sync::Arc::new(pipeline), device: d, baked: std::sync::Mutex::new(std::collections::HashMap::new()) }))
     })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_compute_pipeline_new_with_options(d: *mut NmbDevice, f: *mut NmbFunction, _options: *const c_void) -> *mut NmbComputePipeline {
+    nmb_compute_pipeline_new(d, f)
 }
 
 #[unsafe(no_mangle)]
@@ -448,6 +464,11 @@ pub extern "C" fn nmb_render_pipeline_new(d: *mut NmbDevice, descriptor: *const 
         }
         Ok(boxed(NmbRenderPipeline { first: program, pipeline: std::sync::Arc::new(pipeline), fixed, device: d, plans: std::sync::Mutex::new(std::collections::HashMap::new()) }))
     })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_render_pipeline_new_with_options(d: *mut NmbDevice, descriptor: *const NmbRenderPipelineDescriptor, _options: *const c_void) -> *mut NmbRenderPipeline {
+    nmb_render_pipeline_new(d, descriptor)
 }
 
 #[unsafe(no_mangle)]

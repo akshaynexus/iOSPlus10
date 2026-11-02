@@ -254,6 +254,13 @@ pub struct NmnRaster {
     pub reads_framebuffer: bool,
     pub pass_width: u32,
     pub pass_height: u32,
+    pub stencil_enable: bool,
+    pub st_func: [u32; 2],
+    pub st_fail: [u32; 2],
+    pub st_zpass: [u32; 2],
+    pub st_zfail: [u32; 2],
+    pub st_read: [u32; 2],
+    pub st_write: [u32; 2],
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -347,6 +354,8 @@ unsafe extern "C" {
     pub fn nmn_cmd_buffer_to_image(cs: *mut NwCs, src: u64, pitch: u32, dst: *const NmnImage, level: u32, layer: u32, origin: *const u32, size: *const u32);
     pub fn nmn_cmd_image_to_buffer(cs: *mut NwCs, src: *const NmnImage, level: u32, layer: u32, origin: *const u32, size: *const u32, dst: u64, pitch: u32);
 
+    pub fn nmn_cmd_mip_down(cs: *mut NwCs, i: *const NmnImage, level: u32, layer: u32);
+    pub fn nmn_program_local_size(p: *const NmnProgram, out: *mut u32);
     pub fn nmn_program_variant(p: *const NmnProgram, stage: u32) -> *const c_void;
     pub fn nmn_program_push_range(p: *const NmnProgram, stage: u32, first_vec4: *mut u32, vec4s: *mut u32, lo_dwords: *mut u32) -> bool;
 }

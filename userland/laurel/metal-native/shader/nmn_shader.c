@@ -568,6 +568,14 @@ const void *nmn_program_code(const struct nmn_program *p, unsigned stage, uint32
 	return p->stage[stage].variant->bin;
 }
 
+void nmn_program_local_size(const struct nmn_program *p, uint32_t out[3])
+{
+	const struct ir3_shader_variant *v = p->stage[0].variant;
+	out[0] = v->local_size[0] ? v->local_size[0] : 1;
+	out[1] = v->local_size[1] ? v->local_size[1] : 1;
+	out[2] = v->local_size[2] ? v->local_size[2] : 1;
+}
+
 bool nmn_program_push_range(const struct nmn_program *p, unsigned stage, uint32_t *first_vec4, uint32_t *vec4s, uint32_t *lo_dwords)
 {
 	if (stage >= p->count)

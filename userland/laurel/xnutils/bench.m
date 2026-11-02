@@ -350,7 +350,7 @@ run_text(NSString *line)
 	[tv deselectRowAtIndexPath:ip animated:NO];
 	if (ip.section == 0) {
 		if (ip.row == 0) {
-			[self choose:@"Metal stack" verb:@"metaloption" names:@[ @"default", @"hot" ] restart:YES];
+			[self choose:@"Metal stack" verb:@"metaloption" names:@[ @"default", @"hot", @"native" ] restart:YES];
 		} else if (ip.row == 1) {
 			[self choose:@"Turnip mode" verb:@"tumode" names:@[ @"auto", @"sysmem", @"gmem" ] restart:YES];
 		} else {

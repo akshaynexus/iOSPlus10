@@ -102,6 +102,8 @@ struct nmn_raster {
 	uint32_t depth_func;    /* 7: always */
 	bool depth_write, depth_test, reads_framebuffer;
 	uint32_t pass_width, pass_height;
+	bool stencil_enable;
+	uint32_t st_func[2], st_fail[2], st_zpass[2], st_zfail[2], st_read[2], st_write[2]; /* front, back; Metal's raw values */
 };
 void nmn_cmd_raster(struct nw_cs *, const struct nmn_raster *);
 /* The bindless bases: set 0 and set 1. graphics false: compute. */
@@ -121,6 +123,8 @@ void nmn_cmd_copy_image(struct nw_cs *, const struct nmn_image *src, uint32_t sr
 void nmn_cmd_buffer_to_image(struct nw_cs *, uint64_t src, uint32_t pitch, const struct nmn_image *dst, uint32_t level, uint32_t layer, const uint32_t origin[2], const uint32_t size[2]);
 void nmn_cmd_image_to_buffer(struct nw_cs *, const struct nmn_image *src, uint32_t level, uint32_t layer, const uint32_t origin[2], const uint32_t size[2], uint64_t dst, uint32_t pitch);
 void nmn_cmd_end_marker(struct nw_cs *, uint64_t iova, uint32_t value);
+/* generateMipmaps: one level from the level above, filtered */
+void nmn_cmd_mip_down(struct nw_cs *, const struct nmn_image *, uint32_t level, uint32_t layer);
 
 #ifdef __cplusplus
 }

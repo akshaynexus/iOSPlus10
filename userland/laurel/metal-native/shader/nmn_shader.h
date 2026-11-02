@@ -61,6 +61,7 @@ bool nmn_program_info(const struct nmn_program *, unsigned stage, struct nmn_sta
 const void *nmn_program_variant(const struct nmn_program *, unsigned stage);
 /* The stage's code and its constant data, with a stage's push range in the const file. */
 const void *nmn_program_code(const struct nmn_program *, unsigned stage, uint32_t *bytes);
+void nmn_program_local_size(const struct nmn_program *, uint32_t out[3]);
 bool nmn_program_push_range(const struct nmn_program *, unsigned stage, uint32_t *first_vec4, uint32_t *vec4s, uint32_t *lo_dwords);
 
 #ifdef __cplusplus

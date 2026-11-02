@@ -1326,9 +1326,18 @@ void nmn_cmd_raster(struct nw_cs *cs, const struct nmn_raster *r)
 	/* depth, stencil */
 	REGS(cs, A6XX_RB_DEPTH_CNTL(.z_test_enable = r->depth_test, .z_write_enable = r->depth_write, .zfunc = r->depth_test ? (enum adreno_compare_func)r->depth_func : FUNC_NEVER, .z_clamp_enable = false, .z_read_enable = r->depth_test));
 	REGS(cs, A6XX_GRAS_SU_DEPTH_CNTL(.z_test_enable = r->depth_test));
-	REGS(cs, A6XX_RB_STENCIL_CONTROL(.func = FUNC_ALWAYS, .fail = STENCIL_KEEP, .zpass = STENCIL_KEEP, .zfail = STENCIL_KEEP, .func_bf = FUNC_ALWAYS, .fail_bf = STENCIL_KEEP, .zpass_bf = STENCIL_KEEP, .zfail_bf = STENCIL_KEEP));
-	REGS(cs, A6XX_GRAS_SU_STENCIL_CNTL(.stencil_enable = false));
-	REGS(cs, A6XX_RB_STENCILMASK(.mask = 0xff, .bfmask = 0xff), A6XX_RB_STENCILWRMASK(.wrmask = 0xff, .bfwrmask = 0xff), A6XX_RB_STENCILREF(.ref = r->stencil_front, .bfref = r->stencil_back));
+	/* MTLStencilOperation: keep, zero, replace, inc clamp, dec clamp, invert, inc wrap, dec wrap. a3xx: keep, zero, replace, incr clamp, decr clamp, invert, incr wrap, decr wrap: the same numbers. MTLCompareFunction == a3xx compare func. */
+	if (r->stencil_enable) {
+		REGS(cs, A6XX_RB_STENCIL_CONTROL(.stencil_enable = true, .stencil_enable_bf = true, .stencil_read = true,
+			.func = (enum adreno_compare_func)r->st_func[0], .fail = (enum adreno_stencil_op)r->st_fail[0], .zpass = (enum adreno_stencil_op)r->st_zpass[0], .zfail = (enum adreno_stencil_op)r->st_zfail[0],
+			.func_bf = (enum adreno_compare_func)r->st_func[1], .fail_bf = (enum adreno_stencil_op)r->st_fail[1], .zpass_bf = (enum adreno_stencil_op)r->st_zpass[1], .zfail_bf = (enum adreno_stencil_op)r->st_zfail[1]));
+		REGS(cs, A6XX_GRAS_SU_STENCIL_CNTL(.stencil_enable = true));
+		REGS(cs, A6XX_RB_STENCILMASK(.mask = r->st_read[0], .bfmask = r->st_read[1]), A6XX_RB_STENCILWRMASK(.wrmask = r->st_write[0], .bfwrmask = r->st_write[1]), A6XX_RB_STENCILREF(.ref = r->stencil_front, .bfref = r->stencil_back));
+	} else {
+		REGS(cs, A6XX_RB_STENCIL_CONTROL(.func = FUNC_ALWAYS, .fail = STENCIL_KEEP, .zpass = STENCIL_KEEP, .zfail = STENCIL_KEEP, .func_bf = FUNC_ALWAYS, .fail_bf = STENCIL_KEEP, .zpass_bf = STENCIL_KEEP, .zfail_bf = STENCIL_KEEP));
+		REGS(cs, A6XX_GRAS_SU_STENCIL_CNTL(.stencil_enable = false));
+		REGS(cs, A6XX_RB_STENCILMASK(.mask = 0xff, .bfmask = 0xff), A6XX_RB_STENCILWRMASK(.wrmask = 0xff, .bfwrmask = 0xff), A6XX_RB_STENCILREF(.ref = r->stencil_front, .bfref = r->stencil_back));
+	}
 	REGS(cs, A6XX_RB_Z_BOUNDS_MIN(0.0f), A6XX_RB_Z_BOUNDS_MAX(1.0f));
 	REGS(cs, A6XX_RB_LRZ_CNTL());
 	pkt4(cs, REG_A6XX_RB_BLEND_RED_F32, 4);
@@ -1536,6 +1545,26 @@ void nmn_cmd_image_to_buffer(struct nw_cs *cs, const struct nmn_image *src, uint
 	REGS(cs, A6XX_RB_2D_DST_INFO(.color_format = fmt, .color_swap = fd6_color_swap(f, TILE6_LINEAR, false), .srgb = util_format_is_srgb(f)), A6XX_RB_2D_DST(.qword = base), A6XX_RB_2D_DST_PITCH(pitch));
 	REGS(cs, A6XX_GRAS_2D_DST_TL(.x = dx, .y = 0), A6XX_GRAS_2D_DST_BR(.x = dx + size[0] - 1, .y = size[1] - 1));
 	REGS(cs, A6XX_GRAS_2D_SRC_TL_X(o[0]), A6XX_GRAS_2D_SRC_BR_X(o[0] + size[0] - 1), A6XX_GRAS_2D_SRC_TL_Y(o[1]), A6XX_GRAS_2D_SRC_BR_Y(o[1] + size[1] - 1));
+	pkt7(cs, CP_BLIT, 1);
+	nw_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
+	flush_color(cs);
+}
+
+/* generateMipmaps with the 2D engine, as tu_CmdBlitImage: a filtered scale from level - 1 */
+void nmn_cmd_mip_down(struct nw_cs *cs, const struct nmn_image *im, uint32_t level, uint32_t layer)
+{
+	enum pipe_format f = (enum pipe_format)im->format;
+	enum a6xx_tile_mode dtile = tile_of(&im->layout, level), stile = tile_of(&im->layout, level - 1);
+	enum a6xx_format fmt = fd6_color_format(f, dtile);
+	uint32_t sw = u_minify(im->layout.width0, level - 1), sh = u_minify(im->layout.height0, level - 1), dw = u_minify(im->layout.width0, level), dh = u_minify(im->layout.height0, level);
+	r2d_common(cs, f, fmt, format_ifmt(f), false);
+	REGS(cs, SP_PS_2D_SRC_INFO(CHIP, .color_format = fd6_color_format(f, stile), .tile_mode = stile, .color_swap = fd6_color_swap(f, stile, false), .filter = true, .srgb = util_format_is_srgb(f), .unk20 = 1, .unk22 = 1),
+	     SP_PS_2D_SRC_SIZE(CHIP, .width = sw, .height = sh),
+	     SP_PS_2D_SRC(CHIP, .qword = im->iova + fdl_surface_offset(&im->layout, level - 1, layer)),
+	     SP_PS_2D_SRC_PITCH(CHIP, .pitch = fdl_pitch(&im->layout, level - 1)));
+	r2d_dst_image(cs, im, level, layer, f, fmt);
+	REGS(cs, A6XX_GRAS_2D_DST_TL(.x = 0, .y = 0), A6XX_GRAS_2D_DST_BR(.x = dw - 1, .y = dh - 1));
+	REGS(cs, A6XX_GRAS_2D_SRC_TL_X(0), A6XX_GRAS_2D_SRC_BR_X(sw - 1), A6XX_GRAS_2D_SRC_TL_Y(0), A6XX_GRAS_2D_SRC_BR_Y(sh - 1));
 	pkt7(cs, CP_BLIT, 1);
 	nw_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
 	flush_color(cs);

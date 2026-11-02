@@ -255,5 +255,58 @@ int main(int argc, char **argv)
 	char err[256] = "";
 	nmb_command_buffer_error(cb, err, sizeof(err));
 	printf("scene: wait %d status %llu error '%s'\n", w, (unsigned long long)nmb_command_buffer_status(cb), err);
-	return w == 0 ? 0 : 1;
+	if (w != 0)
+		return 1;
+	/* blits: the 2D engine's paths, and a readback of the drawn target. On the fake kernel no GPU runs, so the bytes stay zero; on a phone this is the first pixel */
+	const uint32_t row = 720 * 4;
+	NmbBuffer *readback = nmb_buffer_new(dev, row * 1560, 0, NULL), *copy = nmb_buffer_new(dev, 4096, 0, NULL), *fill = nmb_buffer_new(dev, 4096, 0, NULL);
+	NmbCommandBuffer *b2 = nmb_command_buffer_new(queue);
+	NmbEncoder *bl = b2 ? nmb_blit_encoder_new(b2) : NULL;
+	if (readback == NULL || copy == NULL || fill == NULL || bl == NULL)
+		FAIL("blit encoder");
+	const uint64_t origin[3] = {0, 0, 0}, full[3] = {720, 1560, 1}, small[3] = {64, 64, 1};
+	struct NmbTextureDescriptor md = {.type = 2, .format = 80, .width = 64, .height = 64, .depth = 1, .levels = 7, .samples = 1, .array_length = 1, .usage = 5, .options = 2u << 4};
+	NmbTexture *mips = nmb_texture_new(dev, &md);
+	if (mips == NULL)
+		FAIL("mip texture");
+	if (!nmb_blit_fill_buffer(bl, fill, 0, 4096, 0x5a) || !nmb_blit_copy_buffer(bl, fill, 64, copy, 128, 1024))
+		FAIL("buffer blit");
+	if (!nmb_blit_copy_texture(bl, image, 0, 0, origin, small, mips, 0, 0, origin) || !nmb_blit_generate_mipmaps(bl, mips))
+		FAIL("texture blit");
+	if (!nmb_blit_texture_to_buffer(bl, target, 0, 0, origin, full, readback, 0, row, 0))
+		FAIL("readback blit");
+	if (!nmb_encoder_end(bl) || !nmb_command_buffer_commit(b2) || nmb_command_buffer_wait(b2, 20000) != 0)
+		FAIL("blit commit");
+	const uint32_t *px = nmb_buffer_contents(readback);
+	const unsigned char *cp = nmb_buffer_contents(copy);
+	printf("scene: pixel (0,0) %08x, (360,780) %08x, (719,1559) %08x; copied byte %02x (a GPU writes 5a)\n", px[0], px[780 * 720 + 360], px[1559 * 720 + 719], cp[128]);
+	/* compute: the first kernel of the library that compiles with no arguments bound */
+	NmbFunction *kf = nmb_function_new(lib, "compute_apl");
+	if (kf == NULL) {
+		char name[128];
+		for (uint32_t i = 0; kf == NULL && i < nmb_library_function_count(lib); i++) {
+			nmb_library_function_name(lib, i, name, sizeof(name));
+			if (strstr(name, "kernel") != NULL || strstr(name, "compute") != NULL)
+				kf = nmb_function_new(lib, name);
+		}
+	}
+	NmbComputePipeline *kp = kf ? nmb_compute_pipeline_new(dev, kf) : NULL;
+	if (kp == NULL) {
+		printf("scene: no compute pipeline: %s\n", nmb_last_error());
+		return 0;
+	}
+	NmbCommandBuffer *b3 = nmb_command_buffer_new(queue);
+	NmbEncoder *ce = b3 ? nmb_compute_encoder_new(b3) : NULL;
+	if (ce == NULL || !nmb_compute_set_pipeline(ce, kp))
+		FAIL("compute encoder");
+	const uint64_t groups[3] = {4, 4, 1}, per[3] = {32, 32, 16};
+	if (!nmb_compute_dispatch(ce, groups, per, false)) {
+		printf("scene: compute refused: %s\n", nmb_last_error());
+		nmb_encoder_discard(ce);
+		return 0;
+	}
+	if (!nmb_encoder_end(ce) || !nmb_command_buffer_commit(b3) || nmb_command_buffer_wait(b3, 20000) != 0)
+		FAIL("compute commit");
+	printf("scene: compute: PASS\n");
+	return 0;
 }
