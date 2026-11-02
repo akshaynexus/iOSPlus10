@@ -78,7 +78,7 @@ if unshare -r true 2>/dev/null; then
   h26() { unshare -r "$D/helper26" "$@"; }
   DB=$F/private/var/db/negronimetal; L2=$F/System/Library/Extensions/NegroniMetal.bundle/option.local
   # iOS 26: no Metal choice may take the compositor off the GPU (boot 11: "* -backboardd" put it on the CPU)
-  W26="* -chronod -cameracaptured -WidgetRenderer_Default -PosterBoard"
+  W26="* -chronod -cameracaptured -PosterBoard"
   for m in all auto; do
     : > "$DB/off"; h26 metal $m; [ "$(tail -1 "$C")" = "$W26" ] && cmp -s "$C" "$L" && [ ! -e "$DB/off" ] && ! grep -q -e '-backboardd' -e laurel-metal-gate "$C" || { echo "xnutils-test: FAIL: iOS 26 metal $m" >&2; fail=1; }
   done
@@ -89,10 +89,10 @@ if unshare -r true 2>/dev/null; then
   h26 metaloption hot; [ "$(cat "$DB/option")" = hot ] && [ "$(cat "$L2")" = hot ] && [ ! -e "$DB/stack/state" ] && [ ! -e "$DB/stack/failed" ] && [ ! -e "$DB/stack/ok" ] || { echo "xnutils-test: FAIL: metaloption hot" >&2; fail=1; }
   h26 tumode sysmem; [ "$(grep -c '^TU_DEBUG=' "$DB/env")" = 1 ] && grep -qx TU_DEBUG=sysmem "$DB/env" && grep -qx NEGRONIMETAL_OPEN_MS=60000 "$DB/env" || { echo "xnutils-test: FAIL: tumode sysmem" >&2; fail=1; }
   h26 tumode auto; ! grep -q '^TU_DEBUG=' "$DB/env" && grep -qx NEGRONIMETAL_OPEN_MS=60000 "$DB/env" || { echo "xnutils-test: FAIL: tumode auto" >&2; fail=1; }
-  h26 liveglass on; [ -f "$DB/live-glass" ] || { echo "xnutils-test: FAIL: liveglass on" >&2; fail=1; }
+  h26 liveglass on; [ ! -e "$DB/no-live-glass" ] || { echo "xnutils-test: FAIL: liveglass on" >&2; fail=1; }
   echo "default option hot failed in 2 starts of the compositor" > "$DB/stack/active"
   ST=$(h26 metalstate); for w in OPTION=hot ACTIVE=default 'WHY=option hot failed in 2 starts of the compositor' TUMODE=auto GLASS=live; do printf '%s\n' "$ST" | grep -qxF "$w" || { echo "xnutils-test: FAIL: metalstate has no $w" >&2; fail=1; }; done
-  h26 liveglass off; [ ! -e "$DB/live-glass" ] || { echo "xnutils-test: FAIL: liveglass off" >&2; fail=1; }
+  h26 liveglass off; [ -f "$DB/no-live-glass" ] || { echo "xnutils-test: FAIL: liveglass off" >&2; fail=1; }
   h26 bench-begin; [ -f "$DB/stack/bench-on" ] || { echo "xnutils-test: FAIL: bench-begin" >&2; fail=1; }
   [ "$(h26 bench-end)" = PRESENTS=none ] && [ ! -e "$DB/stack/bench-on" ] || { echo "xnutils-test: FAIL: bench-end without a compositor" >&2; fail=1; }
   rc=0; h26 metaloption ../x 2>/dev/null || rc=$?; [ $rc = 2 ] || { echo "xnutils-test: FAIL: a bad option gives $rc, not 2" >&2; fail=1; }

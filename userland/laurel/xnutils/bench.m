@@ -354,7 +354,7 @@ run_text(NSString *line)
 		} else if (ip.row == 1) {
 			[self choose:@"Turnip mode" verb:@"tumode" names:@[ @"auto", @"sysmem", @"gmem" ] restart:YES];
 		} else {
-			[self choose:@"Live glass" verb:@"liveglass" names:@[ @"off", @"on" ] restart:NO];
+			[self choose:@"Live glass" verb:@"liveglass" names:@[ @"on", @"off" ] restart:YES];
 		}
 	} else if (ip.section == 1) {
 		if (ip.row == 0) {

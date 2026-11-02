@@ -1185,10 +1185,8 @@ static void bbd_screen_check_start(void)
 
 #ifdef NMTL_IOS26
 /*
- * Live glass: selective CABackdropLayer bypass in backboardd and SpringBoard. Same hook as IOS-26-Hot d249939 phone/media/inject_sysfix.c (MIT), reported there on an Adreno 640 on 23F84: a live backdrop is a
- * framebuffer readback plus a blur pyramid per frame; icons (pre-baked by iconservicesagent), pills and spring animations stay. On the A610 one glass_background pixel costs 549 to 1703 ir3 instructions [V host],
- * with 1 SP core and a 300 to 600 MHz clock. On by default. The file NMTL_DIR/live-glass brings live glass back within 5 s. Not "Reduce Transparency". Limit [I]: the hook goes in when this process opens its device,
- * so a layer made before that keeps its state until its next setEnabled:.
+ * Liquid glass: owner decision 2026-11-03: live CABackdropLayer capture and Apple's own glass shaders are the default on this phone. The bypass (same hook as IOS-26-Hot d249939 phone/media/inject_sysfix.c, MIT) stays only as a kill switch:
+ * NEGRONIMETAL_GLASS=0 in NMTL_DIR/env, or the file NMTL_DIR/no-live-glass. The hook acts in clients: an app's layer is that app's. With no kill switch at the device open no hook goes in, and nothing here costs anything.
  */
 static IMP g_cabd_is_enabled, g_cabd_set_enabled, g_cabd_init;
 static SEL g_cabd_set_sel;
@@ -1199,7 +1197,7 @@ static bool live_glass(void)
 	const time_t now = time(NULL);
 	if (cached < 0 || now - last >= 5) {
 		last = now;
-		cached = access(NMTL_DIR "/live-glass", F_OK) == 0;
+		cached = access(NMTL_DIR "/no-live-glass", F_OK) != 0;
 	}
 	return cached != 0;
 }
@@ -1224,19 +1222,25 @@ static void glass_bypass_start(void)
 	const char *name = getprogname() ?: "";
 	if (strcmp(name, "backboardd") != 0 && strcmp(name, "SpringBoard") != 0)
 		return;
+	const char *kill = getenv("NEGRONIMETAL_GLASS");
+	const bool file = access(NMTL_DIR "/no-live-glass", F_OK) == 0;
+	if (!file && !(kill != NULL && kill[0] == '0')) {
+		nlog("LAUREL GLASS: on: live CABackdropLayer capture and Apple's glass shaders in %s (kill switch: NEGRONIMETAL_GLASS=0 or %s/no-live-glass)", name, NMTL_DIR);
+		return;
+	}
 	Class cls = objc_getClass("CABackdropLayer");
 	Method is = cls ? class_getInstanceMethod(cls, sel_registerName("isEnabled")) : NULL;
 	g_cabd_set_sel = sel_registerName("setEnabled:");
 	Method set = cls ? class_getInstanceMethod(cls, g_cabd_set_sel) : NULL;
 	Method init = cls ? class_getInstanceMethod(cls, sel_registerName("init")) : NULL;
 	if (!is || !set || !init) {
-		nlog("LAUREL GLASS: off: no CABackdropLayer isEnabled, setEnabled: or init in this QuartzCore: live backdrops stay");
+		nlog("LAUREL GLASS: on: the kill switch finds no CABackdropLayer isEnabled, setEnabled: or init in this QuartzCore: live backdrops stay");
 		return;
 	}
 	g_cabd_is_enabled = method_setImplementation(is, (IMP)glass_is_enabled);
 	g_cabd_set_enabled = method_setImplementation(set, (IMP)glass_set_enabled);
 	g_cabd_init = method_setImplementation(init, (IMP)glass_init);
-	nlog("LAUREL GLASS: on: live CABackdropLayer capture off in %s (touch %s/live-glass to bring it back)", name, NMTL_DIR);
+	nlog("LAUREL GLASS: off: kill switch: live CABackdropLayer capture off in %s (%s)", name, file ? NMTL_DIR "/no-live-glass" : "NEGRONIMETAL_GLASS=0");
 }
 #include "icon_store_rule.h"
 /* See icon_store_rule.h. In iconservicesagent, before its first draw on this device. A store of another generation empties, and this process ends once so that nothing it has read stays: launchd starts it at the next ask. */
