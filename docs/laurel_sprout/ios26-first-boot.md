@@ -114,7 +114,7 @@ Previous boot, when this boot says nothing: from Android, `scripts/laurel/log-pu
 
 ## 6. Back to Android
 
-1. Boot menu of branch `t3/laurel-boot-menu`, when it is merged and on the phone (on 2026-11-02 that branch has no commit of its own: not available yet).
+1. Boot menu (`boot-menu.md`), once a writable menu image is on the phone. The first read-only image has no Android entry: use the next way.
 2. Else: `out/bin/op10tool ctl bootloader` (also from a panic), or Power + VolDown; then `fastboot set_active a`, `fastboot reboot`. Exception: after a manual Android update do not use `set_active a` (`dual-boot.md`).
 3. With no computer: reboot iOS until the 7 retries of slot b end.
 

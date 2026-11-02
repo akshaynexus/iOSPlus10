@@ -231,9 +231,17 @@ mk_kernel() {
   printf 'stamp=%s\nseries=0123456789abcdef\nsha256=%s\n' "$ST" "$(sha256sum "$K" | cut -d' ' -f1)" > "$K.stamp"
 }
 printf 'pass\n' > "$R/scripts/laurel/mkadt.py"   # the real one needs external/ios-topaz; it takes no part in these checks
+# a menu image needs an FD of this tree's Mu patches
+mkdir -p "$T/repo/patches/laurel/mu"; echo fake > "$T/repo/patches/laurel/mu/0201.patch"
+sha256sum "$T/repo/patches/laurel/mu/0201.patch" | cut -d' ' -f1 > "$T/mu/fd.patches"
 UE="env UEFI_W=$T/w FD=$T/mu/fd SHIM=$T/mu/shim STOCK_BOOT=$T/stock KERNEL=$K"
 mk_kernel "no marker here"
 expect "H1 uefi-image.sh: a kernel without 2950: no image" 1 "no patch 2950" $UE bash "$G/uefi-image.sh"
+mv "$T/mu/fd.patches" "$T/mu/fd.patches.good"
+expect "Menu uefi-image.sh: an FD with no record of its Mu patches: no image" 1 "not built from patches/laurel/mu" $UE bash "$G/uefi-image.sh"
+echo stale > "$T/mu/fd.patches"
+expect "Menu uefi-image.sh: an FD of other Mu patches: no image" 1 "not built from patches/laurel/mu" $UE bash "$G/uefi-image.sh"
+mv "$T/mu/fd.patches.good" "$T/mu/fd.patches"
 mk_kernel "$M"
 ue() { : > "$T/calls"; o=$("$@" 2>&1) || true; n=$((n + 1)); }
 ok_() { echo "ok   $1"; }

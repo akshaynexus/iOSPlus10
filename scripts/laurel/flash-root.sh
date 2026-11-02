@@ -12,9 +12,9 @@ IMG=${1:?usage: flash-root.sh ROOT.simg}
 [ -f "$IMG" ] || { echo "flash-root: missing $IMG" >&2; exit 1; }
 ts() { date +%H:%M:%S; }
 die() { echo "flash-root: REFUSED: $1. Nothing was written." >&2; exit 3; }
-# the sparse header: magic, then blk_sz at byte 12 and total_blks at byte 20
+# the sparse header: magic, then blk_sz at byte 12 and total_blks at byte 16 (total_chunks is byte 20)
 [ "$(LC_ALL=C od -An -tx4 -N4 "$IMG" | tr -d ' \n')" = ed26ff3a ] || die "$IMG is not a sparse image"
-sz=$(LC_ALL=C od -An -tu4 -j12 -N4 "$IMG" | tr -d ' \n'); tb=$(LC_ALL=C od -An -tu4 -j20 -N4 "$IMG" | tr -d ' \n')
+sz=$(LC_ALL=C od -An -tu4 -j12 -N4 "$IMG" | tr -d ' \n'); tb=$(LC_ALL=C od -An -tu4 -j16 -N4 "$IMG" | tr -d ' \n')
 [ $((sz * tb)) -le "$IOSROOT_VOLUME_MAX" ] || die "$IMG holds $((sz * tb)) bytes: iosroot takes $IOSROOT_VOLUME_MAX and the console log"
 # One phone in fastboot, and it says it is the Mi A3, with the partition of the plan. ABL answers getvar on stderr.
 var() { fastboot getvar "$1" 2>&1 | sed -n "s/^$1: *//p" | tr -d '\r'; }
@@ -42,6 +42,15 @@ if ! fastboot -S 512M flash iosroot "$IMG"; then
   echo "$(ts) flash-root: flash failed. Hold Power+VolDown for fastboot, then run this again." >&2
   exit 1
 fi
+# ABL answers OKAY before it writes, and reports a failed write only at the next flash or download
+# (FastbootCmds.c:3437-3447). This download goes only to ABL's RAM, and it brings out a failed last piece.
+_probe=$(mktemp); head -c 4096 /dev/zero > "$_probe"
+if ! fastboot stage "$_probe"; then
+  rm -f "$_probe"
+  echo "$(ts) flash-root: FAILED: ABL reports a failed write in iosroot. Run fastboot reboot bootloader, then this step again." >&2
+  exit 1
+fi
+rm -f "$_probe"
 echo "$(ts) flash-root: iosroot flashed"
 fastboot reboot || echo "$(ts) flash-root: ABL did not take 'reboot' (it can hang after a big flash): hold Power for a restart"
 echo "$(ts) flash-root: done"

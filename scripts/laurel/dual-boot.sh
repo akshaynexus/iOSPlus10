@@ -149,8 +149,12 @@ need_fastboot_mi_a3() {
 }
 fb_var() { fastboot -s "$FB_S" getvar "$1" 2>&1 | sed -n "s/^$1: *//p" | tr -d '\r'; }
 need_fastboot_layout() {
-  _u=$(fb_var partition-size:userdata); _i=$(fb_var partition-size:iosroot)
-  [ -n "$_i" ] || die "ABL sees no partition iosroot (userdata: '$_u'): the new table is not there"
+  # ABL can answer one getvar wrongly after a longer command (docs/notes.md): ask again before calling it a real absence.
+  _try=0; _u=; _i=
+  while [ "$_try" -lt 3 ] && { [ -z "$_i" ] || [ -z "$_u" ]; }; do
+    _try=$((_try + 1)); _u=$(fb_var partition-size:userdata); _i=$(fb_var partition-size:iosroot)
+  done
+  [ -n "$_i" ] || die "ABL sees no partition iosroot after 3 tries (userdata: '$_u'). Run: fastboot reboot bootloader, then this step again. If it says the same in a clean session, stop: the new table is not there"
   [ "$((_i))" = "$IOSROOT_BYTES" ] && [ "$((_u))" = "$USERDATA_BYTES" ] || die "ABL sees iosroot $_i and userdata $_u, the plan has $IOSROOT_BYTES and $USERDATA_BYTES"
   say "ABL sees the new table: iosroot $_i, userdata $_u"
 }
@@ -287,6 +291,17 @@ need_rehearsal() {
 rehearsal_note() { mkdir -p "$D"; echo "$1 $(date +%Y-%m-%dT%H:%M:%S)" >> "$REHEARSAL"; }
 RECOVERY_NEXT="Next, owner: hold Power + Vol Up until recovery shows [I: not tried on this phone; the rehearsal records what works]. If that does not work: fastboot reboot, and Android's init formats userdata by itself (docs/laurel_sprout/dual-boot.md section 8)."
 
+# The phone must not wait in fastboot during the conversion: notes record that an idle ABL USB device can die. Output: the .simg path on stdout.
+make_simg() {
+  _s=${1%.img}.simg
+  if [ ! -f "$_s" ] || [ "$1" -nt "$_s" ]; then
+    echo "dual-boot: making $_s (a long step: run this with scripts/bg.sh)" >&2
+    "$TOOL" img2simg "$1" "$_s.partial" >&2
+    mv "$_s.partial" "$_s"
+  fi
+  echo "$_s"
+}
+
 cmd=${1:-}
 [ $# = 0 ] || shift
 case "$cmd" in
@@ -347,7 +362,7 @@ GUIDE
       say "ABL accepted fastboot reboot recovery. Next, in Lineage recovery: Advanced -> Enable ADB, then: dual-boot.sh rehearsal recovery"
     else
       rehearsal_note "reach fastboot-reboot-recovery refused"
-      say "ABL refused fastboot reboot recovery: a result, nothing changed. after-gpt prints the other way. $RECOVERY_NEXT Then, in recovery: Advanced -> Enable ADB, then: dual-boot.sh rehearsal recovery"
+      say "ABL refused fastboot reboot recovery: a result, nothing changed. Next, owner: hold Power + Vol Up until recovery shows. This rehearsal formats nothing, and the table is still the old one. Then, in recovery: Advanced -> Enable ADB, then: dual-boot.sh rehearsal recovery"
     fi
     ;;
   recovery)
@@ -434,7 +449,7 @@ after-gpt)
     say "ABL refused fastboot reboot recovery. Nothing changed, and the new table is good. $RECOVERY_NEXT"
     [ ! -f "$REHEARSAL" ] || { say "the rehearsal has this on record:"; grep '^reach ' "$REHEARSAL" || true; }
   fi
-  say "In Lineage recovery (owner): Factory reset -> Format data / factory reset -> yes; then Reboot system now. Android sets itself up. Then: Rooted debugging on, adb root, dual-boot.sh android-check"
+  say "In Lineage recovery (owner): Factory reset -> Format data / factory reset -> yes; then Reboot system now. Finish Android setup. Settings -> About phone: tap Build number 7 times. Developer options: USB debugging on, accept the RSA key dialog (the wipe removed the key), Rooted debugging on. Then: adb root, dual-boot.sh android-check"
   ;;
 android-check)
   need_root
@@ -451,8 +466,17 @@ android-check)
   [ "$((_bc * 4096))" -le "$USERDATA_BYTES" ] || die "the f2fs on /data claims $((_bc * 4096)) bytes, userdata has $USERDATA_BYTES: a stale superblock. Stop: Format data in recovery"
   mkdir -p "$D"
   echo "android-opened $(date +%Y-%m-%dT%H:%M:%S) f2fs-bytes $((_bc * 4096))" >> "$RESULT"
+  # D2: the wipe gave the Updater back. An update writes slot b and flips the slots. Updates stay by hand.
+  ash pm disable-user --user 0 org.lineageos.updater >/dev/null || die "cannot disable Lineage's Updater: stop, an update would overwrite slot b"
   grep -q '^ro-on ' "$RESULT" && echo "android-opened-after-ro $(date +%Y-%m-%dT%H:%M:%S)" >> "$RESULT"
   say "Android opened its data on the new layout: userdata $USERDATA_BYTES bytes, f2fs $((_bc * 4096)) bytes, iosroot $IOSROOT_BYTES bytes. Recorded: $RESULT"
+  ;;
+prepare-root)
+  # Host only, before the phone goes to fastboot.
+  need_tool
+  img=${1:-$(default_root)}
+  [ -f "$img" ] || die "missing $img"
+  say "ready: $(make_simg "$img"). Next: adb reboot bootloader; CONFIRM=install dual-boot.sh install"
   ;;
 install)
   need_confirm install
@@ -464,12 +488,7 @@ install)
   _vb=$("$TOOL" hfs-size "$img" | sed -n 's/.* = \([0-9]*\) bytes .*/\1/p') || die "$img has no HFS+ volume"
   [ -n "$_vb" ] || die "$img has no HFS+ volume"
   [ "$_vb" -le "$IOSROOT_VOLUME_MAX" ] || die "the volume in $img has $_vb bytes: too big"
-  simg=${img%.img}.simg
-  if [ ! -f "$simg" ] || [ "$img" -nt "$simg" ]; then
-    say "making $simg (a long step: run this with scripts/bg.sh)"
-    "$TOOL" img2simg "$img" "$simg.partial"
-    mv "$simg.partial" "$simg"
-  fi
+  simg=$(make_simg "$img")
   head -c 1048576 "$img" > "$D/root.first1m"
   need_fastboot_mi_a3
   need_fastboot_layout
@@ -522,6 +541,8 @@ switch)
   need_root
   check_layout
   need_slots_a
+  _dis=$(ash "pm list packages -d") || die "cannot read the disabled packages"
+  case "$_dis" in *org.lineageos.updater*) ;; *) die "Lineage's Updater is on: an update would overwrite slot b. Run dual-boot.sh android-check, which turns it off" ;; esac
   slot_yes is-slot-bootable 0 || die "slot a is not bootable: no way back"
   slot_yes is-slot-marked-successful 0 || die "slot a is not marked successful: ABL has nothing to fall back to. Boot Android to the end first"
   grep -q '^android-opened ' "$RESULT" 2>/dev/null || die "no record that Android opened its data on the new layout: dual-boot.sh android-check"
@@ -565,8 +586,9 @@ ro-result)
 to-android)
   need_confirm to-android
   need_fastboot_mi_a3
-  fastboot -s "$FB_S" set_active a
-  fastboot -s "$FB_S" reboot
+  # A session entered with the buttons after a panic can answer wrongly (docs/notes.md).
+  fastboot -s "$FB_S" set_active a || die "set_active a failed: nothing changed. Run: fastboot reboot bootloader, then this step again. (From slot b that command can start iOS once: then hold Power + Vol Down)"
+  fastboot -s "$FB_S" reboot || die "slot a is active, but ABL did not take reboot: hold Power for a restart"
   say "Slot a active, Android starts. Android must open its data; then: dual-boot.sh android-check"
   ;;
 gpt-restore|gpt-repair)

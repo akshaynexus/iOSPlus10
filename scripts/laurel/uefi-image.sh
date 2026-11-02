@@ -27,6 +27,8 @@ W=${UEFI_W:-$OUT/laurel/uefi}    # own folder: scripts/laurel/ios26-image.sh
 STOCK=${STOCK_BOOT:-$HOME/laurel-backup/stock/images/boot.img}
 MU=${MU_DIR:-$OUT/laurel/mu}
 FD=${FD:-$MU/SILICIUM_UEFI-DEBUG.fd}
+# A menu image needs an FD built from these patches: an older FD has no slot code, and its menu says "unknown action".
+mu_patches_sha() { cat "$REPO"/patches/laurel/mu/*.patch | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1; }
 SHIM=${SHIM:-$MU/BootShim.bin}
 KERNEL_BY_HAND=${KERNEL:-}
 KERNEL=${KERNEL:-$OUT/laurel-kernel/out/kernel.development.sweet.4k}
@@ -50,6 +52,9 @@ CMDLINE=${1:-"debug=0xc serial=3 cpus=$CPUS keepsyms=1 -noprogress rd=ufsroot0 u
 BOOT_MENU=${BOOT_MENU:-1}
 # The read-only first boot writes nothing we control: no Android entry, no retries refill (Mu's GPT write), no marks, so the app cannot start it; `dual-boot.sh switch` and `to-android` are its way.
 [ "${LAUREL_READONLY:-0}" != 1 ] || BOOT_MENU=0
+if [ "$BOOT_MENU" = 1 ] && [ "${MU_ONLY:-0}" != 1 ] && [ "$(cat "$FD.patches" 2>/dev/null)" != "$(mu_patches_sha)" ]; then
+  echo "uefi-image: FAILED: $FD is not built from patches/laurel/mu of this tree, so it has no current menu or slot code. Run scripts/laurel/mu-build.sh, or BOOT_MENU=0" >&2; exit 1
+fi
 ENTRY_TITLE=${ENTRY_TITLE:-iOS 16 (laurel XNU, TOPAZ_4K)}
 STOCK_DTBO=${STOCK_DTBO:-$HOME/laurel-backup/stock/images/dtbo.img}
 # a panic resets after 30 s, so the menu comes back with no computer (without it the panic hold stays until `op10tool ctl bootloader`); docs/laurel_sprout/usb-debug.md
@@ -89,7 +94,7 @@ if [ "${MU_ONLY:-0}" = 1 ]; then
   truncate -s 4096 "$rd"
   IMG=$W/laurel-mu-only-boot.img
 else
-  [ -f "$KERNEL" ] || { echo "uefi-image: missing kernel $KERNEL (scripts/laurel/kernel-linux.sh)" >&2; exit 1; }
+  [ -f "$KERNEL" ] || { echo "uefi-image: missing kernel $KERNEL (scripts/laurel/kernel-linux.sh, or for iOS 26 kernel-ios26-linux.sh)" >&2; exit 1; }
   # no boot image from a kernel that is not proven: kernel-linux.sh stamps only what passed its checks
   python3 -I "$BS" kernel-check "$KERNEL" ${KERNEL_BY_HAND:+--no-repo} || { echo "uefi-image: FAILED: kernel not good: no boot image" >&2; rm -f "$W/laurel-uefi-boot.img.stamp"; exit 1; }
   STAMP_LINE=$(python3 -I "$BS" image-line "$KERNEL" "$FD")

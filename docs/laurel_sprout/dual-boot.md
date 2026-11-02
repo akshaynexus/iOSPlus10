@@ -8,6 +8,8 @@ Owner decisions 2026-11-02: iOS gets the partition `iosroot` on LUN 0. One GPT w
 
 ## 1. The steps
 
+**Run every step from one checkout, the main one, and do not clean it:** all records are in its `out/laurel/dualboot/`. `clean-worktrees.sh` removes a worktree with its records. Build the iOS 26 kernel in that checkout at the final commit. If fastboot answers strangely after a panic or a button entry, run `fastboot reboot bootloader` and repeat the step. Treat one flash piece that takes over 2 minutes as a stall (`install` records nothing then, and a new run starts again from the first piece).
+
 All script steps: `scripts/laurel/dual-boot.sh`. Each writing step needs `CONFIRM=<step>`. **Agents run no writing step until the owner asks for that step.**
 
 | # | Who | Step | Writes |
@@ -17,9 +19,9 @@ All script steps: `scripts/laurel/dual-boot.sh`. Each writing step needs `CONFIR
 | 1b | Owner, agent | **The rehearsal**: `dual-boot.sh rehearsal`, section 1b. How the phone reaches recovery; does recovery give root adb. Step 2 refuses with no result on record | no table block, no partition of ours; `misc` only if ABL accepts `fastboot reboot recovery` (ABL writes it) |
 | 2 | Owner yes, agent | `CONFIRM=gpt-write dual-boot.sh gpt-write`: the write, then read back past the page cache and compared with the plan, before any reboot | 4 table blocks + 2 superblock blocks of userdata |
 | 3 | Agent, right after | `adb reboot bootloader`, `CONFIRM=after-gpt dual-boot.sh after-gpt`: ABL must show the new sizes; then `fastboot reboot recovery`. If ABL refuses that command, this step does not fail: it prints the next step for the owner | nothing |
-| 4 | Owner | Lineage recovery: Factory reset -> Format data / factory reset -> yes; Reboot system now. Android sets itself up. Unlock once; Rooted debugging on again (the wipe turned it off) | all of userdata, metadata |
+| 4 | Owner | Lineage recovery: Factory reset -> Format data / factory reset -> yes; Reboot system now. Finish Android setup. About phone: tap Build number 7 times. Developer options: USB debugging on, accept the RSA key dialog (the wipe removed the key), Rooted debugging on. `android-check` then turns Lineage's Updater off again | all of userdata, metadata |
 | 5 | Agent | `adb root`, `dual-boot.sh android-check`: new sizes, `/data` on the new size, f2fs block count fits, data open. A record on the host | nothing |
-| 6 | Owner yes, agent | `adb reboot bootloader`; `scripts/bg.sh db-install env CONFIRM=install scripts/laurel/dual-boot.sh install` (default the iOS 26 root). Android starts after it | `iosroot` only |
+| 6 | Owner yes, agent | `dual-boot.sh prepare-root` first, in Android (the phone must not wait in fastboot during this conversion). Then `adb reboot bootloader`; `scripts/bg.sh db-install env CONFIRM=install scripts/laurel/dual-boot.sh install` (default the iOS 26 root). Android starts after it | `iosroot` only |
 | 7 | Agent | `scripts/bg.sh db-image scripts/laurel/dual-boot.sh image`: read-only image (kernel of `kernel-ios26-linux.sh` through `ios26-image.sh`, no `ufsrw`, no `rootrw`) | host only |
 | 8 | Owner yes, owner cable | `adb reboot bootloader`, `CONFIRM=flash-slot-b dual-boot.sh flash-slot-b`, `fastboot reboot`. **Android must start** | `boot_b`, `dtbo_b` |
 | 9 | Owner yes, agent | `CONFIRM=switch dual-boot.sh switch`: all checks, then `bootctl set-active-boot-slot 1`, then a normal `adb reboot` | slot attributes |
@@ -229,8 +231,8 @@ The root was a pinned, preallocated f2fs file in `/data`, written raw, reached b
 | # | Decision | State |
 | --- | --- | --- |
 | D1 | Rooted debugging | Done; on again after the wipe |
-| D2 | Lineage's Updater disabled. A sideload still writes slot b: `switch` refuses | Done |
-| D3 | Selecting the OS from the device (owner requirement 2026-11-02), for example iOS writes slot attributes for a button "Android", and a switch on Android with no computer | **Not built here, and needed.** This branch needs a computer for `switch` and for the fast way back; with no computer only the 7 retries return to Android. A write of slot attributes from iOS needs its own fence: LUN 0 is the only LUN the fence allows, and only `iosroot` |
+| D2 | Lineage's Updater disabled, and `android-check` disables it again after the wipe; `switch` refuses if it is on. A sideload still writes slot b: `switch` refuses | Done |
+| D3 | Selecting the OS from the device (owner requirement 2026-11-02) | Built: `boot-menu.md`. Needs an FD from `mu-build.sh` of this tree; `uefi-image.sh` refuses a menu image without it. Not proven on the phone |
 | D8 | One GPT write on LUN 0, one data wipe | Approved 2026-11-02 |
 | D9 | First boot on the new partition is iOS 26 | Decided 2026-11-02 |
 

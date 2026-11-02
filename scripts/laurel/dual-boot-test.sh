@@ -199,11 +199,23 @@ getvar)
     elif [ "\${FAKE_PRODUCT:-laurel_sprout}" != none ]; then echo "product: \${FAKE_PRODUCT:-laurel_sprout}" >&2; fi ;;
   current-slot) echo "current-slot: \${FAKE_SLOT:-a}" >&2 ;;
   partition-size:userdata) echo "partition-size:userdata: \${FAKE_UD:-0x12e1}" >&2 ;;
-  partition-size:iosroot) [ "\${FAKE_IR:-}" != none ] && echo "partition-size:iosroot: \${FAKE_IR:-0x817d8}" >&2 ;;
+  partition-size:iosroot)
+    if [ "\${FAKE_IR_LATE:-0}" = 1 ] && [ "\$(grep -c 'getvar partition-size:iosroot' "\$T/calls")" -lt 2 ]; then echo "unknown command" >&2
+    elif [ "\${FAKE_IR:-}" != none ]; then echo "partition-size:iosroot: \${FAKE_IR:-0x817d8}" >&2; fi ;;
   esac ;;
+set_active) case " \${FAKE_FAIL:-} " in *" fb-set-active "*) echo "FAILED (remote: 'garbled')" >&2; exit 1 ;; esac ;;
+stage) case " \${FAKE_FAIL:-} " in *" fb-stage "*) echo "FAILED (remote: 'flash write failure')" >&2; exit 1 ;; esac ;;
 reboot) if [ "\${2:-}" = recovery ]; then case " \${FAKE_FAIL:-} " in *" fb-reboot-recovery "*) echo "FAILED (remote: 'unknown command')" >&2; exit 1 ;; esac; fi ;;
 esac
 exit 0
+EOT
+cat > "$T/pbin/pm" <<EOT
+#!/bin/sh
+echo "pm \$*" >> "$T/calls"
+case "\$1" in
+list) [ "\${FAKE_UPDATER:-off}" = on ] || echo package:org.lineageos.updater ;;
+disable-user) case " \${FAKE_FAIL:-} " in *" pm-disable "*) exit 1 ;; esac; echo "Package org.lineageos.updater new state: disabled-user" ;;
+esac
 EOT
 for f in "$T"/pbin/*; do chmod +x "$f"; done
 chmod +x "$T/bin/fastboot"
@@ -712,6 +724,29 @@ if start "Android check: data not open yet: stops"; then
 fi
 
 # ---- install ----
+if start "Install: one garbled getvar: asked again, not called absent"; then
+  printf 'android-opened x f2fs-bytes 1\n' > "$RES"; mkdir -p "$D"
+  fb CONFIRM=install FAKE_IR_LATE=1 sh "$DB" install "$T/root.img"
+  exit_is 0; ran "fastboot -S 512M flash iosroot"; done_
+fi
+if start "Install: ABL reports a failed last piece at the next download: no installed record"; then
+  printf 'android-opened x f2fs-bytes 1\n' > "$RES"
+  fb CONFIRM=install FAKE_FAIL=fb-stage sh "$DB" install "$T/root.img"
+  exit_not0; said "failed write"; grep -q '^installed ' "$RES" && no "recorded as installed"; done_
+fi
+if start "Prepare root: host only, makes the sparse image, asks nothing of the phone"; then
+  rm -f "$T/root.simg"; run sh "$DB" prepare-root "$T/root.img"
+  exit_is 0; said "ready:"; [ -f "$T/root.simg" ] || no "no simg"; not_ran "adb"; not_ran "fastboot"; done_
+fi
+if start "Switch: Lineage's Updater is on: refused before set-active"; then
+  ready
+  run CONFIRM=switch FAKE_UPDATER=on sh "$DB" switch
+  exit_not0; said "Updater is on"; not_ran "bootctl set-active-boot-slot"; done_
+fi
+if start "Android check: Updater disable fails: stops, no record"; then
+  : > "$RES"; run FAKE_FAIL=pm-disable sh "$DB" android-check
+  exit_not0; grep -q '^android-opened ' "$RES" && no "recorded"; done_
+fi
 if start "Install: no record that Android opened its data: nothing"; then
   fb CONFIRM=install sh "$DB" install "$T/root.img"
   exit_not0; said "android-check"; not_ran "fastboot"; done_
@@ -924,6 +959,10 @@ if start "RO gate: result + Android opened after it: rw goes"; then
 fi
 
 # ---- back to Android ----
+if start "To Android: set_active fails: stops, says what to do, no reboot"; then
+  run CONFIRM=to-android FAKE_FAIL=fb-set-active sh "$DB" to-android
+  exit_not0; said "fastboot reboot bootloader"; not_ran "fastboot reboot"; done_
+fi
 if start "To Android: OnePlus in fastboot: no set_active"; then
   run CONFIRM=to-android FAKE_PRODUCT=taro sh "$DB" to-android
   exit_not0; not_ran "fastboot set_active"; not_ran "fastboot reboot"; done_
