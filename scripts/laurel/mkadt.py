@@ -182,6 +182,8 @@ def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwin
     if DONOR.get('dram_all'):
         setprop(chosen, 'dram-base', u64(DONOR['dram_all'][0]))
         setprop(chosen, 'dram-size', u64(DONOR['dram_all'][1]))
+        # xnu-12377 asserts on this: ml_unsafe_kernel_text() (machine_routines.c:3407) [V phone 2026-11-02]. 0: no CTRR, which is true here.
+        setprop(chosen, 'kernel-ctrr-to-be-enabled', u32(0))
     setprop(chosen, 'display-scale', u32(2))
     setprop(chosen, 'laurel-ram-banks', b''.join(u64(b, sz) for b, sz in RAM_BANKS))   # laurel 2100 self-check
     setprop(chosen, 'laurel-ram-reserved', b''.join(u64(b, sz) for b, sz in RAM_RESERVED))

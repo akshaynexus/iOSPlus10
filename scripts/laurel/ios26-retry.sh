@@ -31,7 +31,12 @@ run $DB image $M
 if [ "$(timeout 3 adb get-state 2>/dev/null || true)" = device ] && [ "$(timeout 5 adb shell getprop ro.boot.slot_suffix 2>/dev/null | tr -d '\r')" = _a ]; then
   say "Android is already on slot a"
 else
-  say "waiting for fastboot: owner, hold Power + Vol Down"
+  # A panic hold answers on USB: this asks for fastboot with no buttons, and the session it gives is clean.
+  if lsusb 2>/dev/null | grep -q '1209:0001'; then
+    say "the kernel answers on USB: asking it for fastboot"
+    timeout 15 out/bin/op10tool ctl bootloader 2>&1 | tail -n 1 || true
+  fi
+  say "waiting for fastboot: owner, hold Power + Vol Down if it does not come"
   wait_fb 400 || die "no fastboot in 20 minutes"
   sleep 2
   ok=0
