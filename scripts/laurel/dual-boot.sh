@@ -478,11 +478,8 @@ after-gpt)
   need_confirm after-gpt
   need_fastboot_mi_a3
   need_fastboot_layout
-  # ABL can have no such command: FastbootCmds.c:2596, under DYNAMIC_PARTITION_SUPPORT. A refusal is no failure of this step: the table is good, and the next step is the owner's.
-  if ! fastboot -s "$FB_S" reboot recovery; then
-    say "ABL refused fastboot reboot recovery. Nothing changed, and the new table is good. $RECOVERY_NEXT"
-    [ ! -f "$REHEARSAL" ] || { say "the rehearsal has this on record:"; grep '^reach ' "$REHEARSAL" || true; }
-  fi
+  # [V phone 2026-11-02] fastboot reboot recovery answers OKAY and then boots Android, which here would meet zeroed superblocks. So the owner goes to recovery by the buttons [V docs of the LineageOS install on this phone].
+  say "ABL sees the new table. Next, owner, from this fastboot screen: hold Volume Up + Power, and let go at the Android One logo, for recovery. If Android starts instead, it may stop or wipe by itself; that does no harm here, and then: adb reboot recovery"
   say "In Lineage recovery (owner): Factory reset -> Format data / factory reset -> yes; then Reboot system now. Finish Android setup. Settings -> About phone: tap Build number 7 times. Developer options: USB debugging on, accept the RSA key dialog (the wipe removed the key), Rooted debugging on. Then: adb root, dual-boot.sh android-check"
   ;;
 android-check)

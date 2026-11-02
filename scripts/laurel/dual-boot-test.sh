@@ -675,10 +675,10 @@ if start "S2 guard: recovery has no root: step 2 refuses until the owner's word,
   run CONFIRM=gpt-write NO_RECOVERY_ROOT=lun-erase-accepted sh "$DB" gpt-write
   exit_is 0; said "ERASES ALL OF LUN 0"; disk_is_new; done_
 fi
-if start "S1 after-gpt: ABL refuses fastboot reboot recovery: no failure, the next step is printed"; then
-  printf 'reach fastboot-reboot-recovery refused x\nrecovery root x\n' > "$D/rehearsal.result"
-  fb CONFIRM=after-gpt FAKE_FAIL=fb-reboot-recovery sh "$DB" after-gpt
-  exit_is 0; ran "fastboot reboot recovery"; said "ABL refused"; said "Power + Vol Up"; said "Format data"; said "reach fastboot-reboot-recovery refused"; done_
+if start "After GPT: never runs fastboot reboot recovery: on this phone it boots Android; says the buttons"; then
+  formatted 2>/dev/null || true
+  fb CONFIRM=after-gpt sh "$DB" after-gpt
+  exit_is 0; not_ran "fastboot reboot recovery"; said "Volume Up + Power"; said "Format data"; done_
 fi
 
 # ---- a stale op10tool: the main checkout's out/bin/op10tool had no gpt command ----
@@ -726,7 +726,7 @@ if start "After GPT: ABL sees other sizes: stops"; then
 fi
 if start "After GPT: right sizes: recovery, and the text says Format data"; then
   fb CONFIRM=after-gpt sh "$DB" after-gpt
-  exit_is 0; ran "fastboot reboot recovery"; said "Format data"; done_
+  exit_is 0; not_ran "fastboot reboot recovery"; said "Volume Up + Power"; said "Format data"; done_
 fi
 if start "Android check: all well: a record"; then
   formatted; : > "$RES"
