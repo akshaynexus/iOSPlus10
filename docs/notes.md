@@ -5121,7 +5121,7 @@ Not proven: all of it on the phone. dyld with opcode fixups, the wrappers' inser
 - [V] Truth CPU: `cortex-a76`, not `neoverse-v1`: it has LSE and RCpc and no LSE2, so an unaligned atomic gives SIGBUS, as this userland's A11 [I for the A11]. `neoverse-v1` has LSE2 and would not fault.
 - [V] After: 2,000,010 cases, 0 mismatches, rules 138 of 138. Before (patch taken back): 200,010 cases, 79,810 mismatches, 33,244 table misses, rules 79 failures. The script fails if the old text shows nothing.
 - [V] `scripts/bg.sh NAME VAR=x script` runs in the tmux server's environment: a variable set in front of `scripts/bg.sh` does not reach the job. Use `scripts/bg.sh NAME env VAR=x script`.
-- [V] iOS 26 output with 2960 in skip.txt: source trees differ only in `laurel_build_stamp.h`; kernel same size, 91 bytes differ in 10 runs: LC_UUID, stamp, series hash, date and tree name in the version string.
+- [V] iOS 26 output with 2960 in skip.txt: source trees differ only in `laurel_build_stamp.h`; kernel same size, 91 to 102 bytes differ (hash digits) in 10 runs: LC_UUID, stamp, series hash, date and tree name in the version string.
 - [V] Evidence for the owner's crashes: none. 41 logs of the main checkout have one `Kernel data abort` (2 files, same event), far is a kernel address: not this bug.
 - [I] CAS with a failed compare on a read-only page: qemu faults, the code does not (iOS 26 the same). Kept: it cannot make a new crash.
 - Gap: no bound on the LL/SC loop on iOS 16 (iOS 26 has 4096). Not changed, doc section 6. Not proven: all of it on the phone.

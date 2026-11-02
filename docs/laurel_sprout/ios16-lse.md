@@ -38,7 +38,7 @@ Baseline f1f8216 against the branch, same checkout and path [V]:
 | `diff -r` of the source trees (no `.git`, no `BUILD`) | 1 file: `bsd/dev/laurel_build_stamp.h`, its stamp |
 | Git trees of each series step (`--dev`) | all equal |
 | Kernel size | 20,176,520 and 20,176,520 bytes |
-| Bytes that differ | 91, in 10 runs: LC_UUID, the series hash, the stamp (2 copies), date and tree name of the version string (2 copies) |
+| Bytes that differ | 91 at 463a2a1, 102 at df778ff (the number depends on the hash digits), always 10 runs: LC_UUID, the series hash, the stamp (2 copies), date and tree name of the version string (2 copies) |
 | Series report | one new line `skipped: not needed`; 7 skipped becomes 8 |
 
 ## 4. Truth test: `scripts/laurel/test-lse0081.sh`
