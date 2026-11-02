@@ -127,7 +127,7 @@ diff --git a/bsd/dev/laurel_ufs_queue.h b/bsd/dev/laurel_ufs_queue.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/laurel_ufs_queue.h
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,481 @@
 +/*
 + * laurel 2971: reads of the root go to the UFS device in parallel (a piece of sweet_ufs.c; the host test
 + * scripts/laurel/test-ufs-queue.sh runs this code against a fake host with threads).
@@ -220,6 +220,7 @@ new file mode 100644
 +	bool was = luq.on;
 +	luq.on = false;
 +	lck_mtx_unlock(&luq_lock);
++	thread_wakeup((event_t)&luq.free_mask); /* a slot that timed out never comes back: the readers that wait for one go to slot 0 */
 +	if (was) {
 +		printf("LAUREL UFS QUEUE: off: %s; reads go through the one slot\n", why);
 +	}
@@ -317,18 +318,25 @@ new file mode 100644
 +	return ucd->resp[7] ? EIO : 0;
 +}
 +
++#define LUQ_NO_SLOT (~0u)
++
++/* LUQ_NO_SLOT: the queue went off: the caller reads through slot 0. */
 +static unsigned
 +luq_take(void)
 +{
 +	bool waited = false;
 +
 +	lck_mtx_lock(&luq_lock);
-+	while (luq.free_mask == 0) {
++	while (luq.on && luq.free_mask == 0) {
 +		waited = true;
 +		assert_wait((event_t)&luq.free_mask, THREAD_UNINT);
 +		lck_mtx_unlock(&luq_lock);
 +		thread_block(THREAD_CONTINUE_NULL);
 +		lck_mtx_lock(&luq_lock);
++	}
++	if (!luq.on) {
++		lck_mtx_unlock(&luq_lock);
++		return LUQ_NO_SLOT;
 +	}
 +	unsigned i = (unsigned)__builtin_ctz(luq.free_mask);
 +	luq.free_mask &= ~(1u << i);
@@ -395,6 +403,9 @@ new file mode 100644
 +		uint32_t want = MIN(count - done, LUQ_BOUNCE - skip);
 +		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
 +		unsigned i = luq_take();
++		if (i == LUQ_NO_SLOT) {
++			break;
++		}
 +		uint64_t began = mach_absolute_time();
 +
 +		luq_prepare(i, su.first_block + pos / UFS_BLOCK, blocks);

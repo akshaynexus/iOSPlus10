@@ -233,6 +233,7 @@ static void thread_block(void *c)
 	asserted = 0;
 }
 static void thread_wakeup_one(event_t e) { (void)e; pthread_mutex_lock(&evm); wake_gen++; pthread_cond_broadcast(&evc); pthread_mutex_unlock(&evm); }
+static void thread_wakeup(event_t e) { (void)e; pthread_mutex_lock(&evm); wake_gen++; pthread_cond_broadcast(&evc); pthread_mutex_unlock(&evm); }
 static void thread_deallocate(thread_t t) { (void)t; }
 static int kernel_thread_start(void (*f)(void *, wait_result_t), void *a, thread_t *t)
 {
@@ -426,6 +427,18 @@ main(void)
 	CHECK(!luq.on && fell == 1, "hang: on %d fell %u", luq.on, fell);
 	CHECK(strstr(printed, "off: a read timed out") != NULL, "line: %s", printed);
 	CHECK((luq.free_mask & 1) == 0, "the slot that timed out stays out: %x", luq.free_mask);
+	hang_after = -1;
+
+	/* review 2026-11-03: the device stalls under more readers than slots: all slots time out, no reader stays in the wait for a slot. A hang here ends the test by SIGALRM. */
+	reset();
+	luq_start();
+	CHECK(luq.on, "on: %s", printed);
+	luq.cmd_timeout = 20 * 1000 * 1000;
+	hang_after = (int)served;
+	alarm(30);
+	run(12, 2, 4096, 0, &bad, &fell);
+	alarm(0);
+	CHECK(!luq.on && luq.in_flight == 0 && fell == 24, "stall: on %d in flight %u fell %u", luq.on, luq.in_flight, fell);
 	hang_after = -1;
 
 	/* few host slots; the kill switch */
