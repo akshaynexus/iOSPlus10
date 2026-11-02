@@ -70,6 +70,7 @@ GPU families [V]: `new_metal_context` asks `supportsFamily:` 1001 to 1005, 1007,
 |---|---|---|
 | `newComputePipelineStateWithDescriptor:error:` + 6 asynchronous forms | `_MTLDevice` answers them through its compiler object, nil here. A nil compute pipeline is an abort: "Metal failed to build compute pipeline" | [V] disassembly of `-[_MTLDevice newComputePipelineStateWithDescriptor:error:]`; zeta hm1-v1 |
 | Linked functions of render stages | RenderBox custom effects, Mercury wallpaper: `NeedsInput(LinkedFunction)` | zeta black wallpaper diagnosis; bridge + frontend |
+| `specializedName` as the link name (`flame-ios26/0002`, `m2v-ios26/0001`) | RenderBox links every effect as `custom_fn`. Boot 11 refused 3 of them: `ios26-gpu-lag.md` section 2 | [V] 23F84, boot 11; host chain |
 | `setResponsibleProcess:`, `setResponsibleTaskIDs:count:`, residency set calls, `allocatedSize`, view descriptor, ranged texture copy, queue priorities | sent by QuartzCore or RenderBox; missing | [V] gap; zeta |
 | `featureProfile`, `minimumTextureBufferAlignmentForPixelFormat:` | CoreImage, IconRendering abort without them | [V] gap; zeta |
 | `newSharedEventWithMachPort:` | `discover_shared_event`: the base class would make an Apple event. Local event; waits on it are skipped (a client presents after its GPU work) | [V] caller, [I] that skipping is safe |
@@ -158,6 +159,8 @@ kernel stand-in: takes the surface, shows it
 [V] from `QuartzCore.lst`, `IOMobileFramebuffer.lst`. `IOMFBDisplay::get_ctx` makes one more Metal context, for copies, in a `dispatch_once`.
 
 **metal2vulkan's Vulkan WSI does nothing here.** No bridge or frontend file uses a swapchain [V: 0 matches]. Turnip has no surface path on iOS (`-Dplatforms=`), though its extension table still names it. The compositor renders into IOSurfaces, and `presentDrawable:` of a client calls `-[CAMetalDrawable present]` after the GPU work. No `vkQueuePresentKHR` exists in the path.
+
+Boot 11 numbers, the fence fix, the 600 MHz limit: `ios26-gpu-lag.md`.
 
 **Sync.** Apple's display waits on a surface's GPU work; ours shows it at once. So in backboardd the plug-in sets `NEGRONIMETAL_SYNC=1` (iOS 26, and the iOS 16 test option): `waitUntilScheduled` waits for completion. That costs one CPU stall per frame, and keeps half-drawn frames off the panel. The kernel's `topaz_surface_drawn` covers a surface named in a submission. Not more than one of these two should stay after the first numbers [U which].
 
