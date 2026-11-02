@@ -25,11 +25,12 @@
  *   Anything else: Apple's shape stays (off line with the reason). Kill switch: boot-arg notch=0 (in sb_wrap.c).
  * Log: syslog + /var/tmp/laurel-notch.log + /dev/console, so the lines reach the USB log (launchd sends SpringBoard's stderr to /dev/null).
  *
- * Top bar in SpringBoard [V 23F84 UIKitCore, docs/laurel_sprout/ios26-touch.md section 5]: _UIStatusBarVisualProvider_Split no longer falls back to
- *   _FixedSplit: no code of UIKitCore names that class; only the default UIStatusBarVisualProviderClassName reaches it. A width in no table (720 px) gets nil, and nil is
- *   the red rdar://45025538 bar. So when Split gives nil on this screen, it gives _FixedSplit, as UIKit of 20H392 does with Jindo off. One line says what the default holds, and
- *   whether UIKit calls this screen embedded: those are the two tests in front of the default. Self-check: both classes, and the method type. Else Apple's nil stays, one off line.
+ * Top bar in SpringBoard [V 23F84, docs/laurel_sprout/ios26-touch.md section 5]: SpringBoard's bar is STUIStatusBar of SystemStatusUI, not _UIStatusBar of UIKitCore.
+ *   STUIStatusBarGetVisualProviderClassForScreen does not read the default UIStatusBarVisualProviderClassName: only PTSettings (visualProviderSettings.visualProviderClassName). Its Split
+ *   has no fallback: 720 px gives nil, and nil is the red rdar://45025538 bar. So Split with nil on the embedded 360x780 @2 screen gives FixedSplit, in both stacks. One line:
+ *   "top bar: on|off: reason", also when no bar asks within 60 s. Self-check: both classes, and the method type. Else Apple's nil stays. The UIKit default stays for apps.
  */
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <math.h>
 #include <pthread.h>
@@ -140,67 +141,90 @@ hook_shape(id self, SEL cmd, unsigned long type)
 }
 
 /* ---- top bar: Split with no table entry -> FixedSplit ---- */
-static Class (*orig_split)(id, SEL, id, id);
-static Class fixed_split;
+#define TOPBAR_CHECK_S 60
+static Class (*orig_split_ui)(id, SEL, id, id), (*orig_split_stui)(id, SEL, id, id);
+static Class fixed_ui, fixed_stui;
 static int topbar_said;
+static volatile int topbar_ui_asked;
 
-/* What the default holds in this process: the suite UIKit reads (_UIKitUserDefaults), as text. Only for the log line. */
-static const char *
-topbar_default(void)
+/* this process's screen is the 360x780 @2 embedded one */
+static int
+topbar_screen_ok(id screen)
 {
-	Class nsud = objc_getClass("NSUserDefaults"), nss = objc_getClass("NSString");
-	id (*str)(id, SEL, const char *) = (id (*)(id, SEL, const char *))objc_msgSend;
-	id d, v;
-
-	if (nsud == Nil || nss == Nil) {
-		return "?";
-	}
-	d = ((id (*)(id, SEL))objc_msgSend)((id)nsud, sel_registerName("alloc"));
-	d = ((id (*)(id, SEL, id))objc_msgSend)(d, sel_registerName("initWithSuiteName:"), str((id)nss, sel_registerName("stringWithUTF8String:"), "com.apple.UIKit"));
-	if (d == nil) {
-		return "no suite";
-	}
-	v = ((id (*)(id, SEL, id))objc_msgSend)(d, sel_registerName("objectForKey:"), str((id)nss, sel_registerName("stringWithUTF8String:"), "UIStatusBarVisualProviderClassName"));
-	return v == nil ? "not set" : ((const char *(*)(id, SEL))objc_msgSend)(((id (*)(id, SEL))objc_msgSend)(v, sel_registerName("description")), sel_registerName("UTF8String"));
-}
-
-static Class
-hook_split(id self, SEL cmd, id screen, id info)
-{
-	Class c = orig_split(self, cmd, screen, info);
 	rect_t b;
 
-	if (c != Nil || sb_bounds == NULL || sb_scale == NULL) {
-		return c;
+	if (sb_bounds == NULL || sb_scale == NULL) {
+		return 0;
 	}
 	b = sb_bounds();
-	if (fabs(b.w - SCREEN_W) > 0.01 || fabs(b.h - SCREEN_H) > 0.01 || fabs(sb_scale() - SCREEN_S) > 0.01) {
-		return c;
-	}
+	return fabs(b.w - SCREEN_W) <= 0.01 && fabs(b.h - SCREEN_H) <= 0.01 && fabs(sb_scale() - SCREEN_S) <= 0.01 &&
+	    ((BOOL (*)(id, SEL))objc_msgSend)(screen, sel_registerName("_isEmbeddedScreen"));
+}
+
+/* SystemStatusUI: the bar of SpringBoard. This is the path that gave the red bar on 23F84 */
+static Class
+hook_split_stui(id self, SEL cmd, id screen, id info)
+{
+	Class c = orig_split_stui(self, cmd, screen, info);
+	int ok = c == Nil && topbar_screen_ok(screen);
+
 	if (!__atomic_exchange_n(&topbar_said, 1, __ATOMIC_RELAXED)) {
-		say("top bar: on: UIKit has no provider for 720 px and read the default as '%s', embedded screen %d: _UIStatusBarVisualProvider_FixedSplit",
-		    topbar_default(), (int)((BOOL (*)(id, SEL))objc_msgSend)(screen, sel_registerName("_isEmbeddedScreen")));
+		if (ok) {
+			say("top bar: on: SystemStatusUI has no provider for 720 px: STUIStatusBarVisualProvider_FixedSplit");
+		} else if (c != Nil) {
+			say("top bar: on: Apple's table gives %s", class_getName(c));
+		} else {
+			say("top bar: off: SystemStatusUI gives no provider, and the screen is not the embedded 360x780 @2 one");
+		}
 	}
-	return fixed_split;
+	return ok ? fixed_stui : c;
+}
+
+/* UIKit: the bar of a UIKit status bar in this process. No line of its own: the check below names it */
+static Class
+hook_split_ui(id self, SEL cmd, id screen, id info)
+{
+	Class c = orig_split_ui(self, cmd, screen, info);
+
+	topbar_ui_asked = 1;
+	return c == Nil && topbar_screen_ok(screen) ? fixed_ui : c;
+}
+
+/* the line also when no bar asked for a provider */
+static void
+topbar_check(void *ctx)
+{
+	if (!__atomic_exchange_n(&topbar_said, 1, __ATOMIC_RELAXED)) {
+		say("top bar: off: %d s after the start SpringBoard did not ask SystemStatusUI for a Split provider (UIKit asked: %d); the hook did nothing",
+		    TOPBAR_CHECK_S, topbar_ui_asked);
+	}
+}
+
+/* one hook: nil -> fixed; returns the old IMP, or NULL when a test fails */
+static IMP
+topbar_hook(const char *split, const char *fixed, Class *out, IMP imp)
+{
+	Class c = objc_getClass(split);
+	Method m = c == Nil ? NULL : class_getClassMethod(c, sel_registerName("visualProviderSubclassForScreen:visualProviderInfo:"));
+
+	*out = objc_getClass(fixed);
+	if (m == NULL || *out == Nil || strcmp(method_getTypeEncoding(m), "#32@0:8@16@24") != 0) {
+		return NULL;
+	}
+	return method_setImplementation(m, imp);
 }
 
 static void
 topbar_init(void)
 {
-	Class split = objc_getClass("_UIStatusBarVisualProvider_Split");
-	SEL sel = sel_registerName("visualProviderSubclassForScreen:visualProviderInfo:");
-	Method m = split == Nil ? NULL : class_getClassMethod(split, sel);
-
-	fixed_split = objc_getClass("_UIStatusBarVisualProvider_FixedSplit");
-	if (m == NULL || fixed_split == Nil) {
-		say("top bar: off: no %s", m == NULL ? "+[_UIStatusBarVisualProvider_Split visualProviderSubclassForScreen:visualProviderInfo:]" : "class _UIStatusBarVisualProvider_FixedSplit");
+	orig_split_ui = (Class (*)(id, SEL, id, id))topbar_hook("_UIStatusBarVisualProvider_Split", "_UIStatusBarVisualProvider_FixedSplit", &fixed_ui, (IMP)hook_split_ui);
+	orig_split_stui = (Class (*)(id, SEL, id, id))topbar_hook("STUIStatusBarVisualProvider_Split", "STUIStatusBarVisualProvider_FixedSplit", &fixed_stui, (IMP)hook_split_stui);
+	if (orig_split_stui == NULL) {
+		__atomic_store_n(&topbar_said, 1, __ATOMIC_RELAXED);
+		say("top bar: off: no STUIStatusBarVisualProvider_Split/_FixedSplit with the type #32@0:8@16@24 [V 23F84]: Apple's nil stays (the red bar)");
 		return;
 	}
-	if (strcmp(method_getTypeEncoding(m), "#32@0:8@16@24") != 0) {
-		say("top bar: off: the Split method has type %s, not #32@0:8@16@24 [V 23F84]", method_getTypeEncoding(m));
-		return;
-	}
-	orig_split = (Class (*)(id, SEL, id, id))method_setImplementation(m, (IMP)hook_split);
+	dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, TOPBAR_CHECK_S * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, topbar_check);
 }
 
 __attribute__((constructor))
