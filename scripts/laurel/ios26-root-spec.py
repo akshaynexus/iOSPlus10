@@ -220,12 +220,12 @@ def tweaks(t, a):
     drop(DROP_TOPAZ, 'no baseband service')
     drop(DROP_EXTRA, 'missing hardware or restart loops, iOS 16 list')
     drop(DROP_N104, 'no Neural Engine on this SoC')
-    if os.environ.get('PERF_DROPS', '1') != '0':
+    if os.environ.get('PERF_DROPS', '0') == '1':
         drop(DROP_LOAD_LOOPS, 'crash and kill loops of boot 11')
         drop(DROP_LOAD_HOT, 'no hardware or no client here, IOS-26-Hot list')
         drop(DROP_LOAD_INTELLIGENCE, 'on-device learning, no Apple Intelligence on A13')
     else:
-        t.audit('launchd drop perf', 'kept', 'PERF_DROPS=0: the jobs of boot 11 stay')
+        t.audit('launchd drop perf', 'kept', 'owner 2026-11-03: no job is removed; PERF_DROPS=1 removes the 33')
     ks = [k for k, j in jobs.items() if isinstance(j, dict) and program(j) in DROP_PROGRAMS]
     for k in ks:
         del jobs[k]
