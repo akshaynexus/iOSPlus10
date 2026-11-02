@@ -1424,7 +1424,7 @@ def spec_tasks_from_overlay(spec, req):
     return sorted(bad)
 
 
-def _parity_real_checks(t, work, ok, jobs_of, line, tree, d):
+def _parity_real_checks(t, work, ok, jobs_of, line, tree, d, said):
     """The real stages are all on. A missing path here is one failed check, not a stop: real() catches it."""
     SSH = '/System/Library/LaunchDaemons/dev.iosplus10.dropbear.plist'
     B = b'System/Library/Audio/Plug-Ins/HAL/'
@@ -1605,7 +1605,7 @@ def parity_self_test(d):
             for k in off:
                 print('    ' + line(t, k))
         else:
-            _parity_real_checks(t, work, ok, jobs_of, line, tree, d)
+            _parity_real_checks(t, work, ok, jobs_of, line, tree, d, said)
         # 5. boot tasks: launchd's own plist: none of these hooks writes a program of a task with RequireSuccess: a hook that wrote one would stop the boot
         lw = os.path.expanduser('~/op10-apple/ios26/23F84-n104ap/tree/root/os/sbin/launchd')
         if os.path.exists(lw):
