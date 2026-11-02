@@ -5210,3 +5210,15 @@ Full text: `docs/laurel_sprout/ios26-gpu-lag.md`.
 - The kernel holds CX + MX NOM for the boot, and stock 745 MHz needs just that: the next cheap GPU gain, not done (no host proof).
 - `LAUREL CPU TOP` hides ended tasks: 197 to 284 s a minute in boot 11, names [U].
 
+## 2026-11-03: Mi A3 GPU levels to 950 MHz (branch t3/57b0d99e; host only, no flash, no adb)
+Full text: `docs/laurel_sprout/gpu.md` section "All stock levels". Patch 2961, both kernels.
+- **CX iPeak gates 900 and 950 MHz** [V adreno-gpulist.h, kgsl_pwrctrl.c]: a vote at TCSR 0x3ed000 + 0x6000 before the raise, no raise when the danger bit stays. The older "PLL + corner" recipes missed it.
+- `qcom,gpu-gaming-bin` limits nothing, only a userspace query. No speed bin in the phone's DTB. `dtbo.img` has no GPU levels.
+- Android's GPU thermal limits are DT only: 95 C (`gpu-step`), 100 C with 5 C hysteresis (`gpu-cx-mon`). `thermal-engine*.conf` of the vendor image has no GPU rule [V]. Our 90/80 C was a guess.
+- A clock read with 10 % tolerance cannot tell 900 from 950. Now 3 %.
+- `alpha_pll_round_rate` rounds the alpha up: 745 MHz is ALPHA 0xaaaaab00, not 0xaaaaaaaa as in the old gpu.md table.
+- **The RPM has never had a DDR vote from XNU on this phone** [V: 1355 >= 1017, so 2892 sent none]. 950 MHz votes 1804. Whether it follows with no `Enab`: [U], the `LAUREL DDR` line says.
+- A kernel line ends after 255 bytes. The self-check line is built in `opp_on_line` so the host test can measure the longest case (194 bytes).
+- Rail vote from 300 to 600 MHz stays NOM (held for the AP's other blocks since 2892), above the GPU's own corner. "Never above the stock corner" holds from 745 MHz.
+- Reading a stock DTB: `boot.img` holds many appended DTBs: find the FDT magic, `dtc`, look for model `TRINKET SoC`. Use `simg2img` + `debugfs -R "cat /etc/..."` for vendor files: 1 GiB raw in `out/`, delete it after.
+

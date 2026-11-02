@@ -1152,3 +1152,9 @@ Done: fence wait no longer spins (`negroni_drm.c`, deadline on the kernel's cloc
 Results [V host]: `test-fence-wait.sh c811ee5`: 1 system call against 3,900. `test-renderbox-effects.sh`: 3 pipelines made for FD610, the control gives the phone's refusal. `ios26-root-spec.py --self-test`: perf 12 of 12, recover 7 of 7, parity 42 of 42 (with the stages a worktree has). `ios26-metal-build.sh all` from a fresh fetch: 8 Mach-O files, 0 failed, 0 instructions newer than ARMv8.0.
 Not proven: all of it on the phone; pixels of the effects; what the 8 on-device learning jobs' clients do with no service.
 Next: new root + the owner's flash (`ios26-root.sh`, then `dual-boot.md`); read section 7 of the doc. Kernel: 745 MHz (section 5). Then pool (section 6).
+
+## Mi A3 iOS 26: GPU levels to 950 MHz (2026-11-03, branch t3/57b0d99e; host only, NOTHING RUN ON THE PHONE)
+Done: patch 2961 (`gpu.md` section "All stock levels"): PLL1 320/465, GPLL0 300/600, PLL0 745/820/900/950, stock CX corner, CX iPeak from 900, stock bus level, Android thermal limits, self-check per level, fallback to the 300/600 path. Kill switches `gpudcvs=0`, `gpupll=0`.
+Results [V host]: `scripts/laurel/test-gpu-opp.sh` PASS (table against source and the phone's DTB; 1904 level changes with failures; 4 controls). Series 0 errors. Kernel built (see the branch report).
+Next: a boot. Read `LAUREL GPU CLOCK: on: MHz=GCC/CP` and `LAUREL DDR`. If DDR does not follow: owner decision on `Enab`. Guess [I]: 39 ms a long submission -> 25 to 28 ms.
+
