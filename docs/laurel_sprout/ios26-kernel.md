@@ -25,7 +25,7 @@ Series method and work flow: [`patches/laurel/xnu-12377/README.md`](../../patche
 
 ## 2. Series totals
 
-309 patch files (201 topaz + 108 laurel), 309 result lines [V]: **210 applied, 83 applied+rules, 11 base, 5 skipped, 0 errors**. The 3 stage
+309 patch files (201 topaz + 108 laurel), 309 result lines [V]: **210 applied, 83 applied+rules, 11 base, 5 skipped, 0 errors**. (That count is of commit 7d428f2. At the commit of laurel 2960: 315 patch files; summary line: 212 applied, 86 applied+rules, 11 base, 8 skipped (2 of them the stage lines), 0 errors; `ios26-kernel-series.txt`; 2960 is skipped: `ios16-lse.md`.) The 3 stage
 scripts: BearSSL (topaz) ran; libpthread and HFS were replaced by their 12377 pairs (2 lines `skipped: replaced`, 2 lines `ran`).
 
 | Skip | Reason |

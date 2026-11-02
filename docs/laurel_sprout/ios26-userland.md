@@ -416,9 +416,9 @@ What this does not show: the kernel path (recovery table, `vm_fault`, exception 
 |---|---|---|
 | The old PACEMU self-check expected `0xD71F0C41` to decode, and the decoder did not: PAC emulation turned itself off at first use | iOS 26 kernel | Fixed: new decoder |
 | PACEMU gave PACGA a hash, the tool gives 0: signer and checker would disagree | iOS 26 kernel | Fixed: 0 |
-| **topaz 0081 put its LSE fault ranges after `copyio_recover_table_end`: `find_copyio_recovery_entry` misses them, so a fault in an emulated LSE word (first write to a COW page) panics** [V: section 0x60 bytes longer than the table, 4 entries, in both kernels] | iOS 26 and **iOS 16** | Fixed on iOS 26 (table end moved). iOS 16 unchanged as ordered: owner decision |
-| topaz 0081 LDUMIN: `csel` uses the flags of `cmp w1, #6`, not of the values: the result is always the operand [V source; not run] | iOS 26 and **iOS 16** | iOS 26 does not reach it unless `laurelemu=0`. iOS 16 unchanged: owner decision |
-| 0081 sends a bad pointer to EXC_BAD_INSTRUCTION, not EXC_BAD_ACCESS | both | iOS 26 emulator: correct |
+| **topaz 0081 put its LSE fault ranges after `copyio_recover_table_end`: `find_copyio_recovery_entry` misses them, so a fault in an emulated LSE word (first write to a COW page) panics** [V: section 0x60 bytes longer than the table, 4 entries, in both kernels] | iOS 26 and **iOS 16** | Fixed on iOS 26 (table end moved). iOS 16: laurel 2960, branch `t3/laurel-ios16-lse`, not run on the phone: `ios16-lse.md` |
+| topaz 0081 LDUMIN: `csel` uses the flags of `cmp w1, #6`, not of the values: the result is always the operand [V source; not run] | iOS 26 and **iOS 16** | iOS 26 does not reach it unless `laurelemu=0` (not changed). iOS 16: laurel 2960: `ios16-lse.md` |
+| 0081 sends a bad pointer to EXC_BAD_INSTRUCTION, not EXC_BAD_ACCESS | both | iOS 26 emulator: correct. iOS 16: laurel 2960 |
 | **`processor_start` on 12377 is `mov w0,#5; ret` (`processor_start_from_kext`), and SweetCPU panics on that result: the boot panics at the secondary CPUs** [V 12377 source, found through IOS-26-Hot 0136] | iOS 26, and the **negroni 12377 base 0004 has the same call** | Fixed on iOS 26: `ml_processor_register` moved into the `startAll` loop. Negroni: not changed, owner decision |
 | dyld pager: arm64e chained fixups did not compile with no PAC | iOS 26 kernel | Fixed from Hot 0129 idea: `signPointer` gives a plain pointer |
 | Spawn with an arm64e preference refused arm64 slices; shared region did not match arm64 and arm64e | iOS 26 kernel | Fixed |

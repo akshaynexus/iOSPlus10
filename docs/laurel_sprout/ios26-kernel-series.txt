@@ -326,5 +326,6 @@
 2951-laurel-boot-state.patch                                   applied+rules(1): glue
 2955-laurel-power-hold-reset.patch                             applied
 2956-laurel-panic-reset-word.patch                             applied+rules(1): 3way osfmk/kern/debug.c
+2960-laurel-lse-emulation.patch                                skipped: not needed: iOS 16 fix of the topaz 0081 text. On this kernel LSE goes to laurel_a64emu, and post/9000 moved the table end; 0081 stays only with laurelemu=0 (base 0003), unchanged here so that this kernel stays byte-identical
 9000-series-12377-api.patch                                    post
-== series: 212 applied, 86 applied+rules, 0 replaced, 7 skipped, 11 base, 0 errors
+== series: 212 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors

@@ -1,7 +1,7 @@
 # Mi A3 iOS 26 kernel series (xnu-12377.121.6, SWEET machine config, Linux build)
 
 Same method as `patches/xnu-12377` (negroni): **one series, data rules, base-owned files, a skip list with reasons**. The iOS 16
-kernel and this kernel apply the same 310 patch files: `external/ios-topaz/xnu/patches/*.patch` + `patches/laurel/xnu/*.patch`, in name
+kernel and this kernel apply the same patch files: `external/ios-topaz/xnu/patches/*.patch` + `patches/laurel/xnu/*.patch`, in name
 order. A driver fix lands once. Nothing of 8796 is copied. Build: `scripts/laurel/kernel-ios26-linux.sh`. Status: `docs/laurel_sprout/ios26-kernel.md`.
 
 ## Order (`scripts/ios26/apply-series.py --profile scripts/laurel/ios26-series.py`)
