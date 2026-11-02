@@ -7,14 +7,16 @@
 # the result, then a second a64-lower of the cache to prove the output is the same bytes. Host results only.
 # a64-verify replays the checks of dyld and the kernel on each cache file (also alone: op10tool a64-preflight --cache FILE).
 # DEAD images: their __text becomes trampoline space for WebCore and WebKit (subcaches .09 and .11 have too little slack).
+# dyld maps a dead image when a daemon's dependents reach it, so it must have no load-time code; a64-lower refuses one that has.
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
 . "$(dirname "$0")/donor.sh"
 T=$APPLE/ios26/$BUILD-$DEV/tree
 L=${LOWERED:-$APPLE/ios26/$BUILD-$DEV/lowered}  # LOWERED=DIR: a scratch output; the shared folder and its link stay
 C=$T/cache/dyld_shared_cache_arm64e
-# Images that never load on this phone [I]: no ANE; the Image Playground frameworks need an A17 Pro or newer.
-DEAD=${DEAD:-ANECompiler.framework/ANECompiler VisualGeneration.framework/VisualGeneration}
+# Code in it never runs on this phone [I]: the Image Playground frameworks need an A17 Pro or newer. 2.7 MiB of __text, all 47,899 sites in reach.
+# Not ANECompiler: most daemons load it through Espresso and it has 2 initializers (docs/laurel_sprout/ios26-entry.md).
+DEAD=${DEAD:-VisualGeneration.framework/VisualGeneration}
 dead_args=; for d in $DEAD; do dead_args="$dead_args --dead-image $d"; done
 TOOL=$OUT/bin/op10tool
 rm -rf "$L" "$L.again" "$OUT/ios26/census-$DEV-lowered"

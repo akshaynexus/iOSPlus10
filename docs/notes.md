@@ -5150,3 +5150,18 @@ Full text: `docs/laurel_sprout/ios26-dyld.md`.
 - Page-in linking on this kernel: dyld passes page size 0x4000, the kernel answers `KERN_INVALID_ARGUMENT` with no print, dyld links in-process [V both sides].
 - Host check before any boot: `op10tool a64-preflight --cache FILE`. `a64-verify` and `ios26-root.sh` run it.
 - Next boot must print `LAUREL DYLD: cache on: launchd[1] mapped 85 files, 107 mappings, slide 0x...` (post 9003).
+
+## Mi A3 iOS 26: `pc 0x100000000`: dyld ran trampolines as ANECompiler's initializers (2026-11-02, branch t3/laurel-ios26-entry; host only, no flash)
+Full text: `docs/laurel_sprout/ios26-entry.md`.
+- A pc equal to a neat address is not an entry point until shown. It was a stale stack word: `add sp,#176` in a trampoline popped dyld's frame of the same size. Measure sp against the stack top first: top = 0x16fe00000 - (mh - 0x100000000). At entry the depth is about 0x320; the crash was at 0x4d50 or deeper, the same in every boot. That alone rules out the entry.
+- `prepare()` of dyld has a frame of 0x3c00 or more, which grows with the image count. So a depth that follows the image count means dyld's or libSystem's start, not `main()`.
+- `op10tool --dead-image` means "code may not run". It says nothing on whether the image loads: dyld loads it through weak and upward links. `a64-lower` now refuses one with initializers or +load.
+- The closure from load commands (`libSystem` -> 642 images with weak and upward) does not predict what loads: `keybagd` and `notifyd` do not run ANECompiler's initializers. Run it, do not count it.
+- **Host replay: `scripts/laurel/ios26-user-emu.sh PROGRAM` runs dyld, the real lowered cache and the program to `main()` under Unicorn, cortex-a72, in seconds.** It gave the phone's registers to the byte. Use it before a boot when dyld, the cache or an early initializer changes. `--trace-after N --trace-size M`: the last basic blocks. `--inits`: images whose initializers ran. It stops after `main()`: `int 7` in libdispatch or libxpc is its limit, not a bug.
+- Emulator traps I fell in: an output buffer larger than asked hides as `__stack_chk_fail`; a private memory arena must not lie in the shared region (up to 0x2d0610000 with a slide); a MIG reply needs remote port 0, local = reply port, and id + 100, or the stub returns -300.
+- 23F84 dyld reads `DynamicRegion` at cache base + header 0x1f0, magic `dyld_data    v`, version at byte 0xe; file ID at 0x10 and 0x18; path offset at 0x24. dyld restarts itself from the cache copy: `tsd base` set twice is normal. `shared_region_check_np(-1)` is the auth remap call.
+- UserEventAgent is the only program of 23F84 with CS_ENFORCEMENT in its signature (0x3202). Under `TOPAZ_4K` no page is validated, so it died in dyld: `post/9004`.
+- launchd reboots on 3 crashes in a row of a service with flag bit 60. runningboardd has `ThrottleInterval 1`, so it gets there first. The job on the root has no `_RecoverOnCrash`; the source of the flag is [U].
+- `LAUREL EMU: counts pac=1`: first trap `braaz x16` at 0x2a353075c in `libsystem_platform`, a word of the tool's "left, not proven" list. The report prints at the first trap and then every 60 s.
+- The next boot must print `LAUREL CS: off: ... first UserEventAgent`, and no `pc 0x100000000`.
+

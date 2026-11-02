@@ -540,6 +540,16 @@ pub fn run(cache_path: Option<&Path>, machos: &[PathBuf], outdir: &Path, rules: 
 }
 
 #[allow(clippy::too_many_arguments)]
+/// A dead image can still be a dependent of a daemon: dyld then maps it and runs its load-time code. Trampolines in its __text
+/// turn that code into a stray `add sp, sp, #176` (docs/laurel_sprout/ios26-entry.md). So a dead image must have no such code.
+fn dead_image_runs_code(m: &Macho) -> Option<String> {
+    m.sections.iter().find_map(|s| match s.flags & 0xff {
+        0x09 | 0x15 | 0x16 if s.size != 0 => Some(format!("section {} has {} bytes of initializers", s.name, s.size)),
+        _ if (s.name == "__objc_nlclslist" || s.name == "__objc_nlcatlist") && s.size != 0 => Some(format!("section {} has +load code", s.name)),
+        _ => None,
+    })
+}
+
 fn lower_cache(main: &Path, outdir: &Path, tmp: &Path, rules: &Rules, page_shift: u32, dead: &[String], plan_only: bool, report: &mut String) -> Result<()> {
     let started = std::time::Instant::now();
     let cache = Cache::open(main)?;
@@ -569,6 +579,11 @@ fn lower_cache(main: &Path, outdir: &Path, tmp: &Path, rules: &Rules, page_shift
         let m = Macho::parse(cache.read(*address, 32 + size as usize)?)?;
         taken.push((*address, *address + 32 + size));
         let d = dead.iter().any(|x| path.contains(x.as_str()));
+        if d {
+            if let Some(why) = dead_image_runs_code(&m) {
+                bail!("--dead-image {path}: {why}: dyld runs it at load, and its __text would hold trampolines (docs/laurel_sprout/ios26-entry.md)");
+            }
+        }
         for s in &m.sections {
             taken.push((s.addr, s.addr + s.size));
             if d && s.flags & dsc::SECTION_INSTRUCTIONS != 0 && s.size >= 64 && s.name == "__text" {
@@ -960,6 +975,11 @@ pub fn verify(orig: &Path, lowered: &Path, dead: &[String], macho_orig: Option<&
         let head = a.read(*address, 32)?;
         let m = Macho::parse(a.read(*address, 32 + dsc::u32_at(head, 20)? as usize)?)?;
         let d = dead.iter().any(|x| path.contains(x.as_str()));
+        if d {
+            if let Some(why) = dead_image_runs_code(&m) {
+                let _ = writeln!(problems, "dead image {path}: {why}");
+            }
+        }
         for s in m.instruction_sections() {
             if d && s.name == "__text" {
                 dead_text.push((s.addr, s.addr + s.size));
@@ -1599,6 +1619,20 @@ mod tests {
         assert_eq!(preflight_cache(&cache, &mut problems), 1);
         assert!(problems.contains("subcache count exceeds limit"), "{problems}");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dead_image_with_load_time_code_is_refused() {
+        let sect = |name: &str, flags: u32, size: u64| dsc::Section { segment: "__TEXT".into(), name: name.into(), addr: 0x1000, size, fileoff: 0, flags, reserved2: 0 };
+        let image = |sections| Macho { sections, ..Macho::default() };
+        // ANECompiler 23F84: two offsets in __init_offsets, type 0x16. Trampolines over them were the crash of every daemon that loads it.
+        let ane = image(vec![sect("__text", dsc::SECTION_INSTRUCTIONS, 0x143b4e4), sect("__init_offsets", 0x16, 8)]);
+        assert!(dead_image_runs_code(&ane).unwrap().contains("__init_offsets"));
+        assert!(dead_image_runs_code(&image(vec![sect("__mod_init_func", 0x09, 8)])).is_some());
+        assert!(dead_image_runs_code(&image(vec![sect("__objc_nlclslist", 0, 8)])).is_some());
+        // VisualGeneration 23F84: Swift and ObjC metadata, classes are lazy.
+        let vg = image(vec![sect("__text", dsc::SECTION_INSTRUCTIONS, 0x29b970), sect("__objc_classlist", 0x1000_0000, 0x240), sect("__init_offsets", 0x16, 0)]);
+        assert_eq!(dead_image_runs_code(&vg), None);
     }
 
     #[test]

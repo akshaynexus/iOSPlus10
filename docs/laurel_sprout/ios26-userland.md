@@ -243,9 +243,9 @@ ret
   mappings). So the trampolines go in free bytes inside the r-x mappings: zero runs of 64 bytes or more that no section and no load
   command owns. **12,439,776 such bytes exist** across the cache, 3,689,848 needed by a first model. Per file it is short: `.11` (WebCore)
   has 53,296 and needs 709,148.
-- With free bytes only: 47,522 sites in WebCore + WebKit have no slot in reach. With two dead images (`ANECompiler`, 21 MB `__text`:
-  this phone has no ANE; `VisualGeneration`: Image Playground, needs a newer SoC) [I they never load]: **0 sites have no slot**. Used:
-  trampolines 841,212 bytes (16,327, from 6,150 unique words) + stubs 2,782,240 bytes.
+- With free bytes only: 47,899 sites in WebCore + WebKit have no slot in reach. With one dead image (`VisualGeneration`: Image Playground, needs a newer SoC, 2.7 MiB `__text`, no load-time code): **0 sites have no slot**. Used:
+  trampolines 844,268 bytes (16,389, from 6,150 unique words) + stubs 2,785,632 bytes.
+- **Wrong first version [V, boot 8 of 2026-11-02]: `ANECompiler` was a dead image too, "[I] it never loads". Most daemons load it, and dyld ran its 2 initializers: trampoline bytes. Crash `pc 0x100000000`: `ios26-entry.md`.** `a64-lower` now refuses a dead image with load-time code. It was not needed for space.
 - Unwinding: trampolines have no unwind info. A frame-pointer walk still works (x29 stays). A fault inside a trampoline, on a bad
   pointer, gives a crash report with a PC outside any function. C++ and Swift unwinding never start there [I].
 - `lr_dead` is conservative: any word with 30 in a register field, a `ret`, a tail call or a jump table counts as live.
@@ -284,7 +284,7 @@ The boot itself is far slower than iOS 16 for other reasons: 5.2 GB cache, more 
 | AMX | 419,408 | 0 |
 | Apple registers (A13 column, DIT gone) | 837 | 656 |
 
-The two dead images keep 2,322 LSE, 185,928 PAC and 11,956 `ldapr` words: they must never load.
+(Table from before `ios26-entry.md`, with two dead images.) The dead image `VisualGeneration` is not lowered: it may load, but none of its code may run. It has no load-time code; `a64-lower` checks this.
 
 Root files with LSE left (no free space in the file's `__TEXT`): CommCenter 2,661, libaxis 897, Measure 698, libdispatch_profile 227,
 introspection libdispatch 215, diskimagescontroller 172, USDRendererExtension 126, wirelessinsightsd 124, locationd 92,

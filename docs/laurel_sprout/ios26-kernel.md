@@ -70,6 +70,7 @@ The two tracks are joined: `ios26-userland.md` sections 7.1-7.4 (state per item,
 | Undefined instruction hook | **`LAUREL EMU`** `osfmk/arm64/laurel_abi.c` + `laurel_a64emu.c`, from `handle_uncategorized` and `handle_msr_trap`: PAC, LSE, CASP, RCpc, RCpc2, FP16, FCMA, DotProd, JSCVT, FHM, SHA3, SHA512, RDM, DIT, SB. Kill switches `laurelemu=0` (the 0081 path stays), `laurelpacemu=0`. This replaces the `LAUREL PACEMU` of the first version, which turned itself off at first use (ios26-userland.md 7.3) |
 | Copyio recovery | `copyio_recover_table_end` moved to the end of `machine_routines_asm.s`: the 0081 ranges were outside the table |
 | dyld flags, commpage | `LAUREL DYLD`, `LAUREL CPUID`. `post/9003`: one line per map of a shared region, `LAUREL DYLD: cache on` or `off` (`ios26-dyld.md`) |
+| Code signing on 4 KiB pages | `post/9004` `LAUREL CS`: an unvalidated code page is no violation, so UserEventAgent (flags 0x3202) is not killed. `ios26-entry.md` section 4 |
 | User clients | IOSurface, IOMFB of 23F84: ios26-userland.md 8.2. **This kernel no longer answers an iOS 16 userland on these clients: the doc's section 8 line "the kernel reaches launchd of iOS 16" stops at the first surface** |
 
 ## 4.1 Debug without a picture

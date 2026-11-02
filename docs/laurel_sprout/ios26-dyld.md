@@ -86,6 +86,7 @@ No `dyld cache '(null)'` and no `Library not loaded`. Then `<Notice>: boot-args 
 | 4 | Code signing page shift | **Not a blocker** [V]: shift 12 accepted, replay passes, `cs_validate_range` returns at once under `TOPAZ_4K` |
 | 5 | Region size | **Not a blocker** [V]: `SHARED_REGION_SIZE_ARM64` 0x180000000; cache 0x1403d0000 + max slide 0x20000000 fit. `_SR_FILE_MAPPINGS_MAX_FILES` 256: 85 used |
 | 6 | Page-in linking | **Not a blocker** [V both sides]: dyld mode 2 (0x18d48). launchd chains have page size 0x4000; the kernel answers `KERN_INVALID_ARGUMENT` with no print for `mwli_page_size != PAGE_SIZE`; dyld then links in-process (0x2aed0). Cost: CPU at each start |
+| 1a | **Seen at boot 8**: `pc 0x100000000` in 48 daemons, launchd reboots: not the slide pager. `ios26-entry.md` | [V] fixed on the host |
 | 7 | dyld closures | [I] not a blocker: lowered launchd has a new cdhash, so its prebuilt set is refused and dyld uses `JustInTimeLoader`; header UUIDs stay. Zeta has the same |
 | 8 | Dynamic region | [V code] dyld stops with `dyld shared region dynamic config data was not set` if the file ID is empty (0x1c098). HFS gives device and inode: [I] fine |
 | 9 | Boot task `mount -P 1` | [V code]: no `/filesystems/fstab`: "failed to get filesystem info", not fatal. Env 0: "data volume missing, but not required". `_APFSContainerGetBootDevice` fails: up to 5 tries, a delay. 23F84 `mount` has no `boot-manifest-hash` string. `cc_fips_test`: HMAC resealed [V host], never run. `init_data_protection`, `tzinit`, `fsck -qL`: [U] |

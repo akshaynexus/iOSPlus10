@@ -1,0 +1,39 @@
+--- a/osfmk/vm/vm_fault.c
++++ b/osfmk/vm/vm_fault.c
+@@ -2779,6 +2779,22 @@
+ /*
+  * Check if the page being entered into the pmap violates code signing.
+  */
++#if defined(TOPAZ_4K)
++/* Always false: see the caller. One line at the first time, so the state of a boot can be read. */
++static bool
++laurel_cs_no_page_hash(void)
++{
++	static bool said;
++
++	if (!said) {
++		said = true;
++		printf("LAUREL CS: off: no page hash check on 4 KiB pages: CS_ENFORCEMENT does not stop an unvalidated code page, first %s\n",
++		    current_proc() ? proc_best_name(current_proc()) : "?");
++	}
++	return false;
++}
++#endif /* TOPAZ_4K */
++
+ static kern_return_t
+ vm_fault_cs_check_violation(
+ 	bool cs_bypass,
+@@ -2910,6 +2926,13 @@
+ 		*cs_violation = TRUE;
+ 	} else if (!VMP_CS_VALIDATED(m, fault_page_size, fault_phys_offset) &&
+ 	    (prot & VM_PROT_EXECUTE)
++#if defined(TOPAZ_4K)
++	    /*
++	     * laurel: vm_page_validate_cs() validates no page here (16 KiB hash units on 4 KiB pages), so "not validated" says nothing.
++	     * A signature with CS_ENFORCEMENT + CS_KILL (UserEventAgent 23F84, flags 0x3202) was killed at the start of dyld.
++	     */
++	    && laurel_cs_no_page_hash()
++#endif /* TOPAZ_4K */
+ #if CODE_SIGNING_MONITOR
+ 	    /*
+ 	     * Executable pages will be validated by the code signing monitor. If the
