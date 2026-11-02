@@ -41,8 +41,8 @@ chmod 644 "$D/clients" "$R/System/Library/Extensions/NegroniMetal.bundle/clients
   if [ -n "${METAL_ENV:-}" ]; then printf '%s\n' "$METAL_ENV"; fi
 } > "$D/env"
 chmod 644 "$D/env"
-# The stack selector's folder (option_select.m) and its setting: no file means the default. Fresh root: nothing else to write. backboardd runs as mobile
-mkdir -p "$D/stack"; chmod 777 "$D/stack"
+# The stack selector's folder (option_select.m) and its setting: no file means the default. Fresh root: nothing else to write. backboardd runs as mobile, so all may add a file; the sticky bit: only the owner removes it (helper_ios26.c stack_dir)
+mkdir -p "$D/stack"; chmod 1777 "$D/stack"
 # XNUtils with the switches + bench: only with METAL26_XNUTILS=1 on a mounted root as root (its helper is setuid), after the first boot. The first-boot image has none
 if [ "${METAL26_XNUTILS:-0}" != 1 ]; then
   :

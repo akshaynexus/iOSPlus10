@@ -96,8 +96,9 @@ static bool read_word(const char *path, char *out, size_t size)
 		}
 		nmtl_option_state_read(text, &s);
 		if (compositor) {
-			mkdir(STACK_D, 0777);
-			chmod(STACK_D, 0777);
+			/* the mode of helper_ios26.c stack_dir(): a root process can come here first; as mobile both calls only fail: the parent folder and this one are root's */
+			mkdir(STACK_D, 01777);
+			chmod(STACK_D, 01777);
 		}
 		const bool ok = compositor && access(OK_MARK, F_OK) == 0, failed = compositor && access(FAILED, F_OK) == 0;
 		const char *pick = nmtl_option_choose(wanted, known, &s, ok, failed, compositor, why, sizeof(why));

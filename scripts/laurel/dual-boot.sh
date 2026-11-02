@@ -12,7 +12,9 @@
 #   CONFIRM=gpt-write dual-boot.sh gpt-write       THE GPT WRITE, LUN 0 only: 4 table blocks, the 2 superblock blocks of userdata. Reads it back before any reboot. Android's data is gone after the next reboot
 #   CONFIRM=after-gpt dual-boot.sh after-gpt       phone in fastboot (adb reboot bootloader): ABL must see the new sizes; then reboot to recovery. There the owner does Format data
 #   dual-boot.sh android-check                     read-only: Android opened its data on the new layout; a record on the host
+#   dual-boot.sh prepare-root [IMG]                host only: the sparse image and its read-back list, before the phone goes to fastboot (tmux)
 #   CONFIRM=install dual-boot.sh install [IMG]     phone in fastboot: the root image to iosroot (tmux). Only iosroot
+#   dual-boot.sh verify-root                       read-only, in Android, after install: all RAW and FILL blocks of iosroot against the sparse image, a record on the host. switch needs it (tmux: about 18 GB of reads)
 #   dual-boot.sh image [rw]                        host only: boot image. Default read-only (no ufsrw, no rootrw); rw refuses until the read-only run is on record
 #   CONFIRM=flash-slot-b dual-boot.sh flash-slot-b [rw]   phone in fastboot: boot_b = that image, dtbo_b = stock dtbo; Android stays active
 #   CONFIRM=switch dual-boot.sh switch [rw]        Android -> iOS: all checks, slot b active, normal reboot
@@ -30,7 +32,7 @@ G=$D/gpt
 RESULT=$D/first-boot.result
 PREWRITE=$D/pre-write-backup
 REHEARSAL=$D/rehearsal.result
-GPT_FEATURES=ldb-gpt-2
+GPT_FEATURES=ldb-gpt-3
 HELPER=/data/local/tmp/ldbhelper
 SDA=/dev/block/sda
 TOOL=${OP10TOOL:-$OUT/bin/op10tool}
@@ -151,10 +153,11 @@ fb_var() { fastboot -s "$FB_S" getvar "$1" 2>&1 | sed -n "s/^$1: *//p" | tr -d '
 need_fastboot_layout() {
   # ABL can answer one getvar wrongly after a longer command (docs/notes.md): ask again before calling it a real absence.
   _try=0; _u=; _i=
-  while [ "$_try" -lt 3 ] && { [ -z "$_i" ] || [ -z "$_u" ]; }; do
+  while [ "$_try" -lt 3 ] && { ! laurel_size_ok "$_i" || ! laurel_size_ok "$_u"; }; do
     _try=$((_try + 1)); _u=$(fb_var partition-size:userdata); _i=$(fb_var partition-size:iosroot)
   done
   [ -n "$_i" ] || die "ABL sees no partition iosroot after 3 tries (userdata: '$_u'). Run: fastboot reboot bootloader, then this step again. If it says the same in a clean session, stop: the new table is not there"
+  laurel_size_ok "$_i" && laurel_size_ok "$_u" || die "ABL gives iosroot '$_i' and userdata '$_u' after 3 tries: not numbers. Run: fastboot reboot bootloader, then this step again"
   [ "$((_i))" = "$IOSROOT_BYTES" ] && [ "$((_u))" = "$USERDATA_BYTES" ] || die "ABL sees iosroot $_i and userdata $_u, the plan has $IOSROOT_BYTES and $USERDATA_BYTES"
   say "ABL sees the new table: iosroot $_i, userdata $_u"
 }
@@ -296,10 +299,41 @@ make_simg() {
   _s=${1%.img}.simg
   if [ ! -f "$_s" ] || [ "$1" -nt "$_s" ]; then
     echo "dual-boot: making $_s (a long step: run this with scripts/bg.sh)" >&2
-    "$TOOL" img2simg "$1" "$_s.partial" >&2
-    mv "$_s.partial" "$_s"
+    "$TOOL" img2simg "$1" "$_s.partial" >&2 || { rm -f "$_s.partial"; echo "dual-boot: img2simg of $1 failed" >&2; return 1; }
+    mv "$_s.partial" "$_s" || return 1
   fi
   echo "$_s"
+}
+# The read-back list of a sparse image, from its own chunks: $D/simg.list, and $D/simg.expect with the words `ldbhelper root-verify` must print. Made again when the image is newer or another one. The phone must not wait in fastboot for this either.
+make_list() {
+  mkdir -p "$D"
+  if [ -f "$D/simg.list" ] && [ -f "$D/simg.expect" ] && [ "$(sed -n 1p "$D/simg.expect")" = "simg $1" ] && [ ! "$1" -nt "$D/simg.list" ]; then return 0; fi
+  rm -f "$D/simg.list" "$D/simg.expect"
+  echo "dual-boot: reading $1 for its block ranges (about 30 s for 18 GB)" >&2
+  _o=$("$TOOL" simg-verify-list "$1" -o "$D/simg.list.new") || { rm -f "$D/simg.list.new"; echo "dual-boot: no read-back list from $1" >&2; return 1; }
+  printf '%s\n' "$_o" | sed '$d' >&2
+  _w=$(printf '%s\n' "$_o" | sed -n '$p')
+  case "$_w" in "verify ranges "*) ;; *) rm -f "$D/simg.list.new"; echo "dual-boot: op10tool said '$_w', not its result line" >&2; return 1 ;; esac
+  mv "$D/simg.list.new" "$D/simg.list"
+  printf 'simg %s\n%s\n' "$1" "$_w" > "$D/simg.expect"
+}
+# The state of the root on record: none; started (a flash began and no `installed` line came after it); installed (no read-back since); verified. Only a read-back after the last flash counts.
+root_state() {
+  [ -f "$RESULT" ] || { echo none; return 0; }
+  awk 'BEGIN { st = "none" }
+    /^install-started / { st = "started"; sha = "" }
+    /^installed / { st = "installed"; sha = $NF }
+    /^root-verified / { if (st == "installed" && $NF == sha) st = "verified" }
+    END { print st }' "$RESULT"
+}
+need_root_verified() {
+  case "$(root_state)" in
+  verified) ;;
+  none) die "no record of an installed root: dual-boot.sh install" ;;
+  started) die "a flash of iosroot started and did not end with a record: CONFIRM=install dual-boot.sh install, then dual-boot.sh verify-root" ;;
+  installed) die "iosroot was not read back after the install, so a failed last piece would boot as a damaged root: dual-boot.sh verify-root" ;;
+  *) die "the record $RESULT makes no sense: stop, and report it" ;;
+  esac
 }
 
 cmd=${1:-}
@@ -464,11 +498,11 @@ android-check)
   [ "$#" = 3 ] && [ "$1" = $((0xF2F52010)) ] || die "no f2fs superblock on $FSDEV: $_sb"
   _bc=$(($2 + ($3 << 32)))
   [ "$((_bc * 4096))" -le "$USERDATA_BYTES" ] || die "the f2fs on /data claims $((_bc * 4096)) bytes, userdata has $USERDATA_BYTES: a stale superblock. Stop: Format data in recovery"
+  # D2: the wipe gave the Updater back. An update writes slot b and flips the slots. Updates stay by hand. Before the record: a failure here records nothing, and the next run of this step writes both lines.
+  ash pm disable-user --user 0 org.lineageos.updater >/dev/null || die "cannot disable Lineage's Updater: stop, an update would overwrite slot b. Nothing recorded: run dual-boot.sh android-check again"
   mkdir -p "$D"
   echo "android-opened $(date +%Y-%m-%dT%H:%M:%S) f2fs-bytes $((_bc * 4096))" >> "$RESULT"
-  # D2: the wipe gave the Updater back. An update writes slot b and flips the slots. Updates stay by hand.
-  ash pm disable-user --user 0 org.lineageos.updater >/dev/null || die "cannot disable Lineage's Updater: stop, an update would overwrite slot b"
-  grep -q '^ro-on ' "$RESULT" && echo "android-opened-after-ro $(date +%Y-%m-%dT%H:%M:%S)" >> "$RESULT"
+  if grep -q '^ro-on ' "$RESULT"; then echo "android-opened-after-ro $(date +%Y-%m-%dT%H:%M:%S)" >> "$RESULT"; fi
   say "Android opened its data on the new layout: userdata $USERDATA_BYTES bytes, f2fs $((_bc * 4096)) bytes, iosroot $IOSROOT_BYTES bytes. Recorded: $RESULT"
   ;;
 prepare-root)
@@ -476,11 +510,14 @@ prepare-root)
   need_tool
   img=${1:-$(default_root)}
   [ -f "$img" ] || die "missing $img"
-  say "ready: $(make_simg "$img"). Next: adb reboot bootloader; CONFIRM=install dual-boot.sh install"
+  _ready=$(make_simg "$img") || die "no sparse image from $img"
+  make_list "$_ready" || die "no read-back list from $_ready"
+  say "ready: $_ready. Next: adb reboot bootloader; CONFIRM=install dual-boot.sh install"
   ;;
 install)
   need_confirm install
   grep -q '^android-opened ' "$RESULT" 2>/dev/null || die "no record that Android opened its data on the new layout: dual-boot.sh android-check first"
+  need_tool
   img=${1:-$(default_root)}
   [ -f "$img" ] || die "missing $img"
   _sz=$(wc -c < "$img" | tr -d ' ')
@@ -488,13 +525,60 @@ install)
   _vb=$("$TOOL" hfs-size "$img" | sed -n 's/.* = \([0-9]*\) bytes .*/\1/p') || die "$img has no HFS+ volume"
   [ -n "$_vb" ] || die "$img has no HFS+ volume"
   [ "$_vb" -le "$IOSROOT_VOLUME_MAX" ] || die "the volume in $img has $_vb bytes: too big"
-  simg=$(make_simg "$img")
+  simg=$(make_simg "$img") || die "no sparse image from $img: nothing was asked of the phone"
+  make_list "$simg" || die "no read-back list from $simg: nothing was asked of the phone"
   head -c 1048576 "$img" > "$D/root.first1m"
   need_fastboot_mi_a3
   need_fastboot_layout
   "$REPO/scripts/laurel/flash-root.sh" "$simg"
+  # what verify-root compares with: the list of this image, also when another image is prepared later
+  cp "$D/simg.list" "$D/root-verify.list"; cp "$D/simg.expect" "$D/root-verify.expect"
   echo "installed $(date +%Y-%m-%dT%H:%M:%S) $img $(sha "$D/root.first1m")" >> "$RESULT"
-  say "iosroot holds $img ($_sz bytes; margin to the log $((IOSROOT_VOLUME_MAX - _sz)) bytes). Android stays active. Next: dual-boot.sh image"
+  say "ABL took $img ($_sz bytes; margin to the log $((IOSROOT_VOLUME_MAX - _sz)) bytes). This does not show that all of it was written. Android stays active and starts now. Next, in Android: adb root; scripts/bg.sh db-verify scripts/laurel/dual-boot.sh verify-root"
+  ;;
+verify-root)
+  # F1: the record `switch` asks for. Only reads on the phone, and the one thing that shows the last piece was written: docs/laurel_sprout/dual-boot.md step 6b.
+  case "$(root_state)" in
+  installed|verified) ;;
+  none) die "no record of an installed root: dual-boot.sh install" ;;
+  *) die "a flash of iosroot started and did not end with a record: CONFIRM=install dual-boot.sh install first" ;;
+  esac
+  [ -f "$D/root-verify.list" ] && [ -f "$D/root-verify.expect" ] || die "no $D/root-verify.list of the installed image: run this in the checkout that ran install"
+  _want=$(sed -n 2p "$D/root-verify.expect")
+  case "$_want" in "verify ranges "*) ;; *) die "$D/root-verify.expect is damaged: CONFIRM=install dual-boot.sh install" ;; esac
+  need_helper
+  check_layout
+  _inst=$(sed -n 's/^installed .* \([0-9a-f]\{64\}\)$/\1/p' "$RESULT" | tail -1)
+  adb push "$D/root-verify.list" "$HELPER.list" >/dev/null || die "adb push of the list failed"
+  _h=$(ash sha256sum "$HELPER.list") || die "cannot hash the list on the phone"
+  [ "${_h%% *}" = "$(sha "$D/root-verify.list")" ] || die "the list on the phone is not the list here"
+  _lim=${ROOT_VERIFY_LIMIT:-1800}
+  say "reading iosroot on the phone: $_want. Time [I, not run yet]: about 1 to 3 minutes on UFS 2.1; the phone's lines come below, one per GiB. Limit $_lim s. A failure or a lost adb leaves no record"
+  # the output goes to a file: `ash` would hold the progress until the end. The last line is the phone's exit code, as in ash(): no such line: adb lost the phone.
+  _o=$D/root-verify.out; : > "$_o"
+  tail -n +1 -f "$_o" & _tail=$!
+  _r=0
+  laurel_with_limit "$_lim" adb shell "$HELPER root-verify $HELPER.list /dev/block/by-name/iosroot; _ldb_r=\$?; echo; echo $ASH_MARK\$_ldb_r" > "$_o" 2>&1 || _r=$?
+  command sleep 1; kill "$_tail" 2>/dev/null || true; wait "$_tail" 2>/dev/null || true
+  [ "$_r" != 124 ] || die "no answer from the phone in $_lim s: nothing recorded, the helper may still read there (it only reads). Run this step again; a phone slower than the limit: ROOT_VERIFY_LIMIT=seconds"
+  _body=$(tr -d '\r' < "$_o")
+  _last=${_body##*"$NL"}
+  case "$_last" in
+  "$ASH_MARK"0) ;;
+  "$ASH_MARK"[0-9]*) die "the helper failed on the phone (status ${_last#"$ASH_MARK"}): nothing recorded. A read error here is a result: report it. Then run this step again" ;;
+  *) die "adb lost the phone during the read: nothing recorded. Run this step again" ;;
+  esac
+  [ "$_r" = 0 ] || die "adb failed during the read (status $_r): nothing recorded. Run this step again"
+  _got=$(printf '%s\n' "$_body" | grep '^verify ranges ' | tail -1 || true)
+  if [ "$_got" != "$_want" ]; then
+    echo "dual-boot: FAILED: iosroot is not what was flashed. Nothing recorded, and switch stays refused" >&2
+    echo "  flashed: $_want" >&2
+    echo "  on it:   ${_got:-no result line}" >&2
+    die "the flash lost or damaged a part of the image (it can be the last piece). Run this step once more: the same result: adb reboot bootloader; CONFIRM=install dual-boot.sh install; then this step"
+  fi
+  ash rm -f "$HELPER.list" >/dev/null || true
+  echo "root-verified $(date +%Y-%m-%dT%H:%M:%S) $_want $_inst" >> "$RESULT"
+  say "iosroot read back: all RAW and FILL blocks equal the image. Limit of this check: a CRC-32 finds accidental damage, not a change on purpose; DON'T CARE blocks were not read. Recorded: $RESULT. Next: dual-boot.sh image"
   ;;
 image)
   m=$(mode_arg "${1:-}")
@@ -502,6 +586,8 @@ image)
   if [ "$m" = rw ]; then
     grep -q "^ro-on $(marker) " "$RESULT" 2>/dev/null || die "no recorded result of a read-only boot of this kernel fence: dual-boot.sh ro-result LOG"
     grep -q '^android-opened-after-ro ' "$RESULT" 2>/dev/null || die "Android has not opened its data after the read-only iOS boot: dual-boot.sh android-check"
+    # this image's marks let the app switch with no `switch` step: the same gate here
+    need_root_verified
   fi
   case "$TARGET" in ios26) s=$REPO/scripts/laurel/ios26-image.sh ;; ios16) s=$REPO/scripts/laurel/uefi-image.sh ;; *) die "TARGET=$TARGET: ios26 or ios16" ;; esac
   ro=1; [ "$m" = ro ] || ro=0
@@ -546,6 +632,7 @@ switch)
   slot_yes is-slot-bootable 0 || die "slot a is not bootable: no way back"
   slot_yes is-slot-marked-successful 0 || die "slot a is not marked successful: ABL has nothing to fall back to. Boot Android to the end first"
   grep -q '^android-opened ' "$RESULT" 2>/dev/null || die "no record that Android opened its data on the new layout: dual-boot.sh android-check"
+  need_root_verified
   _inst=$(sed -n 's/^installed .* \([0-9a-f]\{64\}\)$/\1/p' "$RESULT" 2>/dev/null | tail -1)
   [ -n "$_inst" ] || die "no record of an installed root: dual-boot.sh install"
   _h=$(ash "head -c 1048576 /dev/block/by-name/iosroot | sha256sum") || die "cannot read iosroot on the phone"
@@ -656,5 +743,5 @@ Each flash has -S 512M: plain fastboot flash fails on this ABL (docs/notes.md, "
 PRINT
   ;;
 *)
-  sed -n 2,25p "$0" >&2; exit 2 ;;
+  sed -n 2,27p "$0" >&2; exit 2 ;;
 esac

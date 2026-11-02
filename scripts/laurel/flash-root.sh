@@ -5,6 +5,9 @@
 # Same session rules as flash-boot.sh (docs/notes.md): fastboot reboot bootloader first (a session entered with the buttons after a panic has a broken USB state), then the
 # flash; -S 512M sends the image as sparse pieces (ABL max-download-size 768 MiB). ABL stops a sparse image over the partition size [V FastbootCmds.c HandleSparseImgFlash].
 # After a big flash the Xiaomi ABL can hang (topaz NOTES.md:40): this script then says so; the owner re-enters fastboot with Power+VolDown.
+# This script cannot know that the last piece was written. [V ABL FastbootCmds.c] ABL answers OKAY to a piece before it writes it, AcceptCmd (:3425) does not wait for the write when the command is a download and reads
+# FlashResult (:3437) while the write runs, a piece written by SparseImgFlashThread (:1358) drops its result, and a `reboot` waits for the write (:3427) but stops only flash and download on a failed result.
+# A `fastboot stage` here said "failed" with no write failure and "good" with one, so it is gone. The verdict is the read-back in Android: dual-boot.sh verify-root; dual-boot.sh switch refuses without it.
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
 . "$REPO/scripts/lib/laurel-layout.sh"
@@ -24,11 +27,17 @@ need_phone() {
   _p=
   for _ in 1 2 3; do _p=$(var product); [ "$_p" = laurel_sprout ] && break; sleep 1; done
   [ "$_p" = laurel_sprout ] || die "the phone in fastboot says product '${_p:-no answer}', not laurel_sprout"
-  _s=$(var partition-size:iosroot)
-  [ -n "$_s" ] || die "the phone has no partition iosroot: run the GPT steps of docs/laurel_sprout/dual-boot.md"
+  size_of iosroot
+  [ -n "$_s" ] || die "ABL names no partition iosroot after 3 tries. Run: fastboot reboot bootloader, then this step again. If a clean session says the same, the new table is not there: the GPT steps of docs/laurel_sprout/dual-boot.md"
+  laurel_size_ok "$_s" || die "ABL gives iosroot the size '$_s' after 3 tries: not a number. Run: fastboot reboot bootloader, then this step again"
   [ "$((_s))" = "$IOSROOT_BYTES" ] || die "iosroot has $_s bytes, the plan has $IOSROOT_BYTES"
-  _s=$(var partition-size:userdata)
-  [ "$((_s))" = "$USERDATA_BYTES" ] || die "userdata has ${_s:-no answer} bytes, the plan has $USERDATA_BYTES"
+  size_of userdata
+  laurel_size_ok "$_s" || die "ABL gives userdata the size '${_s:-no answer}' after 3 tries. Run: fastboot reboot bootloader, then this step again"
+  [ "$((_s))" = "$USERDATA_BYTES" ] || die "userdata has $_s bytes, the plan has $USERDATA_BYTES"
+}
+# One getvar can answer wrongly on this ABL (docs/notes.md): asked again until the answer is a number; the last answer stays in _s.
+size_of() {
+  for _ in 1 2 3; do _s=$(var "partition-size:$1"); laurel_size_ok "$_s" && return 0; sleep 1; done
 }
 need_phone
 echo "$(ts) flash-root: image $IMG ($((sz * tb)) bytes logical)"
@@ -37,20 +46,19 @@ fastboot reboot bootloader
 n=0; until [ -n "$(fastboot devices)" ]; do n=$((n + 1)); [ "$n" -lt 60 ] || die "no phone in fastboot after the reboot"; sleep 2; done
 sleep 2
 need_phone
+# From here iosroot is not what any earlier read-back saw: the record says so before the first byte goes out. A later `installed` line needs its own read-back.
+mkdir -p "$OUT/laurel/dualboot"; echo "install-started $(date +%Y-%m-%dT%H:%M:%S) $IMG" >> "$OUT/laurel/dualboot/first-boot.result"
 echo "$(ts) flash-root: flashing iosroot"
 if ! fastboot -S 512M flash iosroot "$IMG"; then
-  echo "$(ts) flash-root: flash failed. Hold Power+VolDown for fastboot, then run this again." >&2
+  echo "$(ts) flash-root: flash failed: iosroot holds part of the image. Hold Power+VolDown for fastboot, then run this again: it starts again from the first piece." >&2
   exit 1
 fi
-# ABL answers OKAY before it writes, and reports a failed write only at the next flash or download
-# (FastbootCmds.c:3437-3447). This download goes only to ABL's RAM, and it brings out a failed last piece.
-_probe=$(mktemp); head -c 4096 /dev/zero > "$_probe"
-if ! fastboot stage "$_probe"; then
-  rm -f "$_probe"
-  echo "$(ts) flash-root: FAILED: ABL reports a failed write in iosroot. Run fastboot reboot bootloader, then this step again." >&2
-  exit 1
-fi
-rm -f "$_probe"
-echo "$(ts) flash-root: iosroot flashed"
-fastboot reboot || echo "$(ts) flash-root: ABL did not take 'reboot' (it can hang after a big flash): hold Power for a restart"
+echo "$(ts) flash-root: ABL took all pieces. This does not show that the last piece was written: dual-boot.sh verify-root decides"
+# A reboot waits for the write of the last piece (:3427; 11 s on the 12 GB flash, logs/laurel-root-flash.log). A hang costs the limit, not the job. After the limit no write runs: a restart is safe.
+_r=0; laurel_with_limit "${FLASH_REBOOT_LIMIT:-180}" fastboot reboot || _r=$?
+case "$_r" in
+0) ;;
+124) echo "$(ts) flash-root: WARNING: ABL did not answer 'reboot' in ${FLASH_REBOOT_LIMIT:-180} s (it can hang after a big flash). No write runs now. Hold Power for a restart: Android starts. Then: dual-boot.sh verify-root" ;;
+*) echo "$(ts) flash-root: WARNING: ABL did not take 'reboot' (exit $_r; it can hang after a big flash). Hold Power for a restart: Android starts. Then: dual-boot.sh verify-root" ;;
+esac
 echo "$(ts) flash-root: done"

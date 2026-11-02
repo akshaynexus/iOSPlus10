@@ -21,7 +21,8 @@ All script steps: `scripts/laurel/dual-boot.sh`. Each writing step needs `CONFIR
 | 3 | Agent, right after | `adb reboot bootloader`, `CONFIRM=after-gpt dual-boot.sh after-gpt`: ABL must show the new sizes; then `fastboot reboot recovery`. If ABL refuses that command, this step does not fail: it prints the next step for the owner | nothing |
 | 4 | Owner | Lineage recovery: Factory reset -> Format data / factory reset -> yes; Reboot system now. Finish Android setup. About phone: tap Build number 7 times. Developer options: USB debugging on, accept the RSA key dialog (the wipe removed the key), Rooted debugging on. `android-check` then turns Lineage's Updater off again | all of userdata, metadata |
 | 5 | Agent | `adb root`, `dual-boot.sh android-check`: new sizes, `/data` on the new size, f2fs block count fits, data open. A record on the host | nothing |
-| 6 | Owner yes, agent | `dual-boot.sh prepare-root` first, in Android (the phone must not wait in fastboot during this conversion). Then `adb reboot bootloader`; `scripts/bg.sh db-install env CONFIRM=install scripts/laurel/dual-boot.sh install` (default the iOS 26 root). Android starts after it | `iosroot` only |
+| 6 | Owner yes, agent | `scripts/bg.sh db-prep scripts/laurel/dual-boot.sh prepare-root` first, in Android (the phone must not wait in fastboot during this conversion): the sparse image and its read-back list. Then `adb reboot bootloader`; `scripts/bg.sh db-install env CONFIRM=install scripts/laurel/dual-boot.sh install` (default the iOS 26 root). Android starts after it. A hung ABL costs 180 s, then a warning: hold Power | `iosroot` only |
+| 6b | Agent | **The read-back, in Android:** `adb root`, `scripts/bg.sh db-verify scripts/laurel/dual-boot.sh verify-root`: all RAW and FILL blocks of `iosroot` against the sparse image, about 18 GB of reads, one line per GiB. A record on the host. `switch` and `image rw` refuse without it. A failure or a lost adb records nothing. Section 1c | helper and list files in `/data/local/tmp`; no partition |
 | 7 | Agent | `scripts/bg.sh db-image scripts/laurel/dual-boot.sh image`: read-only image (kernel of `kernel-ios26-linux.sh` through `ios26-image.sh`, no `ufsrw`, no `rootrw`) | host only |
 | 8 | Owner yes, owner cable | `adb reboot bootloader`, `CONFIRM=flash-slot-b dual-boot.sh flash-slot-b`, `fastboot reboot`. **Android must start** | `boot_b`, `dtbo_b` |
 | 9 | Owner yes, agent | `CONFIRM=switch dual-boot.sh switch`: all checks, then `bootctl set-active-boot-slot 1`, then a normal `adb reboot` | slot attributes |
@@ -55,6 +56,51 @@ iOS 16 stays supported: `TARGET=ios16` in front of `image`, `flash-slot-b`, `ins
 | nothing | not known | refuses |
 
 The rehearsal does not show that recovery starts when the primary is bad [U]: it runs on a good table. Recovery lives on `boot_a`, another LUN [V backup], so [I] it starts.
+
+## 1c. The read-back after `install` (step 6b)
+
+**Why.** [V ABL source, `out/laurel/abl-src/FastbootCmds.c`] `fastboot flash` cannot show that the last piece was written, and no later fastboot command can either:
+
+- ABL answers OKAY to a piece and writes it after that. [V `logs/laurel-root-flash.log`, the 12.2 GB flash] `Writing 'userdata' OKAY [0.000s]`, then `Rebooting OKAY [11.079s]`: the reboot waited for the write.
+- `AcceptCmd` (:3425) does not wait for the flash when the command is `download`, and it reads `FlashResult` (:3437) while the write runs. So the old `fastboot stage` after the flash saw the value from before the last write.
+- `SparseImgFlashThread` (:1358) drops the result of `HandleSparseImgFlash`: on that path the failed write sets nothing.
+- A `reboot` waits (:3427), but a failed result stops only `flash` and `download` (:3441): the reboot goes on.
+
+`switch` compares only the first 1 MiB. So a root with a lost last piece passed all checks and booted, and a failure at the first boot would have looked like a kernel or userland failure.
+
+**What it does.** The flash path is not changed: it wrote 12.2 GB on this phone.
+
+1. `op10tool simg-verify-list ROOT.simg -o LIST` (`tools/op10tool/src/simgverify.rs`) reads the chunks of the `.simg`, what fastboot sends. A DON'T CARE chunk leaves the old bytes of the partition, so a hash of the whole partition cannot match. Output: the RAW and FILL block ranges, and one CRC-32 over the bytes of those ranges.
+2. `prepare-root` and `install` make the list on the host, before the phone goes to fastboot. `install` keeps the list of the image it flashed.
+3. `flash-root.sh` writes `install-started` to the record right before the first piece. A later `installed` line needs its own read-back: an old `root-verified` line no longer counts, also after a failed flash whose first MiB still matches.
+4. `verify-root`, in Android: `ldbhelper root-verify LIST /dev/block/by-name/iosroot`, already pushed by the same step. One process, 4 MiB reads, `O_DIRECT` (past the page cache), read-only open. It reads the list first and refuses a damaged one before any read of the partition. It prints the same result line as the tool. The host compares the two lines and writes `root-verified`.
+5. `switch` needs the state `verified`: a `root-verified` line after the last `installed` line, with its hash, and no `install-started` after it. `image rw` needs it too: the marks of that image let the app switch with no `switch` step.
+
+**Limits, stated.** CRC-32 finds accidental damage: every burst up to 32 bits, and other damage except 1 in 2^32. It does not find a change made on purpose. DON'T CARE blocks are not read: they hold old flash bytes, which HFS+ does not use [V: the image's allocation bitmap makes each allocated hole a zero FILL, `img2simg.rs` `hfs_allocated`]. The check holds only before iOS writes `iosroot`: after a writable boot the volume has changed, and `verify-root` reports a difference. The record of the install stays.
+
+**Real data [V host, read-only].** `~/op10-apple/ios26/23F84-n104ap/root/ios26-root.simg` (18737105176 bytes, built 2026-11-02 07:02): 8387327 blocks: 4574344 RAW, 161955 FILL, 3651028 DON'T CARE. 2 ranges: 0 + 4736298 blocks, and block 8387326 (the alternate volume header). **18501 MiB to read.** CRC-32 `d11dc181`: the same from the tool on the `.simg` (30.9 s), `ldbhelper` on the raw `.img` (12.6 s, host NVMe), and Python's `zlib` on the raw `.img` over the ranges.
+
+**Time on the phone [I, not measured].** UFS 2.1 and slice-by-8 CRC-32 on a Kryo 260: about 1 to 3 minutes. The helper prints `N of 18501 MiB, S s` per GiB, and the time at the end. The host waits `ROOT_VERIFY_LIMIT` seconds (default 1800), then stops, with no record.
+
+| `verify-root` says | Meaning | What to do |
+| --- | --- | --- |
+| `iosroot read back` | all RAW and FILL blocks equal the image | go on: `dual-boot.sh image` |
+| `iosroot is not what was flashed` | a part of the image was lost or damaged, it can be the last piece. No record, `switch` stays refused | run it once more. The same result: `adb reboot bootloader`, `CONFIRM=install dual-boot.sh install`, then this step. A second bad flash: stop and report |
+| `adb lost the phone` | no result. No record | run it again: the read is only a read |
+| `no answer from the phone in N s` | no result. No record. The helper may still read there | run it again; a phone slower than the limit: `ROOT_VERIFY_LIMIT=seconds` |
+| `the helper failed on the phone` | a read error or a refusal (`ldbhelper: FAILED: ...` above it). A read error on the flash is a result: report it | read the line; a refusal by SELinux [U]: report it |
+| `a flash of iosroot started and did not end` | the last `install` did not end with a record | `CONFIRM=install dual-boot.sh install` |
+
+`flash-root.sh`:
+
+| It says | Meaning | What to do |
+| --- | --- | --- |
+| `ABL took all pieces` | all downloads answered OKAY. No proof of a write | the next line, then step 6b |
+| `flash failed: iosroot holds part of the image` | a piece failed. No `installed` record | Power+VolDown, run `install` again: it starts from the first piece |
+| `WARNING: ABL did not answer 'reboot' in 180 s` | ABL hangs (topaz NOTES.md:40). The time is over any write of a 512 MiB piece: no write runs now | hold Power for a restart, Android starts, step 6b |
+| `WARNING: ABL did not take 'reboot'` | it refused. The record `installed` stays | the same |
+| `ABL names no partition iosroot after 3 tries` | 3 answers with no size | `fastboot reboot bootloader`, the step again. A clean session says the same: the new table is not there, the GPT steps |
+| `ABL gives iosroot the size '...' after 3 tries: not a number` | 3 garbled answers | `fastboot reboot bootloader`, the step again |
 
 ## 2. The layout
 
@@ -224,7 +270,7 @@ The root was a pinned, preallocated f2fs file in `/data`, written raw, reached b
 - [U] The iOS 26 kernel boots at all.
 - [U] Android opens its data after an iOS boot. Biggest risk: section 7.
 - [U] `bootctl` as this repo reads it, on this binary. [V source] true = stdout `1`, exit 0; false = stdout `0`, exit 70; a HAL error = text on stderr, exit 70. A form that differs stops `switch` with a clear message.
-- [V] Read-back after `install` is only the first 1 MiB (`switch` compares it): a full read-back is left for later. A wrong root costs a failed iOS boot, not Android's data.
+- [U] `verify-root` on the real `/dev/block/by-name/iosroot`: SELinux of the `su` domain, `O_DIRECT`, the time. `test/dio_check.c` applies the O_DIRECT rule of 4.14 to the phone's own code: that shows the alignment, not the device. ABL's write of a FILL chunk reads back as the chunk [V source `FastbootCmds.c:808`, U on this phone]: a difference shows in step 6b.
 
 ## 11. Owner decisions
 
@@ -232,7 +278,7 @@ The root was a pinned, preallocated f2fs file in `/data`, written raw, reached b
 | --- | --- | --- |
 | D1 | Rooted debugging | Done; on again after the wipe |
 | D2 | Lineage's Updater disabled, and `android-check` disables it again after the wipe; `switch` refuses if it is on. A sideload still writes slot b: `switch` refuses | Done |
-| D3 | Selecting the OS from the device (owner requirement 2026-11-02) | Built: `boot-menu.md`. Needs an FD from `mu-build.sh` of this tree; `uefi-image.sh` refuses a menu image without it. Not proven on the phone |
+| D3 | Selecting the OS from the device (owner requirement 2026-11-02) | Built: `boot-menu.md`. Needs an FD from `mu-build.sh` of this tree: all Mu patches, `late/`, the slot files, the external pins (`scripts/lib/laurel-mu-inputs.sh`). `uefi-image.sh` refuses a menu image without it. A read-only image has no menu and no such need. Not proven on the phone |
 | D8 | One GPT write on LUN 0, one data wipe | Approved 2026-11-02 |
 | D9 | First boot on the new partition is iOS 26 | Decided 2026-11-02 |
 
@@ -241,6 +287,7 @@ The root was a pinned, preallocated f2fs file in `/data`, written raw, reached b
 - Kernel: `patches/laurel/xnu/2950-laurel-dual-boot.patch`, in both series. `scripts/laurel/kernel-ios26-linux.sh`, `scripts/laurel/kernel-linux.sh`.
 - Host test: `scripts/bg.sh db-test scripts/laurel/test-dualboot.sh` (needs the kernel tree: `AUDIT=1 scripts/laurel/kernel-linux.sh`). It runs: op10tool tests with the real layout from the backup when present; `sweet_ufs.c` over a RAM disk; `ldbhelper-test.sh` (a sparse disk, a stop after each step, a torn primary, one writer, the phone's own code under `dio_check`); `android-guard-test.sh`, `dual-boot-test.sh` (fake adb and fastboot; PATH holds no real one, checked first).
 - Do the tests find the defects: `scripts/bg.sh db-detect scripts/laurel/dualboot-tests-detect.sh`: the new tests on the code before the fixes (`GPT_REV`, with its own helper and op10tool) must fail; each fix taken out of a copy, the test that names it must fail.
+- The read-back: `op10tool simg-verify-list`, `ldbhelper root-verify`: `ldbhelper-test.sh` F1 root-verify (a fake partition; one byte in a range, the last piece lost, a change in a DON'T CARE block, the phone's own code under `dio_check`); `dual-boot-test.sh` F1, F2, F6 (a fake fastboot that really applies the chunks over old bytes, and can lose the last piece).
 - Tools: `dual-boot.sh` asks `op10tool gpt features` first. A stale binary: it runs `scripts/setup/build-op10tool.sh` if cargo is here and `OP10TOOL=` is not set, else it stops. `op10tool gpt {plan,same,verify-new,image,features,state,plan-restore,plan-repair,verify-plan}`, `tools/laurel-dualboot/ldbhelper.c`, `laurel_dualboot.h`, `test/dio_check.c`, `scripts/lib/laurel-layout.sh`, `scripts/laurel/gpt-fake.py` (fixture: names and numbers, no bytes of a real table). Patch 2950 from an edited tree: `scripts/laurel/dualboot-patch-refresh.py`.
 - Guard: `scripts/laurel/android-guard.sh`, flag `config/laurel-android-data`. `userdata`: refuses the old whole-partition flash (`root-flash-test.sh`, `fastboot-drain.py`). `flash-root.sh` writes only `iosroot` and checks the size first. `boot-image`: marker, Lineage header, read-only gate. `ANDROID_IMAGE=1`: only Lineage's hash from the backup, and no iOS text. `other-device` for the OnePlus scripts, with `test-boot.sh` now among them.
 

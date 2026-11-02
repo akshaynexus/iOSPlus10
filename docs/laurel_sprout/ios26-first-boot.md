@@ -133,3 +133,21 @@ scripts/bg.sh -s ios26-root 8                                           # read t
 The script prints `applied   debug-ios26: ...` near its end. `off debug-ios26: ...`: this root has no SSH. `DEBUG26=0`: the kill switch at build time.
 
 Hook: `debug()` of `ios26-root-spec.py` runs `scripts/laurel/root-debug-ios26.sh` on a stage, before `air()` and `metal()`, with one audit line per item in `report.txt` and `/usr/share/laurel/ios26-root-audit.txt`. `python3 -I scripts/laurel/ios26-root-spec.py --self-test` checks it.
+
+## 8. The crash guards of the start programs, at step 10 of `dual-boot.md`
+
+`laurel-springboard` (`userland/laurel/notch/sb_wrap.c`) and `laurel-cameracaptured` (`userland/laurel/flashlight/cc_wrap.c`) insert our libraries and exec Apple's program. Each start counts in a state file in `/var/tmp`.
+
+| You see | Meaning |
+|---|---|
+| `LAUREL FLASHLIGHT: off: no crash guard: cannot write /var/tmp/laurel-cc.state` in the USB log, and `LAUREL NOTCH: off: no crash guard: /var/tmp/laurel-sb.state cannot be written: no dylib in this start` in syslog | Expected on the read-only first boot: no writable `/private/var`. With no state file the guard cannot count, so this start has no library, and Apple's program runs. The other hooks stop in the same way. No `off` line of the guard on a writable boot: the file was written |
+| `LAUREL NOTCH: off: SpringBoard exited N times within 30 s` | The guard: 3 starts in 30 s of the one before. No library for the rest of this boot |
+| `LAUREL NOTCH: ... inserted` again and again, `CRASH SpringBoard[pid]`, over 30 s apart | **The limit of the guard:** a start over 30 s after the one before counts as new. A library that crashes after 30 s is not counted, so launchd keeps restarting it. No fix: a counter of all starts in a boot would also count each respring. To stop it: `notch=0`, `cell=0`, `ringer=0` in the boot-args, or `torch=0`, or `/var/db/laurel/flashlight-off` |
+
+`/dev/console` as user mobile is not a defect: mode 0622 [V xnu `bsd/miscfs/devfs/devfs_vfsops.c:116`]; `NMTL[<pid> backboardd]` lines came that way in `logs/usblog-20261101-165828.txt` [V iOS 16]. `LAUREL NOTCH` lines do not go to the console: syslog and `/var/tmp/laurel-notch.log` only, so on the read-only boot, with no syslogd, they may show nowhere [I]. The kernel's `exec SpringBoard` and `CRASH` lines still show.
+
+## 9. dyld and the setuid helper
+
+Before patch 2957 the kernel answered dyld's AMFI question (`__mac_syscall("AMFI", 0x5a)`) with 0xff for every process, and [V 23F84 `/usr/lib/dyld`: `svc` number 381 (`__mac_syscall`) is there, 327 (`issetugid`) is not] dyld has no other test. So a mobile process could start `powermenu-helper` (root:mobile 4750) with `DYLD_INSERT_LIBRARIES` and run its own code as root before `main()`, so before `caller_allowed()`. **Now: 0 for a process with P_SUGID** (patch 2957, both kernels): dyld then ignores `DYLD_*` and `@` paths there. Other processes keep 0xff: the wrappers above and the GPU's backboardd need it, and they are not setuid. [V] The helper has no `@` path in its load commands. Not run on the phone.
+
+The helper reads files in `/private/var/db/negronimetal/stack`, where backboardd (mobile) writes. The folder is root's, mode 1777. Each read goes through `open_planted()`: no symlink, no FIFO or device, one link only, owner root or mobile, all checked on the open file.

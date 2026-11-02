@@ -35,7 +35,7 @@
 
 #define RB_AUTOBOOT 0     /* <sys/reboot.h>, not in the iPhoneOS SDK */
 #define RB_HALT     0x08
-#define MOBILE_UID  501
+#define MOBILE_UID  XT_MOBILE_UID
 #define APP_PATH    "/Applications/XNUtils.app/XNUtils"
 #define PATH_BUF    4096
 #define MODE_SYSCTL "kern.laurel_reboot_mode"

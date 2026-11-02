@@ -231,9 +231,14 @@ mk_kernel() {
   printf 'stamp=%s\nseries=0123456789abcdef\nsha256=%s\n' "$ST" "$(sha256sum "$K" | cut -d' ' -f1)" > "$K.stamp"
 }
 printf 'pass\n' > "$R/scripts/laurel/mkadt.py"   # the real one needs external/ios-topaz; it takes no part in these checks
-# a menu image needs an FD of this tree's Mu patches
-mkdir -p "$T/repo/patches/laurel/mu"; echo fake > "$T/repo/patches/laurel/mu/0201.patch"
-sha256sum "$T/repo/patches/laurel/mu/0201.patch" | cut -d' ' -f1 > "$T/mu/fd.patches"
+# a menu image needs an FD of this tree's Mu inputs. The stamp comes from what mu-build.sh runs; a tree older than scripts/lib/laurel-mu-inputs.sh (dualboot-tests-detect.sh, the old-code runs): its formula.
+mkdir -p "$T/repo/patches/laurel/mu/late" "$T/repo/tools/laurel-slot/uefi"; echo fake > "$T/repo/patches/laurel/mu/0201.patch"; echo late > "$T/repo/patches/laurel/mu/late/0101.patch"
+for f in laurel_slot.c laurel_slot.h uefi/LaurelSlot.c; do echo "$f" > "$T/repo/tools/laurel-slot/$f"; done
+fd_stamp() {
+  if [ -f "$T/repo/scripts/lib/laurel-mu-inputs.sh" ]; then ( REPO=$T/repo; . "$T/repo/scripts/lib/laurel-mu-inputs.sh"; laurel_mu_inputs_built "$T/nomu" "$T/nounixnu" )
+  else cat "$T"/repo/patches/laurel/mu/*.patch | sha256sum | cut -d' ' -f1; fi
+}
+fd_stamp > "$T/mu/fd.patches"
 UE="env UEFI_W=$T/w FD=$T/mu/fd SHIM=$T/mu/shim STOCK_BOOT=$T/stock KERNEL=$K"
 mk_kernel "no marker here"
 expect "H1 uefi-image.sh: a kernel without 2950: no image" 1 "no patch 2950" $UE bash "$G/uefi-image.sh"
@@ -243,6 +248,28 @@ echo stale > "$T/mu/fd.patches"
 expect "Menu uefi-image.sh: an FD of other Mu patches: no image" 1 "not built from patches/laurel/mu" $UE bash "$G/uefi-image.sh"
 mv "$T/mu/fd.patches.good" "$T/mu/fd.patches"
 mk_kernel "$M"
+# F5: each input of the FD counts, and a read-only image has no gate at all
+for what in "late patch:patches/laurel/mu/late/0101.patch" "slot source:tools/laurel-slot/laurel_slot.c" "slot header:tools/laurel-slot/laurel_slot.h" "slot UEFI source:tools/laurel-slot/uefi/LaurelSlot.c"; do
+  cp "$T/repo/${what#*:}" "$T/saved"; echo changed >> "$T/repo/${what#*:}"
+  expect "F5 uefi-image.sh: the ${what%%:*} changed after the FD: no menu image" 1 "not built from patches/laurel/mu" $UE bash "$G/uefi-image.sh"
+  cp "$T/saved" "$T/repo/${what#*:}"
+done
+expect "F5 uefi-image.sh: the FD of these inputs: a menu image" 0 "uefi-image: boot line" $UE bash "$G/uefi-image.sh"
+# the pins: a git that answers one commit; env.sh must still find the copy by the script's folder
+cat > "$T/bin/git" <<EOT
+#!/bin/sh
+case "\$*" in *show-toplevel*) exit 1 ;; esac
+echo "\${FAKE_PIN:-pin-a}"
+EOT
+chmod +x "$T/bin/git"; fd_stamp > "$T/mu/fd.patches"
+expect "F5 uefi-image.sh: the pin of the FD is the pin of the tree: a menu image" 0 "uefi-image: boot line" $UE bash "$G/uefi-image.sh"
+expect "F5 uefi-image.sh: a pin moved after the FD: no menu image" 1 "not built from patches/laurel/mu" env FAKE_PIN=pin-b $UE bash "$G/uefi-image.sh"
+rm -f "$T/bin/git"; fd_stamp > "$T/mu/fd.patches"
+mv "$T/mu/fd.patches" "$T/mu/fd.patches.good"
+expect "F5 uefi-image.sh: a read-only image needs no .fd.patches: not blocked" 0 "uefi-image: boot line" env LAUREL_READONLY=1 $UE bash "$G/uefi-image.sh"
+if grep -q '^mode ro$' "$T/w/laurel-uefi-boot.img.dualboot"; then echo "ok   F5 uefi-image.sh: that image says mode ro"; else fails=$((fails + 1)); echo "FAIL F5 uefi-image.sh: that image: $(cat "$T/w/laurel-uefi-boot.img.dualboot" 2>/dev/null)"; fi
+expect "F5 uefi-image.sh: BOOT_MENU=0 needs no .fd.patches: not blocked" 0 "uefi-image: boot line" env BOOT_MENU=0 $UE bash "$G/uefi-image.sh"
+mv "$T/mu/fd.patches.good" "$T/mu/fd.patches"
 ue() { : > "$T/calls"; o=$("$@" 2>&1) || true; n=$((n + 1)); }
 ok_() { echo "ok   $1"; }
 bad_() { fails=$((fails + 1)); echo "FAIL $1: $o"; sed 's/^/     calls: /' "$T/calls" | cut -c1-260 | tail -4; }

@@ -9,6 +9,7 @@
  *   - crash guard: every start writes "<boot session> <fast starts in a row> <time>" to /var/tmp/laurel-sb.state; a
  *     start less than FAST_S s after the previous one in the same boot counts as a fast exit; after MAX_FAST of them
  *     SpringBoard runs without the dylib for the rest of this boot (Apple's D22Zoomed shape; the bar still works);
+ *     the state file cannot be written (a read-only root): the guard cannot count, so no dylib in this start, one line;
  *   - no dylib when it is not on the root;
  *   - every decision: syslog + /var/tmp/laurel-notch.log ("LAUREL NOTCH: ..."); after "... inserted" the dylib
  *     writes "on:" or "off:"; no such line = dyld did not load it;
@@ -76,7 +77,7 @@ main(int argc, char *argv[])
 	char args[1024] = "", session[64] = "", old[64] = "", n[16], list[192] = "";
 	size_t len = sizeof(args) - 1;
 	long now = (long)time(NULL), then = 0;
-	int fast = 0, use = 1, cellbar;
+	int fast = 0, use = 1, cellbar, guard = 0;
 	FILE *f;
 
 	(void)argc;
@@ -98,8 +99,8 @@ main(int argc, char *argv[])
 		fast = 0;
 	}
 	if ((f = fopen(STATE, "w")) != NULL) {
-		fprintf(f, "%s %d %ld\n", session[0] ? session : "-", fast, now);
-		fclose(f);
+		guard = fprintf(f, "%s %d %ld\n", session[0] ? session : "-", fast, now) > 0;
+		guard = fclose(f) == 0 && guard;
 	}
 
 	if (bootarg_zero(args, "notch")) {
@@ -109,11 +110,14 @@ main(int argc, char *argv[])
 		use = 0;
 		snprintf(n, sizeof(n), "%d", fast);
 		say("off: SpringBoard exited %s times within 30 s of its start: no dylib for this boot", n);
+	} else if (!guard) {
+		use = 0;
+		say("off: no crash guard: %s cannot be written: no dylib in this start", STATE);
 	} else if (access(DYLIB, R_OK) != 0) {
 		use = 0;
 		say("off: no %s on the root", DYLIB);
 	}
-	cellbar = fast < MAX_FAST && !bootarg_zero(args, "cell") && access(CELLBAR, R_OK) == 0;
+	cellbar = guard && fast < MAX_FAST && !bootarg_zero(args, "cell") && access(CELLBAR, R_OK) == 0;
 	if (use) {
 		strcpy(list, DYLIB);
 		say("%s inserted into SpringBoard (the dylib logs on/off at the first shape request)", DYLIB);
@@ -125,7 +129,7 @@ main(int argc, char *argv[])
 		strcat(list, CELLBAR);
 		say("%s inserted into SpringBoard (its own line: LAUREL CELLBAR)", CELLBAR);
 	}
-	if (fast < MAX_FAST && !bootarg_zero(args, "ringer") && access(RINGER, R_OK) == 0) {
+	if (guard && fast < MAX_FAST && !bootarg_zero(args, "ringer") && access(RINGER, R_OK) == 0) {
 		if (list[0] != 0) {
 			strcat(list, ":");
 		}

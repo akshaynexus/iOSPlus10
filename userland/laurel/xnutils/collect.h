@@ -5,6 +5,9 @@
 #ifndef XT_ROOT
 #define XT_ROOT          ""     /* scripts/laurel/xnutils-test.sh builds the helper's file code for a folder on the host */
 #endif
+#ifndef XT_MOBILE_UID
+#define XT_MOBILE_UID    501
+#endif
 #define XT_DB            XT_ROOT "/private/var/db/negronimetal"
 #define XT_METAL_CLIENTS XT_DB "/clients"
 #define XT_METAL_OFF     XT_DB "/off"

@@ -17,6 +17,7 @@ mod im4p;
 mod img2simg;
 mod ipsw;
 mod portpatch;
+mod simgverify;
 mod uefi;
 
 use anyhow::Result;
@@ -133,6 +134,8 @@ enum Cmd {
     Img2simg { input: PathBuf, output: PathBuf },
     /// Android sparse image -> raw image (for checks)
     Simg2img { input: PathBuf, output: PathBuf },
+    /// The RAW and FILL block ranges of a sparse image, and one CRC-32 over their bytes: what `ldbhelper root-verify` reads back on the phone
+    SimgVerifyList { input: PathBuf, #[arg(short)] output: PathBuf },
     /// Print the HFS+ volume size in bytes of a raw root image (block size x total blocks from the volume header);
     /// with --trim, truncate the file to that size (a simg2img output is partition-sized)
     HfsSize { input: PathBuf, #[arg(long)] trim: bool },
@@ -372,6 +375,7 @@ fn main() -> Result<()> {
         },
         Cmd::Img2simg { input, output } => img2simg::img2simg(&input, &output),
         Cmd::Simg2img { input, output } => img2simg::simg2img(&input, &output),
+        Cmd::SimgVerifyList { input, output } => simgverify::run(&input, &output),
         Cmd::HfsSize { input, trim } => img2simg::hfs_size(&input, trim),
         Cmd::IpswGet { url, outdir, names, jobs, chunk_mib } => ipsw::run(&url, &outdir, &names, jobs, chunk_mib << 20),
         Cmd::UefiUnpack { image, outdir } => uefi::run(&image, &outdir),

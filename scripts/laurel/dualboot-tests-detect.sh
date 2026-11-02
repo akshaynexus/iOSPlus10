@@ -1,6 +1,6 @@
 #!/bin/sh
 # Do the dual boot tests find the defects? For each fix: a copy of the tree with exactly that fix taken out (the old behaviour put back), and the test that names it. That test must FAIL there.
-#   scripts/bg.sh db-detect scripts/laurel/dualboot-tests-detect.sh
+#   scripts/bg.sh db-detect scripts/laurel/dualboot-tests-detect.sh      ONLY_NEW=1: only the block of the install read-back (INSTALL_REV)
 # The file design's code is gone, so "the old code" is this: the lines of the fix reversed. F2, F3 also run against the commit before this work (OLD_REV, default 378b2e9), where those scripts exist.
 # The GPT fixes: the new tests run on the commit before them (GPT_REV, default 9cad90f), with that commit's scripts, helper, op10tool and driver: each must fail there.
 # Needs the patched kernel tree (AUDIT=1 scripts/laurel/kernel-linux.sh or a build) and a built op10tool. No phone, the same fakes as the tests. Writes only under out/.
@@ -12,6 +12,7 @@ W=$OUT/laurel-dualboot-detect
 TOOL=${OP10TOOL:-${CARGO_TARGET_DIR:-$OUT/cargo}/release/op10tool}
 rm -rf "$W"; mkdir -p "$W"
 rc=0
+INSTALL_REV=${INSTALL_REV:-f1f8216}     # the commit before the install read-back: dual-boot.md step 6b
 copy() { rm -rf "$W/t"; mkdir -p "$W/t/tools"; cp -R "$REPO/scripts" "$W/t/scripts"; cp -R "$REPO/tools/laurel-dualboot" "$W/t/tools/laurel-dualboot"; }
 # mutate NAME FILE OLD NEW: python exact replace; a pattern that is gone stops this script: then the mutation tests nothing
 mutate() {
@@ -28,6 +29,42 @@ judge() {   # WHAT OUTPUT: the test must say FAIL
 }
 guard() { ONLY="$2" sh "$REPO/scripts/laurel/android-guard-test.sh" "$W/t" > "$W/o" 2>&1; judge "$1" "$W/o"; }
 script() { ONLY="$2" OP10TOOL=$TOOL sh "$REPO/scripts/laurel/dual-boot-test.sh" "$W/t" > "$W/o" 2>&1; judge "$1" "$W/o"; }
+
+# ---- the install read-back and its review (F1 to F9): the new tests on the code of $INSTALL_REV. Each must FAIL there. Shows the test's own FAIL lines.
+install_block() {
+  echo "== the commit before the install read-back ($INSTALL_REV): the new tests on the old code: each must FAIL"
+  I=$W/inst; rm -rf "$I"; mkdir -p "$I"; git -C "$REPO" archive "$INSTALL_REV" scripts tools/laurel-dualboot tools/op10tool userland/laurel/notch userland/laurel/flashlight userland/laurel/xnutils | tar -x -C "$I"
+  cargo build --release --manifest-path "$I/tools/op10tool/Cargo.toml" --target-dir "$W/inst-cargo" > "$W/inst-cargo.log" 2>&1 || { tail -20 "$W/inst-cargo.log"; echo "dualboot-tests-detect: FAILED: the old op10tool does not build" >&2; exit 1; }
+  ITOOL=$W/inst-cargo/release/op10tool
+  i_script() { ONLY="$2" OP10TOOL=$ITOOL sh "$REPO/scripts/laurel/dual-boot-test.sh" "$I" > "$W/o" 2>&1; judge "$1" "$W/o"; grep -E '^FAIL' "$W/o" | cut -c1-210 | head -"${3:-2}" | sed 's/^/     /'; }
+  i_guard() { ONLY="$2" sh "$REPO/scripts/laurel/android-guard-test.sh" "$I" > "$W/o" 2>&1; judge "$1" "$W/o"; grep -E '^FAIL' "$W/o" | cut -c1-210 | head -"${3:-6}" | sed 's/^/     /'; }
+  i_script "F1: all well needs a verify-root the old code does not have" 'F1 install, verify-root, switch*'
+  i_script "F1: a lost last piece" 'F1 ABL says OKAY*'
+  i_script "F1: one byte in a range" 'F1 one byte damaged*'
+  i_script "F1: switch with no read-back goes" 'F1 switch with no read-back*'
+  i_script "F1: a failed later flash keeps the old record" 'F1 a later flash voids the read-back: a failed one*'
+  i_script "F2: a stage failure blocks a good flash" 'F2 install: no fastboot stage*'
+  i_script "F2: ABL hangs at reboot: no limit" 'F2 ABL hangs at fastboot reboot*'
+  i_script "F3: the record before pm" 'F3 Android check: Updater disable fails*'
+  i_script "F3: pm fails after the read-only boot" 'F3 Android check after the read-only boot*'
+  i_script "F4: a failed img2simg says ready" 'F4 prepare-root: img2simg fails*'
+  i_script "F6: one getvar with no answer: wrong advice" 'F6 flash-root: one getvar*'
+  i_script "F6: one garbled size: a shell error" 'F6 flash-root: one garbled*'
+  i_script "F6: a garbled size in need_fastboot_layout" 'F6 dual-boot: a garbled*'
+  i_guard "F5: the inputs of the FD" 'F5*' 8
+  sh "$REPO/scripts/laurel/wrap-guard-test.sh" "$I" > "$W/o" 2>&1; judge "F7: an unwritable state file keeps the library" "$W/o"; grep -E '^FAIL' "$W/o" | cut -c1-210 | sed 's/^/     /'
+  sh "$REPO/scripts/laurel/root-helper-test.sh" "$I" > "$W/o" 2>&1; judge "F9: the helper reads a planted name" "$W/o"; grep -E '^FAIL' "$W/o" | cut -c1-210 | sed 's/^/     /'
+  sed 's/uint64_t allow = proc_issetugid(p) ? 0 : SWEET_AMFI_DYLD_ALLOW_ALL;/uint64_t allow = SWEET_AMFI_DYLD_ALLOW_ALL;/' "$OUT/laurel-kernel/xnu-src/xnu-8796.141.3/bsd/kern/sweet_amfi.c" > "$W/sweet_amfi-old.c"
+  sh "$REPO/scripts/laurel/amfi-dyld-test.sh" "$W/sweet_amfi-old.c" > "$W/o" 2>&1; judge "F9: the kernel answers all to a setuid process" "$W/o"; grep -E '^FAIL' "$W/o" | cut -c1-210 | sed 's/^/     /'
+  git -C "$REPO" show "$INSTALL_REV:scripts/laurel/ios26-root-spec.py" > "$REPO/scripts/laurel/.old-root-spec.py"
+  python3 -I "$REPO/scripts/laurel/.old-root-spec.py" --self-test > "$W/spec.out" 2>&1; sr=$?; rm -f "$REPO/scripts/laurel/.old-root-spec.py"
+  if [ "$sr" != 0 ] && grep -q KeyError "$W/spec.out"; then echo "ok   detected: F8: the old self-test stops with a KeyError with no stages (exit $sr): $(grep KeyError "$W/spec.out" | tail -1 | cut -c1-120)"; else echo "note F8: the old self-test: exit $sr, no KeyError here: the stages of this checkout are all on"; fi
+}
+install_block
+if [ "${ONLY_NEW:-0}" = 1 ]; then
+  [ "$rc" = 0 ] && echo "dualboot-tests-detect: PASS (the new block only)"
+  exit "$rc"
+fi
 
 echo "== the commit before this work ($OLD_REV), scripts as they were"
 rm -rf "$W/old"; mkdir -p "$W/old"; git -C "$REPO" archive "$OLD_REV" scripts tools/laurel-dualboot | tar -x -C "$W/old"
@@ -150,9 +187,14 @@ mutate tools/laurel-dualboot/ldbhelper.c 'if (state_of(fd, count, &total, &torn)
 		die("the new table does not read back in full", 0);
 	}' ''
 script "GPT: a write that did nothing is called good" 'GPT write: all well*'
+copy; mutate scripts/laurel/dual-boot.sh '  need_root_verified
+  _inst=$(sed' '  _inst=$(sed'
+script "F1: switch asks for no read-back" 'F1 switch with no read-back*'
+copy; mutate scripts/laurel/flash-root.sh 'mkdir -p "$OUT/laurel/dualboot"; echo "install-started' 'echo "install-started" > /dev/null; echo "install-started'
+script "F1: a later flash leaves the record of the old read-back" 'F1 a later flash voids*'
 copy; mutate scripts/laurel/dual-boot.sh '[ "$((_bc * 4096))" -le "$USERDATA_BYTES" ] || die' ': || die'
 script "Format: a stale superblock passes android-check" 'Android check: a stale*'
-copy; mutate scripts/laurel/flash-root.sh '[ -n "$_s" ] || die "the phone has no partition iosroot' ': || die "the phone has no partition iosroot'
+copy; mutate scripts/laurel/flash-root.sh '[ -n "$_s" ] || die "ABL names no partition iosroot' ': || die "ABL names no partition iosroot'
 mutate scripts/laurel/dual-boot.sh '[ -n "$_i" ] || die "ABL sees no partition iosroot' ': || die "ABL sees no partition iosroot'
 mutate scripts/laurel/dual-boot.sh '[ "$((_i))" = "$IOSROOT_BYTES" ] && [ "$((_u))" = "$USERDATA_BYTES" ] || die' ': || die'
 mutate scripts/laurel/flash-root.sh '[ "$((_s))" = "$IOSROOT_BYTES" ] || die' ': || die'

@@ -92,8 +92,9 @@ fd=$MU/Build/laurel_sproutPkg/${TARGET}_CLANGPDB/FV/SILICIUM_UEFI.fd
 [ -f "$fd" ] || { echo "mu-build: no $fd" >&2; exit 1; }
 mkdir -p "$O"
 cp "$fd" "$O/SILICIUM_UEFI-$TARGET.fd"
-# uefi-image.sh refuses a menu image from an FD of other patches.
-cat "$REPO"/patches/laurel/mu/*.patch | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1 > "$O/SILICIUM_UEFI-$TARGET.fd.patches"
+# uefi-image.sh refuses a menu image from an FD of other inputs (scripts/lib/laurel-mu-inputs.sh).
+. "$REPO/scripts/lib/laurel-mu-inputs.sh"
+laurel_mu_inputs_built "$MU" "$UNIXNU" > "$O/SILICIUM_UEFI-$TARGET.fd.patches"
 cp BootShim/BootShim.bin "$O/BootShim.bin"
 [ -f Mu-laurel_sprout.img ] && mv -f Mu-laurel_sprout.img "$O/Mu-laurel_sprout.img"
 ls -l "$O"

@@ -59,7 +59,7 @@ impl Layout {
 }
 
 /// What dual-boot.sh asks of this binary (`gpt features`). A later change of the commands changes this text, so a stale out/bin/op10tool is seen before it is used.
-pub const FEATURES: &str = "ldb-gpt-2";
+pub const FEATURES: &str = "ldb-gpt-3";
 
 /// One copy of the table as it lies on disk.
 pub struct Table {

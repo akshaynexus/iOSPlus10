@@ -27,8 +27,8 @@ W=${UEFI_W:-$OUT/laurel/uefi}    # own folder: scripts/laurel/ios26-image.sh
 STOCK=${STOCK_BOOT:-$HOME/laurel-backup/stock/images/boot.img}
 MU=${MU_DIR:-$OUT/laurel/mu}
 FD=${FD:-$MU/SILICIUM_UEFI-DEBUG.fd}
-# A menu image needs an FD built from these patches: an older FD has no slot code, and its menu says "unknown action".
-mu_patches_sha() { cat "$REPO"/patches/laurel/mu/*.patch | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1; }
+# A menu image needs an FD built from this tree's Mu inputs: an older FD has no slot code, and its menu says "unknown action". scripts/lib/laurel-mu-inputs.sh names them.
+. "$REPO/scripts/lib/laurel-mu-inputs.sh"
 SHIM=${SHIM:-$MU/BootShim.bin}
 KERNEL_BY_HAND=${KERNEL:-}
 KERNEL=${KERNEL:-$OUT/laurel-kernel/out/kernel.development.sweet.4k}
@@ -52,8 +52,8 @@ CMDLINE=${1:-"debug=0xc serial=3 cpus=$CPUS keepsyms=1 -noprogress rd=ufsroot0 u
 BOOT_MENU=${BOOT_MENU:-1}
 # The read-only first boot writes nothing we control: no Android entry, no retries refill (Mu's GPT write), no marks, so the app cannot start it; `dual-boot.sh switch` and `to-android` are its way.
 [ "${LAUREL_READONLY:-0}" != 1 ] || BOOT_MENU=0
-if [ "$BOOT_MENU" = 1 ] && [ "${MU_ONLY:-0}" != 1 ] && [ "$(cat "$FD.patches" 2>/dev/null)" != "$(mu_patches_sha)" ]; then
-  echo "uefi-image: FAILED: $FD is not built from patches/laurel/mu of this tree, so it has no current menu or slot code. Run scripts/laurel/mu-build.sh, or BOOT_MENU=0" >&2; exit 1
+if [ "$BOOT_MENU" = 1 ] && [ "${MU_ONLY:-0}" != 1 ] && [ "$(cat "$FD.patches" 2>/dev/null)" != "$(laurel_mu_inputs_wanted "${UNIXNU_TREE:-$EXT/UniXNU}")" ]; then
+  echo "uefi-image: FAILED: $FD is not built from patches/laurel/mu, tools/laurel-slot and the external pins of this tree, so its menu or slot code can be old. Run scripts/laurel/mu-build.sh, or BOOT_MENU=0" >&2; exit 1
 fi
 ENTRY_TITLE=${ENTRY_TITLE:-iOS 16 (laurel XNU, TOPAZ_4K)}
 STOCK_DTBO=${STOCK_DTBO:-$HOME/laurel-backup/stock/images/dtbo.img}

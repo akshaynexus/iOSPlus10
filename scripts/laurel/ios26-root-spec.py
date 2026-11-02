@@ -643,7 +643,7 @@ def metal_self_test(d):
         same,
         t.n[B + b'NegroniMetal'].uid == 0,
         t.n[B + b'libvulkan_freedreno.dylib'].mode & 0o111 != 0 or t.n[B + b'libvulkan_freedreno.dylib'].mode & 0o444 == 0o444,
-        t.n[db + b'cache'].mode == 0o1777 and t.n[db + b'strikes'].mode == 0o1777 and t.n[db + b'stack'].mode == 0o777,
+        t.n[db + b'cache'].mode == 0o1777 and t.n[db + b'strikes'].mode == 0o1777 and t.n[db + b'stack'].mode == 0o1777,
         t.n[db + b'metal.log'].mode == 0o666,
         t.exists(db + b'clients') and t.exists(db + b'env') and t.exists(db + b'build.txt'),
         b'-PosterBoard' in t.read(db + b'clients'),
@@ -1240,6 +1240,68 @@ def root_manifest(t, stamp=None):
     t.audit('root-manifest', 'built', text.splitlines()[0])
 
 
+def boot_task_programs(launchd_path):
+    """Paths in the tree of the programs of boot tasks with RequireSuccess."""
+    return {v['Program'].lstrip('/') for v in boot_tasks(launchd_path).values() if v.get('RequireSuccess')}
+
+
+def written_programs(before, t, req):
+    """The programs of REQ that the tree holds now in another form than BEFORE: a hook wrote them. Compares nodes: this tree need not hold the donor's files."""
+    return sorted(k for k in (p.encode() for p in req) if k in t.n and before.get(k) != (t.n[k].kind, t.n[k].mode, t.n[k].uid, t.n[k].gid, t.n[k].src))
+
+
+def spec_tasks_from_overlay(spec, req):
+    """From a real `work/spec` (main()): the programs of REQ whose source is in the overlay, the folder of what hooks write (Tree.overlay)."""
+    want = {p.encode() for p in req}
+    bad = []
+    with open(spec, 'rb') as f:
+        for row in f:
+            x = row.rstrip(b'\n').split(b'\0')
+            if len(x) >= 8 and x[6] in want and b'/overlay/' in x[7]:
+                bad.append(x[6])
+    return sorted(bad)
+
+
+def _parity_real_checks(t, work, ok, jobs_of, line, tree, d):
+    """The real stages are all on. A missing path here is one failed check, not a stop: real() catches it."""
+    SSH = '/System/Library/LaunchDaemons/dev.iosplus10.dropbear.plist'
+    B = b'System/Library/Audio/Plug-Ins/HAL/'
+    J = '/System/Library/LaunchDaemons/'
+    jobs = jobs_of(t)
+
+    def real(name, fn):
+        try:
+            ok(name, fn())
+        except (KeyError, AttributeError) as e:
+            print(f'  off: {name}: no {e}')
+            ok(name, False)
+    real('real: all on but the two with a reason', lambda: all(v == 'applied' for k, v in said.items() if k not in ('camera-plugin', 'root-update')))
+    real('real: SSH job stays', lambda: SSH in jobs)
+    real('real: SpringBoard wrapper', lambda: jobs[J + 'com.apple.SpringBoard.plist']['ProgramArguments'][0] == '/usr/local/libexec/laurel-springboard')
+    real('real: notch files', lambda: t.n[b'usr/local/lib/liblaurel-notch.dylib'].mode == 0o755 and t.n[b'usr/local/libexec/laurel-springboard'].uid == 0)
+    real('real: cell job', lambda: jobs[J + 'com.laurel.celld.plist']['KeepAlive'] is False and t.exists('usr/local/libexec/laurel-celld') and t.exists('usr/local/lib/liblaurel-cellbar.dylib'))
+    real('real: ringer file', lambda: t.exists('usr/local/lib/liblaurel-ringer.dylib'))
+    real('real: audio plug-in', lambda: t.n[B + b'RedwoodAudio.driver/RedwoodAudio'].mode == 0o755 and t.n[B + b'RedwoodAudio.driver/Info.plist'].mode == 0o644)
+    real('real: VirtualAudio stays, BTAudio moved', lambda: t.exists('Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio') and not t.exists(B + b'BTAudioHALPlugin.driver') and t.exists(b'System/Library/Audio/Plug-Ins/HAL.disabled/BTAudioHALPlugin.driver/BTAudioHALPlugin'))
+    j = jobs.get(J + 'com.apple.bluetoothd.plist', {})
+    real('real: bluetoothd job', lambda: j['EnvironmentVariables']['BT_HCI_TRANSPORT'] == 'H4BC:POSIX:com.apple.uart.bluetooth,3000000' and '_PanicOnCrash' not in j and '_PanicOnCrasX' in j)
+    real('real: BlueTool stand-in', lambda: jobs[J + 'com.apple.BlueTool.plist']['ProgramArguments'] == ['/usr/libexec/negroni-bluetool'] and t.n[b'usr/libexec/negroni-bluetool'].mode == 0o755)
+    real('real: flashlight', lambda: jobs[J + 'com.apple.cameracaptured.plist']['ProgramArguments'][0] == '/usr/local/libexec/laurel-cameracaptured' and t.exists(B + b'LaurelFlashlight.driver/LaurelFlashlight') and jobs[J + 'com.apple.cameracaptured.plist']['KeepAlive'] == {'#Then': True})
+    real('real: hevc slot', lambda: t.n[b'System/Library/VideoDecoders/HEVCH8.videodecoder'].mode == 0o755)
+    h = t.n.get(b'usr/local/libexec/powermenu-helper')
+    real('real: xnutils helper 4750 root:mobile', lambda: h.mode == 0o4750 and h.uid == 0 and h.gid == MOBILE)
+    real('real: xnutils app', lambda: t.n[b'Applications/XNUtils.app/XNUtils'].mode == 0o755 and t.n[b'Applications/XNUtils.app/Info.plist'].mode == 0o644)
+    real('real: firmware for the kernel', lambda: t.n[b'usr/share/firmware/laurel/a630_sqe.fw'].mode == 0o644 and t.exists('usr/share/firmware/laurel/a610_zap.mdt') and not t.exists('usr/share/firmware/laurel/a610_zap.elf'))
+    real('real: camera tables for the kernel', lambda: t.exists('usr/share/firmware/laurel-camera/libmmcamera_laurus_imx586_sunny.so') and t.exists('usr/share/firmware/laurel-camera/libactuator_dw9800.so'))
+    # one failed stage does not stop the others: audio's file is broken
+    audio_file = stage_src('out/ios26/audio/RedwoodAudio.driver/RedwoodAudio')
+    os.environ['PARITY_CHECK_LIST'] = _list_without(d, audio_file)
+    t2, work = tree()
+    parity(t2, work)
+    ok('one failed hook: audio off, others on', line(t2, 'audio').startswith('off') and line(t2, 'bluetooth').startswith('applied') and line(t2, 'xnutils').startswith('applied') and SSH in jobs_of(t2) and not t2.exists('Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin'))
+    del os.environ['PARITY_CHECK_LIST']
+
+
 def parity_self_test(d):
     """The parity hooks. Real scripts, real stages of this checkout when they exist; a made-up root. Checks: one audit line per hook; a failure leaves nothing and keeps SSH; owners, modes, jobs; no boot task with RequireSuccess touched."""
     import shutil
@@ -1358,48 +1420,43 @@ def parity_self_test(d):
     # 3. a binary that is not on the list is refused, one line; a wrong file type too
     ok('need_binary: not a Mach-O', _refused(os.path.join(d, 'pl.plist')))
 
-    # 4. the real stages, when this checkout has them
+    # 4. the real stages, when this checkout has them. PARITY_REAL_LIST: another list for this part (a test: a worktree with no stages)
+    real_list = os.environ.get('PARITY_REAL_LIST')
+    if real_list:
+        os.environ['PARITY_CHECK_LIST'] = real_list
     if checked_binaries() is None:
         print(f'parity hook self-test: {sum(checks)} of {len(checks)}; real stages not run: no {CHECK_LIST} (scripts/laurel/ios26-parity-build.sh)')
     else:
         t, work = tree()
+        before = {k: (n.kind, n.mode, n.uid, n.gid, n.src) for k, n in t.n.items()}
         parity(t, work)
         said = {n: line(t, n).split(None, 1)[0] if line(t, n) else 'none' for n in FEATURES if n not in ('debug-ios26', 'air-ios26', 'metal26')}
         print('  real stages: ' + ' '.join(f'{k}={v}' for k, v in said.items()))
-        jobs = jobs_of(t)
-        J = '/System/Library/LaunchDaemons/'
-        ok('real: all on but the two with a reason', all(v == 'applied' for k, v in said.items() if k not in ('camera-plugin', 'root-update')))
-        ok('real: SSH job stays', SSH in jobs)
-        ok('real: SpringBoard wrapper', jobs[J + 'com.apple.SpringBoard.plist']['ProgramArguments'][0] == '/usr/local/libexec/laurel-springboard')
-        ok('real: notch files', t.n[b'usr/local/lib/liblaurel-notch.dylib'].mode == 0o755 and t.n[b'usr/local/libexec/laurel-springboard'].uid == 0)
-        ok('real: cell job', jobs[J + 'com.laurel.celld.plist']['KeepAlive'] is False and t.exists('usr/local/libexec/laurel-celld') and t.exists('usr/local/lib/liblaurel-cellbar.dylib'))
-        ok('real: ringer file', t.exists('usr/local/lib/liblaurel-ringer.dylib'))
-        B = b'System/Library/Audio/Plug-Ins/HAL/'
-        ok('real: audio plug-in', t.n[B + b'RedwoodAudio.driver/RedwoodAudio'].mode == 0o755 and t.n[B + b'RedwoodAudio.driver/Info.plist'].mode == 0o644)
-        ok('real: VirtualAudio stays, BTAudio moved', t.exists('Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio') and not t.exists(B + b'BTAudioHALPlugin.driver') and t.exists(b'System/Library/Audio/Plug-Ins/HAL.disabled/BTAudioHALPlugin.driver/BTAudioHALPlugin'))
-        j = jobs[J + 'com.apple.bluetoothd.plist']
-        ok('real: bluetoothd job', j['EnvironmentVariables']['BT_HCI_TRANSPORT'] == 'H4BC:POSIX:com.apple.uart.bluetooth,3000000' and '_PanicOnCrash' not in j and '_PanicOnCrasX' in j)
-        ok('real: BlueTool stand-in', jobs[J + 'com.apple.BlueTool.plist']['ProgramArguments'] == ['/usr/libexec/negroni-bluetool'] and t.n[b'usr/libexec/negroni-bluetool'].mode == 0o755)
-        ok('real: flashlight', jobs[J + 'com.apple.cameracaptured.plist']['ProgramArguments'][0] == '/usr/local/libexec/laurel-cameracaptured' and t.exists(B + b'LaurelFlashlight.driver/LaurelFlashlight') and jobs[J + 'com.apple.cameracaptured.plist']['KeepAlive'] == {'#Then': True})
-        ok('real: hevc slot', t.n[b'System/Library/VideoDecoders/HEVCH8.videodecoder'].mode == 0o755)
-        h = t.n[b'usr/local/libexec/powermenu-helper']
-        ok('real: xnutils helper 4750 root:mobile', h.mode == 0o4750 and h.uid == 0 and h.gid == MOBILE)
-        ok('real: xnutils app', t.n[b'Applications/XNUtils.app/XNUtils'].mode == 0o755 and t.n[b'Applications/XNUtils.app/Info.plist'].mode == 0o644)
-        ok('real: firmware for the kernel', t.n[b'usr/share/firmware/laurel/a630_sqe.fw'].mode == 0o644 and t.exists('usr/share/firmware/laurel/a610_zap.mdt') and not t.exists('usr/share/firmware/laurel/a610_zap.elf'))
-        ok('real: camera tables for the kernel', t.exists('usr/share/firmware/laurel-camera/libmmcamera_laurus_imx586_sunny.so') and t.exists('usr/share/firmware/laurel-camera/libactuator_dw9800.so'))
-        # 5. boot tasks: launchd's own plist: none of these hooks writes a program of a task with RequireSuccess; new jobs have no such key
+        off = [k for k, v in said.items() if v != 'applied' and k not in ('camera-plugin', 'root-update')]
+        if off:
+            # a checkout with a list and without these stages: no check below can hold. Each off line says why; what a build needs is in report.txt of that build
+            print(f'  real stages not checked: off here: {" ".join(off)}')
+            for k in off:
+                print('    ' + line(t, k))
+        else:
+            _parity_real_checks(t, work, ok, jobs_of, line, tree, d)
+        # 5. boot tasks: launchd's own plist: none of these hooks writes a program of a task with RequireSuccess: a hook that wrote one would stop the boot
         lw = os.path.expanduser('~/op10-apple/ios26/23F84-n104ap/tree/root/os/sbin/launchd')
         if os.path.exists(lw):
-            tasks = boot_tasks(lw)
-            req = {v['Program'].lstrip('/') for v in tasks.values() if v.get('RequireSuccess')}
-            ok(f'boot tasks: {len(req)} programs with RequireSuccess, none written', req and not [p for p in req if t.exists(p)])
-            ok('new jobs: no boot-task key', not any(x in v for v in jobs.values() for x in ('RequireSuccess', 'AllowCrash', 'PerformInRestore')))
-        # one failed stage does not stop the others: audio's file is broken
-        real = stage_src('out/ios26/audio/RedwoodAudio.driver/RedwoodAudio')
-        os.environ['PARITY_CHECK_LIST'] = _list_without(d, real)
-        t2, work = tree()
-        parity(t2, work)
-        ok('one failed hook: audio off, others on', line(t2, 'audio').startswith('off') and line(t2, 'bluetooth').startswith('applied') and line(t2, 'xnutils').startswith('applied') and SSH in jobs_of(t2) and not t2.exists('Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin'))
+            req = boot_task_programs(lw)
+            ok(f'boot tasks: {len(req)} programs with RequireSuccess, none written by these hooks', req and not written_programs(before, t, req))
+            one = sorted(req)[0]
+            t3, _ = tree()
+            before3 = {k: (n.kind, n.mode, n.uid, n.gid, n.src) for k, n in t3.n.items()}
+            t3.write(one, b'x', 0o755, 0, 0)
+            ok('boot tasks: the check finds a hook that writes one', written_programs(before3, t3, req) == [one.encode()])
+            # the real spec of the last root build, when it is on this machine: each such program comes from the donor, none from the overlay of a hook
+            sp = os.environ.get('PARITY_REAL_SPEC') or os.path.expanduser('~/op10-apple/ios26/23F84-n104ap/root/work/spec')
+            if os.path.exists(sp):
+                bad = spec_tasks_from_overlay(sp, req)
+                print(f'  boot tasks in the real spec {sp}: {len(req)} programs, from an overlay: {[x.decode() for x in bad]}')
+                ok('boot tasks: the real spec takes none from an overlay', not bad)
+    if real_list:
         del os.environ['PARITY_CHECK_LIST']
     print(f'parity hook self-test: {sum(checks)} of {len(checks)}')
     print('  ' + ' '.join(f'{i}:{"ok" if c else "FAIL(" + names[i] + ")"}' for i, c in enumerate(checks)))

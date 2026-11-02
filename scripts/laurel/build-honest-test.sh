@@ -262,5 +262,21 @@ expect "clean" 0 "volume clean" env PATH="$BIN:$PATH" FAKE_FSCK=clean bash "$F" 
 expect "only the header note: accepted" 0 "accepted" env PATH="$BIN:$PATH" FAKE_FSCK=minor bash "$F" "$T/o2"
 expect "another finding: fails" 1 "FAILED: volume not clean" env PATH="$BIN:$PATH" FAKE_FSCK=bad bash "$F" "$T/o2"
 
+echo "== the parity self-test of ios26-root-spec.py"
+SPEC=$REPO/scripts/laurel/ios26-root-spec.py
+if [ -x "$REPO/scripts/laurel/build-honest-test.sh" ]; then pass "this test can run as the docs say: mode $(stat -c %a "$REPO/scripts/laurel/build-honest-test.sh" 2>/dev/null || stat -f %Lp "$REPO/scripts/laurel/build-honest-test.sh")"; else echo "not executable" > "$T/o"; bad "this test is not executable"; fi
+: > "$T/empty-list"
+expect "F8 a checkout whose stages are not on the list: off lines, no stop" 0 "real stages not checked: off here" env PARITY_REAL_LIST="$T/empty-list" python3 -I "$SPEC" --self-test
+LW=$HOME/op10-apple/ios26/23F84-n104ap/tree/root/os/sbin/launchd
+if [ -f "$LW" ]; then
+  python3 -I - "$T/bad-spec" <<'PYB'
+import sys
+open(sys.argv[1], 'wb').write(b'\0'.join([b'f', b'755', b'0', b'0', b'1', b'0', b'sbin/fsck', b'/x/work/overlay/sbin/fsck']) + b'\n')
+PYB
+  expect "F8 the real-spec check fails on a spec with a boot task from an overlay" 1 "from an overlay: ['sbin/fsck']" env PARITY_REAL_SPEC="$T/bad-spec" PARITY_REAL_LIST="$T/empty-list" python3 -I "$SPEC" --self-test
+else
+  echo "note no $LW: the boot-task checks of the self-test were not run"
+fi
+
 echo "$((n - fails)) of $n passed"
 [ "$fails" = 0 ]

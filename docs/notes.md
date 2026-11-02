@@ -5114,3 +5114,19 @@ Gotchas:
 - IOS-26-Hot removes 41 jobs on 23F84; 32 stay on our root (doc section 10). First list to read if the first boot shows a crash loop.
 Not proven: all of it on the phone. dyld with opcode fixups, the wrappers' insert, the type encodings (self-checks say), BlueTool XPC on 26, VirtualAudio's route, thermal monitor's torch level.
 
+## Mi A3: flash path review: read-back, ABL's false answers, AMFI and setuid (2026-11-02, branch t3/laurel-install-verify; host only, NOTHING RUN ON THE PHONE)
+Facts [V source, `out/laurel/abl-src/FastbootCmds.c`]:
+- `AcceptCmd` :3425 waits for a running flash for every command except `download`; `FlashResult` is read at :3437 either way. A failed result stops only `flash` and `download`: `reboot` goes on. `SparseImgFlashThread` :1358 drops the result. So **no fastboot command proves that the last piece was written**. `Rebooting OKAY [11.079s]` in `logs/laurel-root-flash.log` is that wait.
+- The real `.simg` (07:02 build): 3651028 DON'T CARE blocks, not the 3634708 of the review: the root was rebuilt [I]. All of it is one gap: 2 ranges only, 0 + 4736298, and block 8387326, the alternate volume header. All of the first MiB is in the first range; a root with a DON'T CARE block in its first MiB would fail `switch`'s first-MiB hash.
+Facts [V kernel, dyld]:
+- `sweet_amfi_syscall` answered dyld's AMFI question with 0xff for all processes. 23F84 `/usr/lib/dyld` has `svc` 381 (`__mac_syscall`), and no 327 (`issetugid`). So **`DYLD_INSERT_LIBRARIES` did run code as root in `powermenu-helper` (setuid root) before `caller_allowed()`**: by code, not run. Patch 2957 answers 0 for P_SUGID. The fix is in the kernel because nothing in a setuid binary runs before dyld's insert.
+- exec clears P_SUGID (`exec_handle_sugid`) and sets it only for an image that changes the user or group: jobs with `DYLD_INSERT_LIBRARIES` keep 0xff.
+- `/dev/console` is mode 0622 (`devfs_vfsops.c:116`): user mobile writes it; `NMTL[pid backboardd]` lines in `logs/usblog-20261101-165828.txt` confirm it on iOS 16. The review's point about `cc_wrap` writing it as mobile is no defect.
+- `kern.bootsessionuuid` is a real sysctl (`kern_sysctl.c:3029`): the guard's session id is there.
+Gotchas:
+- XNU has no rule against a hard link to a file you cannot read: `O_NOFOLLOW` alone does not stop a planted name. `open_planted()` also asks for one link, with the check on the open file. A FIFO at the name hangs a plain open: `O_NONBLOCK`.
+- `cut -d, -fN` prints the whole line when there is no comma in it: a sequence of fake answers needs a trailing comma.
+- A worktree can be a `+` commit of `external/UniXNU` against the pin. The FD gate compares the tree HEAD at build with the pin at check, so build in a tree at the pin (`mu-private-tree.sh`), and give `UNIXNU_TREE=` to `uefi-image.sh` when `external/UniXNU` has no objects of that commit.
+- `laurel_with_limit`: the command must not write into a pipe the caller reads to its end: a child of a killed command holds the pipe, and `$(...)` then waits. So `verify-root` writes to a file and `tail -f` shows it.
+Not proven: all of it on the phone.
+
