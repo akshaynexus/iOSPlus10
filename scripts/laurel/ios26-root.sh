@@ -34,6 +34,8 @@ SIZE=$IOS26_VOLUME_BYTES
 avail=$(df -k --output=avail "$APPLE" | tail -1)
 [ "$avail" -gt $((30 << 20)) ] || { echo "ios26-root: under 30 GiB free at $APPLE" >&2; exit 1; }
 echo "ios26-root: iosroot $IOSROOT_BYTES bytes, volume $SIZE bytes, console log $LOG_BYTES bytes, margin $((IOSROOT_VOLUME_MAX - SIZE)) bytes, at least $VAR_GIB GiB free for /private/var"; df -h "$APPLE" | tail -1
+# The checks of dyld and the kernel on each cache file: dyld gives no reason for a subcache that fails them (docs/laurel_sprout/ios26-dyld.md)
+"$TOOL" a64-preflight --cache "$L/dyld_shared_cache_arm64e" | tail -n 25
 mkdir -p "$W" "$OUT/ios26"
 MNT=$OUT/ios26/mnt/root26; mkdir -p "$MNT/os" "$MNT/sys" "$MNT/app" "$MNT/ro"
 LOOP=

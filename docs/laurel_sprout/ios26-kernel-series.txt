@@ -329,4 +329,7 @@
 2957-laurel-amfi-sugid-dyld.patch                              applied
 2960-laurel-lse-emulation.patch                                skipped: not needed: iOS 16 fix of the topaz 0081 text. On this kernel LSE goes to laurel_a64emu, and post/9000 moved the table end; 0081 stays only with laurelemu=0 (base 0003), unchanged here so that this kernel stays byte-identical
 9000-series-12377-api.patch                                    post
+9001-laurel-release-only-initialized-pages.patch               post
+9002-laurel-no-panic-region.patch                              post
+9003-laurel-dyld-cache-line.patch                              post
 == series: 213 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors

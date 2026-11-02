@@ -41,6 +41,8 @@ Output (Apple content, never in git): `~/op10-apple/ios26/23F84-n104ap/root/ios2
 
 The writer (`tools/op10tool/src/hfs.rs`) makes HFSX with journal flags set, so XNU makes the journal at mount. No hard links: a file with more than one APFS link becomes one copy per path. Extended attributes are not copied, as `rsync -aH` on iOS 16. Names are decomposed UTF-16, `:` stored as `/`.
 
+`ios26-root.sh` first runs `op10tool a64-preflight` on the lowered cache and stops if a file fails: dyld gives no reason on the phone (`ios26-dyld.md`).
+
 Same inputs, same bytes: the build hashes the spec, the changed files and each lowered file. A read that gets EIO from `apfs-fuse` under load tries again.
 
 ## 3. Tweaks: audit per item

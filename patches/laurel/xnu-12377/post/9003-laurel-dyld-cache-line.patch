@@ -1,0 +1,30 @@
+--- a/bsd/vm/vm_unix.c	2026-11-02 19:14:05.510798253 +0530
++++ b/bsd/vm/vm_unix.c	2026-11-02 19:14:05.520700896 +0530
+@@ -1904,6 +1904,8 @@
+ 	    files, mappings_count, mappings,
+ 	    &sr_file_mappings, &shared_region, rdir_vp);
+ 	if (error != 0) {
++		printf("LAUREL DYLD: cache off: %s[%d] setup of %u files, %u mappings: errno %d\n",
++		    p->p_comm, proc_getpid(p), files_count, mappings_count, error);
+ 		vnode_put(rdir_vp);
+ 		return error;
+ 	}
+@@ -1939,6 +1941,18 @@
+ 	}
+ 
+ 	/*
++	 * laurel: one line per map of a shared region (normally one in a boot). dyld drops the reason when a subcache
++	 * fails its checks and then makes no call: no such line means dyld stopped before this call.
++	 */
++	if (error == 0) {
++		printf("LAUREL DYLD: cache on: %s[%d] mapped %u files, %u mappings, slide 0x%x\n",
++		    p->p_comm, proc_getpid(p), files_count, mappings_count, files[0].sf_slide);
++	} else {
++		printf("LAUREL DYLD: cache off: %s[%d] map of %u files, %u mappings: kr 0x%x, errno %d\n",
++		    p->p_comm, proc_getpid(p), files_count, mappings_count, kr, error);
++	}
++
++	/*
+ 	 * Mark that this process is now using split libraries.
+ 	 */
+ 	if (error == 0 && (p->p_flag & P_NOSHLIB)) {

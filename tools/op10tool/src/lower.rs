@@ -576,6 +576,8 @@ fn lower_cache(main: &Path, outdir: &Path, tmp: &Path, rules: &Rules, page_shift
             }
         }
     }
+    // The headers are in the r-x mappings and hold long zero runs. Code written there breaks dyld (docs/laurel_sprout/ios26-dyld.md).
+    taken.extend(cache.reserved_ranges()?);
     taken.sort();
     let mut slots = dead_text.clone();
     for (start, size, file, fileoff) in cache.executable_regions() {
@@ -969,6 +971,7 @@ pub fn verify(orig: &Path, lowered: &Path, dead: &[String], macho_orig: Option<&
     sect.sort();
     dead_text.sort();
     let rules = Rules::parse("all").map_err(|e| anyhow!(e))?;
+    let reserved = a.reserved_ranges()?;
     // A resealed FIPS field must hold the HMAC of the new code.
     let seals = fips_seals(&a)?;
     let seal_fields: Vec<(usize, usize)> = seals.iter().map(|s| (s.0, s.1)).collect();
@@ -1010,6 +1013,10 @@ pub fn verify(orig: &Path, lowered: &Path, dead: &[String], macho_orig: Option<&
                     *counts.entry("header words: codeSignatureSize".into()).or_default() += 1;
                     continue;
                 }
+            }
+            if reserved.iter().any(|r| r.0 <= addr && addr < r.1) {
+                let _ = writeln!(problems, "{addr:#x}: cache header or table changed: {old:#x} -> {new:#x}");
+                continue;
             }
             if !in_section {
                 let k = dead_text.partition_point(|s| s.1 <= addr);
@@ -1140,6 +1147,9 @@ pub fn verify(orig: &Path, lowered: &Path, dead: &[String], macho_orig: Option<&
     if auth_left != 0 {
         let _ = writeln!(problems, "{auth_left} auth rebases left");
     }
+    let failed = preflight_cache(&b, &mut problems);
+    counts.insert("dyld preflight: files that pass".into(), (b.files.len() - failed) as u64);
+    counts.insert("dyld preflight: files that fail".into(), failed as u64);
     if let Some(mo) = macho_orig {
         verify_machos(mo, &lowered.join("macho"), &mut counts, &mut problems)?;
     }
@@ -1155,6 +1165,120 @@ pub fn verify(orig: &Path, lowered: &Path, dead: &[String], macho_orig: Option<&
         bail!("verification failed");
     }
     let _ = File::open(lowered)?;
+    Ok(())
+}
+
+const DYLD_MAGIC: &[u8; 16] = b"dyld_v1  arm64e\0";
+const CS_MAX_BLOB_SIZE: u64 = 40 << 20; // xnu bsd/kern/kern_descrip.c
+const VM_PROT_ZF: u32 = 0x10;
+
+/// What dyld (23F84, `preflightCacheFile`, 0x7e288) and the kernel's `F_ADDFILESIGS_RETURN` and map path check on one cache file.
+/// None if it passes. dyld keeps the reason for the main file only: a subcache that fails here gives
+/// `dyld cache '(null)' not loaded: (null)`, with no map call.
+fn preflight_file(d: &[u8], f: &dsc::CacheFile, is_main: bool, platform: u32) -> Result<Option<String>> {
+    let fail = |m: String| Ok(Some(m));
+    let len = d.len() as u64;
+    if len < 0x4000 {
+        return fail("shared cache file pread() failed: under 16 KiB".into());
+    }
+    if &d[..16] != DYLD_MAGIC {
+        return fail("shared cache file has wrong magic".into());
+    }
+    let map_off = dsc::u32_at(d, 0x10)?;
+    let count = f.mappings.len();
+    if map_off >= 0xe0 && dsc::u32_at(d, 0xd8)? != platform && (dsc::u32_at(d, 0x170)? == 0 || dsc::u32_at(d, 0x170)? != platform) {
+        return fail(format!("shared cache file is for a different platform: {}", dsc::u32_at(d, 0xd8)?));
+    }
+    if d[0xdd] & 2 != 0 {
+        return fail("shared cache file is for a simulator".into());
+    }
+    if !(1..=8).contains(&count) {
+        return fail(format!("shared cache file mappings are invalid: {count}"));
+    }
+    let first = f.mappings[0];
+    let last = f.mappings[count - 1];
+    if first.fileoff != 0 {
+        return fail("shared cache text file offset is invalid".into());
+    }
+    if f.sig_offset + f.sig_size != len {
+        return fail(format!("shared cache code signature size is invalid: {:#x} + {:#x} != {len:#x}", f.sig_offset, f.sig_size));
+    }
+    if count >= 2 && last.maxprot != 1 {
+        return fail(format!("shared cache linkedit permissions are invalid: {}", last.maxprot));
+    }
+    if first.maxprot | if count >= 2 { 4 } else { 0 } != 5 {
+        return fail(format!("shared cache text permissions are invalid: {}", first.maxprot));
+    }
+    let mut file_end = 0;
+    for w in f.mappings.windows(2) {
+        file_end += w[0].size;
+        if w[0].address + w[0].size > w[1].address || file_end != w[1].fileoff {
+            return fail("shared cache mappings overlap".into());
+        }
+    }
+    let Some(cd) = code_directories(d, f.sig_offset as usize)?.first().map(|c| c.0) else {
+        return fail("code signature registration for shared cache failed: no CodeDirectory".into());
+    };
+    if f.sig_size > CS_MAX_BLOB_SIZE {
+        return fail(format!("code signature registration for shared cache failed: blob of {:#x} bytes (E2BIG)", f.sig_size));
+    }
+    let (code_limit, hash_size, hash_type, shift) = (be32(d, cd + 32)? as u64, d[cd + 36], d[cd + 37], d[cd + 39]);
+    if shift != 12 && shift != 14 {
+        return fail(format!("code signature registration for shared cache failed: page shift {shift}"));
+    }
+    if !matches!((hash_type, hash_size), (1, 20) | (2, 32) | (3, 20) | (4, 48)) {
+        return fail(format!("code signature registration for shared cache failed: hash {hash_type} size {hash_size}"));
+    }
+    let page = 1u64 << shift;
+    let signed_end = code_limit.div_ceil(page) * page;
+    if signed_end < f.sig_offset {
+        return fail("code signature does not cover entire shared cache file".into());
+    }
+    for m in &f.mappings {
+        if m.initprot & VM_PROT_ZF == 0 && m.fileoff + m.size > signed_end {
+            return fail(format!("mapping at file offset {:#x}, {:#x} bytes, is not code-signed", m.fileoff, m.size));
+        }
+    }
+    let (sub_off, sub_count) = (dsc::u32_at(d, 0x188)? as u64, dsc::u32_at(d, 0x18c)?);
+    if sub_count > 0x7f {
+        return fail(format!("shared cache file subcache count exceeds limit: {sub_count:#x}"));
+    }
+    if !is_main && sub_count != 0 {
+        return fail(format!("no shared cache subcache indices: count {sub_count}"));
+    }
+    if map_off >= 0x1c9 && sub_off + 0x1c00 > len {
+        return fail(format!("shared cache file pread() failed, could not read subcache entries: offset {sub_off:#x}"));
+    }
+    if count < 2 && f.slid.iter().any(|m| m.slide_size != 0) {
+        return fail("slide info with no linkedit mapping (dyld stops on a bad optional)".into());
+    }
+    Ok(None)
+}
+
+/// Each file of a cache through `preflight_file`. Problem lines go to `problems`. Returns the count of files that fail.
+fn preflight_cache(cache: &Cache, problems: &mut String) -> usize {
+    let platform = cache.files.first().and_then(|f| dsc::u32_at(f.data(), 0xd8).ok()).unwrap_or(0);
+    let mut failed = 0;
+    for (i, f) in cache.files.iter().enumerate() {
+        let r = preflight_file(f.data(), f, i == 0, platform).unwrap_or_else(|e| Some(e.to_string()));
+        if let Some(m) = r {
+            failed += 1;
+            let _ = writeln!(problems, "{}: {m}", f.path.display());
+        }
+    }
+    failed
+}
+
+/// a64-preflight: the checks of dyld and the kernel on a cache, before any boot. Every failure is printed.
+pub fn preflight(main: &Path) -> Result<()> {
+    let cache = Cache::open(main)?;
+    let mut problems = String::new();
+    let failed = preflight_cache(&cache, &mut problems);
+    print!("{problems}");
+    println!("dyld preflight: {} of {} files pass", cache.files.len() - failed, cache.files.len());
+    if failed != 0 {
+        bail!("{failed} cache files fail");
+    }
     Ok(())
 }
 
@@ -1398,6 +1522,83 @@ mod tests {
         assert!(out.iter().all(|s| s.1 >= 64 && s.0 % 16 == 0));
         assert!(out.iter().all(|s| !(s.0 < 0x1000 + 1024 && s.0 + s.1 > 0x1000 + 512)));
         assert!(out.iter().all(|s| !(s.0 <= 0x1000 + 100 && s.0 + s.1 > 0x1000 + 100)));
+    }
+
+    /// One cache file: header, one r-x mapping, an ad-hoc signature at the end. `subs` subcache suffixes in the main file.
+    fn synth_cache_file(address: u64, subs: &[&str]) -> Vec<u8> {
+        const CODE: usize = 0x8000;
+        let put32 = |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 = |b: &mut Vec<u8>, at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        let mut sig = Vec::new();
+        for v in [CSMAGIC_EMBEDDED, 0x38, 1, 0, 0x14] {
+            sig.extend_from_slice(&v.to_be_bytes());
+        }
+        for v in [CSMAGIC_CD, 0x24, 0x20400, 2, 0, 0, 0, 0, CODE as u32] {
+            sig.extend_from_slice(&v.to_be_bytes());
+        }
+        sig.extend_from_slice(&[32, 2, 0, 12]);
+        let sig_off = CODE;
+        let mut b = vec![0u8; CODE + 0x4000];
+        b[..16].copy_from_slice(DYLD_MAGIC);
+        put32(&mut b, 0x10, 0x228);
+        put32(&mut b, 0x14, 1);
+        put64(&mut b, 0x28, sig_off as u64);
+        put64(&mut b, 0x30, 0x4000);
+        put32(&mut b, 0xd8, 2);
+        put32(&mut b, 0x138, 0x260);
+        put32(&mut b, 0x13c, 1);
+        put64(&mut b, 0x228, address);
+        put64(&mut b, 0x230, CODE as u64);
+        put32(&mut b, 0x240, 5);
+        put32(&mut b, 0x244, 5);
+        put64(&mut b, 0x260, address);
+        put64(&mut b, 0x268, CODE as u64);
+        put32(&mut b, 0x290, 5);
+        put32(&mut b, 0x294, 5);
+        put32(&mut b, 0x1c0, 0x400); // no images
+        if !subs.is_empty() {
+            put32(&mut b, 0x188, 0x1000);
+            put32(&mut b, 0x18c, subs.len() as u32);
+            for (i, s) in subs.iter().enumerate() {
+                let e = 0x1000 + 56 * i;
+                put64(&mut b, e + 16, (i as u64 + 1) * 0x8000);
+                b[e + 24..e + 24 + s.len()].copy_from_slice(s.as_bytes());
+            }
+        }
+        b[sig_off..sig_off + sig.len()].copy_from_slice(&sig);
+        b
+    }
+
+    #[test]
+    fn lower_keeps_cache_headers_and_preflight_finds_code_there() {
+        let dir = std::env::temp_dir().join(format!("op10-preflight-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (main, sub) = (dir.join("c"), dir.join("c.01"));
+        fs::write(&main, synth_cache_file(0x1_8000_0000, &[".01"])).unwrap();
+        let mut bad = synth_cache_file(0x1_8000_8000, &[]);
+        fs::write(&sub, &bad).unwrap();
+        let cache = Cache::open(&main).unwrap();
+        let mut problems = String::new();
+        assert_eq!(preflight_cache(&cache, &mut problems), 0, "{problems}");
+        // No image in the main file: all of its mapping stays. The subcache keeps only its header and tables.
+        let r = cache.reserved_ranges().unwrap();
+        assert_eq!(r, vec![(0x1_8000_0000, 0x1_8000_8000), (0x1_8000_8000, 0x1_8000_8000 + 0x298)]);
+        let mut taken = r.clone();
+        taken.sort();
+        let mut slots = Vec::new();
+        zero_slots(cache.files[1].data().get(..0x8000).unwrap(), 0x1_8000_8000, &taken, &mut slots);
+        assert!(!slots.is_empty());
+        assert!(slots.iter().all(|s| s.0 >= 0x1_8000_8000 + 0x298), "{slots:x?}");
+        drop(cache);
+        // The first-boot failure: a stub on header offset 0x188. dyld drops this message for a subcache.
+        bad[0x188..0x18c].copy_from_slice(&0xf849_07feu32.to_le_bytes());
+        bad[0x18c..0x190].copy_from_slice(&0x1400_41d7u32.to_le_bytes());
+        fs::write(&sub, &bad).unwrap();
+        let cache = Cache::open(&main).unwrap();
+        let mut problems = String::new();
+        assert_eq!(preflight_cache(&cache, &mut problems), 1);
+        assert!(problems.contains("subcache count exceeds limit"), "{problems}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -238,6 +238,7 @@ ret
 - The red zone stays. My first frame (144) broke it, and the test caught this. [V]
 - Registers: x9-x17 chosen per word, x18 never. A word using x30 or SP as base stays for the kernel (cache 10, root 2; SP base 0).
 - Range [V]: B and BL reach ±128 MiB. Text subcaches are at most 115 MB. The planner works in 16 MiB zones and uses slots within 127 MiB.
+- **Not free [V, boot of 2026-11-02]: the header and mapping tables of each file, and all of the main file.** They are in the r-x mappings and hold long zero runs. Code there made 19 files fail dyld's check: `ios26-dyld.md`. The numbers below are from before this rule; trampolines now 16,321.
 - Layout [V `layout.tsv`]: **the cache has no VM gap between text subcaches** (100 gaps of 0 bytes; only 6 gaps of 32 MiB, between data
   mappings). So the trampolines go in free bytes inside the r-x mappings: zero runs of 64 bytes or more that no section and no load
   command owns. **12,439,776 such bytes exist** across the cache, 3,689,848 needed by a first model. Per file it is short: `.11` (WebCore)
@@ -295,7 +296,7 @@ grades (unwind data, LSDA, code pointers). If one of ours is real code, the kern
 
 ## 6. The tool (Step 3)
 
-`tools/op10tool`: `a64-census`, `a64-lower`, `a64-verify`, `a64-selftest`, `a64-abi`, `a64-dis`. Encodings in `src/a64.rs`, parser in `src/dsc.rs`.
+`tools/op10tool`: `a64-census`, `a64-lower`, `a64-verify`, `a64-preflight`, `a64-selftest`, `a64-abi`, `a64-dis`. Encodings in `src/a64.rs`, parser in `src/dsc.rs`.
 
 ```sh
 op10tool a64-lower --cache CACHE --macho TREE --out DIR --rules all --page-shift 12 --dead-image X   # never in place
@@ -368,7 +369,7 @@ From this CPU's result and zeta's README. Not implemented here. The UniXNU patch
 | 3 | Grading | No change | Lowered files are `CPU_SUBTYPE_ARM64_ALL` |
 | 4 | Code signing, trust | Page shift 12 accepted (`cs_validate_codedirectory`, `PAGE_SHIFT_4K`) [V code]. Trust: built-in AMFI marks every signed file of the root volume platform; trust caches stay off | `ios26-kernel.md` section 3. The merged trust cache is built (`ios26-root.md`) but no kernel code reads it |
 | 5 | Cache location, SIP | No change needed [V code + ADT]. `scdir_enforce` is 0 here (macOS target), the file is on the root volume, the owner check needs uid 0. `/chosen/asmb lp-sip0` = 0x6f has `CSR_ALLOW_UNRESTRICTED_FS` (read back from `mkadt.py --donor n104ap`) | Never run |
-| 6 | dyld flags | Done | `dyld_flags` default 0x8 on this kernel; low half to the commpage at `commpage_populate`, line `LAUREL DYLD: on`; a later `kern.dyld_flags` write by launchd keeps that low half. Bit 0x8 = skip libignition comes from zeta's text, not read in dyld here [I] |
+| 6 | dyld flags | Done | `dyld_flags` default 0x8 on this kernel; low half to the commpage at `commpage_populate`, line `LAUREL DYLD: on`; a later `kern.dyld_flags` write by launchd keeps that low half. Bit 0x8 = skip libignition: read in dyld, `tbnz w8, #3` at 0x1c13c [V, ios26-dyld.md] |
 | 7 | Commpage, sysctls | Done | Bits come from the ID registers; `LAUREL CPUID: on` also clears the listed bits if a CPU reports them. `hw.cpufamily`, `hw.cpusubfamily`: unknown on a non-Apple MIDR [V code]. User page shift 14 [V code] |
 | 8 | EL0 emulation | Done, truth-tested | Section 7.2 |
 | 9 | Reach counts | Done | `LAUREL EMU: counts ...` each 60 s, only when a word trapped; 15 values |

@@ -242,6 +242,12 @@ enum Cmd {
         #[arg(long)]
         macho_orig: Option<PathBuf>,
     },
+    /// The checks of dyld and the kernel on each file of a cache, with the reason dyld drops for a subcache
+    A64Preflight {
+        /// Main cache file
+        #[arg(long)]
+        cache: PathBuf,
+    },
     /// Trace IOConnectCall* and sandbox selectors of named images in a dyld shared cache; dump symbols and strings
     A64Abi {
         #[arg(long)]
@@ -391,6 +397,7 @@ fn main() -> Result<()> {
             lower::run(cache.as_deref(), &macho, &out, &rules, page_shift, &dead_image, plan)
         }
         Cmd::A64Verify { orig, lowered, dead_image, macho_orig } => lower::verify(&orig, &lowered, &dead_image, macho_orig.as_deref()),
+        Cmd::A64Preflight { cache } => lower::preflight(&cache),
         Cmd::HfsBuild { spec, out, size, label, manifest, min_free, created, max_size } => {
             hfs::build(&hfs::BuildOpts { spec: &spec, out: &out, size, label: &label, manifest: &manifest, min_free, created, max_size })
         }

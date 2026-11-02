@@ -148,6 +148,13 @@ impl CacheFile {
     pub fn data(&self) -> &[u8] {
         self.map.bytes()
     }
+    /// File offset where the header and its two mapping tables end. All of it is in the first r-x mapping.
+    pub fn header_end(&self) -> Result<u64> {
+        let d = self.data();
+        let (off, count) = (u32_at(d, HEADER_MAPPINGS)? as u64, u32_at(d, HEADER_MAPPINGS + 4)? as u64);
+        let (slide_off, slide_count) = (u32_at(d, HEADER_MAPPING_SLIDE)? as u64, u32_at(d, HEADER_MAPPING_SLIDE + 4)? as u64);
+        Ok((off + 32 * count).max(slide_off + 56 * slide_count))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -251,6 +258,19 @@ impl Cache {
             bail!("{addr:#x}+{len:#x} crosses a mapping");
         }
         self.files[f].data().get(off..off + len).ok_or_else(|| anyhow!("{addr:#x} past end of file"))
+    }
+
+    /// Unslid ranges inside r-x mappings that no section owns and that are not free: each file's header and mapping tables, and
+    /// all of a main file with no image (it holds the image table, the paths and the subcache table). dyld reads these bytes.
+    pub fn reserved_ranges(&self) -> Result<Vec<(u64, u64)>> {
+        let mut out = Vec::new();
+        for (i, f) in self.files.iter().enumerate() {
+            let Some(m) = f.mappings.first() else { continue };
+            let end = m.address + m.size;
+            let no_image = !self.images.iter().any(|(a, _)| *a >= m.address && *a < end);
+            out.push((m.address, if i == 0 && no_image { end } else { m.address + f.header_end()?.min(m.size) }));
+        }
+        Ok(out)
     }
 
     /// (start, size, file index, fileoff, maxprot), sorted by address.

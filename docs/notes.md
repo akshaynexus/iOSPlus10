@@ -5141,3 +5141,12 @@ Gotchas:
 - `laurel_with_limit`: the command must not write into a pipe the caller reads to its end: a child of a killed command holds the pipe, and `$(...)` then waits. So `verify-root` writes to a file and `tail -f` shows it.
 Not proven: all of it on the phone.
 
+## Mi A3 iOS 26: dyld mapped no cache: the lowering wrote into cache headers (2026-11-02, branch t3/laurel-ios26-dyld; host only, no flash)
+Full text: `docs/laurel_sprout/ios26-dyld.md`.
+- `dyld cache '(null)' not loaded: (null)` means: main cache file passed, **a subcache failed its checks, no map call** [V dyld 23F84 0x7db50, 0x1bfd8]. dyld keeps a subcache's reason in a local copy and drops it. The path is always NULL at that print.
+- Cause [V]: `a64-lower` took zero runs in the r-x headers as free. `.01` has a stub at 0x188, so `subCacheArrayCount` is 0x140041d7 > 0x7f. 19 of 84 files fail.
+- `vm_shared_region_start_address() returned 0x1` twice is normal for the first process: no mapping yet [V]. A third line would mean a map call happened.
+- dyld has the cache name and magic as constants; the process subtype plays no part [V]. Commpage bit 3 skips `ignite` [V 0x1c13c].
+- Page-in linking on this kernel: dyld passes page size 0x4000, the kernel answers `KERN_INVALID_ARGUMENT` with no print, dyld links in-process [V both sides].
+- Host check before any boot: `op10tool a64-preflight --cache FILE`. `a64-verify` and `ios26-root.sh` run it.
+- Next boot must print `LAUREL DYLD: cache on: launchd[1] mapped 85 files, 107 mappings, slide 0x...` (post 9003).
