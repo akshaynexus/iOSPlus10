@@ -15,7 +15,8 @@ say() { echo "$(date +%H:%M:%S) ios26-retry: $*"; }
 die() { say "STOP: $*"; exit 1; }
 fb_ok() { timeout 3 fastboot devices 2>/dev/null | grep -q fastboot; }
 wait_fb() { c=0; until fb_ok; do [ "$c" -lt "$1" ] || return 1; sleep 3; c=$((c + 1)); done; }
-fb_get() { timeout 10 fastboot getvar "$1" 2>&1 | sed -n "s/^$1: *//p" | tr -d '\r'; }
+# [V phone 2026-11-02] After a button entry, every second command of the session can fail: ask up to 4 times.
+fb_get() { for _t in 1 2 3 4; do _v=$(timeout 10 fastboot getvar "$1" 2>&1 | sed -n "s/^$1: *//p" | tr -d '\r'); [ -z "$_v" ] || { echo "$_v"; return 0; }; done; return 0; }
 wait_android() {
   c=0
   until [ "$(timeout 3 adb get-state 2>/dev/null)" = device ] && [ "$(timeout 5 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; do

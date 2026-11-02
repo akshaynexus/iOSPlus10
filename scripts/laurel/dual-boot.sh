@@ -670,8 +670,13 @@ ro-result)
 to-android)
   need_confirm to-android
   need_fastboot_mi_a3
-  # A session entered with the buttons after a panic can answer wrongly (docs/notes.md).
-  fastboot -s "$FB_S" set_active a || die "set_active a failed: nothing changed. Run: fastboot reboot bootloader, then this step again. (From slot b that command can start iOS once: then hold Power + Vol Down)"
+  # [V phone 2026-11-02] After a button entry every second command of the session can fail, and set_active asks slot-count first ("Device does not support slots"). A failed try changes nothing.
+  _try=0
+  until fastboot -s "$FB_S" set_active a; do
+    _try=$((_try + 1))
+    [ "$_try" -lt 4 ] || die "set_active a failed 4 times: nothing changed. Run: fastboot reboot bootloader, then this step again. (From slot b that command can start iOS once: then hold Power + Vol Down)"
+    sleep 1
+  done
   fastboot -s "$FB_S" reboot || die "slot a is active, but ABL did not take reboot: hold Power for a restart"
   say "Slot a active, Android starts. Android must open its data; then: dual-boot.sh android-check"
   ;;
