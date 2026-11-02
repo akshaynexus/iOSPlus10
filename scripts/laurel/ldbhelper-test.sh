@@ -190,6 +190,97 @@ if start "F4 plan-repair: the primary from the backup copy, nothing else; it ref
   [ "$("$TOOL" gpt state --head "$D/th" --tail "$D/tt" --ref-head "$H0" --ref-tail "$T0")" = broken ] || no "state broken"
   done_
 fi
+# F1 (install path): root-verify: the phone's code against a fake partition: the list and the CRC of the real tool on a real .simg; CRC-32 also by python's zlib
+# A fake partition of 2048 blocks that holds old bytes; RAW and FILL chunks from the tool's img2simg go over it by simg-apply below.
+RV=$D/rv; mkdir -p "$RV"
+python3 -I - "$RV/root.img" <<'PY'
+import os, sys
+with open(sys.argv[1], 'wb') as f:
+    f.truncate(2048 * 4096)
+    # data at 0, an all-one-word block (FILL), a run of 1300 RAW blocks, more than one 4 MiB read (1024 blocks), a last block alone
+    f.seek(0); f.write(os.urandom(4096 * 3))
+    f.seek(10 * 4096); f.write(b'\xa5\x5a\x00\xff' * 1024)
+    f.seek(300 * 4096); f.write(os.urandom(4096 * 1300))
+    f.seek(2047 * 4096); f.write(os.urandom(4096))
+PY
+"$TOOL" img2simg "$RV/root.img" "$RV/root.simg" > /dev/null
+RV_LINE=$("$TOOL" simg-verify-list "$RV/root.simg" -o "$RV/root.list" | tail -1)
+rv_flash() { python3 -I - "$RV/root.simg" "$RV/part" "$1" <<'PY'
+import struct, sys
+s, dev, lose = sys.argv[1], sys.argv[2], sys.argv[3] == 'lose-last'
+d = open(s, 'rb').read()
+_, _, _, fh, ch, blk, total, chunks, _ = struct.unpack('<IHHHHIIII', d[:28])
+open(dev, 'wb').write(b'\xee' * (total * blk))
+at, pos, w = fh, 0, []
+for _ in range(chunks):
+    kind, _, size, n = struct.unpack('<HHII', d[at:at + 12])
+    if kind == 0xcac1: w.append((pos, d[at + ch:at + n]))
+    elif kind == 0xcac2: w.append((pos, d[at + ch:at + ch + 4] * (size * blk // 4)))
+    pos += size; at += n
+if lose: w.pop()
+with open(dev, 'r+b') as f:
+    for b, data in w:
+        f.seek(b * blk); f.write(data)
+PY
+}
+rv_poke() { python3 -I - "$RV/part" "$1" <<'PY'
+import sys
+with open(sys.argv[1], 'r+b') as f:
+    f.seek(int(sys.argv[2])); b = f.read(1); f.seek(int(sys.argv[2])); f.write(bytes([b[0] ^ 1]))
+PY
+}
+rv_last() { printf '%s\n' "$o" | grep '^verify ranges ' | tail -1; }
+if start "F1 root-verify: the old bytes stay in the DON'T CARE blocks: the helper says the tool's line; python's zlib says the same CRC"; then
+rv_flash all; run X=1 "$H" root-verify "$RV/root.list" "$RV/part"; exit_0; [ "$(rv_last)" = "$RV_LINE" ] || no "helper '$(rv_last)', tool '$RV_LINE'"
+cmp -s "$RV/part" "$RV/root.img" && no "the fake partition has no old bytes: this tests nothing"
+z=$(python3 -I - "$RV/part" "$RV/root.list" <<'PY'
+import struct, sys, zlib
+d = open(sys.argv[2], 'rb').read(); n = struct.unpack('<Q', d[8:16])[0]; f = open(sys.argv[1], 'rb'); c = 0
+for i in range(n):
+    a, k = struct.unpack('<II', d[40 + 8 * i:48 + 8 * i]); f.seek(a * 4096); c = zlib.crc32(f.read(k * 4096), c)
+print('%08x' % c)
+PY
+); [ "$z" = "${RV_LINE##* }" ] || no "zlib $z, tool ${RV_LINE##* }"; done_
+fi
+if start "F1 root-verify: one byte damaged in a range: another CRC"; then
+rv_flash all; rv_poke $((950 * 4096 + 123)); run X=1 "$H" root-verify "$RV/root.list" "$RV/part"; exit_0; [ "$(rv_last)" != "$RV_LINE" ] || no "not found"; done_
+fi
+if start "F1 root-verify: one byte damaged in the second 4 MiB read of a range: another CRC"; then
+rv_flash all; rv_poke $(((300 + 1024) * 4096)); run X=1 "$H" root-verify "$RV/root.list" "$RV/part"; exit_0; [ "$(rv_last)" != "$RV_LINE" ] || no "not found"; done_
+fi
+if start "F1 root-verify: the last piece lost: another CRC"; then
+rv_flash lose-last; run X=1 "$H" root-verify "$RV/root.list" "$RV/part"; exit_0; [ "$(rv_last)" != "$RV_LINE" ] || no "not found"; done_
+fi
+if start "F1 root-verify: a change in a DON'T CARE block: the same CRC"; then
+rv_flash all; rv_poke $((1700 * 4096)); run X=1 "$H" root-verify "$RV/root.list" "$RV/part"; exit_0; [ "$(rv_last)" = "$RV_LINE" ] || no "'$(rv_last)', wanted '$RV_LINE'"; done_
+fi
+if start "F1 root-verify: it only reads: the partition is the same after it"; then
+rv_flash all; a=$(sha256sum "$RV/part"); run X=1 "$H" root-verify "$RV/root.list" "$RV/part"; exit_0; [ "$(sha256sum "$RV/part")" = "$a" ] || no "changed"; done_
+fi
+if start "F1 root-verify: a damaged list: refused before any read of the partition"; then
+rv_flash all; cp "$RV/root.list" "$RV/bad"; printf 'X' | dd of="$RV/bad" bs=1 seek=41 conv=notrunc 2>/dev/null; run X=1 "$H" root-verify "$RV/bad" "$RV/part"; exit_not0; said "damaged"; done_
+fi
+if start "F1 root-verify: a list cut in the middle of a range: refused"; then
+rv_flash all; head -c 44 "$RV/root.list" > "$RV/bad"; run X=1 "$H" root-verify "$RV/bad" "$RV/part"; exit_not0; said "damaged"; done_
+fi
+if start "F1 root-verify: not a list: refused"; then
+rv_flash all; run X=1 "$H" root-verify "$RV/root.img" "$RV/part"; exit_not0; said "not a range list"; done_
+fi
+if start "F1 root-verify: a partition shorter than the list: refused, no result line"; then
+rv_flash all; truncate -s $((2000 * 4096)) "$RV/part"; run X=1 "$H" root-verify "$RV/root.list" "$RV/part"; exit_not0; said "ends past the device"; [ -z "$(rv_last)" ] || no "a result line"; done_
+fi
+if start "F1 root-verify: a partition that is not a whole number of blocks: refused"; then
+rv_flash all; truncate -s $((2048 * 4096 + 1)) "$RV/part"; run X=1 "$H" root-verify "$RV/root.list" "$RV/part"; exit_not0; said "device size"; done_
+fi
+if [ -n "${LDB_DIRECT:-}" ]; then
+  dio_rv() { o=$("$LDB_DIO" "$RV/part" "$LDB_DIRECT" root-verify "$RV/root.list" "$RV/part" 2>&1); rc=$?; }
+  if start "F1 root-verify, the phone's code: real O_DIRECT, memory, offset and length on the block; the tool's line"; then
+  rv_flash all; dio_rv; exit_0; said " 0 refused"; said " 1 O_DIRECT opens, 0 plain opens"; said " 0 pwrites"; [ "$(rv_last)" = "$RV_LINE" ] || no "'$(rv_last)', wanted '$RV_LINE'"; printf '%s\n' "$o" | grep '^dio_check: [0-9]' | sed 's/^/     /'; done_
+  fi
+  if start "F1 root-verify, the phone's code: the last piece lost: another CRC"; then
+  rv_flash lose-last; dio_rv; exit_0; [ "$(rv_last)" != "$RV_LINE" ] || no "not found"; done_
+  fi
+fi
 # S5: one writer
 holding() { python3 -I - "$1" "$H" "$2" "$3" <<'PY'
 import fcntl, subprocess, sys

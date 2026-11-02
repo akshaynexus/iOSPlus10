@@ -24,17 +24,26 @@
 #define XT_BENCH_OUT   XT_STACK_DIR "/bench-result"
 #define XT_BENCH_WAIT_TICKS 30     /* 100 ms each */
 
+/*
+ * root:wheel 1777. backboardd runs as mobile and must write here, so the folder stays open for new files; the sticky bit keeps a mobile process from removing or replacing what root put here.
+ * That is not enough for a read: a caller can still plant a name that is absent, so each read of this folder goes through open_planted(). XT_DB is root's 0755: nobody else can replace this folder.
+ */
 static int
 stack_dir(void)
 {
+	struct stat st;
+
 	if (ensure_dir(XT_DB, 0755) != 0) {
 		return -1;
 	}
-	if (mkdir(XT_STACK_DIR, 0777) != 0 && errno != EEXIST) {
+	if (mkdir(XT_STACK_DIR, 01777) != 0 && errno != EEXIST) {
 		fprintf(stderr, "powermenu-helper: %s: %s\n", XT_STACK_DIR, strerror(errno));
 		return -1;
 	}
-	(void)chmod(XT_STACK_DIR, 0777);        /* backboardd runs as mobile */
+	if (lstat(XT_STACK_DIR, &st) != 0 || !S_ISDIR(st.st_mode) || chown(XT_STACK_DIR, 0, 0) != 0 || chmod(XT_STACK_DIR, 01777) != 0) {
+		fprintf(stderr, "powermenu-helper: %s: not a folder of root: %s\n", XT_STACK_DIR, strerror(errno));
+		return -1;
+	}
 	return 0;
 }
 
@@ -103,11 +112,11 @@ xt_do_liveglass(int on)
 	return (ensure_dir(XT_DB, 0755) != 0 || write_file(XT_GLASS, "powermenu-helper liveglass on\n") != 0) ? 1 : 0;
 }
 
-/* the first line, without its end; "" when there is none */
+/* the first line of a file in stack/, without its end; "" when there is none */
 static void
 first_line(const char *path, char *out, size_t size)
 {
-	FILE *f = fopen(path, "r");
+	FILE *f = open_planted(path);
 
 	out[0] = 0;
 	if (f == NULL) {
@@ -135,7 +144,7 @@ xt_do_metalstate(void)
 		}
 		fclose(f);
 	}
-	first_line(XT_OPTION, setting, sizeof(setting));
+	first_line(XT_OPTION, setting, sizeof(setting));    /* XT_DB: root's folder, but the same rules cost nothing */
 	first_line(XT_STACK_DIR "/active", active, sizeof(active));
 	first_line(XT_STACK_DIR "/state", state, sizeof(state));
 	char *why = strchr(active, ' ');
@@ -166,7 +175,7 @@ xt_do_bench_end(void)
 	/* the plug-in looks each 500 ms */
 	for (int i = 0; i < XT_BENCH_WAIT_TICKS; i++) {
 		char line[128];
-		FILE *f = fopen(XT_BENCH_OUT, "r");
+		FILE *f = open_planted(XT_BENCH_OUT);
 
 		if (f != NULL) {
 			while (fgets(line, sizeof(line), f) != NULL) {

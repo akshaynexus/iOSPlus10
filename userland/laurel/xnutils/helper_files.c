@@ -61,6 +61,38 @@ write_file(const char *path, const char *text)
 	return 0;
 }
 
+#ifdef XT_IOS26
+/*
+ * A file in a folder that a mobile process can write: stack/, where the compositor (mobile) leaves its lines. This helper runs as root and prints what it reads, so a planted name must not reach another file:
+ * no symlink (O_NOFOLLOW); no FIFO or device (O_NONBLOCK, then regular only: a FIFO must not hold the helper); no hard link to a file of root (one link only: XNU has no rule against linking a file you cannot read).
+ * The checks are on the open file: no time between check and read. Owner: root or mobile, the two that write here. NULL, and one line, for anything else except "no such file".
+ */
+FILE *
+open_planted(const char *path)
+{
+	int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+	struct stat st;
+
+	if (fd < 0) {
+		if (errno != ENOENT) {
+			fprintf(stderr, "powermenu-helper: %s: %s\n", path, strerror(errno));
+		}
+		return NULL;
+	}
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1 || (st.st_uid != 0 && st.st_uid != XT_MOBILE_UID)) {
+		fprintf(stderr, "powermenu-helper: %s: refused: not a plain file of root or mobile with one link\n", path);
+		close(fd);
+		return NULL;
+	}
+	FILE *f = fdopen(fd, "r");
+
+	if (f == NULL) {
+		close(fd);
+	}
+	return f;
+}
+#endif
+
 XT_SHARED int
 remove_file(const char *path)
 {

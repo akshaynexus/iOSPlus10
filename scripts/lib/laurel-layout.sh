@@ -21,6 +21,41 @@ FW_B="abl bluetooth cmnlib cmnlib64 devcfg dsp hyp imagefv keymaster modem qupfw
 laurel_can_write() {
   [ -n "$(LC_ALL=C grep -aoE '(^|[[:space:]"])(ufsrw|rootrw)([[:space:]"]|$)|(ufsrw|rootrw)=[^[:space:]"]*' | LC_ALL=C grep -avE '^(ufsrw|rootrw)=0$' | head -1 | tr -d '\000' || true)" ]
 }
+# A size from getvar: 0x hex or decimal, or no value. One garbled answer (docs/notes.md) must not reach shell arithmetic: a bad value stops the shell with a text of its own, or reads as another number.
+laurel_size_ok() {
+  case "$1" in
+  0x) return 1 ;;
+  0x*[!0-9a-fA-F]*) return 1 ;;
+  0x*) return 0 ;;
+  ""|*[!0-9]*|0[0-9]*) return 1 ;;
+  esac
+  return 0
+}
+# COMMAND with a time limit, on macOS and Linux (no `timeout` there). Exit code: the command's; 124 at the limit. The command's stdin is /dev/null and it must not write into a pipe the caller reads to its end: a child of a killed command can hold that pipe.
+laurel_with_limit() {
+  _lim=$1; shift
+  "$@" < /dev/null &
+  _lim_p=$!
+  _lim_f=$(mktemp "${TMPDIR:-/tmp}/ldb-limit.XXXXXX")
+  (
+    sleep "$_lim" & _lim_s=$!
+    trap 'kill "$_lim_s" 2>/dev/null; exit 0' TERM
+    wait "$_lim_s"
+    echo limit > "$_lim_f"
+    kill "$_lim_p" 2>/dev/null
+    sleep 5 & _lim_s=$!
+    wait "$_lim_s"
+    kill -9 "$_lim_p" 2>/dev/null
+  ) > /dev/null 2>&1 &
+  _lim_w=$!
+  _lim_r=0
+  wait "$_lim_p" || _lim_r=$?
+  kill "$_lim_w" 2>/dev/null || true
+  wait "$_lim_w" 2>/dev/null || true
+  if [ -s "$_lim_f" ]; then _lim_r=124; fi
+  rm -f "$_lim_f"
+  return "$_lim_r"
+}
 # the newest folder with this name pattern in the backup, or nothing
 laurel_backup_dir() { ls -d "$LAUREL_BACKUP"/$1 2>/dev/null | sort | tail -1; }
 # os_version field of a boot image header (v0-v2: byte 44): a 32-bit value: (A<<25 | B<<18 | C<<11 | year-2000<<4 | month)

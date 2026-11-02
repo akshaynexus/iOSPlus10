@@ -1,0 +1,19 @@
+laurel 2957: dyld takes no DYLD_* variables in a setuid process. dyld asks the policy AMFI what it may do (__mac_syscall 0x5a), and this stand-in answered "all" to every process, also to /usr/local/libexec/powermenu-helper (root:mobile 4750): a mobile process could run it with DYLD_INSERT_LIBRARIES and get its own code running as root before main(). Apple's AMFI does not allow this. [V 23F84 /usr/lib/dyld: no issetugid syscall: this answer is the whole test.] No effect on other processes: a job with DYLD_INSERT_LIBRARIES is not setuid, and exec clears P_SUGID for an image that is not. Docs: docs/laurel_sprout/ios26-first-boot.md.
+
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -375,11 +375,12 @@
+ #define SWEET_AMFI_DYLD_ALLOW_ALL       0xffULL
+ 
+ static int
+-sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
++sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	uint64_t in_out[2] = { 0, 0 };
+-	uint64_t allow = SWEET_AMFI_DYLD_ALLOW_ALL;
++	/* laurel 2957: P_SUGID: this image changed the user or group at exec (kern_exec.c exec_handle_sugid). dyld then ignores DYLD_* and @ paths, as for a process Apple's AMFI restricts */
++	uint64_t allow = proc_issetugid(p) ? 0 : SWEET_AMFI_DYLD_ALLOW_ALL;
+ 	int error;
+ 
+ 	if (call != SWEET_AMFI_CHECK_DYLD_POLICY) {
+ 		/*

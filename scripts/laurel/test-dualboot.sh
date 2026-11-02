@@ -1,12 +1,13 @@
 #!/bin/sh
 # Host test of the Mi A3 dual boot (docs/laurel_sprout/dual-boot.md). No phone, no root, no write outside out/. Some minutes: run it with scripts/bg.sh.
 #   scripts/laurel/test-dualboot.sh
-#   1. op10tool unit tests: the GPT plan: layout numbers, every wrong table refused, the real layout when the backup is on this machine (no GPT bytes in git).
+#   1. op10tool unit tests: the GPT plan: layout numbers, every wrong table refused, the real layout when the backup is on this machine (no GPT bytes in git). The read-back list of a sparse image (simg-verify-list).
 #   2. The patch carries laurel_dualboot.h.
 #   3. The real bsd/dev/sweet_ufs.c (the tree of `AUDIT=1 scripts/laurel/kernel-linux.sh` or a build) over a RAM disk: 0 blocks outside iosroot change; the fence; each unexpected GPT = off, no block changed.
 #   4. The phone helper, built for this host: scripts/laurel/ldbhelper-test.sh: the real gpt-write on a sparse disk, a power cut after each step, a torn primary, one writer; and the phone's own code with real O_DIRECT and the block rules of 4.14 (test/dio_check.c). (aarch64 build: compile check only.)
 #   5. The numbers of scripts/lib/laurel-layout.sh = what the tool prints; the real backup through the tool and an independent reader (python, no op10tool).
 #   6. scripts/laurel/android-guard-test.sh and scripts/laurel/dual-boot-test.sh: the scripts themselves, with a fake adb and fastboot. PATH holds no real adb or fastboot there.
+#   7. The small guards of the root: wrap-guard-test.sh (crash guard of the two start programs), root-helper-test.sh (what the setuid helper reads), amfi-dyld-test.sh (the kernel's answer to dyld, patch 2957).
 # Proves the code on the host. Nothing here proves anything about the phone.
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
@@ -22,6 +23,8 @@ case "$CT" in /*) ;; *) CT=$PWD/$CT ;; esac
 echo "== 1. op10tool unit tests"
 (cd "$REPO/tools/op10tool" && CARGO_TARGET_DIR=$CT cargo test --release gpt) > "$D/cargo-test.out" 2>&1 || { tail -30 "$D/cargo-test.out"; echo "test-dualboot: FAILED: cargo test" >&2; exit 1; }
 grep -E '^test |^test result' "$D/cargo-test.out"
+(cd "$REPO/tools/op10tool" && CARGO_TARGET_DIR=$CT cargo test --release simg_verify) > "$D/cargo-test-simg.out" 2>&1 || { tail -30 "$D/cargo-test-simg.out"; echo "test-dualboot: FAILED: cargo test simg_verify" >&2; exit 1; }
+grep -E '^test |^test result' "$D/cargo-test-simg.out"
 (cd "$REPO/tools/op10tool" && CARGO_TARGET_DIR=$CT cargo build --release) > "$D/cargo-build.out" 2>&1 || { tail -30 "$D/cargo-build.out"; exit 1; }
 TOOL=$CT/release/op10tool
 
@@ -98,4 +101,8 @@ fi
 echo "== 6. guards and the dual boot script, with a fake adb and fastboot"
 sh "$REPO/scripts/laurel/android-guard-test.sh" || { echo "test-dualboot: FAILED: android-guard-test" >&2; exit 1; }
 OP10TOOL=$TOOL sh "$REPO/scripts/laurel/dual-boot-test.sh" || { echo "test-dualboot: FAILED: dual-boot-test" >&2; exit 1; }
+echo "== 7. the small guards of the root"
+sh "$REPO/scripts/laurel/wrap-guard-test.sh" || { echo "test-dualboot: FAILED: wrap-guard-test" >&2; exit 1; }
+sh "$REPO/scripts/laurel/root-helper-test.sh" || { echo "test-dualboot: FAILED: root-helper-test" >&2; exit 1; }
+sh "$REPO/scripts/laurel/amfi-dyld-test.sh" || { echo "test-dualboot: FAILED: amfi-dyld-test" >&2; exit 1; }
 echo "test-dualboot: PASS"

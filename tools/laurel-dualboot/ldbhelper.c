@@ -5,6 +5,7 @@
  *   ldbhelper version                     the hash of this source (dual-boot.sh compares it after each push)
  *   ldbhelper gpt-dump DEV HEAD TAIL      the first and last 1 MiB of DEV to files, read past the page cache: the format of the backup
  *   ldbhelper gpt-write PLAN DEV          the steps of a plan of `op10tool gpt`: each old block must be what the plan says, each write is read back past the cache
+ *   ldbhelper root-verify LIST DEV        read-only: DEV over the block ranges of LIST (`op10tool simg-verify-list`), past the page cache, one process, one CRC-32. Prints the result: dual-boot.sh verify-root compares it
  *
  * Why a helper and not sgdisk or dd: docs/laurel_sprout/dual-boot.md section 3. It changes the 4 blocks of the table and zeroes the 2 superblock blocks of userdata, nothing
  * else, and it never asks the kernel to read the table again: the running Android keeps the old table until its reboot.
@@ -26,7 +27,7 @@ typedef _Bool bool;
 __attribute__((used)) static const char helper_version[] = "ldbhelper-version " LDB_HELPER_VERSION;
 
 #if defined(__aarch64__)
-enum { SYS_ioctl = 29, SYS_flock = 32, SYS_openat = 56, SYS_close = 57, SYS_read = 63, SYS_write = 64, SYS_pread = 67, SYS_pwrite = 68, SYS_lseek = 62, SYS_fsync = 82, SYS_exit = 94 };
+enum { SYS_ioctl = 29, SYS_flock = 32, SYS_openat = 56, SYS_close = 57, SYS_read = 63, SYS_write = 64, SYS_pread = 67, SYS_pwrite = 68, SYS_lseek = 62, SYS_fsync = 82, SYS_exit = 94, SYS_clock_gettime = 113 };
 #define O_DIRECT_ 0x10000
 static long
 sc(long n, long a, long b, long c, long d)
@@ -37,7 +38,7 @@ sc(long n, long a, long b, long c, long d)
 }
 __asm__(".globl _start\n_start:\n  mov x0, sp\n  and sp, x0, #-16\n  b start_c\n");
 #elif defined(__x86_64__)
-enum { SYS_read = 0, SYS_write = 1, SYS_openat = 257, SYS_close = 3, SYS_lseek = 8, SYS_ioctl = 16, SYS_pread = 17, SYS_pwrite = 18, SYS_flock = 73, SYS_fsync = 74, SYS_exit = 231 };
+enum { SYS_read = 0, SYS_write = 1, SYS_openat = 257, SYS_close = 3, SYS_lseek = 8, SYS_ioctl = 16, SYS_pread = 17, SYS_pwrite = 18, SYS_flock = 73, SYS_fsync = 74, SYS_exit = 231, SYS_clock_gettime = 228 };
 #define O_DIRECT_ 0x4000
 static long
 sc(long n, long a, long b, long c, long d)
@@ -82,6 +83,14 @@ static uint8_t io[MAX_STEP_BLOCKS * BLK] __attribute__((aligned(4096)));
 static uint8_t wr[MAX_STEP_BLOCKS * BLK] __attribute__((aligned(4096)));
 static uint8_t dump[DUMP_BLOCKS * BLK] __attribute__((aligned(4096)));
 static struct plan_step steps[MAX_STEPS];
+/* root-verify: 4 MiB per read, on the block as O_DIRECT needs; the list is a plain file */
+#define RV_READ_BLOCKS 1024u
+#define RV_LIST_BYTES (64u * 1024u)
+#define RV_HEADER 40
+#define RV_PROGRESS_BLOCKS (256u * 1024u)       /* one line per GiB */
+static uint8_t rv_buf[RV_READ_BLOCKS * BLK] __attribute__((aligned(4096)));
+static uint8_t rv_list[RV_LIST_BYTES] __attribute__((aligned(8)));
+static uint32_t crc_tab[8][256];
 __attribute__((unused)) static char **Envp;
 
 void *
@@ -448,10 +457,177 @@ cmd_write(const char *planpath, const char *dev)
 	}
 	out(1, "gpt-write ok: new table on the device, read back past the cache. The running kernel keeps the old table until its reboot\n");
 }
+/* CRC-32 of zlib and crc32fast (polynomial 0xEDB88320, start and end inverted). Slice-by-8: both builds are little-endian. It finds accidental damage, not a change on purpose. */
+static void
+crc_init(void)
+{
+	for (uint32_t i = 0; i < 256; i++) {
+		uint32_t c = i;
+		for (unsigned k = 0; k < 8; k++) {
+			c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+		}
+		crc_tab[0][i] = c;
+	}
+	for (uint32_t i = 0; i < 256; i++) {
+		for (unsigned t = 1; t < 8; t++) {
+			crc_tab[t][i] = (crc_tab[t - 1][i] >> 8) ^ crc_tab[0][crc_tab[t - 1][i] & 0xff];
+		}
+	}
+}
+static uint32_t
+crc_add(uint32_t crc, const uint8_t *p, uint64_t n)
+{
+	/* p is on the block: each 8 bytes load in one read */
+	for (; n >= 8; n -= 8, p += 8) {
+		uint64_t w = *(const uint64_t *)(const void *)p ^ crc;
+		crc = crc_tab[7][w & 0xff] ^ crc_tab[6][(w >> 8) & 0xff] ^ crc_tab[5][(w >> 16) & 0xff] ^ crc_tab[4][(w >> 24) & 0xff] ^
+		    crc_tab[3][(w >> 32) & 0xff] ^ crc_tab[2][(w >> 40) & 0xff] ^ crc_tab[1][(w >> 48) & 0xff] ^ crc_tab[0][w >> 56];
+	}
+	while (n--) {
+		crc = crc_tab[0][(crc ^ *p++) & 0xff] ^ (crc >> 8);
+	}
+	return crc;
+}
+static void
+hex32(int fd, uint32_t v)
+{
+	char t[9];
+	for (int i = 7; i >= 0; i--) {
+		t[i] = "0123456789abcdef"[v & 15];
+		v >>= 4;
+	}
+	t[8] = 0;
+	out(fd, t);
+}
+static uint64_t
+now_s(void)
+{
+	long ts[2] = { 0, 0 };
+	sc(SYS_clock_gettime, 1 /* CLOCK_MONOTONIC */, (long)ts, 0, 0);
+	return (uint64_t)ts[0];
+}
+/* The ranges one by one, past a small buffer: a list of any length costs no memory */
+static long rv_fd;
+static uint32_t rv_have, rv_at;
+static bool
+rv_next(uint32_t *first, uint32_t *count)
+{
+	if (rv_at == rv_have) {
+		long r = sc(SYS_read, rv_fd, (long)rv_list, RV_LIST_BYTES, 0);
+		if (r < 0) {
+			die("read of the range list", r);
+		}
+		if (r % 8) {
+			die("the range list is damaged: a range is cut", 0);
+		}
+		if (r == 0) {
+			return false;
+		}
+		rv_have = (uint32_t)r;
+		rv_at = 0;
+	}
+	memcpy(first, rv_list + rv_at, 4);
+	memcpy(count, rv_list + rv_at + 4, 4);
+	rv_at += 8;
+	return true;
+}
+static void
+rv_rewind(void)
+{
+	long r = sc(SYS_lseek, rv_fd, RV_HEADER, 0 /* SEEK_SET */, 0);
+	if (r != RV_HEADER) {
+		die("seek in the range list", r < 0 ? r : 0);
+	}
+	rv_have = rv_at = 0;
+}
+/* Only reads. A failed read ends this process with no result line: the host then records nothing. Nothing here waits for the host: a lost adb costs only the time of the reads. */
+static void
+cmd_root_verify(const char *listpath, const char *dev)
+{
+	uint8_t head[RV_HEADER];
+	uint64_t want_ranges, want_blocks, want_end, want_hash, h = 0xcbf29ce484222325ul;
+
+	rv_fd = open_or_die(listpath, O_RDONLY, 0);
+	if (sc(SYS_read, rv_fd, (long)head, RV_HEADER, 0) != RV_HEADER || !blk_eq(head, (const uint8_t *)"LDBRNG1", 8)) {
+		die("not a range list", 0);
+	}
+	memcpy(&want_ranges, head + 8, 8);
+	memcpy(&want_blocks, head + 16, 8);
+	memcpy(&want_end, head + 24, 8);
+	memcpy(&want_hash, head + 32, 8);
+	long fd = open_dev(dev, O_RDONLY);
+	uint64_t disk = dev_blocks(fd);
+	/* first the whole list: a damaged one stops before 18 GB of reads */
+	uint64_t ranges = 0, blocks = 0, end = 0;
+	uint32_t first, count;
+	while (rv_next(&first, &count)) {
+		const uint8_t *e = rv_list + rv_at;
+		for (const uint8_t *b = e - 8; b < e; b++) {
+			h = (h ^ *b) * 0x100000001b3ul;
+		}
+		if (count == 0 || (ranges && first < end)) {
+			die("the range list is damaged: ranges out of order", 0);
+		}
+		end = (uint64_t)first + count;
+		blocks += count;
+		ranges++;
+	}
+	if (h != want_hash || ranges != want_ranges || blocks != want_blocks || end != want_end) {
+		die("the range list is damaged", 0);
+	}
+	if (end > disk) {
+		die("the range list ends past the device: this is not the partition of the list", 0);
+	}
+	out(1, "root-verify: ");
+	num(1, blocks * BLK >> 20);
+	out(1, " MiB in ");
+	num(1, ranges);
+	out(1, " ranges of a device of ");
+	num(1, disk);
+	out(1, " blocks\n");
+
+	crc_init();
+	rv_rewind();
+	uint32_t crc = 0xffffffffu;
+	uint64_t done = 0, t0 = now_s();
+	while (rv_next(&first, &count)) {
+		uint64_t at = first, left = count;
+		while (left) {
+			uint32_t n = left < RV_READ_BLOCKS ? (uint32_t)left : RV_READ_BLOCKS;
+			dev_read(fd, at, rv_buf, n);
+			crc = crc_add(crc, rv_buf, (uint64_t)n * BLK);
+			at += n;
+			left -= n;
+			if ((done + n) / RV_PROGRESS_BLOCKS != done / RV_PROGRESS_BLOCKS) {
+				out(1, "root-verify: ");
+				num(1, (done + n) * BLK >> 20);
+				out(1, " of ");
+				num(1, blocks * BLK >> 20);
+				out(1, " MiB, ");
+				num(1, now_s() - t0);
+				out(1, " s\n");
+			}
+			done += n;
+		}
+	}
+	out(1, "root-verify: read in ");
+	num(1, now_s() - t0);
+	out(1, " s\n");
+	/* the same words as the last line of `op10tool simg-verify-list` */
+	out(1, "verify ranges ");
+	num(1, ranges);
+	out(1, " blocks ");
+	num(1, done);
+	out(1, " end ");
+	num(1, end);
+	out(1, " crc32 ");
+	hex32(1, ~crc);
+	out(1, "\n");
+}
 static void
 usage(void)
 {
-	die("usage: version | gpt-dump DEV HEAD TAIL | gpt-write PLAN DEV", 0);
+	die("usage: version | gpt-dump DEV HEAD TAIL | gpt-write PLAN DEV | root-verify LIST DEV", 0);
 }
 __attribute__((used)) void
 start_c(long *sp)
@@ -471,6 +647,8 @@ start_c(long *sp)
 		cmd_dump(argv[2], argv[3], argv[4]);
 	} else if (streq(c, "gpt-write") && argc == 4) {
 		cmd_write(argv[2], argv[3]);
+	} else if (streq(c, "root-verify") && argc == 4) {
+		cmd_root_verify(argv[2], argv[3]);
 	} else {
 		usage();
 	}

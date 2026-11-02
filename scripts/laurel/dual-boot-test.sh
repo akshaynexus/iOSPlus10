@@ -93,11 +93,12 @@ fails() { case " \${FAKE_FAIL:-} " in *" \$1 "*) return 0 ;; esac; return 1; }
 c=\$1
 { printf 'helper'; for a in "\$@"; do printf ' %s' "\$a"; done; printf '\n'; } | sed -e "s#\$P##g" >> "\$T/calls"
 fails "drop:\$c" && { kill -9 \$PPID; exit 137; }
+fails "hang:\$c" && exec sleep 20 > /dev/null 2>&1
 fails "\$c" && { echo "ldbhelper: FAILED: \$c (fake)" >&2; exit 1; }
 case "\$c" in
 version) fails helper-noexec && exit 126; if fails stale-on-phone; then echo "ldbhelper-version 0000"; else cat "\$P/state/helper_version"; [ -s "\$P/state/helper_version" ] || echo "ldbhelper-version unversioned"; fi ;;
 gpt-write) [ -n "\${FAKE_STOP:-}" ] && export LDB_TEST_STOP=\$FAKE_STOP; exec "\$T/real-helper" "\$@" ;;
-gpt-dump) exec "\$T/real-helper" "\$@" ;;
+gpt-dump|root-verify) exec "\$T/real-helper" "\$@" ;;
 esac
 EOT
 chmod +x "$T/bin/adb" "$T/fake-helper"
@@ -200,12 +201,19 @@ getvar)
   current-slot) echo "current-slot: \${FAKE_SLOT:-a}" >&2 ;;
   partition-size:userdata) echo "partition-size:userdata: \${FAKE_UD:-0x12e1}" >&2 ;;
   partition-size:iosroot)
-    if [ "\${FAKE_IR_LATE:-0}" = 1 ] && [ "\$(grep -c 'getvar partition-size:iosroot' "\$T/calls")" -lt 2 ]; then echo "unknown command" >&2
+    k=\$(grep -c 'getvar partition-size:iosroot' "\$T/calls"); v=\$(printf '%s,' "\${FAKE_IR_SEQ:-}" | cut -d, -f"\$k")
+    if [ -n "\$v" ]; then
+      if [ "\$v" = none ]; then echo "unknown command" >&2; else echo "partition-size:iosroot: \$v" >&2; fi
+    elif [ "\${FAKE_IR_LATE:-0}" = 1 ] && [ "\$(grep -c 'getvar partition-size:iosroot' "\$T/calls")" -lt 2 ]; then echo "unknown command" >&2
     elif [ "\${FAKE_IR:-}" != none ]; then echo "partition-size:iosroot: \${FAKE_IR:-0x817d8}" >&2; fi ;;
   esac ;;
 set_active) case " \${FAKE_FAIL:-} " in *" fb-set-active "*) echo "FAILED (remote: 'garbled')" >&2; exit 1 ;; esac ;;
-stage) case " \${FAKE_FAIL:-} " in *" fb-stage "*) echo "FAILED (remote: 'flash write failure')" >&2; exit 1 ;; esac ;;
-reboot) if [ "\${2:-}" = recovery ]; then case " \${FAKE_FAIL:-} " in *" fb-reboot-recovery "*) echo "FAILED (remote: 'unknown command')" >&2; exit 1 ;; esac; fi ;;
+-S)
+  # fastboot -S 512M flash iosroot FILE: with FAKE_APPLY=1 the chunks really go to the fake partition: DON'T CARE leaves the old bytes. ABL answers OKAY for each piece, and a lost last piece shows nothing here (FastbootCmds.c:3425-3437).
+  case " \${FAKE_FAIL:-} " in *" fb-flash "*) echo "FAILED (remote: 'Download failed')" >&2; exit 1 ;; esac
+  [ "\${FAKE_APPLY:-0}" != 1 ] || python3 -I "\$T/apply-simg.py" "\$5" "$P/dev/block/by-name/\$4" "\${FAKE_LOSE_LAST:-0}" ;;
+stage) echo "FAILED (remote: 'stage is no verdict')" >&2; exit 1 ;;
+reboot) if [ -z "\${2:-}" ]; then case " \${FAKE_FAIL:-} " in *" fb-reboot-hang "*) exec sleep 20 > /dev/null 2>&1 ;; *" fb-reboot "*) echo "FAILED (remote: 'garbled')" >&2; exit 1 ;; esac; fi; if [ "\${2:-}" = recovery ]; then case " \${FAKE_FAIL:-} " in *" fb-reboot-recovery "*) echo "FAILED (remote: 'unknown command')" >&2; exit 1 ;; esac; fi ;;
 esac
 exit 0
 EOT
@@ -217,6 +225,24 @@ list) [ "\${FAKE_UPDATER:-off}" = on ] || echo package:org.lineageos.updater ;;
 disable-user) case " \${FAKE_FAIL:-} " in *" pm-disable "*) exit 1 ;; esac; echo "Package org.lineageos.updater new state: disabled-user" ;;
 esac
 EOT
+cat > "$T/apply-simg.py" <<'PY'
+# What ABL does with a sparse image: RAW and FILL go to the partition, DON'T CARE leaves its bytes. Argument 3 = 1: the last piece that holds data is lost, as a write failure after ABL's OKAY.
+import struct, sys
+s, dev, lose = sys.argv[1], sys.argv[2], sys.argv[3] == '1'
+d = open(s, 'rb').read()
+_, _, _, fh, ch, blk, total, chunks, _ = struct.unpack('<IHHHHIIII', d[:28])
+at, pos, writes = fh, 0, []
+for _ in range(chunks):
+    kind, _, size, bytes_ = struct.unpack('<HHII', d[at:at + 12])
+    body = d[at + ch:at + bytes_]
+    if kind == 0xcac1: writes.append((pos, body))
+    elif kind == 0xcac2: writes.append((pos, body[:4] * (size * blk // 4)))
+    pos += size; at += bytes_
+if lose: writes.pop()
+with open(dev, 'r+b') as f:
+    for b, data in writes:
+        f.seek(b * blk); f.write(data)
+PY
 for f in "$T"/pbin/*; do chmod +x "$f"; done
 chmod +x "$T/bin/fastboot"
 
@@ -249,9 +275,13 @@ with open(sys.argv[1], 'wb') as f:
     h[0x7c:0x80] = struct.pack('>I', 1); h[0x80:0x88] = struct.pack('>II', 2, 1)
     f.write(h)
     bm = bytearray(256)
-    for b in range(0, 3): bm[b // 8] |= 0x80 >> (b % 8)
+    # all of the first MiB in use, as in the real root (its first range starts at block 0): `switch` hashes the first MiB
+    for b in range(0, 256): bm[b // 8] |= 0x80 >> (b % 8)
     f.seek(2 * 4096); f.write(bm)
     f.seek(100 * 4096); f.write(b'\x55' * 8192)
+    # data past the first MiB, in its own piece, at the end: the part that `switch` never read before verify-root
+    f.seek(1000 * 4096); f.write(bytes(range(256)) * 16)
+    f.seek(2000 * 4096); f.write(bytes(range(255, -1, -1)) * 16)
 PY
 head -c 4096 /dev/urandom > "$T/dtbo.img"
 export STOCK_DTBO="$T/dtbo.img" OP10TOOL="$TOOL" APPLE="$T/apple"
@@ -319,6 +349,7 @@ ready() {
   cp "$T/root.img" "$P/dev/block/by-name/iosroot"
   head -c 1048576 "$T/root.img" > "$T/first1m"
   printf 'installed x %s %s\n' "$T/root.img" "$(sha256sum "$T/first1m" | cut -d' ' -f1)" >> "$RES"
+  printf 'root-verified x verify ranges 1 blocks 1 end 1 crc32 00000000 %s\n' "$(sha256sum "$T/first1m" | cut -d' ' -f1)" >> "$RES"
   mkimg "$ROIMG" " boot args: rd=ufsroot0 $M LAURELESP"; sidecar "$ROIMG" ro
   cp "$ROIMG" "$P/dev/block/by-name/boot_b"; cp "$STOCK_DTBO" "$P/dev/block/by-name/dtbo_b"
 }
@@ -729,23 +760,184 @@ if start "Install: one garbled getvar: asked again, not called absent"; then
   fb CONFIRM=install FAKE_IR_LATE=1 sh "$DB" install "$T/root.img"
   exit_is 0; ran "fastboot -S 512M flash iosroot"; done_
 fi
-if start "Install: ABL reports a failed last piece at the next download: no installed record"; then
+if start "F2 install: no fastboot stage: it is no verdict, and it stops no good flash"; then
   printf 'android-opened x f2fs-bytes 1\n' > "$RES"
-  fb CONFIRM=install FAKE_FAIL=fb-stage sh "$DB" install "$T/root.img"
-  exit_not0; said "failed write"; grep -q '^installed ' "$RES" && no "recorded as installed"; done_
+  fb CONFIRM=install sh "$DB" install "$T/root.img"
+  exit_is 0; not_ran "fastboot stage"; grep -q '^installed ' "$RES" || no "no record"; said "verify-root"; done_
+fi
+if start "F2 fastboot reboot is refused after the flash: a warning, what to do, the record, exit 0"; then
+  printf 'android-opened x f2fs-bytes 1\n' > "$RES"
+  fb CONFIRM=install FAKE_FAIL=fb-reboot sh "$DB" install "$T/root.img"
+  exit_is 0; said "WARNING: ABL did not take 'reboot'"; said "Hold Power"; said "verify-root"; grep -q '^installed ' "$RES" || no "no record"; done_
+fi
+if start "F2 ABL hangs at fastboot reboot: the job ends at the limit, a warning, what to do, the record"; then
+  printf 'android-opened x f2fs-bytes 1\n' > "$RES"; t0=$(date +%s)
+  fb CONFIRM=install FAKE_FAIL=fb-reboot-hang FLASH_REBOOT_LIMIT=2 sh "$DB" install "$T/root.img"
+  exit_is 0; said "did not answer 'reboot' in 2 s"; said "Hold Power"; said "verify-root"; grep -q '^installed ' "$RES" || no "no record"
+  [ $(($(date +%s) - t0)) -lt 15 ] || no "it waited past the limit"; done_
+fi
+if start "F2 the flash itself fails: no installed record, what to do"; then
+  printf 'android-opened x f2fs-bytes 1\n' > "$RES"
+  fb CONFIRM=install FAKE_FAIL=fb-flash sh "$DB" install "$T/root.img"
+  exit_not0; said "flash failed"; said "Power+VolDown"; grep -q '^installed ' "$RES" && no "recorded as installed"; [ "$(sed -n 2p "$RES" | cut -d' ' -f1)" = install-started ] || no "no install-started line"; done_
+fi
+
+# ---- F6: flash-root.sh asks getvar again ----
+FR=$T/repo/scripts/laurel/flash-root.sh
+if start "F6 flash-root: one getvar with no answer: asked again, no wrong advice, the flash goes"; then
+  rm -f "$T/root.simg"; run sh "$DB" prepare-root "$T/root.img"; exit_is 0
+  fb FAKE_IR_SEQ=none sh "$FR" "$T/root.simg"
+  exit_is 0; ran "fastboot -S 512M flash iosroot"; printf '%s' "$o" | grep -q 'GPT steps' && no "wrong advice"; done_
+fi
+if start "F6 flash-root: one garbled size: asked again, no shell error, the flash goes"; then
+  rm -f "$T/root.simg"; run sh "$DB" prepare-root "$T/root.img"; exit_is 0
+  fb FAKE_IR_SEQ=0xZZ sh "$FR" "$T/root.simg"
+  exit_is 0; ran "fastboot -S 512M flash iosroot"; done_
+fi
+if start "F6 flash-root: three garbled sizes: refused, says what to do, no flash"; then
+  rm -f "$T/root.simg"; run sh "$DB" prepare-root "$T/root.img"; exit_is 0
+  fb FAKE_IR_SEQ=0xZZ,0xZZ,0xZZ sh "$FR" "$T/root.simg"
+  exit_is 3; said "not a number"; said "fastboot reboot bootloader"; said "Nothing was written"; not_ran "-S 512M"; done_
+fi
+if start "F6 flash-root: three answers with no size: only then the GPT steps, after a clean session"; then
+  rm -f "$T/root.simg"; run sh "$DB" prepare-root "$T/root.img"; exit_is 0
+  fb FAKE_IR_SEQ=none,none,none sh "$FR" "$T/root.simg"
+  exit_is 3; said "after 3 tries"; said "fastboot reboot bootloader"; said "GPT steps"; not_ran "-S 512M"; done_
+fi
+if start "F6 flash-root: a garbled userdata size: refused, no shell error"; then
+  rm -f "$T/root.simg"; run sh "$DB" prepare-root "$T/root.img"; exit_is 0
+  run FAKE_UD=0xQQ "FAKE_IR=$FBI" sh "$FR" "$T/root.simg"
+  exit_is 3; said "userdata the size '0xQQ'"; not_ran "-S 512M"; done_
+fi
+if start "F6 dual-boot: a garbled size in need_fastboot_layout: refused with words, no shell error"; then
+  run CONFIRM=after-gpt "FAKE_IR=0xZZ" "FAKE_UD=$FBU" sh "$DB" after-gpt
+  exit_not0; said "not numbers"; not_ran "fastboot reboot"; done_
+fi
+
+# ---- F1: the read-back of the whole root ----
+# the partition with old bytes in every block, then the real chunks over it: what a flash leaves behind
+oldbytes() { rm -f "$P/dev/block/by-name/iosroot"; python3 -I - "$P/dev/block/by-name/iosroot" <<'PY'
+import sys
+open(sys.argv[1], 'wb').write(b'\xa5' * (2048 * 4096))
+PY
+}
+installed() { formatted; printf 'android-opened x f2fs-bytes 1\n' > "$RES"; oldbytes; fb CONFIRM=install FAKE_APPLY=1 "$@" sh "$DB" install "$T/root.img"; exit_is 0; }
+slotb() { mkimg "$ROIMG" " boot args: rd=ufsroot0 $M LAURELESP"; sidecar "$ROIMG" ro; cp "$ROIMG" "$P/dev/block/by-name/boot_b"; cp "$STOCK_DTBO" "$P/dev/block/by-name/dtbo_b"; }
+patch_block() { python3 -I - "$P/dev/block/by-name/iosroot" "$1" <<'PY'
+import sys
+with open(sys.argv[1], 'r+b') as f:
+    f.seek(int(sys.argv[2])); b = f.read(1); f.seek(int(sys.argv[2])); f.write(bytes([b[0] ^ 0xff]))
+PY
+}
+if start "F1 install, verify-root, switch: all well: the record, then slot b"; then
+  installed; grep -q '^installed ' "$RES" || no "no installed"; [ -f "$D/root-verify.list" ] || no "no list"
+  run sh "$DB" verify-root
+  exit_is 0; said "read back"; said "root-verify: read in"; ran "helper root-verify"; grep -q '^root-verified ' "$RES" || no "no record"
+  slotb; run "$SW" sh "$DB" switch; exit_is 0; state_is active 1; done_
+fi
+if start "F1 the first flash leaves old bytes in the DON'T CARE blocks, and a change there is no failure"; then
+  installed
+  cmp -s "$P/dev/block/by-name/iosroot" "$T/root.img" && no "the fake partition has no old bytes, so this tests nothing"
+  [ "$(od -An -tx1 -j$((1500 * 4096)) -N1 "$P/dev/block/by-name/iosroot" | tr -d ' ')" = a5 ] || no "block 1500 is not old flash bytes"
+  patch_block $((1500 * 4096)); run sh "$DB" verify-root
+  exit_is 0; grep -q '^root-verified ' "$RES" || no "no record"; done_
+fi
+if start "F1 one byte damaged in a range: found, no record, switch refused"; then
+  installed; patch_block $((1000 * 4096 + 77)); run sh "$DB" verify-root
+  exit_not0; said "not what was flashed"; said "CONFIRM=install"; ! grep -q '^root-verified ' "$RES" || no "a record"
+  slotb; run "$SW" sh "$DB" switch; exit_not0; said "not read back"; not_ran "bootctl set-active"; done_
+fi
+if start "F1 ABL says OKAY and the last piece is lost: first MiB good, found by verify-root only"; then
+  installed FAKE_LOSE_LAST=1
+  [ "$(head -c 1048576 "$P/dev/block/by-name/iosroot" | sha256sum | cut -d' ' -f1)" = "$(head -c 1048576 "$T/root.img" | sha256sum | cut -d' ' -f1)" ] || no "the first MiB differs: this tests nothing"
+  run sh "$DB" verify-root
+  exit_not0; said "not what was flashed"; ! grep -q '^root-verified ' "$RES" || no "a record"; done_
+fi
+if start "F1 adb lost during the read: no record, says so"; then
+  installed; run FAKE_FAIL=drop:root-verify sh "$DB" verify-root
+  exit_not0; said "adb lost the phone"; ! grep -q '^root-verified ' "$RES" || no "a record"; done_
+fi
+if start "F1 the time limit ends: no record, says so, the job ends"; then
+  installed; t0=$(date +%s); run ROOT_VERIFY_LIMIT=2 FAKE_FAIL=hang:root-verify sh "$DB" verify-root
+  exit_not0; said "no answer from the phone in 2 s"; ! grep -q '^root-verified ' "$RES" || no "a record"; [ $(($(date +%s) - t0)) -lt 15 ] || no "it waited past the limit"; done_
+fi
+if start "F1 the helper fails on the phone: no record, says so"; then
+  installed; run FAKE_FAIL=root-verify sh "$DB" verify-root
+  exit_not0; said "the helper failed"; ! grep -q '^root-verified ' "$RES" || no "a record"; done_
+fi
+if start "F1 verify-root with no install on record: nothing asked of the phone"; then
+  printf 'android-opened x f2fs-bytes 1\n' > "$RES"; run sh "$DB" verify-root
+  exit_not0; said "no record of an installed root"; not_ran "adb"; done_
+fi
+if start "F1 switch with no read-back: refused"; then
+  ready; grep -v '^root-verified ' "$RES" > "$RES.x"; mv "$RES.x" "$RES"
+  run "$SW" sh "$DB" switch; exit_not0; said "not read back"; said "verify-root"; not_ran "bootctl set-active"; done_
+fi
+if start "F1 a later flash voids the read-back: a failed one: switch refused, though the first MiB still matches"; then
+  installed; run sh "$DB" verify-root; exit_is 0
+  fb CONFIRM=install FAKE_FAIL=fb-flash sh "$DB" install "$T/root.img"; exit_not0
+  slotb; run "$SW" sh "$DB" switch; exit_not0; said "did not end with a record"; not_ran "bootctl set-active"
+  run sh "$DB" verify-root; exit_not0; said "CONFIRM=install"; done_
+fi
+if start "F1 a later flash voids the read-back: a good one needs its own"; then
+  installed; run sh "$DB" verify-root; exit_is 0
+  fb CONFIRM=install FAKE_APPLY=1 sh "$DB" install "$T/root.img"; exit_is 0
+  slotb; run "$SW" sh "$DB" switch; exit_not0; said "not read back"; not_ran "bootctl set-active"
+  run sh "$DB" verify-root; exit_is 0; run "$SW" sh "$DB" switch; exit_is 0; done_
+fi
+if start "F1 image rw: the marks let the app switch: refused with no read-back"; then
+  ready; printf 'ro-on %s x\nandroid-opened-after-ro x\n' "$M" >> "$RES"; grep -v '^root-verified ' "$RES" > "$RES.x"; mv "$RES.x" "$RES"
+  run sh "$DB" image rw; exit_not0; said "not read back"; done_
+fi
+if start "F1 a stale op10tool, install: stops before the phone is asked"; then
+  printf 'android-opened x f2fs-bytes 1\n' > "$RES"
+  run OP10TOOL="$T/stale-tool" CONFIRM=install sh "$DB" install "$T/root.img"
+  exit_not0; said "no GPT support"; not_ran "fastboot"; done_
+fi
+
+# ---- F4: a failed conversion is a failure ----
+cat > "$T/fail-tool" <<EOT
+#!/bin/sh
+case "\$1" in \${FAIL_CMD:-none}) echo "op10tool: \$1: failed (fake)" >&2; exit 1 ;; esac
+exec "$TOOL" "\$@"
+EOT
+chmod +x "$T/fail-tool"
+if start "F4 prepare-root: img2simg fails: exit not 0, no ready line, no image"; then
+  rm -f "$T/root.simg" "$T/root.simg.partial"
+  run OP10TOOL="$T/fail-tool" FAIL_CMD=img2simg sh "$DB" prepare-root "$T/root.img"
+  exit_not0; printf '%s' "$o" | grep -q 'ready:' && no "says ready: $o"; said "no sparse image"; [ ! -f "$T/root.simg" ] || no "an image"; [ ! -f "$T/root.simg.partial" ] || no "a partial file"; done_
+fi
+if start "F4 prepare-root: the read-back list fails: exit not 0, no ready line"; then
+  rm -f "$T/root.simg"
+  run OP10TOOL="$T/fail-tool" FAIL_CMD=simg-verify-list sh "$DB" prepare-root "$T/root.img"
+  exit_not0; printf '%s' "$o" | grep -q 'ready:' && no "says ready: $o"; said "no read-back list"; done_
+fi
+if start "F4 install: make_simg fails: nothing asked of fastboot, no record"; then
+  printf 'android-opened x f2fs-bytes 1\n' > "$RES"; rm -f "$T/root.simg"
+  fb OP10TOOL="$T/fail-tool" FAIL_CMD=img2simg CONFIRM=install sh "$DB" install "$T/root.img"
+  exit_not0; said "no sparse image"; not_ran "fastboot"; grep -q '^install' "$RES" && no "a record"; done_
 fi
 if start "Prepare root: host only, makes the sparse image, asks nothing of the phone"; then
   rm -f "$T/root.simg"; run sh "$DB" prepare-root "$T/root.img"
-  exit_is 0; said "ready:"; [ -f "$T/root.simg" ] || no "no simg"; not_ran "adb"; not_ran "fastboot"; done_
+  exit_is 0; said "ready: $T/root.simg"; [ -f "$T/root.simg" ] || no "no simg"; [ -f "$D/simg.list" ] || no "no list"; not_ran "adb"; not_ran "fastboot"; done_
 fi
 if start "Switch: Lineage's Updater is on: refused before set-active"; then
   ready
   run CONFIRM=switch FAKE_UPDATER=on sh "$DB" switch
   exit_not0; said "Updater is on"; not_ran "bootctl set-active-boot-slot"; done_
 fi
-if start "Android check: Updater disable fails: stops, no record"; then
-  : > "$RES"; run FAKE_FAIL=pm-disable sh "$DB" android-check
-  exit_not0; grep -q '^android-opened ' "$RES" && no "recorded"; done_
+if start "F3 Android check: Updater disable fails: stops, no record, and it did reach pm"; then
+  formatted; : > "$RES"; run FAKE_FAIL=pm-disable sh "$DB" android-check
+  exit_not0; said "Updater"; ran "pm disable-user"; grep -q '^android-opened ' "$RES" && no "recorded"; done_
+fi
+if start "F3 Android check after the read-only boot: pm fails: neither record; the next run writes both"; then
+  formatted; printf 'android-opened x f2fs-bytes 1\nro-on %s x\n' "$M" > "$RES"; run FAKE_FAIL=pm-disable sh "$DB" android-check
+  exit_not0; ! grep -q '^android-opened-after-ro ' "$RES" || no "after-ro recorded"; [ "$(grep -c '^android-opened ' "$RES")" = 1 ] || no "a new android-opened line"
+  run sh "$DB" android-check; exit_is 0; grep -q '^android-opened-after-ro ' "$RES" || no "the next run wrote no after-ro"; [ "$(grep -c '^android-opened ' "$RES")" = 2 ] || no "the next run wrote no android-opened"; done_
+fi
+if start "F3 Android check: pm runs before the record is written"; then
+  formatted; : > "$RES"; run sh "$DB" android-check
+  exit_is 0; ran "pm disable-user"; grep -q '^android-opened ' "$RES" || no "no record"; grep -q '^android-opened-after-ro ' "$RES" && no "after-ro with no read-only boot"; done_
 fi
 if start "Install: no record that Android opened its data: nothing"; then
   fb CONFIRM=install sh "$DB" install "$T/root.img"
