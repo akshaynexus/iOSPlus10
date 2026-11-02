@@ -1,0 +1,136 @@
+laurel 2975: LAUREL GPU TIME: the window server's time in RedwoodGPU per request, in the one existing "a submission" line (top entries that fit, name calls/ms). Log 2026-11-03 02:54:49-02:55:16: 2.5-4.2 s of 5 s in requests, and the log did not say which. Rule in laurel_gpu_time_core.h; host test scripts/laurel/gpu-push-test.sh.
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 1fdc6cd..b55287e 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -45,6 +45,7 @@
+ #include <sys/proc.h>
+ 
+ #include "SweetSurface.h"
++#include "laurel_gpu_time_core.h"       /* laurel 2975 */
+ 
+ extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
+ bool topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds);
+@@ -234,6 +235,8 @@ static TUNABLE(uint32_t, gGPUHostImport, "gpu_hostimport", 1);    /* laurel 2160
+ static TUNABLE(uint32_t, gGPUClientSeed, "gpuclientseed", 1);
+ static uint64_t gWSCallTime;                    /* laurel 2913: the window server's requests, all of them: time here (mach ticks) */
+ static uint32_t gWSCalls;
++static uint64_t gWSSelTime[LGT_SLOTS];          /* laurel 2975: LAUREL GPU TIME: the same time, per request (the window server has many threads: atomic) */
++static uint32_t gWSSelCalls[LGT_SLOTS];
+ static TUNABLE(uint32_t, gGPUSeedRule, "gpuseed", 1);   /* kill switch gpuseed=0: the 4 ms rule above for every surface */
+ 
+ static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
+@@ -1645,8 +1648,21 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		absolutetime_to_nanoseconds(gWSCallTime, &ws_time);
+ 		gWSCalls = 0;
+ 		gWSCallTime = 0;
+-		IOLog("RedwoodGPU: a submission: %llu us before the lock, %llu us with it; the window server: %u requests, %llu us here in all\n",
+-		    lock_wait / NSEC_PER_USEC / gGPUStat.submissions, held / NSEC_PER_USEC / gGPUStat.submissions, ws_calls, ws_time / NSEC_PER_USEC);
++		/* laurel 2975: per request, largest first: name calls/ms (the request still running here counts in the next window) */
++		uint64_t sel_us[LGT_SLOTS];
++		uint32_t sel_calls[LGT_SLOTS];
++		char sel[LGT_TEXT];
++
++		for (unsigned i = 0; i < LGT_SLOTS; i++) {
++			uint64_t ns;
++
++			absolutetime_to_nanoseconds(__atomic_exchange_n(&gWSSelTime[i], 0, __ATOMIC_RELAXED), &ns);
++			sel_us[i] = ns / NSEC_PER_USEC;
++			sel_calls[i] = __atomic_exchange_n(&gWSSelCalls[i], 0, __ATOMIC_RELAXED);
++		}
++		(void) lgt_text(sel, sizeof(sel), sel_us, sel_calls);
++		IOLog("RedwoodGPU: a submission: %llu us before the lock, %llu us with it; the window server: %u requests, %llu us here in all; LAUREL GPU TIME: %s\n",
++		    lock_wait / NSEC_PER_USEC / gGPUStat.submissions, held / NSEC_PER_USEC / gGPUStat.submissions, ws_calls, ws_time / NSEC_PER_USEC, sel);
+ 		bzero(&gGPUStat, sizeof(gGPUStat));
+ 	}
+ 	gGPUStat.held += mach_absolute_time() - began;         /* laurel 2913 */
+@@ -1848,8 +1864,13 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		break;
+ 	}
+ 	if (called != 0) {
+-		gWSCallTime += mach_absolute_time() - called;
++		uint64_t spent = mach_absolute_time() - called;
++		unsigned slot = lgt_slot(selector);
++
++		gWSCallTime += spent;
+ 		gWSCalls++;
++		__atomic_fetch_add(&gWSSelTime[slot], spent, __ATOMIC_RELAXED);
++		__atomic_fetch_add(&gWSSelCalls[slot], 1, __ATOMIC_RELAXED);
+ 	}
+ 	if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
+ 		if (args->structureOutputSize > size) {
+diff --git a/iokit/Kernel/arm/laurel_gpu_time_core.h b/iokit/Kernel/arm/laurel_gpu_time_core.h
+new file mode 100644
+index 0000000..2dca185
+--- /dev/null
++++ b/iokit/Kernel/arm/laurel_gpu_time_core.h
+@@ -0,0 +1,68 @@
++/*
++ * laurel 2975: LAUREL GPU TIME: the window server's time in RedwoodGPU per request, plain C, so that a host test builds exactly this file
++ * (scripts/laurel/gpu-push-test.sh, tools/gpu-push-test/). Log 2026-11-03 02:54:49-02:55:16: 2.5 to 4.2 s of 5 s in requests, and the log did not say which.
++ * A kernel log line ends after 255 bytes (laurel 2892), so the text goes in the existing line, largest time first, as many as fit.
++ */
++#ifndef LAUREL_GPU_TIME_CORE_H
++#define LAUREL_GPU_TIME_CORE_H
++
++#define LGT_SLOTS       20
++#define LGT_TEXT        100     /* with the rest of the line: under 255 bytes, host test */
++
++static const char * const lgt_names[LGT_SLOTS] = {
++	"close", "getparam", "setparam", "new", "info", "prep", "fini", "submit", "fence", "madvise",
++	"userptr", "qnew", "qclose", "qquery", "who", "plane", "drawn", "surface", "show", "other",
++};
++
++/* the numbers of RedwoodGPU.cpp's request enum */
++static inline unsigned
++lgt_slot(uint32_t selector)
++{
++	if (selector == 0x09) {
++		return 0;
++	}
++	if (selector >= 0x40 && selector <= 0x4c) {
++		return selector - 0x40 + 1;     /* 0x40-0x48: getparam ... madvise; 0x49 userptr; 0x4a-0x4c: the queues */
++	}
++	if (selector >= 0x7b && selector <= 0x7f) {
++		return selector - 0x7b + 14;    /* who, plane, drawn, surface, show */
++	}
++	return LGT_SLOTS - 1;
++}
++
++/* "name calls/ms" of the largest times into s (always ended): whole entries only. The number of entries. */
++static inline unsigned
++lgt_text(char *s, size_t n, const uint64_t *microseconds, const uint32_t *calls)
++{
++	bool used[LGT_SLOTS];
++	size_t at = 0;
++	unsigned count = 0;
++
++	memset(used, 0, sizeof(used));
++	s[0] = '\0';
++	for (;;) {
++		int best = -1;
++		char one[40];
++		int len;
++
++		for (unsigned i = 0; i < LGT_SLOTS; i++) {
++			if (!used[i] && calls[i] != 0 && (best < 0 || microseconds[i] > microseconds[best])) {
++				best = (int)i;
++			}
++		}
++		if (best < 0) {
++			return count;
++		}
++		used[best] = true;
++		len = snprintf(one, sizeof(one), "%s%s %u/%llu", count != 0 ? ", " : "", lgt_names[best], calls[best],
++		    (unsigned long long)(microseconds[best] / 1000));
++		if (len < 0 || (size_t)len >= sizeof(one) || at + (size_t)len + 1 > n) {
++			return count;
++		}
++		memcpy(s + at, one, (size_t)len + 1);
++		at += (size_t)len;
++		count++;
++	}
++}
++
++#endif /* LAUREL_GPU_TIME_CORE_H */
