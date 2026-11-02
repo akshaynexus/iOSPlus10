@@ -5076,6 +5076,9 @@ Results: see plan.md. Not run: everything on the phone. Next (owner decides any 
 - `kextsymboltool: error` 39 lines in the iOS 26 build.log are not from this work: the same 39 are in the build before it. Compile errors: 0 in both trees.
 - The main checkout's out/bin/op10tool (Oct 31) has no `gpt`: `error: unrecognized subcommand 'gpt'`. `dual-boot.sh` now asks `op10tool gpt features` first.
 - A worktree build, this time: symlink external/{ios-sweet-linux,ios-topaz,IOS-26-Hot,ios-sweet,UniXNU-ios26,xnu-linux-toolchain,hackios-scion}, reflink out/laurel-kernel/{deps,theos,cache,dl} and out/laurel-kernel-ios26/{cache,deps,dl,kdk}. Remove the symlinks before you stage.
+- Trap, my own F7 defect: the kernel line `ufsrw=%s` is text in the kernel, and the kernel lies uncompressed in the image, so `laurel_can_write` called every real read-only image writable. All fakes passed; only `boot-menu-test.sh` with a real kernel found it. A new string with `ufsrw=` or ` ufsrw ` in a kernel patch breaks the read-only gate: `test-dualboot.sh` now checks the built kernels.
+- Trap: `X=${X:-$(for ...; do [ ... ] && { ...; break; }; done)}` under `set -e`: when the last test is false the substitution has status 1 and the script ends with no message. uefi-image.sh had this for FW_B_SUMS: `; true` inside.
+- Merging laurel-sprout twice during this round moved the patch count: 311, 312, 314. Results count only on the final merge: both kernels and all tests ran again after each.
 - Not proven by anything here: all of the phone side (docs/plan.md, the entry of this round).
 
 ## Mi A3: boot menu after the independent review (2026-11-02, branch t3/laurel-boot-menu; host and QEMU only, nothing flashed)
