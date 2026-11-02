@@ -5277,3 +5277,14 @@ Full text: `docs/laurel_sprout/ios26-gpu-render.md`.
 - `MODEM_POOL_BASE` is compile-time and is written in three places (TopazModem, TopazAdreno, mkadt). A move changes all three; `ram-map-test.sh` checks only mkadt's copy.
 - In a worktree, `kernel-linux.sh` needs `external/ios-sweet-linux` and `external/ios-topaz`: symlink them from the main checkout (they show as untracked: do not add them).
 - No script starts XNU in QEMU: `boot-menu-qemu.sh` stops at the UEFI menu. start.s and arm_vm_init with the new map run first on the phone.
+## 2026-11-03: Mi A3 iOS 26: wallpaper, Waiting… widgets, BlastDoor, pc 0 (branch t3/laurel-ios26-wallpaper-widget-fixes; host only)
+
+Details: `docs/laurel_sprout/ios26-wallpaper-widgets.md`.
+
+- [V] `Waiting…` on a widget = `-[SBHWidget displayName]` with no `containingBundleRecord` from LaunchServices. It is not drawn content: read it first when plates are empty.
+- [V] All extensions that ran in that log are in `System/Library/ExtensionKit/Extensions`; none from an app's `PlugIns`. Widget and poster points are only in the signed `extensions.plist`.
+- [V] `tree/root/os` has Mach-O files only. For plists and HEIC: mount the donor images with apfs-fuse. `usr/libexec` of the lowered root: `lowered/macho/os`.
+- [V host] The BlastDoor fatal is `cannot run unsandboxed`; `sandbox_check` writes through `args[0]`. Host method: `ios26-user-emu.py --blastdoor-gate`.
+- [V] objc_msgSend's bucket: `stp`/`ldp` of imp and sel, no lock. Not atomic as a pair on ARMv8.0: pc 0 with lr after a send. Any such crash in any framework is this first. Rule in `a64-lower`, 4 sites.
+- A64 rule: `lower.rs` can edit 2 words in place when PAC left them dead; no trampoline, no range change.
+

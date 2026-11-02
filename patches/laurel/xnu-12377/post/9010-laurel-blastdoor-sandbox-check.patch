@@ -1,0 +1,62 @@
+laurel 9010 (iOS 26): BlastDoor services are told they are sandboxed. MessagesBlastDoorService no longer traps at start.
+
+--- a/bsd/kern/sweet_amfi.c	2026-11-03 03:57:13.705159209 +0530
++++ b/bsd/kern/sweet_amfi.c	2026-11-03 03:57:13.748883588 +0530
+@@ -372,6 +372,48 @@
+ 	return copyout(val, (user_addr_t)ptr, len);
+ }
+ 
++/*
++ * laurel 9010: a BlastDoor service asks whether it is sandboxed, and traps when it is not:
++ * BlastDoor/Sandbox.swift, 23F84: sandbox_check(getpid(), NULL, 0) != 1 gives "BlastDoor cannot run
++ * unsandboxed." [V host: scripts/laurel/test-ios26-blastdoor.sh, the real code]. Result of boot 16:
++ * MessagesBlastDoorService sig 5 every 10 s, 54 crashes. This stand-in has no profiles, so its op 2 left
++ * the answer at 0 for all. Answer 1 only for that question (the process about itself, no operation) and
++ * only for a process that names a sandbox state flag in its entitlements: the 8 BlastDoor services of 23F84
++ * [V entitlements], which next set blastdoor-post-launch (op 0x41, 0 = done here). Every other process
++ * and every check of an operation stay as they were: allowed. Nothing is enforced; the service runs its
++ * parsers as Apple's code, with no profile around it: as every process on this kernel.
++ * libsystem_sandbox: args -> { u64 *result; i64 pid; const char *operation; ... }.
++ * Kill switch laurelbdsandbox=0: the service traps again, as before; nothing else changes.
++ */
++static TUNABLE(uint32_t, laurel_blastdoor_sandboxed, "laurelbdsandbox", 1);
++
++static int
++laurel_sandbox_check_self(struct proc *p, user_addr_t arg)
++{
++	static bool logged;
++	const uint64_t yes = 1;
++	uint64_t a[3];
++	void *ent, *flags;
++
++	if (!laurel_blastdoor_sandboxed || copyin(arg, a, sizeof(a)) != 0 || a[2] != 0 ||
++	    a[0] == 0 || (int64_t)a[1] != proc_pid(p)) {
++		return 0;
++	}
++	ent = sweet_proc_entitlements(p);
++	flags = ent != NULL ? sweet_entitlements_copy_object(ent, "com.apple.private.security.enable-state-flags") : NULL;
++	if (flags == NULL) {
++		return 0;
++	}
++	osobject_release(flags);
++	if (!logged) {
++		char name[32];
++		logged = true;
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("LAUREL SANDBOX: on: %s and its kind are told they are sandboxed: they name a state flag (no profile runs here)\n", name);
++	}
++	return copyout(&yes, (user_addr_t)a[0], sizeof(yes));
++}
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+@@ -382,6 +424,8 @@
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
++	case 2:         /* sandbox_check (laurel 9010) */
++		return laurel_sandbox_check_self(p, arg);
+ 	case 4:         /* container path (audit token / pid) */
+ 		return sweet_sandbox_container_path(arg);
+ 	case 5:         /* extension issue (laurel 2903) */

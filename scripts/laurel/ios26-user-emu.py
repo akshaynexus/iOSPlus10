@@ -37,6 +37,9 @@ ap.add_argument('--start-cost', action='store_true', help='at main(): instructio
 ap.add_argument('--display-create', metavar='PLIST', help='at main(): run CoreBrightness DisplayCreateWithCapabilitiesAndID, with this plist as the registry of AppleARMBacklight')
 ap.add_argument('--hid-event', metavar='JSON', help='at main(): give what the kernel sends for a touch (tools/laurel-hid-test) to the real IOHIDEventCreateWithBytesInternal of IOKit, the call of IOHIDEventServicePlugin, and read it with the real getters')
 ap.add_argument('--container', action='store_true', help='with --display-create: the frames of the crash, from [[CBDisplayContaineriOS alloc] initWithBacklightService:] and -start. No CADisplay here: messages to it answer nil')
+ap.add_argument('--sandbox-self', action='store_true', help='answer the Sandbox op of sandbox_check(self, NULL, 0) as kernel post/9010 does for a BlastDoor service; log it and the state flag')
+ap.add_argument('--blastdoor-gate', action='store_true', help='at main(): run the gate of BlastDoor/Sandbox.swift (0x21825d59c, 23F84): sandbox_check of itself, then the state flag blastdoor-post-launch. Exit 0: it returns. Exit 3: its fatal message')
+ap.add_argument('--cpbitmap', metavar='FILE', help='at main(): the real AppSupport CPBitmapCreateImagesFromData on these bytes, as PBUIWallpaperDirectoryDataStore calls it (flags 1). Prints the images. Exit 0: one image, its width and height. Run it with a program that links PaperBoardUI')
 args = ap.parse_args()
 
 u32 = lambda b, o: struct.unpack_from('<I', b, o)[0]
@@ -543,6 +546,14 @@ def bsd(n):
             mu.mem_write(x(2), struct.pack('<Q', 0xff))
             return ret_ok(0)
         if pol == 'Sandbox':
+            # Kernel post/9010: sandbox_check(self, NULL, 0) of a process with com.apple.private.security.enable-state-flags. args: { u64 *result; i64 pid; const char *operation; ... }
+            if args.sandbox_self and x(1) == 2:
+                res, pid, op_ = struct.unpack('<QQQ', bytes(mu.mem_read(x(2), 24)))
+                print('sandbox_check pid %d operation %#x' % (pid, op_))
+                if op_ == 0:
+                    mu.mem_write(res, struct.pack('<Q', 1))
+            if args.sandbox_self and x(1) == 0x41:
+                print('sandbox_enable_state_flag %r' % rdstr(struct.unpack('<Q', bytes(mu.mem_read(x(2) + 16, 8)))[0]))     # args { pid, idversion, name }: libsystem_sandbox 0x2a3534df8
             return ret_ok(0)
         return ret_err(errno.ENOSYS)
     if n == 500:  # getentropy
@@ -696,6 +707,10 @@ def hook_main(uc, addr, size, ud):
             display_create_start(uc)
         if args.hid_event:
             hid_event_start(uc)
+        if args.blastdoor_gate:
+            blastdoor_gate_start(uc)
+        if args.cpbitmap:
+            cpbitmap_start(uc)
 written, insns = set(), [0]
 def start_cost_report():
     # the area of an address: where() names an image or says '?'; cache images have 'unslid' in their name
@@ -950,6 +965,80 @@ def hid_step_done():
     if n == 'child0':
         hid_holds[int(t[5:]) if t[5:].isdigit() else 0]['child'] = x(0)
 
+cpb = {}
+def cpbitmap_start(uc):
+    import importlib.util
+    sp_ = importlib.util.spec_from_file_location('dsc_image', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dsc-image.py'))
+    dsc = importlib.util.module_from_spec(sp_)
+    sp_.loader.exec_module(dsc)
+    c = dsc.Cache(BASE + '/tree/cache')
+    def sy(frag, name):
+        return next(a for a, k, n in dsc.symbols(c, c.find(frag)[0]) if n == name) + SLIDE
+    data = open(args.cpbitmap, 'rb').read()
+    buf = 0x2e0000000
+    mu.mem_map(UNTIL, 0x1000, UC_PROT_ALL)
+    mu.mem_map(buf, (len(data) + 0x4fff) & ~0xfff, UC_PROT_ALL)
+    mu.mem_write(buf, data)
+    out = buf + ((len(data) + 0xfff) & ~0xfff)
+    def rec(name):
+        def f(r):
+            cpb[name] = r
+            return None
+        return f
+    cf, cg, app = 'CoreFoundation.framework/CoreFoundation', 'CoreGraphics.framework/CoreGraphics', 'AppSupport.framework/AppSupport'
+    def keep(name, fn):
+        def g(r):
+            cpb[name] = r
+            return fn(r)
+        return g
+    steps.extend([
+        (sy(cf, '_CFDataCreate'), lambda r: [0, buf, len(data)]),
+        (sy(app, '_CPBitmapCreateImagesFromData'), keep('data', lambda r: [r, out, 1, out + 8])),
+        (sy(cf, '_CFArrayGetCount'), keep('array', lambda r: [r])),
+        (sy(cf, '_CFArrayGetValueAtIndex'), keep('count', lambda r: [cpb['array'], 0])),
+        (sy(cg, '_CGImageGetWidth'), keep('image', lambda r: [r])),
+        (sy(cg, '_CGImageGetHeight'), keep('width', lambda r: [cpb['image']])),
+    ])
+    last_result[0] = 0
+    next_step(uc)
+    uc.emu_stop()
+
+def cpbitmap_report():
+    if mu.reg_read(UC_ARM64_REG_PC) != UNTIL or steps:
+        print('RESULT cpbitmap: did not end: pc %s after %s; so far %s; stop %s' % (where(mu.reg_read(UC_ARM64_REG_PC)), cpb, len(steps), stop_reason[0]))
+        return 3
+    print('RESULT cpbitmap: %d image(s), %d x %d' % (cpb['count'], cpb['width'], x(0)))
+    return 0 if cpb['count'] >= 1 and cpb['width'] else 3
+
+def blastdoor_gate_start(uc):
+    """The first caller in the phone's crash: BlastDoorServer.resume(sandboxID:) -> this function -> _assertionFailure (bt 0x2186ee51c 0x21825d6b8, boot 16). Both messages reach one call, at 0x21825d6b4."""
+    mu.mem_map(UNTIL, 0x1000, UC_PROT_ALL)
+    def fatal(u, addr, size, ud):
+        ptr = u.reg_read(UC_ARM64_REG_X4) & 0x7fffffffffffffff
+        gate_fatal[0] = rdstr(ptr + 0x20, 200)
+        u.emu_stop()
+    uc.hook_add(UC_HOOK_CODE, fatal, begin=0x21825d6b4 + SLIDE, end=0x21825d6b4 + SLIDE)
+    def task_info(u, addr, size, ud):   # this fake has no MIG. task_info(self, TASK_AUDIT_TOKEN, out, &count): the pid is word 5, as the kernel gives
+        u.mem_write(u.reg_read(UC_ARM64_REG_X2), struct.pack('<8I', 501, 501, 501, 501, 501, 27, 0, 1))
+        u.reg_write(UC_ARM64_REG_X0, 0)
+        pending[0] = addr + 4
+        u.emu_stop()
+    uc.hook_add(UC_HOOK_CODE, task_info, begin=0x21825d790 + SLIDE, end=0x21825d790 + SLIDE)
+    uc.reg_write(UC_ARM64_REG_LR, UNTIL)
+    pending[0] = 0x21825d59c + SLIDE
+    uc.emu_stop()
+
+gate_fatal = [None]
+def blastdoor_gate_report():
+    if gate_fatal[0]:
+        print('RESULT blastdoor-gate: fatal: %s' % gate_fatal[0])
+        return 3
+    if mu.reg_read(UC_ARM64_REG_PC) != UNTIL:
+        print('RESULT blastdoor-gate: did not return: pc %s stop %s' % (where(mu.reg_read(UC_ARM64_REG_PC)), stop_reason[0]))
+        return 3
+    print('RESULT blastdoor-gate: returned: the service is in its post launch state')
+    return 0
+
 def hid_event_report():
     pc = mu.reg_read(UC_ARM64_REG_PC)
     if pc != UNTIL:
@@ -1000,7 +1089,7 @@ pc = DYLD + 0x30f0
 t0 = time.time()
 while True:
     try:
-        mu.emu_start(pc, UNTIL if args.display_create or args.hid_event else 0xffffffffffffff00, timeout=args.secs * 1000000, count=args.max)
+        mu.emu_start(pc, UNTIL if args.display_create or args.hid_event or args.blastdoor_gate or args.cpbitmap else 0xffffffffffffff00, timeout=args.secs * 1000000, count=args.max)
     except UcError as e:
         print('UcError', e)
         break
@@ -1061,4 +1150,8 @@ if args.display_create:
     sys.exit(display_create_report())
 if args.hid_event:
     sys.exit(hid_event_report())
+if args.blastdoor_gate:
+    sys.exit(blastdoor_gate_report())
+if args.cpbitmap:
+    sys.exit(cpbitmap_report())
 sys.exit(0 if reached[0] else 3)
