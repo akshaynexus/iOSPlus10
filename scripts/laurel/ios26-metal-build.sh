@@ -3,6 +3,7 @@
 # The same steps as scripts/laurel/metal-build.sh (Turnip for FD610, metal2vulkan bridge, NegroniMetal.bundle) with:
 #   out/ios26/metal, out/ios26/gpu                     output (METAL_OUT, GPU_OUT)
 #   userland/metal/patches/flame-ios26                 frontend + bridge: the 23F84 SPI, last in the series (METAL_EXTRA_FLAME)
+#   userland/metal/patches/m2v-ios26                   metal2vulkan: specializedName links a function (METAL_EXTRA_M2V)
 #   -DNMTL_IOS26=1                                     plug-in: compositor rules of iOS 26 (userland/metal/plugin/NegroniMetal.mm)
 #   IOS_DSC = the 23F84 cache                          the import check reads iOS 26's exports (out/ios26/metal-spi/exports)
 # Target stays arm64 (no PAC) -mcpu=cortex-a53, minos 16.0: the same plain ABI as a third-party app on an A13 [I], so no signed pointer is ever made here. See docs/laurel_sprout/ios26-metal.md section 2.
@@ -13,6 +14,7 @@ REPO=$(cd "$HERE/../.." && pwd)
 OUTDIR=${OUTDIR:-$REPO/out}
 export METAL_OUT=${METAL_OUT:-$OUTDIR/ios26/metal} GPU_OUT=$OUTDIR/ios26/gpu
 export METAL_EXTRA_FLAME="$REPO/userland/metal/patches/flame-ios26 $REPO/userland/metal/patches/flame-bbd"
+export METAL_EXTRA_M2V="$REPO/userland/metal/patches/m2v-ios26"   # the iOS 16 translator stays as it is
 export METAL_EXPORTS_CACHE=$OUTDIR/ios26/metal-spi/exports
 export IOS_DSC=${IOS_DSC:-$HOME/op10-apple/ios26/23F84-n104ap/tree/cache/dyld_shared_cache_arm64e}
 # a CMake compile flag only (scripts/laurel/metal-env.sh sets NMTL_CPU_FLAGS; ours goes in after it through this variable)

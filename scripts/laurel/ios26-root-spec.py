@@ -37,6 +37,25 @@ DROP_EXTRA = ['com.apple.fairplayd.H2', 'com.apple.voicemail.vmd', 'com.apple.Re
 # new for this CPU: no Neural Engine here [I]; nothing it serves can run
 DROP_N104 = ['com.apple.aned']
 DROP_PROGRAMS = 'nanotimekitcompaniond wifip2pd syncdefaultsd'.split()
+# Boot 11 (logs/usblog-20261103-000638.txt): CPUs 96 % busy (461 s of 480), crash loops. docs/laurel_sprout/ios26-gpu-lag.md section 4. Each label is in 23F84's launchd.plist [V].
+# None serves an item of the iOS 16 parity list (KEEP_FOR_PARITY); DROP_LOAD_HOT is IOS-26-Hot's SKIP_LABELS on 23F84 [self-reported, its phone]. PERF_DROPS=0 at the root build keeps all of them.
+DROP_LOAD_LOOPS = ['com.apple.deviceaccessd', 'com.apple.gamepolicyd', 'com.apple.security.cryptexd', 'com.apple.driverkitd', 'com.apple.watchdogd', 'com.apple.softposreaderd']   # killed or crashed again and again in boot 11; gamepolicyd is new here, the rest are also Hot's
+DROP_LOAD_HOT = ['com.apple.nfcd', 'com.apple.seld', 'com.apple.factory.NFQRCoded', 'com.apple.biometrickitd.pearl', 'com.apple.nanoregistryd', 'com.apple.nanoregistrylaunchd', 'com.apple.nanoprefsyncd.2',
+                 'com.apple.nanobackupd', 'com.apple.cloudpaird', 'com.apple.modelcatalogd', 'com.apple.generativeexperiencesd', 'com.apple.siriinferenced', 'com.apple.sirittsd', 'com.apple.callintelligenced',
+                 'com.apple.PerfPowerServices', 'com.apple.PerfPowerServicesExtended', 'com.apple.perfpowermetricd', 'com.apple.biomed', 'com.apple.biomesyncd']
+# Apple Intelligence and on-device learning: FitnessIntelligence was 28.4 s and 20.3 s of CPU a minute in boot 11. An A13 has no Apple Intelligence [I]; no report on another phone for these [U]
+DROP_LOAD_INTELLIGENCE = ['com.apple.fitnessintelligenced', 'com.apple.intelligenceplatformd', 'com.apple.intelligenceflowd', 'com.apple.intelligencecontextd', 'com.apple.intelligencetasksd',
+                          'com.apple.knowledgeconstructiond', 'com.apple.servicesintelligenced', 'com.apple.batteryintelligenced']
+# never in a drop list: what the parity list stands on (docs/laurel_sprout/ios26-parity.md section 9), the UI and the scheduler
+KEEP_FOR_PARITY = {'com.apple.wifid', 'com.apple.wifianalyticsd', 'com.apple.audiomxd', 'com.apple.bluetoothd', 'com.apple.BlueTool', 'com.apple.cameracaptured', 'com.apple.videocodecd', 'com.apple.backboardd',
+                   'com.apple.SpringBoard', 'com.apple.configd', 'com.apple.runningboardd', 'com.apple.lsd', 'com.apple.dasd', 'com.apple.healthd', 'com.apple.searchd', 'com.apple.sharingd',
+                   'com.apple.mediaplaybackd', 'com.apple.mediaremoted', 'com.apple.iconservices.iconservicesagent', 'com.apple.thermalmonitord', 'com.apple.locationd', 'com.apple.cfprefsd.xpc.daemon'}
+# Jetsam limits, MB: a floor only for what stays and died at its limit in boot 11. Not a page size matter: at main() a daemon has written 976-1000 KiB in 4 KiB pages against 1472-1504 KiB in 16 KiB pages
+# [V host: ios26-user-emu.sh --start-cost]. iconservicesagent: its Metal device adds 15-20 MB (jetsam_widgets.py), limit 15 when inactive: killed 3 times with its icons half made.
+JETSAM_FLOORS = {'Daemon': {'com.apple.iconservices.iconservicesagent': {'InactiveHardMemoryLimit': 96}, 'com.apple.liveactivitiesd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
+                            'com.apple.linkd': {'ActiveSoftMemoryLimit': 32, 'InactiveHardMemoryLimit': 32}, 'com.apple.watchlistd': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
+                            'com.apple.managedappdistributiond': {'InactiveHardMemoryLimit': 16}, 'com.apple.nehelper': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16}},
+                 'XPCService': {'com.apple.intents.intents-helper': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24}}}
 
 
 class Node:
@@ -139,6 +158,24 @@ def program(job):
     return os.path.basename(prog)
 
 
+def jetsam_floors(t, jets):
+    """JETSAM_FLOORS: raises a limit that is lower, adds an entry that is absent (launchd's own limit for a daemon with no entry is 6 MB [V boot 11: driverkitd has no key, 6 MB in the log]), never lowers."""
+    done = []
+    for j in jets:
+        d = plistlib.loads(t.read(j))
+        v4 = d.get('Version4', {})
+        for sec, names in JETSAM_FLOORS.items():
+            over = v4.setdefault(sec, {}).setdefault('Override', {})
+            for name, floors in names.items():
+                e = over.setdefault(name, {})
+                for k, mb in floors.items():
+                    if not isinstance(e.get(k), int) or e[k] < mb:
+                        done.append(f'{name} {k} {e.get(k)} -> {mb}')
+                        e[k] = mb
+        t.write(j, plistlib.dumps(d, fmt=plistlib.FMT_BINARY))
+    t.audit('jetsam floors', 'applied' if done else 'not-found', '; '.join(done) or 'every limit is already at its floor')
+
+
 def no_recover_on_crash(t, jets):
     """Bring-up: launchd must not reboot the phone when a UI daemon crashes 3 times in 60 s. The flag is the key RecoverOnCrash in Version4/Daemon/Override of the jetsam file
     (backboardd, SpringBoard, configd, runningboardd on N104) [V launchd 0x10000ea10, 0x100021c4c; docs/laurel_sprout/ios26-backboardd.md section 4]. Without it the job restarts every
@@ -183,6 +220,12 @@ def tweaks(t, a):
     drop(DROP_TOPAZ, 'no baseband service')
     drop(DROP_EXTRA, 'missing hardware or restart loops, iOS 16 list')
     drop(DROP_N104, 'no Neural Engine on this SoC')
+    if os.environ.get('PERF_DROPS', '1') != '0':
+        drop(DROP_LOAD_LOOPS, 'crash and kill loops of boot 11')
+        drop(DROP_LOAD_HOT, 'no hardware or no client here, IOS-26-Hot list')
+        drop(DROP_LOAD_INTELLIGENCE, 'on-device learning, no Apple Intelligence on A13')
+    else:
+        t.audit('launchd drop perf', 'kept', 'PERF_DROPS=0: the jobs of boot 11 stay')
     ks = [k for k, j in jobs.items() if isinstance(j, dict) and program(j) in DROP_PROGRAMS]
     for k in ks:
         del jobs[k]
@@ -267,6 +310,7 @@ def tweaks(t, a):
     if not jets:
         t.audit('jetsam', 'not-found', 'no jetsamproperties plist')
     no_recover_on_crash(t, jets)
+    jetsam_floors(t, jets)
 
     # InterfaceNamer
     n = 'System/Library/SystemConfiguration/InterfaceNamer.bundle/Info.plist'
@@ -1520,6 +1564,40 @@ def boot_tasks(launchd_path):
         at = end
 
 
+def perf_self_test(d):
+    """No label of a drop list is one the parity list stands on; floors raise, never lower, and add what is absent."""
+    import shutil
+    drops = DROP_LOAD_LOOPS + DROP_LOAD_HOT + DROP_LOAD_INTELLIGENCE
+    checks = [not (set(drops) & KEEP_FOR_PARITY), len(drops) == len(set(drops)), not (set(drops) & set(DROP_TOPAZ + DROP_N104)),
+              'com.apple.bluetoothd' not in drops and 'com.apple.cameracaptured' not in drops, 'com.apple.dasd' not in drops]
+    j = b'System/Library/LaunchDaemons/com.apple.jetsamproperties.N104.plist'
+    work = os.path.join(d, 'p')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(os.path.join(work, 'overlay'))
+    t = Tree(work)
+    src = os.path.join(d, 'jet2.plist')
+    with open(src, 'wb') as f:
+        plistlib.dump({'Version4': {'Daemon': {'Override': {
+            'com.apple.iconservices.iconservicesagent': {'InactiveHardMemoryLimit': 15, 'ActiveSoftMemoryLimit': 200, 'JetsamPriority': 140},
+            'com.apple.linkd': {'ActiveSoftMemoryLimit': 64, 'InactiveHardMemoryLimit': 10}, 'com.apple.logd': {'JetsamPriority': 1}}},
+            'XPCService': {'Override': {'com.apple.intents.intents-helper': {'ActiveSoftMemoryLimit': 10}}}}}, f)
+    t.mkdirs(os.path.dirname(j))
+    t.n[j] = Node('f', 0o644, 0, 0, 5, src.encode())
+    jetsam_floors(t, [j])
+    o = plistlib.loads(t.read(j))['Version4']
+    dm = o['Daemon']['Override']
+    checks += [dm['com.apple.iconservices.iconservicesagent'] == {'InactiveHardMemoryLimit': 96, 'ActiveSoftMemoryLimit': 200, 'JetsamPriority': 140},
+               dm['com.apple.linkd'] == {'ActiveSoftMemoryLimit': 64, 'InactiveHardMemoryLimit': 32}, dm['com.apple.logd'] == {'JetsamPriority': 1},
+               dm['com.apple.nehelper'] == {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
+               o['XPCService']['Override']['com.apple.intents.intents-helper'] == {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
+               any(x.startswith('applied') and 'jetsam floors' in x for x in t.audit_lines)]
+    jetsam_floors(t, [j])
+    checks.append(any(x.startswith('not-found') and 'jetsam floors' in x for x in t.audit_lines))
+    print(f'perf hook self-test: {sum(checks)} of {len(checks)}')
+    if not all(checks):
+        raise SystemExit('perf hook self-test failed')
+
+
 def recover_self_test(d):
     """The key leaves each daemon, and nothing else changes; RECOVER_ON_CRASH=1 keeps it."""
     import shutil
@@ -1620,6 +1698,7 @@ echo "laurel-root: air-ios26: fake"
         checks += [set(t.n) == set(n), not t.audit_lines]
         print(f'air hook self-test: {sum(checks)} of {len(checks)}')
         recover_self_test(d)
+        perf_self_test(d)
         ok_metal = metal_self_test(d)
         ok_debug = debug_self_test(d)
         ok_parity = parity_self_test(d)

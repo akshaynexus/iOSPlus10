@@ -6,6 +6,8 @@
  * PLAN (text, made by scripts/ios26/ir3-plan.py), one pipeline per line, fields separated by tabs:
  *   K NAME CONSTANTS                  a compute pipeline
  *   R LABEL VERTEX FRAGMENT COLORS VERTEXDESC CONSTANTS   a render pipeline
+ *   L LABEL VERTEX FRAGMENT COLORS VERTEXDESC FUNCTION LINKNAME METALLIB CONSTANTS   a render pipeline whose fragment stage links FUNCTION of METALLIB under LINKNAME
+ *     (MTLFunctionDescriptor.specializedName, RenderBox's custom_fn; LINKNAME "-": under its own name), with depth + stencil format 260 as RenderBox
  * COLORS = comma list of Metal pixel formats; VERTEXDESC = "-" or "attr:format:offset" comma list (buffer 29, stride 256);
  * CONSTANTS = "-" or comma list "i<INDEX>:<METALTYPE>:<v.v.v>" or "n<NAME>:<METALTYPE>:<v.v.v>".
  */
@@ -86,6 +88,35 @@ static uint32_t parse_constants(char *s, struct NmbConstant *c, uint32_t max, un
 	return n;
 }
 
+static void *read_file(const char *path, long *len)
+{
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		perror(path);
+		exit(2);
+	}
+	fseek(f, 0, SEEK_END);
+	*len = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	void *bytes = malloc(*len);
+	if (fread(bytes, 1, *len, f) != (size_t)*len)
+		exit(2);
+	fclose(f);
+	return bytes;
+}
+
+/* the library of a linked function (RenderBox: the effect's own library, the stage comes from RenderBox's); one path per run */
+static NmbLibrary *second_library(NmbDevice *dev, const char *path)
+{
+	static NmbLibrary *lib;
+	if (!lib) {
+		long len;
+		void *bytes = read_file(path, &len);
+		lib = nmb_library_new(dev, bytes, len, false);
+	}
+	return lib;
+}
+
 int main(int argc, char **argv)
 {
 	if (argc != 5) {
@@ -111,25 +142,15 @@ int main(int argc, char **argv)
 		bool have = nmb_device_answer(dev, "supportsFamily:", family, &v);
 		printf("answer supportsFamily:%llu = %llu%s\n", (unsigned long long)family, (unsigned long long)v, have ? "" : " (none)");
 	}
-	FILE *f = fopen(argv[3], "rb");
-	if (!f) {
-		perror(argv[3]);
-		return 2;
-	}
-	fseek(f, 0, SEEK_END);
-	long len = ftell(f);
-	fseek(f, 0, SEEK_SET);
-	void *bytes = malloc(len);
-	if (fread(bytes, 1, len, f) != (size_t)len)
-		return 2;
-	fclose(f);
+	long len;
+	void *bytes = read_file(argv[3], &len);
 	NmbLibrary *lib = nmb_library_new(dev, bytes, len, false);
 	if (!lib) {
 		printf("FAIL library: %s\n", nmb_last_error());
 		return 3;
 	}
 	printf("device open, library %u functions\n", nmb_library_function_count(lib));
-	f = fopen(argv[4], "r");
+	FILE *f = fopen(argv[4], "r");
 	if (!f) {
 		perror(argv[4]);
 		return 2;
@@ -140,9 +161,9 @@ int main(int argc, char **argv)
 		line[strcspn(line, "\n")] = 0;
 		if (!line[0])
 			continue;
-		char *save = NULL, *field[8];
+		char *save = NULL, *field[10];
 		int nf = 0;
-		for (char *p = strtok_r(line, "\t", &save); p && nf < 8; p = strtok_r(NULL, "\t", &save))
+		for (char *p = strtok_r(line, "\t", &save); p && nf < 10; p = strtok_r(NULL, "\t", &save))
 			field[nf++] = p;
 		static struct NmbConstant cons[128];
 		static unsigned char pool[8192];
@@ -164,18 +185,26 @@ int main(int argc, char **argv)
 					nmb_compute_pipeline_release(p);
 				nmb_function_release(fn);
 			}
-		} else if (field[0][0] == 'R' && nf >= 7) {
-			uint32_t n = parse_constants(field[6], cons, 128, pool);
-			NmbFunction *vf = NULL, *ff = NULL;
+		} else if ((field[0][0] == 'R' && nf >= 7) || (field[0][0] == 'L' && nf >= 10)) {
+			const bool linked = field[0][0] == 'L';
+			uint32_t n = parse_constants(field[linked ? 9 : 6], cons, 128, pool);
+			NmbFunction *vf = NULL, *ff = NULL, *lf = NULL;
 			static char desc[1024], colors[128];
 retry:
 			vf = n ? nmb_function_new_specialized(lib, field[2], cons, n) : nmb_function_new(lib, field[2]);
 			ff = n ? nmb_function_new_specialized(lib, field[3], cons, n) : nmb_function_new(lib, field[3]);
-			if (!vf || !ff)
+			if (linked)
+				lf = nmb_function_new_with_descriptor(second_library(dev, field[8]), field[6], strcmp(field[7], "-") ? field[7] : NULL, NULL, 0, false);
+			if (!vf || !ff || (linked && !lf))
 				why = nmb_last_error();
 			else {
 				static struct NmbRenderPipelineDescriptor d;
 				memset(&d, 0, sizeof(d));
+				if (linked) {
+					d.fragment_linked.functions = &lf;
+					d.fragment_linked.function_count = 1;
+					d.depth_format = d.stencil_format = 260;
+				}
 				/* (strtok below eats its input, and a retry parses again) */
 				snprintf(desc, sizeof(desc), "%s", field[5]);
 				snprintf(colors, sizeof(colors), "%s", field[4]);
@@ -241,6 +270,7 @@ retry:
 			}
 			if (vf) nmb_function_release(vf);
 			if (ff) nmb_function_release(ff);
+			if (lf) nmb_function_release(lf);
 		} else {
 			why = "bad plan line";
 		}

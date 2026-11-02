@@ -693,7 +693,7 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   - [V] Turnip 25.0.7 needs msm >= 1.6 (tu_knl_drm_msm.cc:1057); negroni_drm.c reports 1.7. Mesa's binary syncobj move swaps handles (vk_drm_syncobj.c:376), so no sync-file export is needed while the fd extensions are off.
   - [V] Host import in negroni_drm.c (`redwood_drm_host_import`), per docs/gpu-abi.md after 07ae8ca: a noted IOSurface by ID (0x7e) first, because only 0x7e / scalar 12 imports take part in the present path (gpu-abi section 8); other pages by 0x49 USERPTR (0232, 24-byte struct, 16 KiB aligned, <= 256 MiB), retried with READ_ONLY when the kernel answers EIO (pages not writable). No "userptr" in the `NegroniGPUABI` text, or ENOSYS once: no more 0x49 calls. Each 0x7e import gives a new handle (0230 importSurface).
   - [V] Turnip host-pointer imports accept only HOST_CACHED types without HOST_COHERENT (gpu-abi section 6); Turnip has one such type when its L1 line size is known (tu_device.cc:1476, the Darwin sysctl path gives 64). The buffer is cached_non_coherent, so vkInvalidateMappedMemoryRanges drops lines with dc civac.
-  - [V] Kernel msm timeouts are on mach_continuous_time (0230 millisecondsUntil), a time in the past = only ask. Darwin user CLOCK_MONOTONIC uses the same counter [I: libc source not read].
+  - [V] Kernel msm timeouts are on mach_continuous_time (0230 millisecondsUntil), a time in the past = only ask. Darwin user CLOCK_MONOTONIC uses the same counter [I: libc source not read]. **Wrong [V boot 11]: 18.57 s apart; see the 2026-11-03 section.**
   - Staging: `out/gpu/turnip/libvulkan_freedreno.dylib` is the only staged Turnip (scripts/metal/env.sh TURNIP_DYLIB); `out/gpu/libvulkan_freedreno.dylib` is gone [decision].
 - backboardd SIGSEGV every ~18 s on the m2v completion thread (2026-10-25, async-safety agent; not tested on the phone yet):
   - [V] The fault is the CPU `dc civac` of Turnip `tu_bo_sync_cache` (tu_knl.cc) by the user VA of a host import, called by
@@ -5198,3 +5198,15 @@ Full text: `docs/laurel_sprout/ios26-touch.md`.
 - Fix: on iOS 26, XNUtils offers On / Off (CPU), both "On" verbs write the root's list; the plug-in gives backboardd a device whatever the lists say (kill switches still act). The fix for a phone already holding the bad list comes with the new plug-in.
 - Panic after `exec Preferences` at 2 s: the panic text did not reach the USB log (only `@model_dep.c:1256`, "Debugger synch pending on cpu 5"). `ctl logall` replays the ring, not this text. Open.
 - Panic text from the owner's photo [V]: `panic(cpu 2 caller 0xfffffff00759c974): DebuggerXCallEnter>Debugger synch pending on cpu 5 @model_dep.c:1256`. xnu-12377 panics when a CPU does not answer a stackshot's IPI in `debug-ack` (240000 ticks = 12.5 ms at 19.2 MHz); xnu-8796 returned KERN_OPERATION_TIMED_OUT. Fix: post/9007. [I] Settings was the moment, not the cause: any stackshot under load can do it. [U] who asked for the stackshot; why CPU 5 was late; whether Settings itself opens after this fix.
+
+## 2026-11-03: Mi A3 iOS 26 lag: fence spin, RenderBox effects, daemons (branch t3/ios26-metal-gpu-lag-fix; host only, no flash)
+Full text: `docs/laurel_sprout/ios26-gpu-lag.md`.
+- **`RedwoodGPU: 0 waits ... N over before they began` with a large N means every GPU wait spins.** `over` counts a past deadline. Darwin `CLOCK_MONOTONIC` is 18.57 s behind `mach_continuous_time` here [V log, boots 10 and 11]. The note above that says they are the same counter is wrong. Any time crossing to the msm kernel path goes on `CLOCK_MONOTONIC_RAW`, or as time left.
+- `MTLFunctionDescriptor.specializedName` is a link name, not a label. RenderBox links every effect as `custom_fn`; the effects are in IconRendering's default.metallib, the stages in RenderBox's. Test: `scripts/ios26/test-renderbox-effects.sh`.
+- `heap texture: OutOfMemory(Heap)` from RenderBox is its normal "heap full, next heap" path [V `RB::RenderFrame::alloc_texture`]. Do not chase it.
+- A plan value of ca-pipelines: `0.0.0.0` is two numbers to `strtod`: write `0e0.0e0.0e0.0e0`.
+- jetsam: a daemon with no memory key gets 6 MB [V log]. Page size is not why daemons die: `ios26-user-emu.sh PROGRAM --start-cost`: 4 KiB pages give about 1,000 KiB at main(), 16 KiB pages about 1,500.
+- A worktree has no `external/metal2vulkan` files: `git -C external/metal2vulkan rev-parse HEAD` then answers the superproject's HEAD, and `fetch-sources.sh` asks for that commit. Init the submodule first, with `--reference` of the main checkout. Copy `out/laurel-metal/{sdk,bin}` and give `THEOS_BIN=`.
+- The kernel holds CX + MX NOM for the boot, and stock 745 MHz needs just that: the next cheap GPU gain, not done (no host proof).
+- `LAUREL CPU TOP` hides ended tasks: 197 to 284 s a minute in boot 11, names [U].
+
