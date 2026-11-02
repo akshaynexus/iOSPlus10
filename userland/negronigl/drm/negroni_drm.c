@@ -383,7 +383,7 @@ static int64_t
 mono_ns(void)
 {
 	struct timespec now;
-	clock_gettime(CLOCK_MONOTONIC, &now);   /* Darwin: mach_continuous_time, the kernel's msm clock */
+	clock_gettime(CLOCK_MONOTONIC, &now);   /* Mesa's deadlines: os_time_get_nano. Not the kernel's msm clock: msm_fence_wait */
 	return (int64_t)now.tv_sec * 1000000000ll + now.tv_nsec;
 }
 
@@ -393,14 +393,24 @@ seq_before(uint32_t a, uint32_t b)
 	return (int32_t)(a - b) < 0;
 }
 
-/* msm WAIT_FENCE until deadline_ns (CLOCK_MONOTONIC; <= now: only ask). 0 or errno. */
+/*
+ * msm WAIT_FENCE until deadline_ns (CLOCK_MONOTONIC; <= now: only ask). 0 or errno.
+ * The kernel reads the time as mach_continuous_time, which is CLOCK_MONOTONIC_RAW on Darwin (see timeout_ms and tu get_abs_timeout), and the two differ: boot 11:
+ * "a wait for submission 3, ... until 20.779097000 s, asked for at 39.349633385 s: over before it began", 18.57 s in the past. So the kernel answered at once, and
+ * fence_wait_until asked again: every wait for the GPU was a busy loop of system calls (3.9 M in the 32 windows of boot 11, up to 94 000 a second, 1 real wait).
+ * What crosses to the kernel is the time left, on its clock.
+ */
 static int
 msm_fence_wait(uint32_t seq, int64_t deadline_ns)
 {
 	struct drm_msm_wait_fence w = {.fence = seq};
-	if (deadline_ns > 0) {
-		w.timeout.tv_sec = deadline_ns / 1000000000ll;
-		w.timeout.tv_nsec = deadline_ns % 1000000000ll;
+	int64_t left = deadline_ns > 0 ? deadline_ns - mono_ns() : 0;
+	if (left > 0) {
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC_RAW, &now);
+		int64_t at = (int64_t)now.tv_sec * 1000000000ll + now.tv_nsec + left;
+		w.timeout.tv_sec = at / 1000000000ll;
+		w.timeout.tv_nsec = at % 1000000000ll;
 	}
 	return msm_call(NGL_MSM_SEL(DRM_MSM_WAIT_FENCE), &w, sizeof(w));
 }
