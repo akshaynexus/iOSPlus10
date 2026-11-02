@@ -10,7 +10,7 @@ Owner requirement: the iOS 26 image has all features and additions of the Mi A3 
 scripts/bg.sh ios26-parity scripts/laurel/ios26-parity-build.sh     # every binary of the hooks + its check against 23F84 (about 20 minutes: one check at a time)
 scripts/bg.sh ios26-root env FORCE=1 scripts/laurel/ios26-root.sh   # the root; read the lines that start with off at its end, or report.txt
 python3 -I scripts/laurel/ios26-root-spec.py --self-test            # hooks: air, Metal, debug, parity
-python3 -I scripts/laurel/ios26-parity-audit.py --before DIR --after DIR --write docs/laurel_sprout/ios26-parity.md     # section 8; exit 1 = an item has no row, or a row is not in the image
+python3 -I scripts/laurel/ios26-parity-audit.py --before DIR --after DIR --write docs/laurel_sprout/ios26-parity.md     # section 9; exit 1 = an item has no row, or a row is not in the image
 ```
 
 Before the root: `scripts/laurel/ios26-debug-build.sh`, `ios26-metal-build.sh`, `kernel-ios26-linux.sh`, and `gpu-firmware.sh` + `camera-inventory.sh` from the owner's stock vendor image (`ios26-first-boot.md` section 7).
@@ -32,8 +32,12 @@ Before the root: `scripts/laurel/ios26-debug-build.sh`, `ios26-metal-build.sh`, 
 | Same switches as iOS 16 | `GPU STATUSBAR NOTCH CELL AUDIO BT CAMERA TORCH HEVC XNUTILS BRIGHTNESS STAGED_APPS`, new `RINGER`. `=0` is the only wanted off |
 | Binary rules | `need_binary()`: thin plain arm64, signed, page size 4096, and its sha256 on `out/ios26/parity-check.tsv`, which only `ios26-parity-build.sh` writes after `ios26-injected-check.py` (0 instructions newer than ARMv8.0, each library and import in the 23F84 cache). Another file: refused, one line |
 | No probes | Each plug-in has its self-check and one on/off line; a boot-arg is only a kill switch: `notch=0 cell=0 ringer=0 torch=0 laurel_hevc=0 cell_data=0` |
-| Nothing new can stop a boot | No hook edits a boot task. Launchd's own plist has 24 Boot tasks, 14 with `RequireSuccess`; self-test: none of their programs is in the tree of the hooks' files, and no job has a boot-task key. launchd loads the new jobs after those tasks |
+| Nothing new can stop a boot | No hook edits a boot task. Launchd's own plist has 25 Boot tasks, 16 with `RequireSuccess` (13 programs: fsck, mount, dirs_cleaner, cc_fips_test, init_data_protection, launchd_cache_loader, tzinit, and the restore ones); self-test: none of those programs is touched by a hook, and no job has a boot-task key. launchd loads the new jobs after those tasks |
 | A crash loop blocks no other job | `com.laurel.celld`: KeepAlive false. The wrappers of SpringBoard and cameracaptured: two fast exits in a boot = no inserted file for the rest of the boot; the exec of Apple's file stays. Restarts stay launchd's own (ThrottleInterval) |
+
+## 3.1 Wi-Fi settings service
+
+Nothing to install: as on iOS 16, stock `wifid` holds `com.apple.wifi-xpc` and the other Wi-Fi services [V launchd.plist], with the ADT node `wlan` of `mkadt.py` that its `_LimitLoadToDeviceTree` asks for. Kernel: Apple80211 at the 23F84 sizes (`ios26-userland.md` 8.3). `InterfaceNamer` 10 s is in `tweaks()`. IOS-26-Hot found on its phone that configd made a Wi-Fi service for en0 only when `preferences.plist` held no network part [self-reported, its case: a file with host names only]. Ours holds the USB service from `root-add-ssh.py`, as iOS 16, where configd added the Wi-Fi service [V iOS 16 boot; `root-update.md`]. On 26: [U]. Evidence to read: `scutil --dns` style lines of `ssh-net.txt`, the list in Settings.
 
 ## 4. Audio
 
@@ -76,11 +80,28 @@ Until then: the ADT nodes stay (`mkadt.py`, `CAMERA=0` removes them), so Camera.
 
 **Not ported.** `root-update.sh` works over SSH on a running root, with `phone.sh` on toybox + dash, against the sidecar and stages of `root.sh`, and a `flash-check` keyed to the iOS 16 features. It needs a booted iOS 26 root with SSH, and it has never written on a phone on iOS 16 (`root-update.md` section 9). Payload without a consumer would be a stub. Evidence needed: first boot with SSH (`LAUREL SSH: on`); first `--dry-run` of the iOS 16 path on the phone. Until then the iOS 26 root goes on with `dual-boot.sh install`, which erases `/private/var` of iOS 26.
 
-## 8. The table (generated)
+## 8. Results [V host, at merge c4903b2 with origin/laurel-sprout cad01db]
+
+| Check | Result |
+|---|---|
+| Binaries | `ios26-parity-build.sh`: 13 of 13 pass: 0 instructions newer than ARMv8.0, 0 libraries and 0 imports missing in 23F84, page size 4096: liblaurel-notch, laurel-springboard, liblaurel-ringer, liblaurel-cellbar, laurel-celld, RedwoodAudio, negroni-bluetool, LaurelFlashlight, laurel-cameracaptured, HEVCH8.videodecoder, XNUtils, powermenu-helper, pmregister |
+| Hook self-test | `ios26-root-spec.py --self-test`: air 10 of 10, Metal 15 of 15, debug 27 of 27, parity 58 of 58 with the real stages |
+| Audio host test | `scripts/laurel/mic-host-test.sh`: PASS, with `hal_test_ios26.c` under ASan and UBSan. It found one bug of the first patch: 5 devices in a list of `words[4]`. Fixed |
+| iOS 26 kernel | `kernel-ios26-linux.sh`: 212 applied, 86 applied+rules, 7 skipped, 11 base, 0 errors; 0 linker failures; LSE/RCpc 0; printf-arg-check OK; armv80-check 0. `LAUREL BUILD: c4903b26fd 320 patches, series b01e2598da61163b, ios26_4k`. No new kernel patch was needed |
+| iOS 16 kernel | `kernel-linux.sh`: applied 314, failed 0; LSE/RCpc 0; printf-arg-check OK; armv80-check with the data symbols 0. `git diff` of `patches/` on this branch: none of ours |
+| Full root at a scratch path | `ROOT_OUT=out/ios26/root-scratch`: 34,354,491,392 bytes, real 18.0 GB, inside iosroot with margin 401,584,128 bytes. `hfs-verify`: 236,660 files, 2,844 symlinks, 222,717 folders, SHA-256 all match, 17,505 MiB, 14,261 MiB free of 32,762 MiB. `fsck.hfsplus -f -n`: OK. Kernel read-only mount: 462,221 of 462,221 entries, 0 extra, 0 differ. Layout 11 of 11. SHA-256 through the mount: 5,089 MiB, 0 differ |
+| Root manifest | `c4903b26fd 20261102T060446 kernel-series b01e2598da61163b features 19 installed 17 off 2 missing 0` |
+| Build honesty | `build-honest-test.sh`: 60 of 60 (the iOS 16 path) |
+
+The shared image `~/op10-apple/ios26/23F84-n104ap/root/ios26-root.img` was not written. It is the "before" of the table. The owner rebuilds it: section 1.
+
+One root build failed with EIO from `apfs-fuse` on one file (`ContactsUI.axbundle/_CodeSignature/CodeResources`, 8 tries) while two kernels built at the same time and the donor images had a second mount. The next run with no other load passed. It is the read path of `apfs-fuse`, not of the image: run the root alone.
+
+## 9. The table (generated)
 
 <!-- ios26-parity-audit.py: begin -->
 
-Generated by `scripts/laurel/ios26-parity-audit.py`. Counts: **20 present, 19 ported now, 2 not portable before a boot, 4 not applicable**, of 45 rows. 47 source items and 113 kernel patches, each in a row. Tweak items: 45 same, 1 not applicable, 1 differ.
+Generated by `scripts/laurel/ios26-parity-audit.py`. Counts: **20 present, 19 ported now, 2 not portable before a boot, 4 not applicable**, of 45 rows. 47 source items and 113 kernel patches, each in a row. Tweak items: 46 same, 1 not applicable, 0 differ.
 
 ### Features
 
@@ -143,7 +164,7 @@ Generated by `scripts/laurel/ios26-parity-audit.py`. Counts: **20 present, 19 po
 | root-tweaks-extra.py | drop com.apple.tailspind | yes | job not in launchd.plist |
 | root-tweaks-extra.py | drop com.apple.aggregated | yes | job not in launchd.plist |
 | root-tweaks-extra.py | drop com.apple.aggregated.addaily | yes | job not in launchd.plist |
-| root-tweaks-extra.py | drop com.apple.bluetoothd | NO | JOB STILL THERE |
+| root-tweaks-extra.py | drop com.apple.bluetoothd | yes | dropped, then back with BT_HCI_TRANSPORT from the bluetooth hook, as root-bt.sh on iOS 16 |
 | root-tweaks-extra.py | drop com.apple.activityawardsd | yes | job not in launchd.plist |
 | root-tweaks-extra.py | com.apple.migration DMLastMigrationResults | yes | DMLastMigrationResults = {'buildVersion': '23F84', 'success': True} |
 | root-tweaks-extra.py | com.apple.locationd LocationServicesEnabledIn8.0 | yes | LocationServicesEnabledIn8.0 = True |
@@ -210,12 +231,12 @@ off       root-update: not ported before a boot: the update path needs SSH on a 
 
 <!-- ios26-parity-audit.py: end -->
 
-## 9. Differences from IOS-26-Hot that this branch does not take
+## 10. Differences from IOS-26-Hot that this branch does not take
 
 Hot removes 41 jobs on 23F84 (`tools/sweet-root-tweaks.py` `SKIP_LABELS`, self-reported). 32 of them stay on our root: `ManagedSettingsAgent`, `PerfPowerServices` (+Extended), `perfpowermetricd`, `biomed`, `biomesyncd`, `biometrickitd.pearl`, `callintelligenced`, `cameracaptured`, `cloudpaird`, `deviceaccessd`, `driverkitd`, `factory.NFQRCoded`, `familycircled`, `findmy.findmybeaconingd`, `findmy.findmylocated`, `generativeexperiencesd`, `icloud.findmydeviced`, `modelcatalogd`, `nanobackupd`, `nanoprefsyncd.2`, `nanoregistryd`, `nanoregistrylaunchd`, `nfcd`, `passd`, `security.cryptexd`, `seld`, `siriinferenced`, `sirittsd`, `softposreaderd`, `watchdogd`, `webinspectord`. Not an iOS 16 item, and not proven here. If the first boot shows a crash loop in one of them, this is the first list to read. The same for its `CA_DISABLE_FRAMEBUFFER_COMPRESSION=1` on backboardd.
 
 Hot's `cellulard` (a CoreTelephony XPC server) gives Settings > Cellular and calls on its phone [self-reported]. The iOS 16 root has neither, so it is a new feature, not parity. Its QMI lives in user space over `/dev/pmem`; ours lives in the kernel (2760). Not taken.
 
-## 10. What is not proven
+## 11. What is not proven
 
 All of it runs only on the phone. In particular: dyld 23F84 with opcode fixups in binaries of minos 16.0 (`ios26-first-boot.md` table), `DYLD_INSERT_LIBRARIES` in the two wrappers, the method types of the status bar classes (each self-check says so on the phone), the XPC protocol of `com.apple.BlueTool` on 26, VirtualAudio's route build with these five devices, the decoder in `videocodecd`'s sandbox, `FigCaptureThermalMonitor`, and each kernel feature on this xnu.
