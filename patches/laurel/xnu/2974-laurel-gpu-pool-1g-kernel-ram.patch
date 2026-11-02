@@ -1,0 +1,486 @@
+laurel 2974: larger GPU pool and larger kernel RAM on the 6 GB Mi A3; kept buffers give way before a pool request fails. Log 2026-11-03 02:54:49-02:55:00: `GPU pool 0 of 512 MB free`, 91-119 MB kept, 3-7 submissions in 5 s. New map (Mu 0101, mkadt.py): GPU pool 0x80000000 + 1 GiB (was 0xC0000000 + 512 MiB), TopazModem pool 0xC0000000 + 16 MiB (was 0xE0000000), kernel window 0xC1004000 + 3904 MiB to 0x1B5004000 (was 0xE1004000 + 3264 MiB; 1007 MiB below 4 GiB, was 495). GPU_POOL_MAX, the chunk table and lgp's unit table were already sized for 1 GiB. Self-checks: lgp_place (laurel_gpu_pool_core.h, host test) cuts a reserved range in front of kernel RAM or the modem pool; at the first allocation every chunk above 512 MiB must map and hold a pattern, the first that does not ends the pool, so a failure leaves 512 MiB (kill switch gpu_poolbig=0); 2100: a window past the ADT banks falls back to 3264 MiB (kill switch laurelramgrow=0). Pool pressure: keep() no longer keeps a pool buffer when under 64 MiB of the pool is free; redwood_gpu_pool_take gives kept pool buffers back, the oldest first, when the pool has no room: the window server's own request and pass-through take from all clients, other clients and IOSurfaces only from clients that are not the window server. Lines: `LAUREL GPU POOL: on: 1024 MiB at 0x80000000, 16 chunks of 64 MiB` or `LAUREL GPU POOL: chunk N at 0x.. failed its check: M MiB instead of 1024 MiB`; `LAUREL GPU KEPT: the pool is empty: N MiB of kept buffers gave way for one of B bytes (...)`. No request sleeps for pool memory: pool empty goes to scattered pages (gemNew, stage 1), kIOReturnNoMemory only in pass-through or when kernel RAM is out. docs/laurel_sprout/gpu.md "Pool size". Host test scripts/laurel/gpu-pool-test.sh, scripts/laurel/ram-map-test.sh.
+
+diff --git a/iokit/Kernel/arm/laurel_gpu_pool_core.h b/iokit/Kernel/arm/laurel_gpu_pool_core.h
+--- a/iokit/Kernel/arm/laurel_gpu_pool_core.h
++++ b/iokit/Kernel/arm/laurel_gpu_pool_core.h
+@@ -168,4 +168,40 @@
+ 	return NULL;
+ }
+ 
++/*
++ * laurel 2974: where the pool goes. Of the reserved ranges res[nr] (base, size): the largest that, cut to at most maxsize and to a whole
++ * number of chunks, is at least minsize, chunk aligned, below 4 GiB, inside one of banks[nb], and outside [kbase, kend) (kernel RAM) and
++ * [mbase, mend) (the modem pool). A range that runs into one of those two is cut in front of it. false: no such range.
++ */
++static inline bool
++lgp_place(const uint64_t (*res)[2], unsigned nr, const uint64_t (*banks)[2], unsigned nb, uint64_t kbase, uint64_t kend, uint64_t mbase,
++    uint64_t mend, uint64_t minsize, uint64_t maxsize, uint64_t *base, uint64_t *size)
++{
++	*base = *size = 0;
++	for (unsigned i = 0; i < nr; i++) {
++		uint64_t b = res[i][0], e = b + (res[i][1] > maxsize ? maxsize : res[i][1]), sz;
++		bool in_bank = false;
++
++		if (b < kbase && kbase < e) {
++			e = kbase;
++		}
++		if (b < mbase && mbase < e) {
++			e = mbase;
++		}
++		sz = (e - b) & ~(uint64_t)(GPU_POOL_CHUNK - 1);
++		e = b + sz;
++		if (sz < minsize || (b & (GPU_POOL_CHUNK - 1)) != 0 || e > (1ull << 32) || (b < kend && kbase < e) || (b < mend && mbase < e)) {
++			continue;
++		}
++		for (unsigned j = 0; j < nb; j++) {
++			in_bank |= b >= banks[j][0] && e <= banks[j][0] + banks[j][1];
++		}
++		if (in_bank && sz > *size) {
++			*base = b;
++			*size = sz;
++		}
++	}
++	return *size != 0;
++}
++
+ #endif /* LAUREL_GPU_POOL_CORE_H */
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -486,6 +486,7 @@
+ static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (a test): none kept; gpu_keep=2: kept ones cleared when given again */
+ 
+ class RedwoodGPUUserClient;
++extern "C" uint64_t redwood_gpu_pool_take(uint64_t size, void ** va, bool all);        /* laurel 2974 */
+ extern "C" uint64_t redwood_gpu_give_back_kept(void);          /* laurel 2916 */
+ extern "C" void redwood_gpu_held(uint64_t * buffers, uint64_t * host, uint64_t * kept, uint32_t * clients);
+ #define GPU_CLIENTS 64
+@@ -528,6 +529,8 @@
+ 
+ public:
+ 	uint64_t giveBackKept(void);    /* laurel 2916: with the lock held */
++	struct gpu_kept * oldestPoolKept(bool all);     /* laurel 2974: with the lock held */
++	void dropKeptOne(struct gpu_kept * k) { dropKept(k); }
+ 	void held(uint64_t * buffers, uint64_t * host, uint64_t * kept);
+ 	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
+ 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+@@ -888,6 +891,23 @@
+ 	return bytes;
+ }
+ 
++/* laurel 2974: with the lock held. The kept pool buffer that waited longest, or NULL. all: the window server's as well. */
++struct gpu_kept *
++RedwoodGPUUserClient::oldestPoolKept(bool all)
++{
++	struct gpu_kept * oldest = NULL;
++
++	if (fWindowServer && !all) {
++		return NULL;
++	}
++	for (uint32_t i = 0; i < GPU_KEPT; i++) {
++		if (fKept[i].memory != NULL && fKept[i].address >= kSamePlaceBase && (oldest == NULL || fKept[i].since < oldest->since)) {
++			oldest = &fKept[i];
++		}
++	}
++	return oldest;
++}
++
+ void
+ RedwoodGPUUserClient::held(uint64_t * buffers, uint64_t * host, uint64_t * kept)
+ {
+@@ -906,6 +926,10 @@
+ 	    (kernel == NULL && OSDynamicCast(IOBufferMemoryDescriptor, memory) == NULL)) {
+ 		return false;
+ 	}
++	/* laurel 2974: a short pool gets its buffer back: 91-119 MiB stayed kept with 0 of 512 MiB free (log 2026-11-03 02:54:49-02:55:00) */
++	if (address >= kSamePlaceBase && !topaz_gpu_midmem() && !topaz_gpu_pool_room(0, 64ull << 20)) {
++		return false;
++	}
+ 	for (;;) {
+ 		struct gpu_kept * oldest = NULL;
+ 
+@@ -1023,7 +1047,7 @@
+ 			(void) redwood_gpu_give_back_kept();
+ 		}
+ 		if (ident || fWindowServer || topaz_gpu_pool_room(size, 64ull << 20)) {
+-			pa = topaz_gpu_pool_alloc(size, &va);
++			pa = redwood_gpu_pool_take(size, &va, ident || fWindowServer);  /* laurel 2974: kept buffers give way first */
+ 		} else {
+ 			static uint32_t told;
+ 			if (told++ < 8) {
+@@ -1868,6 +1892,49 @@
+ 	return bytes;
+ }
+ 
++/*
++ * laurel 2974: a pool buffer; when the pool has none, kept pool buffers go back, the longest kept first, until one fits. all: the window server's
++ * as well (only its own request, or the pass-through path where the pool is the only memory; at most GPU_KEPT_BYTES per client). 0: the pool has
++ * none even so: the caller goes to scattered pages (gemNew; user space sees slower frames, no failure) or fails only in pass-through.
++ * Takes gGPULock: not from under it. The pool's lock is taken inside it, as always (2156). No wait anywhere: a request never sleeps for pool memory.
++ */
++extern "C" uint64_t
++redwood_gpu_pool_take(uint64_t size, void ** va, bool all)
++{
++	static uint32_t times;
++	uint64_t pa = topaz_gpu_pool_alloc(size, va), bytes = 0;
++
++	if (pa != 0 || gGPULock == NULL || topaz_gpu_midmem()) {
++		return pa;
++	}
++	IOLockLock(gGPULock);
++	while (pa == 0) {
++		RedwoodGPUUserClient * who = NULL;
++		struct gpu_kept * k = NULL;
++
++		for (uint32_t i = 0; i < GPU_CLIENTS; i++) {
++			struct gpu_kept * one = gGPUClients[i] != NULL ? gGPUClients[i]->oldestPoolKept(all) : NULL;
++
++			if (one != NULL && (k == NULL || one->since < k->since)) {
++				k = one;
++				who = gGPUClients[i];
++			}
++		}
++		if (k == NULL) {
++			break;
++		}
++		bytes += k->size;
++		who->dropKeptOne(k);
++		pa = topaz_gpu_pool_alloc(size, va);
++	}
++	IOLockUnlock(gGPULock);
++	if (bytes != 0 && (times++ < 4 || (times & 255) == 0)) {
++		IOLog("LAUREL GPU KEPT: the pool is empty: %llu MiB of kept buffers gave way for one of %llu bytes (%s, call %u)\n", bytes >> 20, size,
++		    pa != 0 ? "it fits now" : "still no room", times);
++	}
++	return pa;
++}
++
+ extern "C" void
+ redwood_gpu_held(uint64_t * buffers, uint64_t * host, uint64_t * kept, uint32_t * clients)
+ {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -48,6 +48,7 @@
+ 
+ /* topaz GPU (TopazAdreno.cpp): the GPU pool below 4 GiB */
+ extern "C" uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
++extern "C" uint64_t redwood_gpu_pool_take(uint64_t size, void **va, bool all);        /* laurel 2974: RedwoodGPU.cpp */
+ extern "C" void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
+ extern "C" IOMemoryDescriptor *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
+ /* laurel 2100 (osfmk/arm64/laurel_ram.c): the LAUREL RAM line, repeated at the first surface for the USB log */
+@@ -1219,7 +1220,7 @@
+ 		 * a command buffer, read back as addresses (SMMU FAR 0x0001ff497b7b11c0: a grey pixel).
+ 		 */
+ 		uint64_t take = s->allocSize + 64ull * s->bytesPerRow;
+-		uint64_t pa = topaz_gpu_pool_alloc(take, &va);
++		uint64_t pa = redwood_gpu_pool_take(take, &va, false);   /* laurel 2974: other clients' kept buffers give way first */
+ 		IOMemoryDescriptor *md = pa != 0 ? topaz_gpu_pool_md(pa, s->allocSize) : NULL;
+ 		if (md != NULL) {
+ 			s->poolSize = take;
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -189,14 +189,17 @@
+  */
+ /*
+  * laurel: the pool is the range the ADT reserves for it: /chosen laurel-ram-reserved (u64 base/size pairs,
+- * mkadt.py; area A's map: 0xC0000000 + 512 MiB GPU, 0xE0000000 + 16 MiB modem). gpu_pool_place() takes the
++ * mkadt.py; laurel 2974: 0x80000000 + 1 GiB GPU, 0xC0000000 + 16 MiB modem). gpu_pool_place() takes the
+  * largest reserved range that is >= 128 MiB, below 4 GiB, 64 MiB aligned, inside one /chosen laurel-ram-banks
+  * range, and outside the kernel's RAM and TopazModem's pool. None: the GPU takes kernel memory (gpu_midmem).
++ * laurel 2974: the part above GPU_POOL_BASIC is checked chunk by chunk at the first allocation (mapped, a pattern
++ * written and read back); the first bad chunk ends the pool there, so a failure leaves 512 MiB (kill switch gpu_poolbig=0).
+  */
+ #define GPU_POOL_MIN        0x08000000ull       /* 128 MB */
+ #define GPU_POOL_MAX        0x40000000ull       /* 1 GB */
+-#define MODEM_POOL          0xE0000000ull       /* TopazModem.cpp MODEM_POOL_BASE + 16 MB */
+-#define MODEM_POOL_END      0xE1000000ull
++#define GPU_POOL_BASIC      0x20000000ull       /* laurel 2974: 512 MiB, the size before; never checked away */
++#define MODEM_POOL          0xC0000000ull       /* TopazModem.cpp MODEM_POOL_BASE + 16 MB */
++#define MODEM_POOL_END      0xC1000000ull
+ #define GPU_POOL_UNIT       0x10000ull          /* 64 KB */
+ #define GPU_POOL_CHUNK      0x4000000ull        /* 64 MB: mapped on first use (1 GB at once is more IO space than there is) */
+ #define GPU_POOL_CHUNKS     (GPU_POOL_MAX / GPU_POOL_CHUNK)
+@@ -246,10 +249,64 @@
+ }
+ 
+ /* Contiguous GPU memory below 4 GiB: physical address, kernel address (write-combined). 0: none left. */
++/* laurel 2974: chunk c has its kernel map (kept for good, with its descriptor). The lock is held. */
++static bool
++gpu_chunk_map(unsigned c)
++{
++	if (gpu_chunk_va[c] == NULL) {
++		/* in the kernel map, not the small IO submap ml_io_map uses (64 MB there failed) */
++		IOMemoryDescriptor *md = topaz_gpu_pool_md(GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK);
++		IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++		if (map != NULL) {
++			gpu_chunk_va[c] = (uint8_t *)map->getVirtualAddress();
++		}
++		if (gpu_chunk_va[c] == NULL) {
++			OSSafeReleaseNULL(map);
++			OSSafeReleaseNULL(md);
++			return false;
++		}
++	}
++	return true;
++}
++
++/*
++ * laurel 2974: the first allocation: every chunk above GPU_POOL_BASIC must map and hold a pattern at both ends. The first that does not ends the
++ * pool: 512 MiB at the least, as before. [U] A range that TrustZone protects does not fail here: the access resets the phone; every address of the
++ * pool was RAM in earlier boots (docs/laurel_sprout/gpu.md "Pool size"). The lock is held. why: the line for the caller to log, after the lock.
++ */
++static void
++gpu_pool_check_big(char *why, size_t n)
++{
++	for (unsigned c = (unsigned)(GPU_POOL_BASIC / GPU_POOL_CHUNK); c < gpu_pool_size / GPU_POOL_CHUNK; c++) {
++		static const uint64_t pattern[2] = { 0x4c4152454c504f4full, 0xb3bead10a5a55a5aull };
++		bool good = gpu_chunk_map(c);
++
++		for (unsigned i = 0; good && i < 2; i++) {
++			volatile uint64_t *at = (volatile uint64_t *)(gpu_chunk_va[c] + (i == 0 ? 0 : GPU_POOL_CHUNK - sizeof(uint64_t)));
++
++			*at = pattern[i];
++			__asm__ volatile ("dsb sy");
++			good = *at == pattern[i];
++			*at = 0;
++		}
++		if (!good) {
++			snprintf(why, n, "LAUREL GPU POOL: chunk %u at %#llx failed its check: %llu MiB instead of %llu MiB",
++			    c, GPU_POOL_BASE + c * GPU_POOL_CHUNK, (c * GPU_POOL_CHUNK) >> 20, gpu_pool_size >> 20);
++			gpu_pool_size = c * GPU_POOL_CHUNK;
++			return;
++		}
++	}
++	snprintf(why, n, "LAUREL GPU POOL: on: %llu MiB at %#llx, %llu chunks of %llu MiB", gpu_pool_size >> 20, GPU_POOL_BASE,
++	    gpu_pool_size / GPU_POOL_CHUNK, GPU_POOL_CHUNK >> 20);
++}
++
+ extern "C" uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
+ uint64_t
+ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ {
++	char line[128];
++
++	line[0] = '\0';
+ 	uint64_t pa;
+ 
+ 	size = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
+@@ -258,30 +315,24 @@
+ 	}
+ 	lck_mtx_lock(&laurel_gpu_pool_lock);
+ 	if (!gpu_pool_ready) {
++		gpu_pool_check_big(line, sizeof(line));         /* laurel 2974 */
+ 		/* one range per chunk, a unit short (the guard); lgp_fits keeps every buffer inside one chunk */
+ 		lgp_init(&gpu_pool, GPU_POOL_BASE, GPU_POOL_SIZE);
+ 		gpu_pool_ready = true;
+ 	}
+ 	pa = lgp_alloc(&gpu_pool, size);
+ 	unsigned c = (unsigned)((pa - GPU_POOL_BASE) / GPU_POOL_CHUNK);
+-	if (pa != 0 && gpu_chunk_va[c] == NULL) {
+-		/* in the kernel map, not the small IO submap ml_io_map uses (64 MB there failed) */
+-		IOMemoryDescriptor *md = topaz_gpu_pool_md(GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK);
+-		IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
+-		if (map != NULL) {
+-			gpu_chunk_va[c] = (uint8_t *)map->getVirtualAddress();     /* (kept for good, with md) */
+-		}
+-		if (gpu_chunk_va[c] == NULL) {
+-			OSSafeReleaseNULL(map);
+-			OSSafeReleaseNULL(md);
+-			(void)lgp_free(&gpu_pool, pa, size);
+-			pa = 0;
+-		}
++	if (pa != 0 && !gpu_chunk_map(c)) {
++		(void)lgp_free(&gpu_pool, pa, size);
++		pa = 0;
+ 	}
+ 	if (pa != 0 && va != NULL) {
+ 		*va = gpu_chunk_va[c] + (pa - GPU_POOL_BASE - c * GPU_POOL_CHUNK);
+ 	}
+ 	lck_mtx_unlock(&laurel_gpu_pool_lock);
++	if (line[0] != '\0') {
++		IOLog("%s\n", line);
++	}
+ 	return pa;
+ }
+ 
+@@ -421,12 +472,6 @@
+ 	return true;
+ }
+ 
+-static bool
+-overlaps(uint64_t b0, uint64_t e0, uint64_t b1, uint64_t e1)
+-{
+-	return b0 < e1 && b1 < e0;
+-}
+-
+ /* laurel: the GPU pool from the ADT (see above); false: none (pool_why says why), the GPU uses kernel memory */
+ static bool
+ gpu_pool_place(void)
+@@ -447,26 +492,11 @@
+ 		snprintf(pool_why, sizeof(pool_why), "no /chosen laurel-ram-banks (u64 pairs) in the ADT");
+ 		return false;
+ 	}
+-	gpu_pool_base = gpu_pool_size = 0;
+-	for (unsigned i = 0; i < nr; i++) {
+-		uint64_t b = res[i][0], sz = res[i][1] > GPU_POOL_MAX ? GPU_POOL_MAX : res[i][1], e;
+-		bool in_bank = false;
+-
+-		sz &= ~(GPU_POOL_CHUNK - 1);
+-		e = b + sz;
+-		if (sz < GPU_POOL_MIN || (b & (GPU_POOL_CHUNK - 1)) != 0 || e > 0x100000000ull ||
+-		    overlaps(b, e, kbase, kend) || overlaps(b, e, MODEM_POOL, MODEM_POOL_END)) {
+-			continue;
+-		}
+-		for (unsigned j = 0; j < nb; j++) {
+-			in_bank |= b >= banks[j][0] && e <= banks[j][0] + banks[j][1];
+-		}
+-		if (in_bank && sz > gpu_pool_size) {
+-			gpu_pool_base = b;
+-			gpu_pool_size = sz;
+-		}
+-	}
+-	if (gpu_pool_size == 0) {
++	uint32_t big = 1;                       /* laurel 2974: kill switch gpu_poolbig=0: 512 MiB, as before */
++
++	(void)PE_parse_boot_argn("gpu_poolbig", &big, sizeof(big));
++	if (!lgp_place(res, nr, banks, nb, kbase, kend, MODEM_POOL, MODEM_POOL_END, GPU_POOL_MIN, big != 0 ? GPU_POOL_MAX : GPU_POOL_BASIC,
++	    &gpu_pool_base, &gpu_pool_size)) {
+ 		snprintf(pool_why, sizeof(pool_why), "no reserved range of >= 128 MiB below 4 GiB outside kernel RAM %#llx-%#llx",
+ 		    kbase, kend);
+ 		return false;
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -96,12 +96,12 @@
+ /*
+  * laurel 2401: pool map owned by area A (docs/laurel_sprout/memory-map.md). RAM the kernel does
+  * not manage (outside the ADT dram window), below 0xF0000000 for TZ/the modem. The coordinator
+- * sets the final base/size at merge time: the topaz value 0xE0000000 is also area F's audio pool.
++ * sets the final base/size at merge time: the topaz value 0xE0000000 was also area F's audio pool (now kernel RAM, laurel 2974).
+  */
+-#define MODEM_POOL_BASE     0xE0000000ull
++#define MODEM_POOL_BASE     0xC0000000ull       /* laurel 2974: just below kernel RAM (was 0xE0000000) */
+ #define MODEM_POOL_SIZE     0x01000000ull       /* 16 MB: metadata, SCM args, rmtfs, CE rings, WMI memory */
+-#define LAUREL_GPU_POOL_BASE 0xC0000000ull      /* area B GPU pool (TopazAdreno GPU_POOL_*), same map */
+-#define LAUREL_GPU_POOL_SIZE 0x20000000ull
++#define LAUREL_GPU_POOL_BASE 0x80000000ull      /* area B GPU pool (TopazAdreno GPU_POOL_*), same map */
++#define LAUREL_GPU_POOL_SIZE 0x40000000ull
+ static_assert(MODEM_POOL_BASE + MODEM_POOL_SIZE <= LAUREL_GPU_POOL_BASE ||
+     MODEM_POOL_BASE >= LAUREL_GPU_POOL_BASE + LAUREL_GPU_POOL_SIZE, "modem pool overlaps the GPU pool");
+ static_assert(MODEM_POOL_BASE + MODEM_POOL_SIZE <= 0xF0000000ull, "TZ and the modem need the pool below 0xF0000000");
+diff --git a/osfmk/arm64/laurel_ram.c b/osfmk/arm64/laurel_ram.c
+--- a/osfmk/arm64/laurel_ram.c
++++ b/osfmk/arm64/laurel_ram.c
+@@ -1,14 +1,13 @@
+ /*
+- * LAUREL RAM (patch 2100): XNU gets 3264 MiB of the 6 GB Mi A3 instead of 768 MiB, with a self-check
+- * and the old 768 MiB as fallback.
++ * LAUREL RAM (patch 2100, 2974): XNU gets 3904 MiB of the 6 GB Mi A3 instead of 768 MiB, with a self-check
++ * and the old sizes (3264 MiB, 768 MiB) as fallback.
+  *
+  * Memory map (docs/laurel_sprout/uefi-boot.md "RAM"): DDR banks A 0x40000000-0x7CC00000 (every fixed
+  * carve-out, UEFI's fixed regions), B 0x80000000-0xC0000000 and C 0xC0000000-0x1C0000000 (B and C touch).
+- *   0x80000000-0xE0000000  free for device pools that are not kernel RAM (the GPU pool of the Adreno port,
+- *                          0xC0000000 + 512 MiB; the room below it for later pools); Mu "Pool RAM" reserved
+- *   0xE0000000-0xE1000000  TopazModem pool (Wi-Fi through the modem), 16 MiB
+- *   0xE1000000-0x1C0000000 Mu "Kernel RAM" (patches/laurel/mu/0101): DarwinBoot window 0xE1004000 +
+- *                          darwinboot-memory-size (mkadt.py --dram auto: 3264 MiB, end 0x1AD004000), UEFI's own
++ *   0x80000000-0xC0000000  Adreno GPU pool, 1 GiB (laurel 2974; Mu "Pool RAM" reserved)
++ *   0xC0000000-0xC1000000  TopazModem pool (Wi-Fi through the modem), 16 MiB
++ *   0xC1000000-0x1C0000000 Mu "Kernel RAM" (patches/laurel/mu/0101): DarwinBoot window 0xC1004000 +
++ *                          darwinboot-memory-size (mkadt.py --dram auto: 3904 MiB, end 0x1B5004000), UEFI's own
+  *                          allocations top-down from 0x1C0000000 above it
+  * XNU's managed RAM is one range from boot_args physBase, so the pools live below the window: they keep no
+  * cacheable alias in the physical aperture, and nothing XNU allocates can land in them.
+@@ -26,13 +25,13 @@
+  *   4. at least LAUREL_RAM_LOW_MIN of it is below 4 GiB (USB/UFS DMA, MDP scanout, flip buffers).
+  * On a failure, or with the kill switch laurelram=0, XNU manages only the first 768 MiB of the window
+  * (the maxmem path of arm_vm_init: mem_size, max_mem and hw.memsize). That is the old size, not the old
+- * place: at 0xE1004000 it is 495 MiB below 4 GiB + 273 MiB above. A window of 768 MiB or less (an old ADT or
++ * place: at 0xC1004000 it is all below 4 GiB. A window of 768 MiB or less (an old ADT or
+  * an old Mu FD) is left as it is. DarwinBoot may give a smaller window than the ADT asks (0102 shrinks it
+  * when no UEFI run is big enough): the line says so.
+  *
+  * Page order: when the window crosses 4 GiB, vm_himemory_mode = FALSE (vm_resident.c pmap_startup): the
+  * free queue is filled from the top, so general allocations (zones, user pages) use RAM above 4 GiB first
+- * and the 495 MiB below 4 GiB stay free for the buffers that need them (the screen-surface pool of 2101
++ * and the 1007 MiB below 4 GiB stay free for the buffers that need them (the screen-surface pool of 2101
+  * reports what is left: "below-4G free N MiB"). Only the boot allocations of pmap_steal (vm_pages array,
+  * page tables) come from just above the kernel, below 4 GiB.
+  *
+@@ -40,15 +39,15 @@
+  * with an old Mu FD and a new ADT, where 3. caps the window) has a cacheable alias for that short time;
+  * nothing touches it then. The final physical aperture ends at physBase + mem_size.
+  *
+- * DMA below 4 GiB: the window now reaches above 4 GiB (495 MiB of it is below). The display (MDP,
++ * DMA below 4 GiB: the window now reaches above 4 GiB (1007 MiB of it is below). The display (MDP,
+  * SweetFramebuffer/SweetSurface) and the GPU already ask for memory below 4 GiB with a physical mask; the
+  * USB (sweet_usb.c) and UFS (sweet_ufs.c) DMA blocks come from kmem_alloc_contig, which now gets
+  * max_pnum = 4 GiB as well (both are allocated early, while RAM below 4 GiB is free).
+  *
+  * One line at EARLY_BOOT (console), repeated by laurel_ram_summary() for the USB log:
+- *   "LAUREL RAM: on: 3264 MiB at 0xe1004000..0x1ad004000 (banks 0x80000000..0x1c0000000; 495 MiB below 4 GiB,
++ *   "LAUREL RAM: on: 3904 MiB at 0xc1004000..0x1b5004000 (banks 0x80000000..0x1c0000000; 1007 MiB below 4 GiB,
+  *    used last)"
+- *   "LAUREL RAM: off: <reason>; XNU keeps the first 768 MiB of the 3264 MiB window at 0xe1004000 (495 MiB below 4 GiB)"
++ *   "LAUREL RAM: off: <reason>; XNU keeps the first 768 MiB of the 3904 MiB window at 0xc1004000 (768 MiB below 4 GiB)"
+  */
+ 
+ #include <pexpert/arm64/board_config.h>
+@@ -73,7 +72,8 @@
+ #define LAUREL_RAM_MAX          (4608ULL << 20)         /* start.s bootstrap table budget, see above */
+ #define LAUREL_RAM_LOW_MIN      (128ULL << 20)          /* RAM below 4 GiB the window must hold */
+ #define LAUREL_RAM_4G           (1ULL << 32)
+-#define LAUREL_GPU_POOL         0x90000000ULL           /* topaz TopazAdreno.cpp GPU_POOL_BASE (gpu=1, no gpu_midmem) */
++#define LAUREL_RAM_BEFORE       (3264ULL << 20)         /* laurel 2974: what XNU managed before the window grew */
++#define LAUREL_GPU_POOL         0x80000000ULL           /* laurel 2974: the pool of the ADT (TopazAdreno gpu_pool_place) */
+ #define LAUREL_GPU_POOL_SIZE    0x40000000ULL
+ #define LAUREL_RAM_BANKS_MAX    8u
+ #define LAUREL_RAM_RESERVED_MAX 8u
+@@ -140,7 +140,7 @@
+ {
+ 	const uint64_t base = args->physBase, size = args->memSize, end = base + size;
+ 	uint64_t run0 = 0, run1 = 0, asked = 0, limit = 0;
+-	uint32_t on = 1, gpu = 0, midmem = 0;
++	uint32_t on = 1, gpu = 0, midmem = 0, grow = 1;
+ 	char why[128], note[96];
+ 	DTEntry chosen = NULL;
+ 	void const *prop = NULL;
+@@ -155,10 +155,15 @@
+ 		return memory_size;
+ 	}
+ 	PE_parse_boot_argn("laurelram", &on, sizeof(on));
++	PE_parse_boot_argn("laurelramgrow", &grow, sizeof(grow));       /* laurel 2974: kill switch =0: at most the 3264 MiB of before */
+ 	PE_parse_boot_argn("gpu", &gpu, sizeof(gpu));
+ 	PE_parse_boot_argn("gpu_midmem", &midmem, sizeof(midmem));
+ 
+ 	limit = memory_size;
++	if (on != 0 && grow == 0 && size > LAUREL_RAM_BEFORE && (limit == 0 || limit > LAUREL_RAM_BEFORE)) {
++		limit = LAUREL_RAM_BEFORE;      /* laurel 2974 */
++		snprintf(note, sizeof(note), "; kill switch laurelramgrow=0: %llu MiB", LAUREL_RAM_BEFORE >> 20);
++	}
+ 	if (on == 0) {
+ 		snprintf(why, sizeof(why), "kill switch laurelram=0");
+ 	} else if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess) {
+@@ -166,7 +171,7 @@
+ 	} else if (SecureDTGetProperty(chosen, "laurel-ram-banks", &prop, &len) != kSuccess ||
+ 	    len == 0 || len % 16 != 0 || len / 16 > LAUREL_RAM_BANKS_MAX) {
+ 		snprintf(why, sizeof(why), "no /chosen laurel-ram-banks (u64 base/size pairs) in the ADT");
+-	} else if (end < base || !laurel_ram_run(chosen, len / 16, base, &run0, &run1) || end > run1) {
++	} else if (end < base || !laurel_ram_run(chosen, len / 16, base, &run0, &run1) || (end > run1 && (size <= LAUREL_RAM_BEFORE || base + LAUREL_RAM_BEFORE > run1))) {
+ 		snprintf(why, sizeof(why), "window 0x%llx..0x%llx is not inside one run of the ADT RAM banks", base, end);
+ 	} else if (SecureDTGetProperty(chosen, "laurel-ram-reserved", &prop, &rlen) == kSuccess &&
+ 	    (rlen % 16 != 0 || rlen / 16 > LAUREL_RAM_RESERVED_MAX)) {
+@@ -185,6 +190,10 @@
+ 			}
+ 		}
+ 	}
++	if (why[0] == '\0' && end > run1 && (limit == 0 || limit > LAUREL_RAM_BEFORE)) {
++		limit = LAUREL_RAM_BEFORE;      /* laurel 2974: a larger window than the banks hold falls back to the size of before */
++		snprintf(note, sizeof(note), "; window end 0x%llx is past the banks: %llu MiB", end, LAUREL_RAM_BEFORE >> 20);
++	}
+ 	if (why[0] == '\0') {
+ 		uint64_t m = (limit != 0 && limit < size) ? limit : size;
+ 		uint64_t lo = base < LAUREL_RAM_4G ? ((base + m < LAUREL_RAM_4G ? base + m : LAUREL_RAM_4G) - base) : 0;

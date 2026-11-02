@@ -17,6 +17,11 @@ awk '/^\+\+\+ b\/iokit\/Kernel\/arm\/laurel_gpu_pool_core\.h$/ {p=1; next}
      p && /^@@/ {next}
      p && /^\+/ {print substr($0, 2)}' "$PATCH" > "$D/laurel_gpu_pool_core.h"
 [ -s "$D/laurel_gpu_pool_core.h" ] || { echo "gpu-pool-test: no laurel_gpu_pool_core.h in $PATCH" >&2; exit 1; }
+# laurel 2974 adds lgp_place to the header
+awk '/^diff --git a\/iokit\/Kernel\/arm\/laurel_gpu_pool_core\.h/ {p=1}
+     p && /^diff --git/ && !/laurel_gpu_pool_core\.h/ {exit}
+     p {print}' "$REPO/patches/laurel/xnu/2974-laurel-gpu-pool-1g-kernel-ram.patch" > "$D/2974-core.patch"
+(cd "$D" && patch -s -p4 laurel_gpu_pool_core.h < 2974-core.patch)
 grep -E '^[ +]#define GPU_POOL_(UNIT|CHUNK|MAX) ' "$P2150" | cut -c2- > "$D/gpu_pool_defs.h"
 [ "$(wc -l < "$D/gpu_pool_defs.h")" -eq 3 ] || { echo "gpu-pool-test: GPU_POOL_UNIT/CHUNK/MAX not found once each in $P2150" >&2; exit 1; }
 ${CC:-cc} -O2 -Wall -Wextra -Werror -pthread -I"$D" -o "$D/gpu_pool_test" "$REPO/tools/gpu-pool-test/gpu_pool_test.c"
