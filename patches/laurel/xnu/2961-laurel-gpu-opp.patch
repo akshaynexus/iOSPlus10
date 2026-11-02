@@ -55,7 +55,7 @@ index 39bfc58..142203f 100644
  bool laurel_gpu_counters(uint64_t *busy, uint64_t *ticks, uint64_t *cycles);
  bool laurel_gpu_fence_check(uint64_t *us);
  bool redwood_gpu_ready(void);
-@@ -51,42 +47,216 @@ bool redwood_gpu_ready(void);
+@@ -51,42 +47,225 @@ bool redwood_gpu_ready(void);
  #define RPM_VLVL        0x6c766c76u     /* "vlvl" */
  #define RPM_MEMC        0x326b6c63u     /* "clk2" */
  #define RPM_KHZ         0x007a484bu     /* "KHz" */
@@ -113,6 +113,7 @@ index 39bfc58..142203f 100644
 +static bool ipeak_used, pll_allowed;
 +static struct opp_state st;
 +static uint16_t read_gcc[OPP_N], read_cp[OPP_N];
++static bool ipeak_feature;
 +static uint32_t ddr_boot, ddr_floor, ddr_vote;  /* MHz; ddr_floor: the boot clock as a bus level; ddr_vote 0: no vote is sent (no need, or the RPM does not follow) */
  
  #include "laurel_gpu_clock_read.h"      /* gfx3d_mhz, cp_mhz, clock_right, ddr_mhz, ddr_want, ddr_start */
@@ -247,8 +248,12 @@ index 39bfc58..142203f 100644
 +static void
 +ipeak_start(void)
 +{
-+	/* cx_ipeak_register_v2: no feature or a bypassed client: stock has no client and sends no vote */
-+	ipeak_used = tcsr != NULL && RD(tcsr, IPEAK_ENABLE) != 0 && (RD(tcsr, IPEAK_BYPASS) & 1u) == 0;
++	/*
++	 * cx_ipeak_register_v2: a bypassed client sends no vote. No feature: on stock Android cx_ipeak_cdev.c sets it; nothing here does, so no safety exists
++	 * and the levels that stock guards with it stay out (stock: "Hardware damage is possible at peak current").
++	 */
++	ipeak_feature = tcsr != NULL && RD(tcsr, IPEAK_ENABLE) != 0;
++	ipeak_used = ipeak_feature && (RD(tcsr, IPEAK_BYPASS) & 1u) == 0;
 +}
 +
  static bool
@@ -261,6 +266,10 @@ index 39bfc58..142203f 100644
  	uint64_t us = 0;
 +	int dc = laurel_thermal_gpu_dC();
 +
++	if (opp_ipeak_refuses(&opp_table[i], ipeak_feature)) {
++		scnprintf(note, n, "%u: no CX iPeak in this boot", opp_table[i].mhz);
++		return false;
++	}
 +	if (dc <= -1000 || dc >= OPP_HOT_DC) {
 +		scnprintf(note, n, "%u: hot, %d C", opp_table[i].mhz, dc / 10);
 +		return false;
@@ -289,7 +298,7 @@ index 39bfc58..142203f 100644
  
  	for (int i = 0; laurel_thermal_gpu_dC() <= -1000; i++) {
  		if (i >= 60) {
-@@ -94,50 +264,130 @@ self_check(void)
+@@ -94,50 +273,130 @@ self_check(void)
  		}
  		IOSleep(500);
  	}
@@ -443,7 +452,7 @@ index 39bfc58..142203f 100644
  	ddr_start();
  	if (!self_check()) {
  		return;
-@@ -146,9 +396,8 @@ dcvs_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -146,9 +405,8 @@ dcvs_thread(void *arg __unused, wait_result_t wr __unused)
  	lm_b0 = b0;
  	lm_t0 = t0;
  	while (redwood_gpu_ready()) {
@@ -455,8 +464,14 @@ index 39bfc58..142203f 100644
  			return;
  		}
  		uint64_t b1, t1, ns = 0, now = mach_absolute_time();
-@@ -156,78 +405,77 @@ dcvs_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -156,78 +414,83 @@ dcvs_thread(void *arg __unused, wait_result_t wr __unused)
  		if (!laurel_gpu_counters(&b1, &t1, &c) || t1 <= t0) {
++			/* no busy number this tick: the thermal rule still holds */
++			const char *hot_why = "";
++			(void)opp_thermal_tick(&th, laurel_thermal_gpu_dC(), level, usable);
++			if (level > th.cap) {
++				(void)set_level(th.cap, &hot_why);
++			}
  			continue;
  		}
 -		uint32_t pct = (uint32_t)((b1 - b0) * 100 / (t1 - t0));
@@ -570,7 +585,7 @@ index 39bfc58..142203f 100644
  	return true;
  }
  
-@@ -245,6 +493,7 @@ laurel_gpu_dcvs_start(void)
+@@ -245,6 +508,7 @@ laurel_gpu_dcvs_start(void)
  	gcc = (volatile uint8_t *)ml_io_map(0x01400000u, 0x80000);
  	gpucc = (volatile uint8_t *)ml_io_map(0x05990000u, 0x9000);
  	mccc = (volatile uint8_t *)ml_io_map(0x0447d000u, 0x1000);
@@ -578,7 +593,7 @@ index 39bfc58..142203f 100644
  	if (gcc == NULL || gpucc == NULL || mccc == NULL) {
  		IOLog("LAUREL GPU CLOCK: off: clock registers not mapped; 300 MHz stays\n");
  		return;
-@@ -261,7 +510,7 @@ extern "C" int laurel_gpu_dcvs_stats(char *s, size_t n);
+@@ -261,7 +525,7 @@ extern "C" int laurel_gpu_dcvs_stats(char *s, size_t n);
  int
  laurel_gpu_dcvs_stats(char *s, size_t n)
  {
@@ -733,7 +748,7 @@ new file mode 100644
 index 0000000..815d34f
 --- /dev/null
 +++ b/iokit/Kernel/arm/laurel_gpu_opp.h
-@@ -0,0 +1,394 @@
+@@ -0,0 +1,402 @@
 +/*
 + * laurel 2961 (a piece of LaurelGpuDcvs.cpp): the stock OPP table of the Mi A3's Adreno 610 and the rules that use it. No hardware access:
 + * the kernel gives the operations in struct opp_ops, and the host test scripts/laurel/test-gpu-opp.sh runs this same text with fakes.
@@ -1033,6 +1048,13 @@ index 0000000..815d34f
 +	return true;
 +}
 +
++/* Levels that stock guards with the CX iPeak do not run without the feature. */
++static inline bool
++opp_ipeak_refuses(const struct laurel_opp *o, bool feature)
++{
++	return o->ipeak && !feature;
++}
++
 +/* The votes for the level the clock is on after a failed raise or after a lower: iPeak first off, then the rail. A refused lower vote only keeps the rail. */
 +static void
 +opp_votes_down(const struct opp_ops *ops, struct opp_state *st)
@@ -1043,8 +1065,9 @@ index 0000000..815d34f
 +		(void)ops->ipeak(false);
 +		st->ipeak = false;
 +	}
-+	if (c < st->cx && ops->cx(c)) {
-+		st->cx = c;
++	if (c < st->cx) {
++		/* false can be a lost ack (topaz_rpm_write: 1000 ms): the RPM may have the vote. Rail unknown: 0 makes the next raise vote, so no level runs under its corner. */
++		st->cx = ops->cx(c) ? c : 0;
 +	}
 +}
 +

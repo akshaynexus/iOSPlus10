@@ -5222,3 +5222,9 @@ Full text: `docs/laurel_sprout/gpu.md` section "All stock levels". Patch 2961, b
 - Rail vote from 300 to 600 MHz stays NOM (held for the AP's other blocks since 2892), above the GPU's own corner. "Never above the stock corner" holds from 745 MHz.
 - Reading a stock DTB: `boot.img` holds many appended DTBs: find the FDT magic, `dtc`, look for model `TRINKET SoC`. Use `simg2img` + `debugfs -R "cat /etc/..."` for vendor files: 1 GiB raw in `out/`, delete it after.
 
+
+## 2026-11-03: GPU 950 MHz: review fixes before the first flash
+- A failed lower vote (`topaz_rpm_write` also returns false on a lost ack, 1000 ms) leaves the rail unknown: `st->cx = 0`, so the next raise votes. Control `lost-ack` in `test-gpu-opp.sh`.
+- 900 and 950 MHz need the CX iPeak feature bit: no feature (`ENABLE` 0) = those levels stay out, with the note `N: no CX iPeak in this boot`. [I] Unless boot firmware sets the bit it reads 0, because on stock the HLOS driver `cx_ipeak_cdev.c` sets it; then the top level is 820 MHz. The bit alone is not the fix: stock sets bypass and thermal clients with it.
+- A tick with a bad counter still runs the thermal rule.
+- Open before long-load tests [V trinket-thermal.dtsi]: stock has `quiet-therm` skin limits (48 C, 52 C to the lowest level) and six other zones that send the GPU to its lowest level; this patch reads sensor 15 only, once a second. See the review in the owner's thread.

@@ -37,7 +37,9 @@ PY
 }
 control no-cx-vote 'if (c > st->cx) {' 'if (false && c > st->cx) {'
 control no-ipeak 'if (t->ipeak && !st->ipeak) {' 'if (false && t->ipeak && !st->ipeak) {'
-control rail-stays 'if (c < st->cx && ops->cx(c)) {' 'if (false && c < st->cx && ops->cx(c)) {'
+control rail-stays 'if (c < st->cx) {' 'if (false && c < st->cx) {'
+control lost-ack 'st->cx = ops->cx(c) ? c : 0;' 'if (ops->cx(c)) { st->cx = c; }'
+control no-ipeak-rule 'return o->ipeak && !feature;' 'return false;'
 control running-pll 'ops->pll_off(t->pll);
 		if (!ops->pll_on(t)) {' 'if (!ops->pll_on(t)) {'
 echo "test-gpu-opp: PASS"

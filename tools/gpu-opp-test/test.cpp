@@ -33,6 +33,7 @@ static struct HW {
 	int n = 0, fail_at = -1;        // the fail_at-th fallible step fails
 	bool fail_after = false;        // and all after it
 	bool cx_low_refused = false;
+	bool cx_lost_ack = false;       // the RPM takes the vote, the ack does not come: false, but the rail moved
 	bool fail() { int k = n++; if (k == fail_at || (fail_after && fail_at >= 0 && k > fail_at)) { return true; } return false; }
 } hw;
 
@@ -50,6 +51,7 @@ static bool f_ddr(uint32_t m) {
 	return true;
 }
 static bool f_cx(uint32_t c) {
+	if (hw.cx_lost_ack) { hw.cx = c; hw.log.push_back("cx lost ack " + std::to_string(c)); return false; }
 	if (hw.fail()) { hw.log.push_back("cx refused"); if (c < hw.cx) hw.cx_low_refused = true; return false; }
 	hw.cx = c;
 	hw.log.push_back("cx " + std::to_string(c));
@@ -140,6 +142,24 @@ int main() {
 	exact(7, 4, "rcg 600, pll0 off, pll0 1490, rcg 745, ipeak-, cx 256");
 	exact(7, 1, "pll1 640, rcg 320, pll0 off, ipeak-, cx 256");
 	exact(1, 2, "ddr 768, rcg 300, pll1 off, pll1 930, rcg 465, read");
+
+	// review 2026-11-03: a lost ack on a lower vote must not leave 950 MHz on the NOM rail
+	{
+		struct opp_state st;
+		const char *why = "";
+		put_on(7, &st);
+		hw.cx_lost_ack = true;
+		if (!opp_go(&ops, &st, 4, &why)) bad("lower with a lost ack failed");
+		hw.cx_lost_ack = false;
+		if (!opp_go(&ops, &st, 7, &why)) bad(std::string("raise after a lost ack failed: ") + why);
+		if (hw.cx < 416) bad("950 MHz on CX " + std::to_string(hw.cx) + " after a lost ack");
+		printf("ok    lost ack: 950 MHz back on CX %u\n", hw.cx);
+	}
+	// review 2026-11-03: no iPeak feature: the levels stock guards with it stay out, the others stay
+	for (uint32_t i = 0; i < OPP_N; i++) {
+		if (opp_ipeak_refuses(&opp_table[i], true)) bad("refused with the feature");
+		if (opp_ipeak_refuses(&opp_table[i], false) != (opp_table[i].mhz >= 900)) bad("iPeak rule at " + std::to_string(opp_table[i].mhz));
+	}
 
 	// every pair, every failure, single and from there on
 	uint32_t runs = 0;
