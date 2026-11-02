@@ -1,7 +1,7 @@
 #!/bin/bash
 # Every binary of the iOS 26 root's parity hooks (docs/laurel_sprout/ios26-parity.md), then the check of each against 23F84. Nothing here writes to a device.
 #   scripts/bg.sh ios26-parity scripts/laurel/ios26-parity-build.sh      (minutes: the HEVC decoder builds FFmpeg once; the check asks the cache per binary)
-#   CHECK=0 only the builds
+#   CHECK=0 only the builds     FORCE_CHECK=1 check every binary again (default: a file whose sha256 is on the last list keeps its result)
 # One failed build does not stop the others: its binary stays unchecked, and ios26-root-spec.py turns that hook off with one line.
 # Output: the stages (out/laurel/{notch,cell,bt,hevc}, out/ios26/{audio,flashlight,ringer,xnutils}), out/ios26/parity-check.tsv: "sha256 TAB path" of each binary that passed all of:
 #   thin plain arm64; 0 instructions newer than ARMv8.0; each library and import in the 23F84 cache (ios26-injected-check.py); signed, CodeDirectory page size 4096.
@@ -43,6 +43,12 @@ printf '# sha256\tpath: passed armv80-check, ios26-injected-check, page size 409
 # one at a time: each check maps the whole cache through ipsw (several GB): with many at once the host's memory killer took this job on 2026-11-02
 for b in $BINS; do
   if [ ! -f "$b" ]; then echo "ios26-parity-build: check $b: no file"; bad="$bad check:$b"; continue; fi
+  sum=$(sha256sum "$b" | cut -d' ' -f1)
+  if [ "${FORCE_CHECK:-0}" != 1 ] && [ -f "$T" ] && grep -q "^$sum	$b$" "$T"; then
+    printf '%s\t%s\n' "$sum" "$b" >> "$T.new"
+    echo "$b: same sha256 as the last check: result kept" > "logs/parity-check-$(basename "$b").log"
+    continue
+  fi
   ( out=$(python3 -I scripts/laurel/ios26-injected-check.py "$REPO/$b" 2>&1); rc=$?
     printf '%s\n' "$out"
     printf '%s\n' "$out" | grep -q 'page size 4096,' || rc=1
@@ -51,7 +57,7 @@ for b in $BINS; do
 done
 for b in $BINS; do
   l="logs/parity-check-$(basename "$b").log"
-  sed -n '/thin arm64/,$p' "$l" | cut -c1-170
+  grep -q 'result kept' "$l" && cut -c1-170 "$l" || sed -n '/thin arm64/,$p' "$l" | cut -c1-170
   grep -q "	$b$" "$T.new" || bad="$bad check:$b"
 done
 mv -f "$T.new" "$T"

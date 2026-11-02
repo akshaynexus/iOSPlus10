@@ -5,7 +5,7 @@ Date: 2026-11-02. **Host only. This root has never booted. Nothing was written t
 ```sh
 scripts/bg.sh ios26-root scripts/laurel/ios26-root.sh         # make laurel-ios26-root
 scripts/bg.sh ios26-again scripts/laurel/ios26-root-again.sh  # same bytes proof: build twice, third run must stop
-python3 -I scripts/laurel/ios26-root-spec.py --self-test      # the air hook, no donor files
+python3 -I scripts/laurel/ios26-root-spec.py --self-test      # the hooks: air, Metal, debug, parity; no donor files
 ```
 
 Inputs: `DEV=n104ap` output of `scripts/ios26/fetch-os.sh`, `sysos-tree.sh`, `lower-userland.sh` (`ios26-userland.md` section 2). No sudo: read-only `apfs-fuse` mounts, `udisksctl` for the kernel mount. The negroni path is `scripts/ios26/root-macos.sh`; this build does not touch it.
@@ -52,7 +52,7 @@ Same inputs, same bytes: the build hashes the spec, the changed files and each l
 - Preferences: key names of iOS 16; each marked [U] where 26 was not read.
 - `activation data ark`: **not-found**. The 23F84 OS volume has no mobileactivationd system container. The kernel path stays; enough on 26: [U].
 
-Not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, audio HAL, Bluetooth userland, camera, HEVC, status bar, XNUtils. SSH and debugging: section 4.2.
+Features of the iOS 16 root on this one, with the table of all of them: [ios26-parity.md](ios26-parity.md). Each is one hook and one audit line; what is off says why in `report.txt`. SSH and debugging: section 4.2.
 
 ## 4. AirDrop and AirPlay hook
 
@@ -87,6 +87,10 @@ Test [V]: `--self-test`: `metal hook self-test: 15 of 15` with the real script o
 - **Sizes and the hash of section 1 are from before these hooks. The image changes.** Run `ios26-root-again.sh` again.
 
 Tests [V]: `--self-test`: `debug hook self-test: 27 of 27`, with the real binaries of `out/ssh/ios` and scratch keys (job, USB address only, owners, modes, links, kill switch, missing tool; the job stays when Metal and AirDrop fail); with `METAL_STAGE` of the real stage also `metal hook self-test: 15 of 15`. Real 23F84 build with `ROOT_OUT` (scratch path, the shared image was not touched), twice: no Metal stage (`off metal26`, `applied debug-ios26`), and with the Metal stage. Each: `hfs-verify` OK, `fsck` OK, kernel read-only mount 0 differ; job, binaries and keys read back from the image.
+
+## 4.3 Parity hooks
+
+`ios26-root-spec.py` function `parity()`, after `debug()`, `air()`, `metal()`. Binaries: `scripts/bg.sh ios26-parity scripts/laurel/ios26-parity-build.sh` first; a hook takes only a file on `out/ios26/parity-check.tsv`. A failure of any kind in one hook restores the tree, launchd.plist and the overlay to what they were before it. Doc: `ios26-parity.md`.
 
 ## 5. What is not proven
 

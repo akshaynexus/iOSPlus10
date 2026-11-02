@@ -53,7 +53,7 @@ ROWS = [
     row('Haptics', 'kernel 2700 + Actuator device of the plug-in', '2700', paths=(HAL + 'RedwoodAudio.driver/RedwoodAudio',), action='Hook audio'),
     row('Bluetooth', 'root-bt.sh, scripts/bt/bt-launchd.py, userland/laurel/bt', '2600', paths=('usr/libexec/negroni-bluetool',), jobs=('com.apple.bluetoothd', 'com.apple.BlueTool'),
         action='Hook bluetooth: job with BT_HCI_TRANSPORT, stand-in. Strings of the transport in 23F84 bluetoothd [V]; the BlueTool XPC of 26: [U]', claims=('feature:bt', 'manifest:bluetooth', 'userland:bt')),
-    row('Camera: kernel, sensor tables', 'root-camera.sh steps 1, 3, 4, 5', '2770 2771 2772 2773 2784 2913', paths=('usr/share/firmware/laurel-camera/libmmcamera_laurus_imx586_sunny.so', 'usr/share/firmware/laurel-camera/libactuator_dw9800.so'),
+    row('Camera: kernel, sensor tables', 'root-camera.sh steps 1, 5', '2770 2771 2772 2773 2784 2913', paths=('usr/share/firmware/laurel-camera/libmmcamera_laurus_imx586_sunny.so', 'usr/share/firmware/laurel-camera/libactuator_dw9800.so'),
         action='Hook camera-tables: the kernel reads them, on any iOS', claims=('feature:camera', 'manifest:camera')),
     row('Camera: iOS plug-in', 'root-camera.sh step 2, userland/camera, userland/laurel/camera', kind='np',
         action='See "Camera" below: 20H392 hook table, capture moved to cameracaptured, vendor init changed, ABI not read, no frame with light on iOS 16 to compare', claims=('userland:camera',)),
@@ -90,7 +90,7 @@ ROWS = [
         action='In tweaks(), one audit line each', claims=('script:sweet-root-tweaks.py', 'script:root-tweaks-extra.py')),
     row('Root layout: containers, logd stores, keybag, dyld', 'external/ios-topaz/tools/mkiosroot.sh', '2904', paths=('private/var/keybags/systembag.kb', 'private/var/db/diagnostics/.migrated', 'private/var/containers/Bundle', 'System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e'),
         action='ios26-root-spec.py main() and tweaks()', claims=('script:mkiosroot.sh',)),
-    row('Kernel base: CPU, RAM, UFS, boot', 'kernel', '2000 2004 2009 2011 2012 2015 2016 2018 2100 2404 2902 2906 2916', kind='kernel', action=NOTE_KERNEL),
+    row('Kernel base: CPU, RAM, UFS, boot, power off', 'kernel', '2000 2003 2004 2009 2011 2012 2015 2016 2018 2100 2404 2902 2906 2916', kind='kernel', action=NOTE_KERNEL),
     row('Sandbox grants, entitlements', 'kernel', '2903 2910', kind='kernel', action='Grants by entitlement, not by process name [V 2910]; 23F84 ops: post/9000'),
     row('Dual boot, build stamp', 'kernel; dual-boot.sh; root-manifest', '2912 2950', paths=('usr/share/laurel/root-manifest',), action='The manifest has one row per hook here'),
 ]
@@ -119,14 +119,6 @@ def load_overlay(root, rel):
 
 def jobs_by_label(root):
     return {j.get('Label'): j for j in load_overlay(root, XPC).get('LaunchDaemons', {}).values() if isinstance(j, dict)}
-
-
-def labels_by_program(root):
-    out = {}
-    for j in load_overlay(root, XPC).get('LaunchDaemons', {}).values():
-        if isinstance(j, dict):
-            out[j.get('Label')] = j
-    return out
 
 
 def source_items():
@@ -194,6 +186,8 @@ def tweak_items():
 def judge_tweak(item, root, paths, labels, audit):
     k = item[0]
     if k == 'gone':
+        if item[1] == 'com.apple.bluetoothd':       # dropped by the tweak, back by root-bt.sh on iOS 16 too
+            return ('BT_HCI_TRANSPORT' in (labels.get(item[1]) or {}).get('EnvironmentVariables', {}), 'dropped, then back with BT_HCI_TRANSPORT from the bluetooth hook, as root-bt.sh on iOS 16')
         return (item[1] not in labels, 'job not in launchd.plist' if item[1] not in labels else 'JOB STILL THERE')
     if k == 'gone-program':
         left = [j for j in labels.values() if os.path.basename((j.get('Program') or (j.get('ProgramArguments') or [''])[0])) == item[1]]
@@ -330,7 +324,7 @@ def main():
             rcol = 'no: nothing to port'
         elif kind == 'np':
             state = 'not portable before a boot'
-            rcol = 'no: ' + (('audit `off`') if any(r['name'] for x in audit) else '')
+            rcol = 'no: one audit line `off`'
         else:
             if not ok_after:
                 fail.append(f'{r["name"]}: not in the --after root: {ev_after}')

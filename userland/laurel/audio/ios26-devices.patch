@@ -46,6 +46,15 @@
  #define MANUFACTURER            CFSTR("redwood")
  /* how often a device says where its clock is, in frames: also the largest I/O buffer the HAL will use */
  #define TIMESTAMP_PERIOD        16384
+@@ -411,7 +425,7 @@
+ 	bool empty;
+ 	bool string;                    /* a CFString: whoever is given it gets a reference of their own */
+ 	union {
+-		UInt32 words[4];
++		UInt32 words[8];        /* the plug-in's device list: 5 here */
+ 		Float64 number;
+ 		Float32 decimal;
+ 		CFStringRef string;
 @@ -494,11 +508,16 @@
  			WORD(0);
  			break;

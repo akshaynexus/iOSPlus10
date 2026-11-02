@@ -1128,7 +1128,7 @@ def flashlight_off_mark(t):
 
 
 def camera_tables(t):
-    """Steps 1, 3, 4, 5 of root-camera.sh: what the kernel reads (2771, 2773) is not tied to iOS. The plug-in of step 2 is another line: `camera plug-in`."""
+    """Steps 1 and 5 of root-camera.sh: what the kernel reads (2771, 2773) is not tied to iOS. The plug-in of step 2 and its knob folder are another line: `camera-plugin`. No MobileGestalt cache to remove: a new root has none."""
     import subprocess
     lib = stage_src('out/laurel/camera/lib')
     if not os.path.isdir(lib):
@@ -1149,8 +1149,7 @@ def camera_tables(t):
             with open(f, 'rb') as g:
                 t.write(f'usr/share/firmware/laurel-camera/{os.path.basename(f)}', g.read(), 0o644, 0, 0)
             m += 1
-    t.mkdirs(b'private/var/db/negronicam')
-    return f'{n} sensor and {m} lens libraries in /usr/share/firmware/laurel-camera (the phone\'s own: the kernel reads them), /var/db/negronicam'
+    return f'{n} sensor and {m} lens libraries in /usr/share/firmware/laurel-camera (the phone\'s own: the kernel reads them)'
 
 
 CAMERA_REASON = ('not ported before a boot: 20H392 hook table (11 fixed addresses), initWithDeviceCreateFunction: is gone in 23F84 (initWithDefaultDeviceCreateFunction:cmioExtensionDeviceCreateFunction:cmioDiscoverySession:), '
