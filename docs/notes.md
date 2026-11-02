@@ -5215,3 +5215,17 @@ Full text: `docs/laurel_sprout/ios26-gpu-lag.md`.
 - [V] `late` = gap over 20 ms, no missed deadline. A SWEET FPS line needs 10 s with no pause, so the real UI had no line: patch 2917 prints a motion when it ends.
 - [V] `vsync_callback` reads a2 + a3 as the next refresh; we sent a3 = tick counter. post/9008 sends the period; kill switch `sweetfb_period=0`. Not booted. The 19.2 / 24 MHz idea is wrong: tick and INTF1 are right on the host clock.
 - Do not chase 24 fps again: first run `frame-pace.py LOG`. Details: `docs/laurel_sprout/gpu.md` "The 24 fps windows".
+
+## 2026-11-03: Mi A3 iOS 26: what limits parallel work (branch t3/cpu-parallel-limits; host and read-only SSH, no flash)
+Full text: `docs/laurel_sprout/cpu-parallel.md`.
+- **Tool on the phone: `ksysctl`, `footprint NAME`, `vm_stat`, `ps -axo`.** The root has no `sysctl`. `footprint` answers why a daemon crosses its limit: the region CoreServices (LaunchServices store) is 3-6.6 MB.
+- `LAUREL CPU TOP`'s `ended tasks` = 53 % of all CPU at rest in boot 11: kill loops. Floors, not drops (owner).
+- **`/dev/rufsroot0` + 4 parallel `dd` is the disk bench, read only:** 1 reader 40 MB/s, 4 readers 44 MB/s at 16 KiB before 2971. Compare after it.
+- A boot-arg that the driver has but no boot passes is off: `ufswait` (topaz 0069) never ran here, so each UFS command spun a CPU.
+- UFS UTRDs are 32 bytes and a cache line 64 on a non-coherent host, in cached memory: **use even slots only**, or a clean of one descriptor overwrites what the host wrote in its neighbour. Task tag = slot.
+- Host test of a kernel piece that runs in threads: `tools/laurel-ufsq`: the real header, a fake host that reads the real descriptors. `ppnum_t` there must be 64 bits (a host VA).
+- Edge without CLPC [V code]: every thread group prefers the boot pset; `sched_edge_cpu_init_completed` sets P to E weight 64, E to P none. It is work-conserving: not a limit, and P/E sysctls are right.
+- `kern.interrupt_masked_debug_mode` is 0 on this boot: no record of who masks interrupts for long. Why CPU 5 was late: still [U].
+- Kernel build in a worktree: `cp -a --reflink=auto` of dl, deps, cache, kdk from the main checkout's `out/laurel-kernel-ios26`, then `scripts/bg.sh NAME scripts/laurel/kernel-ios26-linux.sh`: 148 s.
+- `ddr.boot_mhz=1355, ddr.vote_mhz=0`: DDR fixed below stock 1804: a limit on all compute, next to the GPU clock work; not touched.
+

@@ -52,10 +52,19 @@ KEEP_FOR_PARITY = {'com.apple.wifid', 'com.apple.wifianalyticsd', 'com.apple.aud
                    'com.apple.mediaplaybackd', 'com.apple.mediaremoted', 'com.apple.iconservices.iconservicesagent', 'com.apple.thermalmonitord', 'com.apple.locationd', 'com.apple.cfprefsd.xpc.daemon'}
 # Jetsam limits, MB: a floor only for what stays and died at its limit in boot 11. Not a page size matter: at main() a daemon has written 976-1000 KiB in 4 KiB pages against 1472-1504 KiB in 16 KiB pages
 # [V host: ios26-user-emu.sh --start-cost]. iconservicesagent: its Metal device adds 15-20 MB (jetsam_widgets.py), limit 15 when inactive: killed 3 times with its icons half made.
+# What fills a small limit [V phone, boot 11, `footprint`]: the region CoreServices (the LaunchServices store): liveactivitiesd 6624 KB of 11 MB, nehelper 3136 KB of 5334 KB; 4 KiB page tables 341-566 KB.
+# Owner 2026-11-03: no job is removed, so what stays must live. Boot 11, one log of 52 min: gamepolicyd 271 kills, deviceaccessd 278, liveactivitiesd 204, linkd 34, intents_helper 29, and ended tasks took 28-55 s
+# of CPU a minute at rest, half of all CPU then [V LAUREL CPU TOP]. Each kill also asks for a corpse and can ask for a stackshot, and a stackshot caused the panic of post/9007 [I]. Memory is there: 715 MiB free at the kills [V].
+# Floors: 24 MB for a daemon that maps the store, 16 MB for the others that crossed their limit once or twice.
 JETSAM_FLOORS = {'Daemon': {'com.apple.iconservices.iconservicesagent': {'InactiveHardMemoryLimit': 96}, 'com.apple.liveactivitiesd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
                             'com.apple.linkd': {'ActiveSoftMemoryLimit': 32, 'InactiveHardMemoryLimit': 32}, 'com.apple.watchlistd': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
-                            'com.apple.managedappdistributiond': {'InactiveHardMemoryLimit': 16}, 'com.apple.nehelper': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16}},
-                 'XPCService': {'com.apple.intents.intents-helper': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24}}}
+                            'com.apple.managedappdistributiond': {'InactiveHardMemoryLimit': 16}, 'com.apple.nehelper': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
+                            'com.apple.gamepolicyd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24}, 'com.apple.deviceaccessd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
+                            'com.apple.contextstored': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24}, 'com.apple.appplaceholdersyncd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
+                            'com.apple.tccd': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16}, 'com.apple.softposreaderd': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
+                            'com.apple.driverkitd': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16}},
+                 'XPCService': {'com.apple.intents.intents-helper': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
+                                'com.apple.WorkflowKit.BackgroundShortcutRunner': {'InactiveHardMemoryLimit': 64}}}
 
 
 class Node:
@@ -1589,6 +1598,7 @@ def perf_self_test(d):
     checks += [dm['com.apple.iconservices.iconservicesagent'] == {'InactiveHardMemoryLimit': 96, 'ActiveSoftMemoryLimit': 200, 'JetsamPriority': 140},
                dm['com.apple.linkd'] == {'ActiveSoftMemoryLimit': 64, 'InactiveHardMemoryLimit': 32}, dm['com.apple.logd'] == {'JetsamPriority': 1},
                dm['com.apple.nehelper'] == {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
+               dm['com.apple.gamepolicyd'] == {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24}, dm['com.apple.deviceaccessd'] == {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
                o['XPCService']['Override']['com.apple.intents.intents-helper'] == {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
                any(x.startswith('applied') and 'jetsam floors' in x for x in t.audit_lines)]
     jetsam_floors(t, [j])

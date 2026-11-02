@@ -184,6 +184,11 @@ def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwin
         setprop(chosen, 'dram-size', u64(DONOR['dram_all'][1]))
         # xnu-12377 asserts on this: ml_unsafe_kernel_text() (machine_routines.c:3407) [V phone 2026-11-02]. 0: no CTRR, which is true here.
         setprop(chosen, 'kernel-ctrr-to-be-enabled', u32(0))
+        # libimage4 __darwin_el0_init panics with no such node: cryptexd died in its start, 35 times in boot 11 [V docs/laurel_sprout/ios26-backboardd.md]. The N104AP ADT has both, all
+        # Unused*Property zeros [V n104ap.adt]; iBoot fills them on a real phone, and this phone has no Apple boot manifest, so empty is the truth. zeta's are empty too.
+        for child in ('manifest-properties', 'manifest-object-properties'):
+            if not any(c.name == child for c in chosen.children):
+                chosen.children.append(topaz.node(child))
     setprop(chosen, 'display-scale', u32(2))
     setprop(chosen, 'laurel-ram-banks', b''.join(u64(b, sz) for b, sz in RAM_BANKS))   # laurel 2100 self-check
     setprop(chosen, 'laurel-ram-reserved', b''.join(u64(b, sz) for b, sz in RAM_RESERVED))
@@ -326,6 +331,8 @@ def check(root, cores, boot='gold', darwinboot=False):
     if not DONOR.get('dram_all') and base + size > 1 << 32:
         print(f'mkadt: note: kernel RAM reaches above 4 GiB ({((1 << 32) - base) >> 20} MiB below): display/GPU/DMA '
               f'buffers ask for RAM below 4 GiB (laurel 2100/2101)', file=sys.stderr)
+    if DONOR.get('dram_all'):
+        find(find(root, 'chosen'), 'manifest-properties')    # libimage4 needs it; find stops the build when it is absent
     banks = getprop(find(root, 'chosen'), 'laurel-ram-banks')
     assert banks and len(banks) % 16 == 0, 'laurel-ram-banks: u64 base/size pairs'
 

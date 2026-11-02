@@ -1,0 +1,52 @@
+laurel 2970: UFS: a CPU sleeps while a command runs (it spun for each one)
+
+[V phone, boot 11, boot-args] No ufswait: su.wait is false, so ufs_scsi polls with delay(1) for the whole command: one CPU at 100 % per read, with the mutex held.
+[V dd on /dev/rufsroot0] 16 KiB: 363-400 us a read; 1 MiB: 6.9 ms. Pageins 201,434 x 4 KiB = 787 MB in 39 minutes of boot 11 [V vm_stat].
+The sleep path exists since topaz 0069 (boot-arg, never on here). On by default; spin 20 us, then 80 us sleeps. Kill switch ufswait=0.
+Line: LAUREL UFS WAIT: on|off.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -79,8 +79,8 @@
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+ #define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+-#define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
+-#define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
++#define CMD_SPIN_NS     (20ull * NSEC_PER_USEC)     /* laurel 2970: a 4 KiB read takes over 100 us: the spin only catches the fast end */
++#define CMD_SLEEP_NS    (80ull * NSEC_PER_USEC)
+ 
+ struct utrd {
+ 	uint32_t dw0, dw1, dw2, dw3;
+@@ -113,7 +113,7 @@
+ 	uint32_t secsize;                       /* logical sector size for the BSD layer */
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+-	bool wait;                              /* boot-arg ufswait=1 */
++	bool wait;                              /* laurel 2970: sleep while a command runs; kill switch ufswait=0 */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
+@@ -948,11 +948,11 @@
+ 			printf("LAUREL DUALBOOT: value of boot-arg ufsrw: %s is not the text 1: read-only\n", rw_text);
+ 		}
+ 	}
+-	uint32_t cache = 0, wait = 0;
++	uint32_t cache = 0, wait = 1;
+ 	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	su.cache = (cache == 1);
+-	su.wait = (wait == 1);
++	su.wait = (wait != 0);
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, (ppnum_t)(atop_64(1ULL << 32) - 1), 0,   /* laurel 2100: below 4 GiB */
+@@ -1019,6 +1019,7 @@
+ 	    ldb.first, ldb.blocks, ldb.blocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "writes fenced to this partition" : "read-only", laurel_dualboot_marker);
+ 	su.ready = true;
++	printf("LAUREL UFS WAIT: %s\n", su.wait ? "on: a CPU sleeps while a command runs (spin 20 us, then 80 us sleeps)" : "off: ufswait=0: a CPU spins for each command");
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);

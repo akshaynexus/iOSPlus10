@@ -1415,13 +1415,29 @@ static void watchdog_start(void)
 		setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
 		load_env(); /* before deadman_arm: NMTL_DIR/env can set NEGRONIMETAL_STRIKE_LIMIT */
 #if defined(LAUREL_BBD_METAL) || defined(NMTL_IOS26)
-		if (process_is_backboardd()) {
-			/* CoreAnimation swaps after waitUntilScheduled: Apple's display waits on the surface, ours shows it at once. So scheduled = completed here: no half-drawn frame on the panel */
-			setenv("NEGRONIMETAL_SYNC", "1", 0);
 #ifdef LAUREL_BBD_METAL
+		if (process_is_backboardd()) {
+			/* iOS 16 test option: CoreAnimation swaps after waitUntilScheduled; scheduled = completed here. */
+			setenv("NEGRONIMETAL_SYNC", "1", 0);
 			setenv("NEGRONIMETAL_WATCHDOG_EXIT", "1", 0);
-#endif
 		}
+#endif
+#ifdef NMTL_IOS26
+		if (process_is_backboardd()) {
+			/*
+			 * Owner 2026-11-03: the CPU does not wait for the GPU in a frame. The presenter does: topaz_surface_drawn (SweetFramebuffer.cpp, at each flip)
+			 * waits for the fence of the last submission that names the surface, on its own thread, up to 100 ms. Boot 11: a wait of 0 to 14 us, because the
+			 * sync in this process had waited already. With both, a frame cost CPU + GPU (9 + 30 ms [V ios26-gpu-lag.md]); now the larger of the two [I].
+			 * Kill switch: the file NMTL_DIR/sync (flame/0013): no rebuild, restart backboardd.
+			 */
+			const char *e = getenv("NEGRONIMETAL_SYNC");
+			if ((e != NULL && e[0] == '1') || access(NMTL_DIR "/sync", F_OK) == 0) {
+				nlog("LAUREL COMPOSITOR SYNC: off: a frame waits for the GPU on the CPU (%s)", e != NULL ? "NEGRONIMETAL_SYNC" : NMTL_DIR "/sync");
+			} else {
+				nlog("LAUREL COMPOSITOR SYNC: on: the CPU goes on, the presenter waits for the GPU fence");
+			}
+		}
+#endif
 #endif
 		char strike[256];
 		if (!deadman_arm(strike, sizeof(strike)))

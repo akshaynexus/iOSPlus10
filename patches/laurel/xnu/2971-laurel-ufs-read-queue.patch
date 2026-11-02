@@ -1,0 +1,611 @@
+laurel 2971: UFS: reads of the root go out in parallel; read-ahead no longer stops its caller
+
+[V phone, boot 11, dd on /dev/rufsroot0, read only] 16 KiB reads: 1 reader 40 MB/s, 4 readers 44 MB/s in all. 4 KiB: 13 MB/s, 17 MB/s in all. One slot, one mutex over command and copy.
+Details in bsd/dev/laurel_ufs_queue.h. Writes stay in slot 0 behind the fence of 2950. Host test: scripts/laurel/test-ufs-queue.sh.
+Line: LAUREL UFS QUEUE: on|off, one line a minute with the counts. Kill switch ufsqueue=0. The line also gives the link gear: 144 MB/s at 1 MiB looks like one HS-G1 lane [I].
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -108,7 +108,6 @@
+ 	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
+ 	uint64_t dma_pa;
+ 	uint8_t lun;
+-	uint8_t tag;
+ 	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
+ 	uint32_t secsize;                       /* logical sector size for the BSD layer */
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+@@ -185,7 +184,7 @@
+ 	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
+ 	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;      /* W: data out, R: data in */
+ 	ucd->cmd[2] = su.lun;
+-	ucd->cmd[3] = ++su.tag;
++	ucd->cmd[3] = 0;                        /* laurel 2971: task tag = slot; read slots use theirs */
+ 	ucd->cmd[12] = (uint8_t)(len >> 24);
+ 	ucd->cmd[13] = (uint8_t)(len >> 16);
+ 	ucd->cmd[14] = (uint8_t)(len >> 8);
+@@ -582,36 +581,32 @@
+ 	return 0;
+ }
+ 
++#include "laurel_ufs_queue.h"            /* laurel 2971 */
++
++/* laurel 2971: the transfer of a checked buffer, in the caller's thread or in a read-ahead thread. */
+ static void
+-sweet_ufs_strategy(buf_t bp)
++ufs_bp_io(buf_t bp)
+ {
+ 	int error = 0;
+ 	caddr_t vaddr = NULL;
+ 	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
+-	uint32_t count = buf_count(bp);
+-	uint64_t part_bytes = ldb_bsd_blocks() * UFS_BLOCK;     /* laurel 2950 */
+-
++	uint32_t count = buf_count(bp), resume = 0;
+ 	bool rd = buf_flags(bp) & B_READ;
+ 
+-	buf_setresid(bp, count);
+-	if (!rd && !su.writable) {
+-		error = EROFS;
+-		goto done;
+-	}
+-	if (off > part_bytes || count > part_bytes - off) {
+-		error = EINVAL;
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
+ 		goto done;
+ 	}
+-	if (count == 0) {
+-		goto done;
++	if (rd) {
++		resume = luq_read_range(off, vaddr, count, bp);
+ 	}
+-	if (buf_map(bp, &vaddr)) {
+-		error = EIO;
++	if (resume == count) {
++		buf_unmap(bp);
+ 		goto done;
+ 	}
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+-	for (uint32_t done = 0; done < count;) {
++	for (uint32_t done = resume; done < count;) {
+ 		uint64_t pos = off + done;
+ 		uint64_t lba = pos / UFS_BLOCK;
+ 		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
+@@ -649,6 +644,41 @@
+ 	buf_biodone(bp);
+ }
+ 
++static void
++sweet_ufs_strategy(buf_t bp)
++{
++	int error = 0;
++	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = ldb_bsd_blocks() * UFS_BLOCK;     /* laurel 2950 */
++
++	bool rd = buf_flags(bp) & B_READ;
++
++	buf_setresid(bp, count);
++	if (!rd && !su.writable) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (rd && (buf_flags(bp) & B_ASYNC) && luq_async_put(bp)) {
++		return;
++	}
++	ufs_bp_io(bp);
++	return;
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
+ static int
+ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+     __unused struct proc *p, int is_char)
+@@ -1019,6 +1049,7 @@
+ 	    ldb.first, ldb.blocks, ldb.blocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "writes fenced to this partition" : "read-only", laurel_dualboot_marker);
+ 	su.ready = true;
++	luq_start();                            /* laurel 2971 */
+ 	printf("LAUREL UFS WAIT: %s\n", su.wait ? "on: a CPU sleeps while a command runs (spin 20 us, then 80 us sleeps)" : "off: ufswait=0: a CPU spins for each command");
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+diff --git a/bsd/dev/laurel_ufs_queue.h b/bsd/dev/laurel_ufs_queue.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/laurel_ufs_queue.h
+@@ -0,0 +1,481 @@
++/*
++ * laurel 2971: reads of the root go to the UFS device in parallel (a piece of sweet_ufs.c; the host test
++ * scripts/laurel/test-ufs-queue.sh runs this code against a fake host with threads).
++ *
++ * Before [V phone, boot 11, dd on /dev/rufsroot0]: one slot, one mutex held over the command and the copy, the caller's thread does
++ * all of it: 16 KiB reads: 40 MB/s with 1 reader, 44 MB/s in all with 4. Every program that waits for a page waits for all others.
++ *
++ * Now: slot 0 stays what it was (writes, cache sync, other LUNs, GPT watch, reads this queue gave up on), under its mutex. Reads of the
++ * root take one of up to 7 slots of their own, with their own descriptor and bounce buffer. The mutex is not held. B_ASYNC reads
++ * (read-ahead, async page-in) go to as many threads as slots, so the caller goes on, as with any real disk driver.
++ *
++ * Even hardware slots only: a request descriptor has 32 bytes and a cache line 64, and this host is not cache coherent. A clean of one
++ * descriptor must not touch another that the host writes. So: 2, 4, ... 14; the odd neighbours are never rung. Slot 0's line holds
++ * slot 1, also never rung. Task tag = hardware slot (slot 0: tag 0), so tags never overlap.
++ *
++ * Writes never come here: ufs_write_blocks and its fence stay the only way out.
++ *
++ * Self-check at start: the same blocks through slot 0 and through 2 or 3 read slots rung by one doorbell write must be equal. A later
++ * error or timeout turns the queue off; the read goes on through slot 0. Kill switch ufsqueue=0.
++ */
++#ifndef LAUREL_UFS_QUEUE_H
++#define LAUREL_UFS_QUEUE_H
++
++#define LUQ_READ_SLOTS  7u
++#define LUQ_BOUNCE      (512u << 10)
++#define LUQ_UCD_STEP    2048u                   /* each descriptor table in its own cache lines */
++#define LUQ_BOUNCE_OFF  (16u << 10)
++#define LUQ_DMA_SIZE    (LUQ_BOUNCE_OFF + LUQ_READ_SLOTS * LUQ_BOUNCE)
++#define LUQ_ASYNC_MAX   128u
++#define LUQ_CHECK_BLOCKS 3u
++#define LUQ_LINE_NS     (60ull * NSEC_PER_SEC)
++
++#define REG_UICCMD      0x90
++#define REG_UICARG1     0x94
++#define REG_UICARG2     0x98
++#define REG_UICARG3     0x9c
++#define HCS_UCRDY       (1u << 3)
++#define IS_UCCS         (1u << 10)
++
++_Static_assert(sizeof(struct ucd) <= LUQ_UCD_STEP, "laurel 2971: a descriptor table fits its step");
++_Static_assert(LUQ_READ_SLOTS * LUQ_UCD_STEP <= LUQ_BOUNCE_OFF, "laurel 2971: the tables end before the bounce buffers");
++_Static_assert(LUQ_BOUNCE <= PRDT_MAX * PRDT_CHUNK, "laurel 2971: a bounce buffer fits the PRDT");
++
++static struct {
++	volatile bool on;
++	unsigned slots;
++	uint32_t free_mask;
++	vm_offset_t dma;
++	uint64_t dma_pa;
++	uint64_t cmd_timeout;
++	uint64_t spin, sleep;
++	buf_t q[LUQ_ASYNC_MAX];
++	unsigned q_head, q_n;
++	/* since the last line, under luq_lock */
++	uint64_t reads, bytes, waited, async, busy, io_abs, last_line;
++	unsigned in_flight, peak;
++} luq;
++static LCK_MTX_DECLARE(luq_lock, &sweet_ufs_grp);
++
++static void ufs_bp_io(buf_t bp);
++
++static inline unsigned
++luq_hw(unsigned i)
++{
++	return (i + 1) * 2;
++}
++
++static inline struct utrd *
++luq_utrd(unsigned i)
++{
++	return (struct utrd *)(su.dma + DMA_UTRL) + luq_hw(i);
++}
++
++static inline struct ucd *
++luq_ucd(unsigned i)
++{
++	return (struct ucd *)(luq.dma + i * LUQ_UCD_STEP);
++}
++
++static inline char *
++luq_bounce(unsigned i)
++{
++	return (char *)(luq.dma + LUQ_BOUNCE_OFF + i * LUQ_BOUNCE);
++}
++
++static void
++luq_off(const char *why)
++{
++	lck_mtx_lock(&luq_lock);
++	bool was = luq.on;
++	luq.on = false;
++	lck_mtx_unlock(&luq_lock);
++	thread_wakeup((event_t)&luq.free_mask); /* a slot that timed out never comes back: the readers that wait for one go to slot 0 */
++	if (was) {
++		printf("LAUREL UFS QUEUE: off: %s; reads go through the one slot\n", why);
++	}
++}
++
++/* READ(10) of blocks at lba into slot i's bounce buffer: all but the doorbell. */
++static void
++luq_prepare(unsigned i, uint64_t lba, uint32_t blocks)
++{
++	unsigned hw = luq_hw(i);
++	struct utrd *utrd = luq_utrd(i);
++	struct ucd *ucd = luq_ucd(i);
++	uint64_t ucd_pa = luq.dma_pa + i * LUQ_UCD_STEP, bounce_pa = luq.dma_pa + LUQ_BOUNCE_OFF + i * LUQ_BOUNCE;
++	uint32_t len = blocks * UFS_BLOCK, n = 0;
++
++	bzero(utrd, sizeof(*utrd));
++	bzero(ucd, sizeof(*ucd));
++	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
++	ucd->cmd[1] = 0x40;                     /* R: data in */
++	ucd->cmd[2] = 0;                        /* LUN 0: the root (self-check of 2950) */
++	ucd->cmd[3] = (uint8_t)hw;              /* task tag */
++	ucd->cmd[12] = (uint8_t)(len >> 24);
++	ucd->cmd[13] = (uint8_t)(len >> 16);
++	ucd->cmd[14] = (uint8_t)(len >> 8);
++	ucd->cmd[15] = (uint8_t)len;
++	ucd->cmd[16] = 0x28;                    /* READ(10) */
++	ucd->cmd[18] = (uint8_t)(lba >> 24);
++	ucd->cmd[19] = (uint8_t)(lba >> 16);
++	ucd->cmd[20] = (uint8_t)(lba >> 8);
++	ucd->cmd[21] = (uint8_t)lba;
++	ucd->cmd[23] = (uint8_t)(blocks >> 8);
++	ucd->cmd[24] = (uint8_t)blocks;
++
++	utrd->dw0 = (1u << 28) | (2u << 25) | (1u << 24);       /* SCSI, device to memory, interrupt bit as slot 0 */
++	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
++	utrd->ucdba = (uint32_t)ucd_pa;
++	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
++	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	for (uint32_t done = 0; done < len; done += PRDT_CHUNK, n++) {
++		uint32_t chunk = MIN(PRDT_CHUNK, len - done);
++		ucd->prdt[n].addr_lo = (uint32_t)(bounce_pa + done);
++		ucd->prdt[n].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
++		ucd->prdt[n].dbc = chunk - 1;
++	}
++	utrd->prdt = (1024u / 4) << 16 | n;
++
++	flush_dcache64((addr64_t)(su.dma_pa + DMA_UTRL + hw * sizeof(*utrd)), sizeof(*utrd), TRUE);
++	flush_dcache64((addr64_t)ucd_pa, sizeof(*ucd), TRUE);
++	flush_dcache64((addr64_t)bounce_pa, len, TRUE);
++}
++
++/* 0, or ETIMEDOUT (the slot stays out of use). sleepable: a short spin, then timed sleeps: the CPU goes to other work. */
++static int
++luq_wait(unsigned i, bool sleepable)
++{
++	uint32_t bit = 1u << luq_hw(i);
++	uint64_t now = mach_absolute_time(), deadline = now + luq.cmd_timeout, spin_until = now + luq.spin;
++
++	while (ufs_rd(REG_UTRLDBR) & bit) {
++		now = mach_absolute_time();
++		if (now > deadline) {
++			ufs_wr(REG_UTRLCLR, ~bit);
++			return ETIMEDOUT;
++		}
++		if (sleepable && now >= spin_until) {
++			if (assert_wait_deadline_with_leeway((event_t)luq_ucd(i), THREAD_UNINT, TIMEOUT_URGENCY_SYS_CRITICAL,
++			    now + luq.sleep, 0) == THREAD_WAITING) {
++				thread_block(THREAD_CONTINUE_NULL);
++			}
++		} else {
++			delay(1);
++		}
++	}
++	__builtin_arm_dsb(0xf);
++	return 0;
++}
++
++/* 0, EBUSY (the device's queue is full or it is busy: this read goes through slot 0) or EIO */
++static int
++luq_finish(unsigned i, uint32_t len)
++{
++	struct utrd *utrd = luq_utrd(i);
++	struct ucd *ucd = luq_ucd(i);
++
++	flush_dcache64((addr64_t)(su.dma_pa + DMA_UTRL + luq_hw(i) * sizeof(*utrd)), sizeof(*utrd), TRUE);
++	flush_dcache64((addr64_t)(luq.dma_pa + i * LUQ_UCD_STEP + offsetof(struct ucd, resp)), sizeof(ucd->resp), TRUE);
++	flush_dcache64((addr64_t)(luq.dma_pa + LUQ_BOUNCE_OFF + i * LUQ_BOUNCE), len, TRUE);
++	uint32_t ocs = utrd->dw2 & 0xff;
++	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6]) {
++		return EIO;
++	}
++	if (ucd->resp[7] == 0x08 || ucd->resp[7] == 0x28) {
++		return EBUSY;                   /* BUSY, TASK SET FULL */
++	}
++	return ucd->resp[7] ? EIO : 0;
++}
++
++#define LUQ_NO_SLOT (~0u)
++
++/* LUQ_NO_SLOT: the queue went off: the caller reads through slot 0. */
++static unsigned
++luq_take(void)
++{
++	bool waited = false;
++
++	lck_mtx_lock(&luq_lock);
++	while (luq.on && luq.free_mask == 0) {
++		waited = true;
++		assert_wait((event_t)&luq.free_mask, THREAD_UNINT);
++		lck_mtx_unlock(&luq_lock);
++		thread_block(THREAD_CONTINUE_NULL);
++		lck_mtx_lock(&luq_lock);
++	}
++	if (!luq.on) {
++		lck_mtx_unlock(&luq_lock);
++		return LUQ_NO_SLOT;
++	}
++	unsigned i = (unsigned)__builtin_ctz(luq.free_mask);
++	luq.free_mask &= ~(1u << i);
++	luq.waited += waited;
++	if (++luq.in_flight > luq.peak) {
++		luq.peak = luq.in_flight;
++	}
++	lck_mtx_unlock(&luq_lock);
++	return i;
++}
++
++static void
++luq_give(unsigned i, int error, uint64_t began, uint32_t bytes)
++{
++	uint64_t now = mach_absolute_time(), ns = 0;
++	bool line = false;
++	uint64_t reads = 0, mb = 0, us = 0, waited = 0, async = 0, busy = 0;
++	unsigned peak = 0;
++
++	lck_mtx_lock(&luq_lock);
++	luq.in_flight--;
++	if (error != ETIMEDOUT) {
++		luq.free_mask |= 1u << i;       /* the host may still own a slot that timed out */
++	}
++	luq.busy += error == EBUSY;
++	if (error == 0) {
++		luq.reads++;
++		luq.bytes += bytes;
++		luq.io_abs += now - began;
++	}
++	absolutetime_to_nanoseconds(now - luq.last_line, &ns);
++	if (ns >= LUQ_LINE_NS && luq.reads != 0) {
++		line = true;
++		reads = luq.reads;
++		mb = luq.bytes >> 20;
++		absolutetime_to_nanoseconds(luq.io_abs / luq.reads, &us);
++		us /= 1000;
++		waited = luq.waited;
++		async = luq.async;
++		busy = luq.busy;
++		peak = luq.peak;
++		luq.reads = luq.bytes = luq.io_abs = luq.waited = luq.async = luq.busy = 0;
++		luq.peak = luq.in_flight;
++		luq.last_line = now;
++	}
++	lck_mtx_unlock(&luq_lock);
++	thread_wakeup_one((event_t)&luq.free_mask);
++	if (line) {
++		printf("LAUREL UFS QUEUE: on: last minute: %llu reads, %llu MB, %llu us a read, at most %u at once, %llu waited for a slot, %llu read-ahead, %llu device busy\n",
++		    reads, mb, us, peak, waited, async, busy);
++	}
++}
++
++/* Reads [off, off + count) of the partition into va. Returns the bytes done; the caller does the rest through slot 0. */
++static uint32_t
++luq_read_range(uint64_t off, char *va, uint32_t count, buf_t bp)
++{
++	uint32_t done = 0;
++	bool sleepable = ml_get_interrupts_enabled() && !ml_at_interrupt_context() && get_preemption_level() == 0;
++
++	while (luq.on && done < count) {
++		uint64_t pos = off + done;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want = MIN(count - done, LUQ_BOUNCE - skip);
++		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++		unsigned i = luq_take();
++		if (i == LUQ_NO_SLOT) {
++			break;
++		}
++		uint64_t began = mach_absolute_time();
++
++		luq_prepare(i, su.first_block + pos / UFS_BLOCK, blocks);
++		__builtin_arm_dsb(0xf);
++		ufs_wr(REG_UTRLDBR, 1u << luq_hw(i));
++		int error = luq_wait(i, sleepable);
++		if (!error) {
++			error = luq_finish(i, blocks * UFS_BLOCK);
++		}
++		if (!error) {
++			memcpy(va + done, luq_bounce(i) + skip, want);
++		}
++		luq_give(i, error, began, want);
++		if (error) {
++			if (error != EBUSY) {
++				luq_off(error == ETIMEDOUT ? "a read timed out" : "a read failed");
++			}
++			break;
++		}
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	return done;
++}
++
++/* A read-ahead: to a thread, and the caller goes on. false: it does the read itself. */
++static bool
++luq_async_put(buf_t bp)
++{
++	bool put = false;
++
++	lck_mtx_lock(&luq_lock);
++	if (luq.on && luq.q_n < LUQ_ASYNC_MAX) {
++		luq.q[(luq.q_head + luq.q_n) % LUQ_ASYNC_MAX] = bp;
++		luq.q_n++;
++		luq.async++;
++		put = true;
++	}
++	lck_mtx_unlock(&luq_lock);
++	if (put) {
++		thread_wakeup_one((event_t)&luq.q_n);
++	}
++	return put;
++}
++
++static void
++luq_worker(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		lck_mtx_lock(&luq_lock);
++		while (luq.q_n == 0) {
++			assert_wait((event_t)&luq.q_n, THREAD_UNINT);
++			lck_mtx_unlock(&luq_lock);
++			thread_block(THREAD_CONTINUE_NULL);
++			lck_mtx_lock(&luq_lock);
++		}
++		buf_t bp = luq.q[luq.q_head];
++		luq.q_head = (luq.q_head + 1) % LUQ_ASYNC_MAX;
++		luq.q_n--;
++		lck_mtx_unlock(&luq_lock);
++		ufs_bp_io(bp);
++	}
++}
++
++/* UFS link state for the line: read-only DME_GET. With the mutex held, no command in flight. */
++static int
++luq_dme_get(uint32_t attr, uint32_t *value)
++{
++	if (!(ufs_rd(REG_HCS) & HCS_UCRDY)) {
++		return -1;
++	}
++	ufs_wr(REG_IS, IS_UCCS);
++	ufs_wr(REG_UICARG1, attr << 16);
++	ufs_wr(REG_UICARG2, 0);
++	ufs_wr(REG_UICARG3, 0);
++	ufs_wr(REG_UICCMD, 0x01);               /* DME_GET */
++	for (unsigned i = 0; !(ufs_rd(REG_IS) & IS_UCCS); i++) {
++		if (i >= 1000) {
++			return -1;
++		}
++		delay(1);
++	}
++	ufs_wr(REG_IS, IS_UCCS);
++	if (ufs_rd(REG_UICARG2) & 0xff) {
++		return -1;
++	}
++	*value = ufs_rd(REG_UICARG3);
++	return 0;
++}
++
++/* The self-check. NULL: passed. */
++static const char *
++luq_self_check(const uint64_t *lba, unsigned n, const char *reference)
++{
++	uint32_t bits = 0;
++	const char *why = NULL;
++
++	for (unsigned i = 0; i < n; i++) {
++		luq_prepare(i, lba[i], 1);
++		bits |= 1u << luq_hw(i);
++	}
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_UTRLDBR, bits);              /* all at once, so the host and the device really hold them together */
++	for (unsigned i = 0; i < n; i++) {
++		if (luq_wait(i, false) != 0) {
++			why = "a read of the self-check timed out";
++			for (unsigned j = i + 1; j < n; j++) {
++				ufs_wr(REG_UTRLCLR, ~(1u << luq_hw(j)));
++			}
++			return why;
++		}
++	}
++	for (unsigned i = 0; i < n; i++) {
++		if (luq_finish(i, UFS_BLOCK) != 0) {
++			why = "a read of the self-check failed";
++		} else if (memcmp(luq_bounce(i), reference + i * UFS_BLOCK, UFS_BLOCK) != 0) {
++			why = "a read slot gave other data than slot 0";
++		}
++	}
++	return why;
++}
++
++static void
++luq_start(void)
++{
++	uint32_t on = 1, cap = ufs_rd(REG_CAP);
++	unsigned nutrs = (cap & 0x1f) + 1;
++	unsigned slots = MIN(LUQ_READ_SLOTS, (nutrs - 1) / 2);
++	const char *why = NULL;
++	char *ref = NULL;
++	uint64_t lba[LUQ_CHECK_BLOCKS];
++	uint32_t gear = 0, lanes = 0, mode = 0;
++	bool link = false;
++
++	PE_parse_boot_argn("ufsqueue", &on, sizeof(on));
++	if (on == 0) {
++		printf("LAUREL UFS QUEUE: off: ufsqueue=0\n");
++		return;
++	}
++	if (slots < 2) {
++		printf("LAUREL UFS QUEUE: off: the host has %u slots\n", nutrs);
++		return;
++	}
++	if (kmem_alloc_contig(kernel_map, &luq.dma, LUQ_DMA_SIZE, PAGE_MASK, (ppnum_t)(atop_64(1ULL << 32) - 1), 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("LAUREL UFS QUEUE: off: no contiguous DMA memory\n");
++		return;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)luq.dma);
++	if (pn == 0) {
++		printf("LAUREL UFS QUEUE: off: no physical address for the DMA memory\n");
++		return;
++	}
++	ref = kalloc_data(LUQ_CHECK_BLOCKS * UFS_BLOCK, Z_WAITOK);
++	if (ref == NULL) {
++		printf("LAUREL UFS QUEUE: off: no memory for the self-check\n");
++		return;
++	}
++	luq.dma_pa = ptoa_64(pn);
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &luq.cmd_timeout);
++	nanoseconds_to_absolutetime(CMD_SPIN_NS, &luq.spin);
++	nanoseconds_to_absolutetime(CMD_SLEEP_NS, &luq.sleep);
++	luq.slots = slots;
++	lba[0] = su.first_block;
++	lba[1] = su.first_block + su.nblocks / 2;
++	lba[2] = 1;                             /* the GPT header: never all zero */
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	link = luq_dme_get(0x1583, &gear) == 0 && luq_dme_get(0x1580, &lanes) == 0 && luq_dme_get(0x1571, &mode) == 0;  /* PA_RXGEAR, PA_ACTIVERXDATALANES, PA_PWRMODE */
++	for (unsigned i = 0; i < LUQ_CHECK_BLOCKS && why == NULL; i++) {
++		if (ufs_read_blocks(lba[i], 1) != 0) {
++			why = "slot 0 failed for the self-check";
++		} else {
++			memcpy(ref + i * UFS_BLOCK, (const char *)(su.dma + DMA_BOUNCE), UFS_BLOCK);
++		}
++	}
++	if (why == NULL) {
++		why = luq_self_check(lba, MIN(slots, LUQ_CHECK_BLOCKS), ref);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	kfree_data(ref, LUQ_CHECK_BLOCKS * UFS_BLOCK);
++	if (why != NULL) {
++		printf("LAUREL UFS QUEUE: off: %s; reads go through the one slot\n", why);
++		return;
++	}
++	luq.free_mask = (1u << slots) - 1;
++	luq.last_line = mach_absolute_time();
++	for (unsigned i = 0; i < slots; i++) {
++		thread_t t;
++		if (kernel_thread_start(luq_worker, NULL, &t) == KERN_SUCCESS) {
++			thread_deallocate(t);
++		}
++	}
++	luq.on = true;
++	if (link) {
++		printf("LAUREL UFS QUEUE: on: %u read slots of %u on the host, %u KiB each, %u read-ahead threads; link: gear %u, %u lanes, mode 0x%x\n",
++		    slots, nutrs, LUQ_BOUNCE >> 10, slots, gear, lanes, mode);
++	} else {
++		printf("LAUREL UFS QUEUE: on: %u read slots of %u on the host, %u KiB each, %u read-ahead threads; link state not readable\n",
++		    slots, nutrs, LUQ_BOUNCE >> 10, slots);
++	}
++}
++#endif /* LAUREL_UFS_QUEUE_H */

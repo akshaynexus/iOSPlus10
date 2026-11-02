@@ -1,0 +1,152 @@
+laurel 2972: CPU governor: a core full for one tick goes to its cap; touch holds both caps, GPU work holds Gold's
+
+Owner 2026-11-03: use all CPU cores fully. [V boot 11] Under load both clusters read the top row for all 60 s, so the cap never held a loaded core; the loss is at the edges.
+From idle a load waited 120 ms for the top row (80 ms below it, at 300-650 MHz of 2016) [V gov-test before this patch]. While the UI moved Gold spent 14 s a minute at 1401-1804 MHz [V CPUFREQ lines 00:55-00:57], and touches held Silver at 1305 MHz.
+Line: LAUREL CPUFREQ: on: OSM governor ... Host test: scripts/laurel/gov-test.sh. Cost: more power; the thermal caps of 2303 still win.
+
+diff --git a/bsd/dev/laurel_gov_core.h b/bsd/dev/laurel_gov_core.h
+--- a/bsd/dev/laurel_gov_core.h
++++ b/bsd/dev/laurel_gov_core.h
+@@ -2,27 +2,31 @@
+  * laurel 2890: the OSM governor's one decision, without kernel types, so that the host test
+  * (scripts/laurel/gov-test.sh) runs exactly this code. One step for one cluster.
+  *   busy  % of the busiest core over the last LGOV_WINDOW ticks (LGOV_TICK_MS each)
++ *   tick  % of the busiest core over the last tick alone (laurel 2972)
+  *   row   the row the cluster runs now; cap the thermal cap; floor the governor's lowest row (the cap wins)
+  *   hold  a row wanted by the UI right now (touch, GPU work); 0 = none
+  *   low   ticks in a row below LGOV_LO (kept by the caller)
+  * Before 2890 [V 2303]: 100 ms tick, 300 ms window, > 90 %: cap, > 70 %: +1 row. A load that starts on an idle core reads
+  * 33 %, 66 %, 100 %: the top row came 300 ms after the load, the first frames of a touch ran at 300 MHz.
++ * laurel 2972 (owner 2026-11-03: use all CPU cores fully): a core that was full for one tick goes to the cap at once: 40 ms from idle, not
++ * 120. Over those 80 ms the core runs at 300 to 650 MHz of 2016: 50 to 70 ms of work lost per burst [I].
+  */
+ #ifndef LAUREL_GOV_CORE_H
+ #define LAUREL_GOV_CORE_H
+ #define LGOV_TICK_MS    40u
+ #define LGOV_WINDOW     3u
+ #define LGOV_JUMP       85u     /* a core full for 120 ms: the cap at once */
++#define LGOV_JUMP_TICK  90u     /* laurel 2972: a core full for one tick: the cap at once */
+ #define LGOV_HI         60u     /* +2 rows */
+ #define LGOV_LO         30u
+ #define LGOV_DOWN_TICKS 8u      /* 320 ms below LGOV_LO: -1 row (as before: about 300 ms) */
+ 
+ static inline unsigned
+-lgov_next(unsigned busy, unsigned row, unsigned floor, unsigned cap, unsigned hold, unsigned *low)
++lgov_next(unsigned busy, unsigned tick, unsigned row, unsigned floor, unsigned cap, unsigned hold, unsigned *low)
+ {
+ 	unsigned want = row;
+ 
+-	if (busy > LGOV_JUMP) {
++	if (busy > LGOV_JUMP || tick >= LGOV_JUMP_TICK) {
+ 		want = cap;
+ 		*low = 0;
+ 	} else if (busy > LGOV_HI) {
+diff --git a/bsd/dev/laurel_gov_loop.h b/bsd/dev/laurel_gov_loop.h
+--- a/bsd/dev/laurel_gov_loop.h
++++ b/bsd/dev/laurel_gov_loop.h
+@@ -4,6 +4,7 @@
+ {
+ 	const ml_topology_info_t *topo = ml_get_topology_info();
+ 	uint64_t now = mach_absolute_time(), wall = sampled ? now - wall_last : 0, ww = 0;
++	static uint32_t tick_seen;      /* laurel 2972: the first sample has no tick */
+ 
+ 	wall_last = now;
+ 	wall_d[win_at] = wall;
+@@ -11,6 +12,7 @@
+ 		ww += wall_d[w];
+ 	}
+ 	cl_busy[CL_SILVER] = cl_busy[CL_GOLD] = 0;
++	cl_tick[CL_SILVER] = cl_tick[CL_GOLD] = 0;
+ 	for (unsigned i = 0; i < topo->num_cpus && i < GOV_MAX_CPUS; i++) {
+ 		unsigned c = ((topo->cpus[i].phys_id & 0xff00u) == 0x100u) ? CL_GOLD : CL_SILVER;
+ 		processor_t p = cpu_to_processor((int)topo->cpus[i].cpu_id);
+@@ -30,8 +32,13 @@
+ 		if (pct > cl_busy[c]) {
+ 			cl_busy[c] = pct;
+ 		}
++		uint32_t tick = !tick_seen || wall == 0 || idle >= wall ? 0 : (uint32_t)((wall - idle) * 100 / wall);
++		if (tick > cl_tick[c]) {
++			cl_tick[c] = tick;
++		}
+ 	}
+ 	win_at = (win_at + 1) % GOV_WINDOW;
++	tick_seen = sampled;
+ 	sampled = true;
+ }
+ 
+@@ -55,11 +62,11 @@
+ 	bool gpu = within_ms(laurel_gpu_last_work, now, GPU_HOLD_MS);
+ 
+ 	for (unsigned c = 0; c < CL_N; c++) {
+-		/* a touch: Gold at its cap and Silver at ABL's row until the first frames are out; GPU work: Gold at UI_GOLD_KHZ */
+-		uint32_t hold = touch ? (c == CL_GOLD ? cl_cap[c] : ui_row[c]) : (gpu && c == CL_GOLD ? ui_row[c] : 0);
++		/* laurel 2972: a touch: both clusters at their caps; GPU work: Gold at its cap. Before: Gold 1401 MHz with GPU work, Silver 1305 MHz with a touch */
++		uint32_t hold = touch ? cl_cap[c] : (gpu && c == CL_GOLD ? cl_cap[c] : 0);
+ 		unsigned low = cl_low[c];
+ 
+-		wr_row(c, lgov_next(cl_busy[c], cl_row[c], lo_row(c), cl_cap[c], hold, &low));
++		wr_row(c, lgov_next(cl_busy[c], cl_tick[c], cl_row[c], lo_row(c), cl_cap[c], hold, &low));
+ 		cl_low[c] = low;
+ 	}
+ }
+diff --git a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
+--- a/bsd/dev/laurel_thermal.c
++++ b/bsd/dev/laurel_thermal.c
+@@ -53,7 +53,6 @@
+ #define GOV_TICK_MS     LGOV_TICK_MS
+ #define GOV_WINDOW      LGOV_WINDOW
+ #define GOV_MAX_CPUS    8u
+-#define UI_GOLD_KHZ     1400000u        /* laurel 2890: Gold floor while the GPU has work [I: a frame's CPU part in time] */
+ #define TOUCH_HOLD_MS   500u
+ #define GPU_HOLD_MS     100u
+ #define TH_HOT_DC       950
+@@ -67,7 +66,7 @@
+ static vm_offset_t cl_base[CL_N];
+ static uint32_t cl_khz[CL_N][OSM_ROWS];
+ static uint32_t cl_rows[CL_N], cl_floor[CL_N], cl_row[CL_N], cl_cap[CL_N];
+-static uint32_t cl_busy[CL_N], cl_low[CL_N];
++static uint32_t cl_busy[CL_N], cl_tick[CL_N], cl_low[CL_N];
+ static vm_offset_t ts_base;
+ static bool th_on;
+ static int th_cpu = -1000, th_gpu = -1000;
+@@ -81,7 +80,6 @@
+ static uint64_t cpu_idle_d[GOV_MAX_CPUS][GOV_WINDOW], wall_d[GOV_WINDOW], wall_last;
+ static uint32_t win_at;
+ static bool sampled;
+-static uint32_t ui_row[CL_N];                   /* the row wanted while the UI moves */
+ static uint64_t cl_row_ms[CL_N][OSM_ROWS];      /* time in each row since the last line */
+ static uint64_t busy_total_abs;                 /* all cores, for laurel 2891 */
+ uint64_t laurel_gpu_last_work;                  /* mach time of the last GPU submission (TopazAdreno.cpp) */
+@@ -141,20 +139,10 @@
+ 	uint32_t abl = *(volatile uint32_t *)(cl_base[c] + OSM_PERF_STATE);
+ 	/*
+ 	 * laurel 2890: the floor is row 0 on both clusters. [V boot 19:34] Gold runs row 0 (300 MHz) for minutes; Silver stayed at
+-	 * ABL's row (1305 MHz) with 0 % busy for the whole boot. The ABL row is now the row Silver holds while the UI moves.
++	 * ABL's row (1305 MHz) with 0 % busy for the whole boot.
+ 	 */
+ 	cl_row[c] = abl < n ? abl : 0;
+ 	cl_floor[c] = 0;
+-	ui_row[c] = cl_row[c];
+-	if (c == CL_GOLD) {
+-		ui_row[c] = 0;
+-		for (uint32_t i = 0; i < n; i++) {
+-			if (cl_khz[c][i] >= UI_GOLD_KHZ) {
+-				ui_row[c] = i;
+-				break;
+-			}
+-		}
+-	}
+ 	cl_cap[c] = n - 1;
+ 	return 0;
+ }
+@@ -295,8 +283,8 @@
+ 	}
+ 	thread_deallocate(thread);
+ 	started = 1;
+-	printf("LAUREL CPUFREQ: on: OSM governor %u ms tick, UI hold gold %u MHz, silver %u MHz; silver rows %u..%u (%u..%u MHz), gold rows %u..%u (%u..%u MHz), %u cpus\n",
+-	    GOV_TICK_MS, cl_khz[CL_GOLD][ui_row[CL_GOLD]] / 1000, cl_khz[CL_SILVER][ui_row[CL_SILVER]] / 1000,
++	printf("LAUREL CPUFREQ: on: OSM governor %u ms tick, a core full for one tick goes to the cap, touch holds both caps, GPU work holds gold's; silver rows %u..%u (%u..%u MHz), gold rows %u..%u (%u..%u MHz), %u cpus\n",
++	    GOV_TICK_MS,
+ 	    cl_floor[CL_SILVER], cl_rows[CL_SILVER] - 1, cl_khz[CL_SILVER][cl_floor[CL_SILVER]] / 1000,
+ 	    cl_khz[CL_SILVER][cl_rows[CL_SILVER] - 1] / 1000, cl_floor[CL_GOLD], cl_rows[CL_GOLD] - 1,
+ 	    cl_khz[CL_GOLD][cl_floor[CL_GOLD]] / 1000, cl_khz[CL_GOLD][cl_rows[CL_GOLD] - 1] / 1000, topo->num_cpus);

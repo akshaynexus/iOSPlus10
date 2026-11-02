@@ -39,40 +39,48 @@ main(void)
 	while (row < cap && ms < 2000) {
 		ms += LGOV_TICK_MS;
 		full = full < LGOV_WINDOW ? full + 1 : LGOV_WINDOW;
-		row = lgov_next(full * 100 / LGOV_WINDOW, row, 0, cap, 0, &low);
+		row = lgov_next(full * 100 / LGOV_WINDOW, 100, row, 0, cap, 0, &low);
 		if (row && !first) { first = ms; }
 	}
 	printf("gov-test (host only): 100 %% load from idle, new: first raise %u ms, top row %u ms\n", first, ms);
-	assert(ms <= 3 * LGOV_TICK_MS && first <= 2 * LGOV_TICK_MS);
+	assert(ms == LGOV_TICK_MS && first == LGOV_TICK_MS);
+
+	/* one tick not full, no jump: a light load does not reach the cap */
+	low = 0;
+	assert(lgov_next(10, 50, 1, 0, cap, 0, &low) == 1);
+	assert(lgov_next(10, LGOV_JUMP_TICK, 1, 0, cap, 0, &low) == cap);
+	assert(lgov_next(10, LGOV_JUMP_TICK - 1, 1, 0, cap, 0, &low) == 1);
+	/* the thermal cap wins over the jump */
+	assert(lgov_next(10, 100, 1, 0, 4, 0, &low) == 4);
 
 	/* a touch: the hold row at the next tick, before any load shows */
 	low = 0;
-	row = lgov_next(0, 0, 0, cap, cap, &low);
+	row = lgov_next(0, 0, 0, 0, cap, cap, &low);
 	assert(row == cap);
 	printf("gov-test (host only): touch hold: top row at the next tick (at most %u ms, or at once by the wakeup)\n", LGOV_TICK_MS);
 
 	/* the cap wins over everything: floor and hold above a low cap */
 	low = 0;
-	assert(lgov_next(100, 0, 0, 2, 0, &low) == 2);
-	assert(lgov_next(0, 5, 0, 2, 7, &low) == 2);
-	assert(lgov_next(0, 5, 3, 2, 0, &low) == 2);
+	assert(lgov_next(100, 100, 0, 0, 2, 0, &low) == 2);
+	assert(lgov_next(0, 0, 5, 0, 2, 7, &low) == 2);
+	assert(lgov_next(0, 0, 5, 3, 2, 0, &low) == 2);
 
 	/* down: one row after LGOV_DOWN_TICKS below LGOV_LO, not sooner; a busy tick restarts the count */
 	low = 0;
 	row = 5;
-	for (unsigned i = 0; i + 1 < LGOV_DOWN_TICKS; i++) { row = lgov_next(0, row, 0, cap, 0, &low); assert(row == 5); }
-	row = lgov_next(0, row, 0, cap, 0, &low);
+	for (unsigned i = 0; i + 1 < LGOV_DOWN_TICKS; i++) { row = lgov_next(0, 0, row, 0, cap, 0, &low); assert(row == 5); }
+	row = lgov_next(0, 0, row, 0, cap, 0, &low);
 	assert(row == 4 && low == 0);
-	row = lgov_next(0, row, 0, cap, 0, &low);
+	row = lgov_next(0, 0, row, 0, cap, 0, &low);
 	assert(low == 1);
-	(void)lgov_next(40, row, 0, cap, 0, &low);
+	(void)lgov_next(40, 40, row, 0, cap, 0, &low);
 	assert(low == 0);
 
 	/* the middle band holds the row and never falls below the floor */
 	low = 0;
-	assert(lgov_next(50, 3, 0, cap, 0, &low) == 3);
-	assert(lgov_next(70, 3, 0, cap, 0, &low) == 5);
-	assert(lgov_next(0, 0, 0, cap, 0, &low) == 0);
+	assert(lgov_next(50, 50, 3, 0, cap, 0, &low) == 3);
+	assert(lgov_next(70, 70, 3, 0, cap, 0, &low) == 5);
+	assert(lgov_next(0, 0, 0, 0, cap, 0, &low) == 0);
 	printf("gov-test: all checks passed\n");
 	return 0;
 }

@@ -1,0 +1,18 @@
+laurel 2973: SPMI: a CPU that waits for the transaction lock takes interrupts
+
+sp_xfer_take spun with interrupts off for up to 5 ms; a holder keeps the lock up to 1 ms per transaction. A stackshot waits at most 100 ms now (post/9007), 12.5 ms before: a waiter here was the only one of our paths with a long interrupt-off wait [V code: the other ml_set_interrupts_enabled(FALSE) of our code is in kprintf]. Not shown to be why CPU 5 was late in boot 11 [U]. Interrupts stay off while the lock is held, as before. No new line: no feature to turn off.
+
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -119,7 +119,10 @@
+ 			ml_set_interrupts_enabled(*istate);
+ 			return -1;
+ 		}
++		/* laurel 2973: a waiter takes interrupts while it waits (up to SP_LOCK_WAIT_US). Off only while it may hold the lock. */
++		(void)ml_set_interrupts_enabled(*istate);
+ 		__asm__ volatile("yield");
++		(void)ml_set_interrupts_enabled(FALSE);
+ 	}
+ }
+ 

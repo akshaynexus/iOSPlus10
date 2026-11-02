@@ -38,6 +38,7 @@
 #define FWRITE 2
 #define B_READ 1
 #define B_WRITE 0
+#define B_ASYNC 4
 #define D_DISK 2
 #define DEVFS_BLOCK 0
 #define DEVFS_CHAR 1
@@ -48,6 +49,9 @@
 #define OID_AUTO 0
 #define SYSCTL_INT(...) extern int fake_sysctl_unused
 #define kalloc_data(sz, fl) aligned_alloc(16, ((sz) + 15) & ~15ul)
+#define kfree_data(p, sz) free(p)
+#define assert_wait(e, w) THREAD_WAITING
+#define thread_wakeup_one(e) ((void)0)
 #define DKIOCGETBLOCKSIZE 1
 #define DKIOCSETBLOCKSIZE 2
 #define DKIOCGETPHYSICALBLOCKSIZE 3
