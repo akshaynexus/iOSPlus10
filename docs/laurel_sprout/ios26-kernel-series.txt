@@ -329,6 +329,7 @@
 2956-laurel-panic-reset-word.patch                             applied+rules(1): 3way osfmk/kern/debug.c
 2957-laurel-amfi-sugid-dyld.patch                              applied
 2960-laurel-lse-emulation.patch                                skipped: not needed: iOS 16 fix of the topaz 0081 text. On this kernel LSE goes to laurel_a64emu, and post/9000 moved the table end; 0081 stays only with laurelemu=0 (base 0003), unchanged here so that this kernel stays byte-identical
+2961-laurel-gpu-opp.patch                                      applied
 2970-laurel-ufs-sleep-wait.patch                               applied
 2971-laurel-ufs-read-queue.patch                               applied
 2972-laurel-cpu-full-response.patch                            applied
@@ -342,4 +343,4 @@
 9006-laurel-hid-2238.patch                                     post
 9007-laurel-stackshot-late-cpu.patch                           post
 9008-laurel-vsync-refresh-period.patch                         post
-== series: 218 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
+== series: 219 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
