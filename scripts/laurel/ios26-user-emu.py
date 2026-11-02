@@ -33,6 +33,7 @@ ap.add_argument('--trace-size', type=int, default=4000)
 ap.add_argument('--verbose', action='store_true')
 ap.add_argument('--inits', action='store_true', help='list the images whose initializers ran (slower: a hook on each basic block)')
 ap.add_argument('--env', action='append', default=[])
+ap.add_argument('--start-cost', action='store_true', help='at main(): instructions from dyld start, and pages written, per area, in 4 KiB and in 16 KiB pages (what a start costs a jetsam limit; slower)')
 ap.add_argument('--display-create', metavar='PLIST', help='at main(): run CoreBrightness DisplayCreateWithCapabilitiesAndID, with this plist as the registry of AppleARMBacklight')
 ap.add_argument('--hid-event', metavar='JSON', help='at main(): give what the kernel sends for a touch (tools/laurel-hid-test) to the real IOHIDEventCreateWithBytesInternal of IOKit, the call of IOHIDEventServicePlugin, and read it with the real getters')
 ap.add_argument('--container', action='store_true', help='with --display-create: the frames of the crash, from [[CBDisplayContaineriOS alloc] initWithBacklightService:] and -start. No CADisplay here: messages to it answer nil')
@@ -689,10 +690,32 @@ def hook_main(uc, addr, size, ud):
         reached[0] = True
         s = uc.reg_read(UC_ARM64_REG_SP)
         print('reached main(): pc %s, sp 0x%x (0x%x below the stack top), %d syscalls' % (where(addr), s, STACK_TOP - s, sc_count[0]))
+        if args.start_cost:
+            start_cost_report()
         if args.display_create:
             display_create_start(uc)
         if args.hid_event:
             hid_event_start(uc)
+written, insns = set(), [0]
+def start_cost_report():
+    # the area of an address: where() names an image or says '?'; cache images have 'unslid' in their name
+    areas = collections.defaultdict(set)
+    for pg in written:
+        w = where(pg << 12)
+        a = 'program' if w.startswith('main') else 'dyld' if w.startswith('dyld') else 'cache data' if 'unslid' in w else 'stack' if STACK_TOP - (1 << 24) <= (pg << 12) < STACK_TOP else 'heap and the rest'
+        areas[a].add(pg)
+    print('start-cost: %d instructions to main(), %d KiB written in 4 KiB pages, %d KiB in 16 KiB pages' % (insns[0], 4 * len(written), 16 * len({p >> 2 for p in written})))
+    for a, pages in sorted(areas.items(), key=lambda kv: -len(kv[1])):
+        print('start-cost:   %-18s %6d KiB in 4 KiB pages %6d KiB in 16 KiB pages' % (a, 4 * len(pages), 16 * len({p >> 2 for p in pages})))
+if args.start_cost:
+    def hook_written(uc, access, addr, size, value, ud):
+        written.add(addr >> 12)
+        written.add((addr + size - 1) >> 12)
+    def hook_counted(uc, addr, size, ud):
+        if not reached[0]:
+            insns[0] += size >> 2
+    mu.hook_add(UC_HOOK_MEM_WRITE, hook_written)
+    mu.hook_add(UC_HOOK_BLOCK, hook_counted)
 mu.hook_add(UC_HOOK_CODE, hook_main, begin=EXE + main_entry, end=EXE + main_entry + 3)
 mu.hook_add(UC_HOOK_INTR, hook_intr)
 mu.hook_add(UC_HOOK_MEM_UNMAPPED, hook_unmapped)
