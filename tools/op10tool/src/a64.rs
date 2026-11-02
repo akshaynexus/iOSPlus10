@@ -536,6 +536,35 @@ pub fn one_word(w: u32, rules: &Rules) -> Option<Result<(&'static str, u32), &'s
     None
 }
 
+/// objc_msgSend hit path of 23F84: `b.ne next; eor x10,x10,x1; eor x10,x10,x16; brab x17,x10` (or `autib x17,x10`).
+pub const OBJC_EOR_SEL: u32 = 0xca01_014a;
+pub const OBJC_EOR_CLS: u32 = 0xca10_014a;
+
+/// The method cache of libobjc: `cache_t::insert` writes a free bucket with `stp imp, sel` and objc_msgSend reads it with `ldp imp, sel`, no lock.
+/// Apple relies on LDP/STP being one atomic access; ARMv8.0 gives that only per 64-bit word. So on this CPU a reader can see the new sel with imp 0: `br x17` to 0.
+/// The two `eor` only make the PAC modifier of `brab`/`autib`, and PAC is gone here: they become `cbz x17, miss; nop`, where miss is the target of the `cbz x9` of the
+/// next probe. Same address, inside the restartable range, no new memory access. `words[i]` must be the first eor. Returns the new first word.
+pub fn objc_bucket_race(words: &[u32], i: usize) -> Option<u32> {
+    if i == 0 || words.get(i).copied()? != OBJC_EOR_SEL || words.get(i + 1).copied()? != OBJC_EOR_CLS {
+        return None;
+    }
+    let imm19 = |w: u32| (((w >> 5) & 0x7_ffff) as i32) << 13 >> 13;
+    let bne = words[i - 1];
+    if bne & 0xff00_001f != 0x5400_0001 {
+        return None; // not b.ne
+    }
+    let next = (i - 1) as i64 + imm19(bne) as i64;
+    let cbz = *words.get(usize::try_from(next).ok()?)?;
+    if cbz & 0xff00_001f != 0xb400_0009 {
+        return None; // not cbz x9
+    }
+    let off = next + imm19(cbz) as i64 - i as i64;
+    if !(-(1 << 18)..(1 << 18)).contains(&off) {
+        return None;
+    }
+    Some(0xb400_0000 | (((off as u32) & 0x7_ffff) << 5) | 17)
+}
+
 /// Rule set of `a64-lower`.
 #[derive(Clone, Copy, Debug)]
 pub struct Rules {
@@ -615,6 +644,20 @@ mod tests {
         assert_eq!(newer_hint(27).unwrap().0, "pacibsp");
         assert_eq!(hint_imm(NOP), Some(0));
         assert!(newer_hint(0).is_none());
+    }
+
+    #[test]
+    fn objc_race() {
+        // 23F84 objc_msgSend at 0x18009b440: b.ne +16; eor; eor; brab x17, x10; cbz x9, 0x18009b8a0
+        let w = [0x5400_0081, OBJC_EOR_SEL, OBJC_EOR_CLS, 0xd71f_0e2a, 0xb400_2289];
+        let new = objc_bucket_race(&w, 1).unwrap();
+        // cbz x17, 0x18009b8a0 from 0x18009b444: +0x45c
+        assert_eq!(new, 0xb400_0000 | ((0x45c / 4) << 5) | 17);
+        assert!(objc_bucket_race(&w, 0).is_none());
+        let other = [0x5400_0081, OBJC_EOR_SEL, 0xca10_014b, 0xd71f_0e2a, 0xb400_2289];
+        assert!(objc_bucket_race(&other, 1).is_none());
+        let not_cbz = [0x5400_0081, OBJC_EOR_SEL, OBJC_EOR_CLS, 0xd71f_0e2a, 0xb400_2288];
+        assert!(objc_bucket_race(&not_cbz, 1).is_none());
     }
 
     #[test]

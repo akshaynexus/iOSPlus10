@@ -68,6 +68,13 @@ fn plan_unit(u: &Unit, invalid: &WordSet, rules: &Rules) -> UnitPlan {
 fn scan_range(r: &Range, code: &[bool], rules: &Rules, p: &mut UnitPlan) {
     for (i, &w) in r.words.iter().enumerate() {
         let addr = r.addr + i as u64 * 4;
+        if rules.pac && w == a64::OBJC_EOR_SEL && code[i] && code.get(i + 1) == Some(&true) {
+            if let Some(new) = a64::objc_bucket_race(&r.words, i) {
+                p.edits.push(Edit { addr, old: w, new });
+                p.edits.push(Edit { addr: addr + 4, old: a64::OBJC_EOR_CLS, new: a64::NOP });
+                *p.counts.entry("objc cache bucket: imp 0 is a miss".into()).or_default() += 1;
+            }
+        }
         if let Some(o) = a64::one_word(w, rules) {
             match o {
                 Ok((name, new)) => {
@@ -1055,6 +1062,15 @@ pub fn verify(orig: &Path, lowered: &Path, dead: &[String], macho_orig: Option<&
                 }
                 new_code.push(new);
                 *counts.entry("new code words in free space".into()).or_default() += 1;
+                continue;
+            }
+            // objc_bucket_race(): cbz x17 in the same function (at most 2 KiB away: the miss paths of objc_msgSend are next to it), then nop.
+            if old == a64::OBJC_EOR_SEL && new & 0xff00_001f == 0xb400_0011 && ((new >> 5) & 0x7_ffff) < 0x200 {
+                *counts.entry("objc cache bucket: cbz x17, miss".into()).or_default() += 1;
+                continue;
+            }
+            if old == a64::OBJC_EOR_CLS && new == a64::NOP {
+                *counts.entry("objc cache bucket: nop".into()).or_default() += 1;
                 continue;
             }
             if let Some(Ok((n, w))) = a64::one_word(old, &rules) {
