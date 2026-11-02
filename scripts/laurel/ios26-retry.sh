@@ -27,7 +27,17 @@ wait_android() {
   done
   ANDROID_SERIAL=$_ser; export ANDROID_SERIAL
 }
-to_root() { timeout 15 adb root >/dev/null 2>&1 || true; sleep 3; c=0; until [ "$(timeout 3 adb get-state 2>/dev/null)" = device ]; do [ "$c" -lt 20 ] || return 1; sleep 2; c=$((c + 1)); done; }
+# [V phone 2026-11-02] The installed switcher app (BootLockReceiver) restarts adbd at boot, and that undoes an earlier `adb root`. So root is read again right before each step that needs it, and it must hold for two reads 3 s apart.
+adb_uid() { timeout 5 adb shell id -u 2>/dev/null | tr -d '\r'; }
+to_root() {
+  c=0
+  while [ "$c" -lt 20 ]; do
+    if [ "$(adb_uid)" = 0 ]; then sleep 3; [ "$(adb_uid)" = 0 ] && return 0; fi
+    timeout 15 adb root >/dev/null 2>&1 || true
+    sleep 3; c=$((c + 1))
+  done
+  return 1
+}
 
 say "building the image"
 run $DB image $M
@@ -61,7 +71,7 @@ sleep 2
 CONFIRM=flash-slot-b; export CONFIRM; run $DB flash-slot-b $M
 timeout 15 fastboot reboot >/dev/null 2>&1 || say "ABL did not take reboot: hold Power"
 wait_android || die "Android did not start after flash-slot-b"
-to_root || die "no adb root"
 say "switching to iOS at $(date +%H:%M:%S)"
+to_root || die "no adb root"
 CONFIRM=switch; export CONFIRM; run $DB switch $M
 say "done: iOS 26 is booting. Read the panel; USB log: logs/usblog-*.txt"

@@ -23,7 +23,12 @@
  *   SBHScreenTypeForCurrentDevice, __sb__mainScreenReferenceBounds and __sb__mainScreenScale resolve (dlsym, no
  *   UIScreen: the main-thread-free path of SpringBoard also asks for the shape); the main screen is 360x780 @2.
  *   Anything else: Apple's shape stays (off line with the reason). Kill switch: boot-arg notch=0 (in sb_wrap.c).
- * Log: syslog + /var/tmp/laurel-notch.log (launchd sends SpringBoard's stderr to /dev/null).
+ * Log: syslog + /var/tmp/laurel-notch.log + /dev/console, so the lines reach the USB log (launchd sends SpringBoard's stderr to /dev/null).
+ *
+ * Top bar in SpringBoard [V 23F84 UIKitCore, docs/laurel_sprout/ios26-touch.md section 5]: _UIStatusBarVisualProvider_Split no longer falls back to
+ *   _FixedSplit: no code of UIKitCore names that class; only the default UIStatusBarVisualProviderClassName reaches it. A width in no table (720 px) gets nil, and nil is
+ *   the red rdar://45025538 bar. So when Split gives nil on this screen, it gives _FixedSplit, as UIKit of 20H392 does with Jindo off. One line says what the default holds, and
+ *   whether UIKit calls this screen embedded: those are the two tests in front of the default. Self-check: both classes, and the method type. Else Apple's nil stays, one off line.
  */
 #include <dlfcn.h>
 #include <math.h>
@@ -72,6 +77,10 @@ say(const char *fmt, ...)
 	syslog(LOG_NOTICE, "LAUREL NOTCH: %s", line);
 	if ((f = fopen(LOG, "a")) != NULL) {
 		fprintf(f, "%ld LAUREL NOTCH: %s\n", (long)time(NULL), line);
+		fclose(f);
+	}
+	if ((f = fopen("/dev/console", "a")) != NULL) {         /* mode 0622: mobile can write it */
+		fprintf(f, "LAUREL NOTCH: %s\n", line);
 		fclose(f);
 	}
 }
@@ -130,6 +139,70 @@ hook_shape(id self, SEL cmd, unsigned long type)
 	return orig_shape(self, cmd, type);
 }
 
+/* ---- top bar: Split with no table entry -> FixedSplit ---- */
+static Class (*orig_split)(id, SEL, id, id);
+static Class fixed_split;
+static int topbar_said;
+
+/* What the default holds in this process: the suite UIKit reads (_UIKitUserDefaults), as text. Only for the log line. */
+static const char *
+topbar_default(void)
+{
+	Class nsud = objc_getClass("NSUserDefaults"), nss = objc_getClass("NSString");
+	id (*str)(id, SEL, const char *) = (id (*)(id, SEL, const char *))objc_msgSend;
+	id d, v;
+
+	if (nsud == Nil || nss == Nil) {
+		return "?";
+	}
+	d = ((id (*)(id, SEL))objc_msgSend)((id)nsud, sel_registerName("alloc"));
+	d = ((id (*)(id, SEL, id))objc_msgSend)(d, sel_registerName("initWithSuiteName:"), str((id)nss, sel_registerName("stringWithUTF8String:"), "com.apple.UIKit"));
+	if (d == nil) {
+		return "no suite";
+	}
+	v = ((id (*)(id, SEL, id))objc_msgSend)(d, sel_registerName("objectForKey:"), str((id)nss, sel_registerName("stringWithUTF8String:"), "UIStatusBarVisualProviderClassName"));
+	return v == nil ? "not set" : ((const char *(*)(id, SEL))objc_msgSend)(((id (*)(id, SEL))objc_msgSend)(v, sel_registerName("description")), sel_registerName("UTF8String"));
+}
+
+static Class
+hook_split(id self, SEL cmd, id screen, id info)
+{
+	Class c = orig_split(self, cmd, screen, info);
+	rect_t b;
+
+	if (c != Nil || sb_bounds == NULL || sb_scale == NULL) {
+		return c;
+	}
+	b = sb_bounds();
+	if (fabs(b.w - SCREEN_W) > 0.01 || fabs(b.h - SCREEN_H) > 0.01 || fabs(sb_scale() - SCREEN_S) > 0.01) {
+		return c;
+	}
+	if (!__atomic_exchange_n(&topbar_said, 1, __ATOMIC_RELAXED)) {
+		say("top bar: on: UIKit has no provider for 720 px and read the default as '%s', embedded screen %d: _UIStatusBarVisualProvider_FixedSplit",
+		    topbar_default(), (int)((BOOL (*)(id, SEL))objc_msgSend)(screen, sel_registerName("_isEmbeddedScreen")));
+	}
+	return fixed_split;
+}
+
+static void
+topbar_init(void)
+{
+	Class split = objc_getClass("_UIStatusBarVisualProvider_Split");
+	SEL sel = sel_registerName("visualProviderSubclassForScreen:visualProviderInfo:");
+	Method m = split == Nil ? NULL : class_getClassMethod(split, sel);
+
+	fixed_split = objc_getClass("_UIStatusBarVisualProvider_FixedSplit");
+	if (m == NULL || fixed_split == Nil) {
+		say("top bar: off: no %s", m == NULL ? "+[_UIStatusBarVisualProvider_Split visualProviderSubclassForScreen:visualProviderInfo:]" : "class _UIStatusBarVisualProvider_FixedSplit");
+		return;
+	}
+	if (strcmp(method_getTypeEncoding(m), "#32@0:8@16@24") != 0) {
+		say("top bar: off: the Split method has type %s, not #32@0:8@16@24 [V 23F84]", method_getTypeEncoding(m));
+		return;
+	}
+	orig_split = (Class (*)(id, SEL, id, id))method_setImplementation(m, (IMP)hook_split);
+}
+
 __attribute__((constructor))
 static void
 laurel_notch_init(void)
@@ -140,6 +213,7 @@ laurel_notch_init(void)
 	if (strcmp(getprogname(), "SpringBoard") != 0) {
 		return;
 	}
+	topbar_init();
 	shape_class = objc_getClass("UISDisplaySingleRectShape");
 	sel_shape = sel_registerName("sb_displayShapeForScreenType:");
 	sel_init = sel_registerName("initWithRect:");

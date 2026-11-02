@@ -5177,3 +5177,15 @@ Full text: `docs/laurel_sprout/ios26-backboardd.md`.
 - zsh eats `=====` as an argument (`=cmd` expansion): use no such `echo` in a tool call.
 - A worktree kernel build: `cp -a --reflink=always` of `dl deps kdk cache` of the main `out/laurel-kernel-ios26`: 169 s.
 - Next boot must print `LAUREL BACKLIGHT: on: calibration for CoreBrightness: max 430, mid 107, min 840/1000 nits, table of 17 points; no digital dimming`, and no `CRASH backboardd` at `...924`.
+
+## Mi A3 iOS 26: touch does nothing, red top bar (2026-11-02, branch t3/laurel-ios26-touch; host only, no flash)
+Full text: `docs/laurel_sprout/ios26-touch.md`.
+- **The HID wire format changed between iOS 16 and 23F84.** IOHIDFamily-1915 (topaz 0058): one queue header, IOFixed. 2238: one header per event, digitizer events in doubles (160 bytes). Keys are the same, so a working key says nothing about touch.
+- The kernel queue reader of 23F84 is a file on the root, `System/Library/HIDPlugins/ServicePlugins/IOHIDEventServicePlugin.plugin`, not in the cache. `a64-dis --xref` and a cache scan do not see it. Search `tree/root-list.txt` first.
+- `IOHIDEventCreateWithBytes` (public, converts the old layout) is not what the kernel path calls. `...Internal` takes raw bytes.
+- `ios26-user-emu.py --hid-event JSON` calls real parser functions with bytes from `tools/laurel-hid-test` (Apple's `IOHIDEvent.cpp` + our real `touch()`, cut from the file, on the host). A method to reuse: the host side is real code too.
+- 23F84 `_Split` has no fallback to `_FixedSplit` (20H392 has one with Jindo off). No code names that class: only the default `UIStatusBarVisualProviderClassName`.
+- `LAUREL NOTCH` lines now reach the USB log (`/dev/console`). Before: only syslog and `/var/tmp`, so with no SSH they showed nowhere.
+- Dropbear can stop answering on a loaded phone: TCP connects, no banner, also with 90 s (boot 10, CPU 459 of 480 s busy). Ping and the USB log stay up. Not explained [U].
+- `dual-boot.sh`: `adb` is a function now: no Mi A3 = no adb command. A `timeout 5 adb` in that script would miss the function: use `bounded` with `$ADB_BIN`, or plain `adb`.
+- A tmux job can vanish with no `.exit` file when its folder changes under it: read `tmux ls` and the log, not only the exit file.

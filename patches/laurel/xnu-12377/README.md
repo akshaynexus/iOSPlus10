@@ -48,4 +48,6 @@ header or kernelcache is in git: they stay in `out/` and `~/op10-apple/`.
 
 `post/9005`: `LAUREL BACKLIGHT: on: calibration`: the two properties that CoreBrightness of 23F84 must read on `AppleARMBacklight` (`docs/laurel_sprout/ios26-backboardd.md`).
 
+`post/9006`: IOHIDFamily-2238.120.5 in place of the 1915.140.3 of topaz 0058: the HID wire format of 23F84 (`docs/laurel_sprout/ios26-touch.md`). Made by `scripts/laurel/ios26-hid-port.sh`; host test `scripts/laurel/test-ios26-hid.sh`.
+
 Host tests of what lives in `post/9000`: `scripts/laurel/test-a64emu.sh` (emulator), `scripts/laurel/test-slide.sh` (slide on 4 KiB pages), `scripts/laurel/test-apple80211.sh` (23F84 Apple80211).

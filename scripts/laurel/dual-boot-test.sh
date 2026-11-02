@@ -36,9 +36,24 @@ fails() { case " \${FAKE_FAIL:-} " in *" \$1 "*) return 0 ;; esac; return 1; }
 # /tmp first: \$P itself can lie under /tmp, and each rule runs once on the text
 rewrite() { printf '%s' "\$1" | sed -e "s#^/tmp/#\$P/tmp/#" -e "s# /tmp/# \$P/tmp/#g" -e "s#/data/#\$P/data/#g" -e "s#/dev/block/#\$P/dev/block/#g" -e "s#/sys/#\$P/sys/#g"; }
 shortcmd() { printf '%s' "\$1" | sed -e 's/; _ldb_r=.*//'; }
+# FAKE_OTHER=second: another Android phone is on adb too (it is listed first); only: it is the only one. Its calls go to \$T/calls-other, and a call with no serial that real adb would refuse or send to it goes to \$T/calls-bare.
+s=\${ANDROID_SERIAL:-}
+if [ "\$1" = -s ]; then s=\$2; shift 2; fi
+if [ -n "\${FAKE_OTHER:-}" ] && [ "\$1" != devices ]; then
+  if [ -z "\$s" ]; then echo "adb \$*" >> "\$T/calls-bare"; [ "\$FAKE_OTHER" = only ] || { echo "adb: more than one device/emulator" >&2; exit 1; }; s=OTHER; fi
+  if [ "\$s" = OTHER ]; then
+    echo "\$*" >> "\$T/calls-other"
+    [ "\$*" != "shell getprop ro.product.device" ] || echo Pacman
+    exit 0
+  fi
+  [ "\$FAKE_OTHER" != only ] || { echo "adb: device '\$s' not found" >&2; exit 1; }
+fi
 case "\$1" in
 get-state) echo "adb get-state" >> "\$T/calls"; fails adb-off && exit 1; echo "\${FAKE_STATE:-device}" ;;
-devices) echo "adb devices" >> "\$T/calls"; printf 'List of devices attached\n'; fails adb-off || printf 'FAKE\tdevice\n' ;;
+devices)
+  echo "adb devices" >> "\$T/calls"; printf 'List of devices attached\n'
+  [ -z "\${FAKE_OTHER:-}" ] || printf 'OTHER\tdevice\n'
+  [ "\${FAKE_OTHER:-}" = only ] || fails adb-off || printf 'FAKE\t%s\n' "\${FAKE_STATE:-device}" ;;
 push)
   echo "adb push \$3" >> "\$T/calls"
   fails push && { echo "adb: push failed" >&2; exit 1; }
@@ -302,7 +317,7 @@ reset() {
   rm -rf "$P" "$D" "$T/repo/out/laurel-ios26"
   mkdir -p "$P/data/local/tmp" "$P/tmp" "$P/state" "$P/dev/block/by-name" "$P/sys/class/block/sda15" "$P/sys/class/block/sda16" "$P/sys/block/sda/queue" "$P/sys/block/dm-40/slaves/sda15"
   mkdir -p "$D" "${ROIMG%/*}" "${RWIMG%/*}" "$H/android-20261102-0137" "$H/lineage-24.0-20261027" "$T/apple"
-  : > "$T/calls"
+  : > "$T/calls"; : > "$T/calls-other"; : > "$T/calls-bare"
   # the phone before the change: the old table
   cp "$T/head" "$H/android-20261102-0137/gpt-sda-head.bin"; cp "$T/tail" "$H/android-20261102-0137/gpt-sda-tail.bin"
   python3 -I "$REPO/scripts/laurel/gpt-fake.py" disk "$P/dev/block/sda"
@@ -1175,6 +1190,62 @@ fi
 if start "Helper: the phone reports another version: stops before any step"; then
   run CONFIRM=gpt-write FAKE_FAIL=stale-on-phone sh "$DB" gpt-write
   exit_not0; not_ran "helper gpt-write"; disk_is_old; done_
+fi
+
+# ---- [V 2026-11-02] a second Android phone on adb ----
+other_only_identity() { ! grep -qvF "shell getprop ro.product.device" "$T/calls-other" || no "the other phone got: $(grep -vF "shell getprop ro.product.device" "$T/calls-other" | head -3)"; [ ! -s "$T/calls-bare" ] || no "a call with no serial: $(head -3 "$T/calls-bare")"; }
+if start "Second phone: status: only the Mi A3 gets calls"; then
+  ready
+  run FAKE_OTHER=second sh "$DB" status
+  exit_is 0; said "slot _a"; other_only_identity; ran "adb shell getprop ro.boot.slot_suffix"; done_
+fi
+if start "Second phone: a writing step: the write reaches the Mi A3, the other phone gets only the product read"; then
+  ready; slotb
+  run "$SW" FAKE_OTHER=second sh "$DB" switch
+  exit_is 0; state_is active 1; other_only_identity; ran "bootctl set-active-boot-slot 1"; ran "adb reboot"; done_
+fi
+if start "Second phone: the Mi A3 is not on adb: refused, no command goes to the other phone"; then
+  run FAKE_OTHER=only sh "$DB" status
+  exit_not0; said "not the Mi A3"; other_only_identity; not_ran "adb shell"; done_
+fi
+if start "Second phone: a host-only command asks no phone"; then
+  run FAKE_OTHER=second sh "$DB" gpt-plan
+  exit_is 0; not_ran "adb"; [ ! -s "$T/calls-other" ] || no "the other phone was asked"; done_
+fi
+
+# ---- [V phone 2026-11-02] a writable switch after a writable iOS boot: the first MiB changed, the volume is the same ----
+vol_poke() { python3 -I "$REPO/scripts/laurel/dual-boot-test-poke.py" "$P/dev/block/by-name/iosroot" "$1" "$2"; }
+rw_ready() { ready; slotb; rwimage; printf 'ro-on %s x\nandroid-opened-after-ro x\n' "$M" >> "$RES"; }
+if start "Volume: rw after ro-on, header changed by iOS: passes"; then
+  rw_ready; vol_poke 1032 00000002   # the mount counters of a mounted volume, not its identity
+  run "$SW" sh "$DB" switch rw
+  exit_is 0; said "the same volume"; state_is active 1; done_
+fi
+if start "Volume: read-only mode with a changed header: refused"; then
+  ready; slotb; printf 'ro-on %s x\n' "$M" >> "$RES"; vol_poke 1032 00000002
+  run "$SW" sh "$DB" switch
+  exit_not0; said "does not start with the installed root"; not_ran "bootctl set-active"; done_
+fi
+if start "Volume: rw with no read-only boot on record: refused"; then
+  ready; slotb; rwimage; vol_poke 1032 00000002
+  run "$SW" sh "$DB" switch rw
+  exit_not0; not_ran "bootctl set-active"; done_
+fi
+if start "Volume: rw, another volume (create date): refused"; then
+  rw_ready; vol_poke 1040 01020304
+  run "$SW" sh "$DB" switch rw
+  exit_not0; said "does not start with the installed root"; not_ran "bootctl set-active"; done_
+fi
+if start "Volume: rw, another size (block count): refused"; then
+  rw_ready; vol_poke 1068 00000001
+  run "$SW" sh "$DB" switch rw
+  exit_not0; said "does not start with the installed root"; not_ran "bootctl set-active"; done_
+fi
+if start "Volume: rw, neither the image nor the partition is a volume: refused, two empty headers do not match"; then
+  rw_ready; vol_poke 1024 0000000000000000; python3 -I "$REPO/scripts/laurel/dual-boot-test-poke.py" "$T/root.img" 1024 0000000000000000
+  run "$SW" sh "$DB" switch rw
+  exit_not0; said "does not start with the installed root"; not_ran "bootctl set-active"
+  python3 -I "$REPO/scripts/laurel/dual-boot-test-poke.py" "$T/root.img" 1024 4858000500000000; done_
 fi
 
 # ---- each writing step still needs its word ----

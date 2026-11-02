@@ -34,6 +34,7 @@ ap.add_argument('--verbose', action='store_true')
 ap.add_argument('--inits', action='store_true', help='list the images whose initializers ran (slower: a hook on each basic block)')
 ap.add_argument('--env', action='append', default=[])
 ap.add_argument('--display-create', metavar='PLIST', help='at main(): run CoreBrightness DisplayCreateWithCapabilitiesAndID, with this plist as the registry of AppleARMBacklight')
+ap.add_argument('--hid-event', metavar='JSON', help='at main(): give what the kernel sends for a touch (tools/laurel-hid-test) to the real IOHIDEventCreateWithBytesInternal of IOKit, the call of IOHIDEventServicePlugin, and read it with the real getters')
 ap.add_argument('--container', action='store_true', help='with --display-create: the frames of the crash, from [[CBDisplayContaineriOS alloc] initWithBacklightService:] and -start. No CADisplay here: messages to it answer nil')
 args = ap.parse_args()
 
@@ -690,6 +691,8 @@ def hook_main(uc, addr, size, ud):
         print('reached main(): pc %s, sp 0x%x (0x%x below the stack top), %d syscalls' % (where(addr), s, STACK_TOP - s, sc_count[0]))
         if args.display_create:
             display_create_start(uc)
+        if args.hid_event:
+            hid_event_start(uc)
 mu.hook_add(UC_HOOK_CODE, hook_main, begin=EXE + main_entry, end=EXE + main_entry + 3)
 mu.hook_add(UC_HOOK_INTR, hook_intr)
 mu.hook_add(UC_HOOK_MEM_UNMAPPED, hook_unmapped)
@@ -849,6 +852,92 @@ def display_create_start(uc):
 steps = []
 the_self = []
 last_result = [0]
+# ---- --hid-event: the real parser of 23F84 on the bytes of the kernel ----
+hid_results = []
+
+def hid_event_start(uc):
+    """IOHIDEventServicePlugin (not in the cache; it imports only IOHIDEventCreateWithBytesInternal) calls this with the queue entry. Each event: the parent, then its children."""
+    import importlib.util, json
+    sp_ = importlib.util.spec_from_file_location('dsc_image', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dsc-image.py'))
+    dsc = importlib.util.module_from_spec(sp_)
+    sp_.loader.exec_module(dsc)
+    c = dsc.Cache(BASE + '/tree/cache')
+    iokit = {n: a + SLIDE for a, k, n in dsc.symbols(c, c.find('IOKit.framework/Versions/A/IOKit')[0])}
+    cf = {n: a + SLIDE for a, k, n in dsc.symbols(c, c.find('CoreFoundation.framework/CoreFoundation')[0])}
+    j = json.load(open(args.hid_event))
+    fl = j['fields']
+    mu.mem_map(UNTIL, 0x1000, UC_PROT_ALL)
+    def read_event(tag, e_):
+        """Steps that read one event; each result goes to hid_results as (tag, name, x0, d0)."""
+        for name in ('type',):
+            steps.append((iokit['_IOHIDEventGetType'], lambda r, e=e_: [e()], (tag, 'event-type')))
+        for name in ('x', 'y', 'pressure'):
+            steps.append((iokit['_IOHIDEventGetFloatValue'], lambda r, e=e_, f=fl[name]: [e(), f], (tag, name)))
+        for name in ('type', 'index', 'identity', 'mask', 'button', 'range', 'touch', 'collection'):
+            steps.append((iokit['_IOHIDEventGetIntegerValue'], lambda r, e=e_, f=fl[name]: [e(), f], (tag, 'int-' + name)))
+    ev = []
+    for i, h in enumerate(j['events']):
+        b = bytes.fromhex(h)
+        a = anon(max(len(b), 0x1000))
+        mu.mem_write(a, b)
+        tag = 'event%d' % i
+        hold = {}
+        hid_holds.append(hold)
+        def keep(r, hold=hold, key='parent'):
+            hold[key] = r
+            return [r]
+        steps.append((iokit['_IOHIDEventCreateWithBytesInternal'], lambda r, a=a, n=len(b): [0, a, n], (tag, 'create')))
+        steps.append((iokit['_IOHIDEventGetChildren'], keep, (tag, 'children')))
+        def n_children(r, hold=hold):
+            hold['children'] = r
+            return [r]
+        steps.append((cf['_CFArrayGetCount'], lambda r, hold=hold, n_children=n_children: n_children(r) if r else (hold.__setitem__('children', 0), None)[1], (tag, 'child-count')))
+        def first(r, hold=hold):
+            return [hold['children'], 0]
+        read_event(tag, lambda hold=hold: hold['parent'])
+        steps.append((cf['_CFArrayGetValueAtIndex'], lambda r, hold=hold: [hold['children'], 0] if hold['children'] else None, (tag, 'child0')))
+        def keep_child(r, hold=hold):
+            hold['child'] = r
+        read_event(tag + '.child0', lambda hold=hold: hold.get('child', 0))
+    next_hid_step(uc)
+    uc.emu_stop()
+
+hid_holds = []
+
+def next_hid_step(uc):
+    # A step with no object (no child) is left out: the report shows it as no answer
+    while steps:
+        fn, a, label = steps.pop(0)
+        args_ = a(last_result[0])
+        if args_ is None or (label[0].endswith('.child0') and not args_[0]):
+            continue
+        for i, v in enumerate(args_):
+            setx(i, v)
+        hid_label[0] = label
+        uc.reg_write(UC_ARM64_REG_LR, UNTIL)
+        pending[0] = fn
+        return True
+    return False
+
+hid_label = [None]
+
+def hid_step_done():
+    t, n = hid_label[0]
+    hid_results.append((t, n, x(0), mu.reg_read(UC_ARM64_REG_D0)))
+    if n == 'child0':
+        hid_holds[int(t[5:]) if t[5:].isdigit() else 0]['child'] = x(0)
+
+def hid_event_report():
+    pc = mu.reg_read(UC_ARM64_REG_PC)
+    if pc != UNTIL:
+        print('RESULT hid-event: did not return: pc %s lr %s stop %s after %s' % (where(pc), where(mu.reg_read(UC_ARM64_REG_LR)), stop_reason[0], hid_label[0]))
+        return 3
+    for t, n, v, d in hid_results:
+        f = struct.unpack('<d', struct.pack('<Q', d))[0]
+        print('HID %-14s %-14s x0 %#x d0 %.6f' % (t, n, v, f))
+    print('RESULT hid-event: all calls returned')
+    return 0
+
 def next_step(uc):
     """The next call of the list, with the result of the one before."""
     fn, a = steps.pop(0)
@@ -888,11 +977,19 @@ pc = DYLD + 0x30f0
 t0 = time.time()
 while True:
     try:
-        mu.emu_start(pc, UNTIL if args.display_create else 0xffffffffffffff00, timeout=args.secs * 1000000, count=args.max)
+        mu.emu_start(pc, UNTIL if args.display_create or args.hid_event else 0xffffffffffffff00, timeout=args.secs * 1000000, count=args.max)
     except UcError as e:
         print('UcError', e)
         break
     if pending[0] is not None:
+        pc = pending[0]
+        pending[0] = None
+        continue
+    if args.hid_event and mu.reg_read(UC_ARM64_REG_PC) == UNTIL:
+        last_result[0] = x(0)
+        hid_step_done()
+        if not next_hid_step(mu):
+            break
         pc = pending[0]
         pending[0] = None
         continue
@@ -939,4 +1036,6 @@ if trace:
 print('RESULT %s: %s' % (EXE_PATH, 'reached main()' if reached[0] else 'main() NOT reached: ' + str(stop_reason[0])))
 if args.display_create:
     sys.exit(display_create_report())
+if args.hid_event:
+    sys.exit(hid_event_report())
 sys.exit(0 if reached[0] else 3)

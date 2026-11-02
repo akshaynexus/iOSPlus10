@@ -49,6 +49,26 @@ image_path() { [ "${1:-ro}" = rw ] && echo "$OUT/laurel-$TARGET/uefi-rw/laurel-u
 default_root() { case "$TARGET" in ios26) echo "$APPLE/ios26/23F84-n104ap/root/ios26-root.img" ;; ios16) echo "$APPLE/laurel-ios16-root.img" ;; *) die "TARGET=$TARGET: ios26 or ios16" ;; esac; }
 mode_arg() { case "${1:-}" in ""|ro) echo ro ;; rw) echo rw ;; *) die "'$1': only rw" ;; esac; }
 
+# [V 2026-11-02] Another Android phone can be on adb, also with no USB port. All adb calls of this script go through this function and reach only the Mi A3, by its serial.
+# The first call asks each device for its product; a host-only command never comes here, so it asks nothing. A phone that is not the Mi A3 gets this one read and nothing else.
+# No Mi A3 on adb: no adb command runs at all (a bare adb would reach the only other phone). A serial set by the caller stays, and need_android still reads the product.
+bounded() { if command -v timeout >/dev/null 2>&1; then timeout "$@"; else shift; "$@"; fi; }
+pin_mi_a3() {
+  [ -z "${ANDROID_SERIAL:-}" ] || return 0
+  _pin_all=$(bounded 5 "$ADB_BIN" devices 2>/dev/null) || _pin_all=
+  _pin_seen=
+  for _s in $(printf '%s\n' "$_pin_all" | sed -n 's/[[:space:]]\{1,\}\(device\|recovery\)$//p'); do
+    _pin_d=$(bounded 5 "$ADB_BIN" -s "$_s" shell getprop ro.product.device 2>/dev/null | tr -d '\r') || _pin_d=
+    if [ "$_pin_d" = laurel_sprout ]; then ANDROID_SERIAL=$_s; export ANDROID_SERIAL; return 0; fi
+    _pin_seen="$_pin_seen ${_pin_d:-?}"
+  done
+  return 1
+}
+ADB_BIN=$(command -v adb 2>/dev/null || echo adb)
+adb() {
+  pin_mi_a3 || { echo "dual-boot: no Mi A3 on adb${_pin_seen:+ (other phones:$_pin_seen; no command goes to them)}" >&2; return 1; }
+  "$ADB_BIN" "$@"
+}
 # A command on the phone. stdout = its stdout, exit code = its REAL exit code, read from a marker line: a pipe here hid it, and an adb that stops early has no marker.
 #   255: no marker (adb lost the phone, the result is unknown). 254: marker there but adb itself failed. Every caller acts on the code; a value goes through: v=$(ash ...) || die ...
 ASH_MARK=__ldb_rc_$$__
@@ -86,6 +106,7 @@ need_tool() {
 }
 # $1 = recovery-ok: gpt-restore, gpt-repair and the rehearsal also run in Lineage recovery. adb get-state says recovery there. No /data is mounted: the helper goes to /tmp.
 need_android() {
+  pin_mi_a3 || { [ -z "$_pin_seen" ] || die "this is not the Mi A3 (ro.product.device:$_pin_seen): no command goes to it"; die "no phone on adb"; }
   _st=$(adb get-state 2>/dev/null || true)
   case "$_st:${1:-}" in
   device:*) ;;
@@ -336,12 +357,6 @@ need_root_verified() {
   esac
 }
 
-# [V 2026-11-02] Another Android phone can be on adb, also with no USB port. Pin all adb calls to the Mi A3: owner's order, and a bare adb can reach the other phone.
-if [ -z "${ANDROID_SERIAL:-}" ]; then
-  for _s in $(timeout 5 adb devices 2>/dev/null | sed -n 's/\tdevice$//p'); do
-    if [ "$(timeout 5 adb -s "$_s" shell getprop ro.product.device 2>/dev/null | tr -d '\r')" = laurel_sprout ]; then ANDROID_SERIAL=$_s; export ANDROID_SERIAL; break; fi
-  done
-fi
 cmd=${1:-}
 [ $# = 0 ] || shift
 case "$cmd" in
@@ -408,6 +423,7 @@ GUIDE
   recovery)
     need_tool
     _b=$(backup_with_gpt)
+    pin_mi_a3 || true
     _st=$(adb get-state 2>/dev/null || true)
     [ "$_st" = recovery ] || die "adb says '${_st:-no phone}', not recovery. In Lineage recovery: Advanced -> Enable ADB. If adb never shows there: dual-boot.sh rehearsal no-adb"
     HELPER=/tmp/ldbhelper
@@ -651,6 +667,8 @@ switch)
       for _f in 1-4 33-40 81-96; do
         [ "$(echo "$_pv" | cut -c$_f)" = "$(echo "$_iv" | cut -c$_f)" ] || _same=2
       done
+      # two empty reads compare equal: the header must be a real HFS+ or HFSX header, in full
+      case "$(echo "$_iv" | cut -c1-4):${#_iv}" in 482b:96|4858:96) ;; *) _same=2 ;; esac
       [ "$_same" = 2 ] || _same=1
     fi
     [ "$_same" = 1 ] || die "iosroot does not start with the installed root: dual-boot.sh install"
