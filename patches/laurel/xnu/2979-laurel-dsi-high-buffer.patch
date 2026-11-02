@@ -1,0 +1,19 @@
+laurel 2979: the panel commands go through the FIFO when the command buffer is above 4 GiB
+
+[V] The cause of `LAUREL BACKLIGHT: off: DSI command DMA does not complete`, on some boots only: the buffer comes from above 4 GiB (log: buf 0x1b4664000) in spite of the mask, and DSI register 0x048 holds 32 bits. Boots that pass already end on the FIFO path (line `DCS HS, DMA at line 1568, FIFO`). [U] why the mask does not hold in IOBufferMemoryDescriptor on this kernel; the other users of this mask are bigger buffers with their own checks.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-03 05:03:38.996723081 +0530
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-03 05:03:39.022547981 +0530
+@@ -1751,7 +1751,11 @@
+ 	 * and the other transport Linux has: kickoff_fifo_command (no bus master: the words go in through the TPG FIFO).
+ 	 */
+ 	dsi_wr(fDsi, 0x050, dsi_rd(fDsi, 0x050) | (1u << 20) | (1u << 16));
+-	if (fDsiFifo) {
++	/*
++	 * laurel 2979: [V boots 10, 11, 14, 15, 17: buf 0x1b4664000, 0x1ac5f0000, DMA int 0x10000, no DONE] the below-4-GiB mask of this one-page buffer
++	 * does not hold on this kernel, and register 0x048 takes 32 bits, so the DMA read another address on those boots. The FIFO needs no address.
++	 */
++	if (fDsiFifo || (fDsiBufPhys >> 32) != 0) {
+ 		dsi_wr(fDsi, 0x15c, (1u << 1) | (1u << 2) | (3u << 16));        /* CMD_DMA_TPG_EN, FIFO mode, custom pattern */
+ 		for (uint32_t i = 0; i < size; i += 4) {
+ 			uint32_t word;

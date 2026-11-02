@@ -5298,3 +5298,6 @@ Details: `docs/laurel_sprout/ios26-wallpaper-widgets.md`.
 - A kernel log line ends at 255 bytes: test it in the host test with the largest numbers (112 bytes of text was too long).
 - Mutation run of `gpu-push-test`: 14 of 15 caught. Not caught: the chunk test in `lgk_plan_fit`: the guard unit breaks adjacency already, so it is a second guard.
 - Patches from a series tree: `git -C out/laurel-kernel-ios26/src/xnu diff C~1 C -- iokit`, one commit per patch; `bsd/dev/laurel_build_stamp.h` changes at each build: keep it out. zsh does not split `set -- $C`: use bash for such a step. Never `cat > file` with no input in a tool call: it waits.
+
+## 2026-11-03: `LAUREL BACKLIGHT: off: DSI command DMA does not complete` was a 32-bit truncation
+[V boot 17 and older logs] `SWEET FB: DSI cmd 0x3 not done ... buf 0x1b4664000`. The one-page buffer is above 4 GiB in spite of `inTaskWithPhysicalMask(0xfffff000)`; DSI 0x048 is 32 bits. Patch 2979. post/9009 (retry) cannot help this cause; it stays for other transient causes. The panel can still show frames with this failure (boot 17: Apple logo), so a failed self-check is not a black panel by itself. [U] why boots 14 and 15 were black.
