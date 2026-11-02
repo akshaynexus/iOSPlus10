@@ -190,7 +190,7 @@ script "GPT: a write that did nothing is called good" 'GPT write: all well*'
 copy; mutate scripts/laurel/dual-boot.sh '  need_root_verified
   _inst=$(sed' '  _inst=$(sed'
 script "F1: switch asks for no read-back" 'F1 switch with no read-back*'
-copy; mutate scripts/laurel/flash-root.sh 'mkdir -p "$OUT/laurel/dualboot"; echo "install-started' 'echo "install-started" > /dev/null; echo "install-started'
+copy; mutate scripts/laurel/flash-root.sh '>> "$OUT/laurel/dualboot/first-boot.result"' '> /dev/null'
 script "F1: a later flash leaves the record of the old read-back" 'F1 a later flash voids*'
 copy; mutate scripts/laurel/dual-boot.sh '[ "$((_bc * 4096))" -le "$USERDATA_BYTES" ] || die' ': || die'
 script "Format: a stale superblock passes android-check" 'Android check: a stale*'
@@ -198,6 +198,8 @@ copy; mutate scripts/laurel/flash-root.sh '[ -n "$_s" ] || die "ABL names no par
 mutate scripts/laurel/dual-boot.sh '[ -n "$_i" ] || die "ABL sees no partition iosroot' ': || die "ABL sees no partition iosroot'
 mutate scripts/laurel/dual-boot.sh '[ "$((_i))" = "$IOSROOT_BYTES" ] && [ "$((_u))" = "$USERDATA_BYTES" ] || die' ': || die'
 mutate scripts/laurel/flash-root.sh '[ "$((_s))" = "$IOSROOT_BYTES" ] || die' ': || die'
+mutate scripts/laurel/flash-root.sh 'laurel_size_ok "$_s" || die "ABL gives iosroot' ': || die "ABL gives iosroot'
+mutate scripts/laurel/dual-boot.sh 'laurel_size_ok "$_i" && laurel_size_ok "$_u" || die' ': || die'
 script "Install: no check of the partition" 'Install: ABL sees no iosroot*'
 
 echo "== the helper: the order of the steps and the state check"
