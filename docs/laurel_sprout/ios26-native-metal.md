@@ -15,15 +15,15 @@ Marks: **[V]** read or run here (file, command, log). **[I]** inference or estim
 | Drop `metal2vulkan-runtime`, `ash`, Turnip | **GO** | 261,371 + 44,090 lines leave the path at run time. This is where the per-submit lists and per-command-buffer state come from | [V] |
 | Own PM4 + winsys on RedwoodGPU, no kernel change | **GO** | All needed requests exist. Section 4 | [V] |
 | Name only what the kernel must act on | **GO, the largest sure gain** | Section 3 | [V] code, [I] size |
-| `memoryless` on GMEM for screen-size targets | **NO-GO** | CA asks 720 x 1560 RGBA16Float memoryless = 8.98 MB [V]. GMEM is 132 KiB | [V] |
+| `memoryless` on GMEM for screen-size targets | **NO-GO** | CA asks 720 x 1560 RGBA16Float memoryless = 8.98 MB [V]. GMEM is 132 KiB. On the default stack it makes 108 tiles, section 3.3 | [V] |
 | `memoryless` on shared scratch memory | **GO** | One backing per size and format. The content is undefined between encoders by Metal's rule, so sharing is legal | [I] |
-| GMEM tile passes | **Off at first, sysmem always** | 36 tiles at full screen [I `gpu.md`]; a switch of CCU mode costs a WFI [V `tu_emit_cache_flush_ccu`]. Autotune in Turnip does not count tiles. GMEM can come back per pass if the bench shows a gain | [I] |
+| GMEM tile passes | **Off at first, sysmem always** | 36 tiles at full screen, 108 with CA's second attachment [V capture]; a switch of CCU mode costs a WFI [V `tu_emit_cache_flush_ccu`]. GMEM can come back per pass if the bench shows a gain | [V] numbers, [I] choice |
 | Render pass merging | **GO, small gain** | In sysmem, load and store are free. A merge saves only register setup and a flush. Glass and blur passes read the last target, so they cannot merge | [I] |
 | Shared intermediates for `CABackdropLayer` | **NO-GO in the driver** | CA owns those textures. A driver cannot see their lifetime unless CA uses a heap and `makeAliasable`. A CA hook would be needed: another feature, and a look risk | [I] |
 | GL ES on this winsys | **Stage 6, for apps only** | [V `ios26-userland.md`] On 23F84 the render server has no GL path. CoreAnimation is Metal only. GL is for apps | [V] |
 | 60 fps with full live glass | **Not reachable by a driver** | The cost is pixels x instructions on 1 SP. Section 3.3 | [I] |
 
-**Honest size.** Stages 2 and 3 are host work with strong tests. Stage 4 can reach "the right registers on the host", not "the right pixels". Pixels need the phone. A first start on the phone will find faults that no host test finds. Stage 8 of section 8 lists what the phone test must show.
+**Honest size.** Stages 2 and 3 are host work with strong tests. Stage 4 can reach "the right registers on the host", not "the right pixels". Pixels need the phone. A first start on the phone will find faults that no host test finds. Section 8 lists what the phone test must show.
 
 ## 2. Call census of 23F84
 
@@ -57,20 +57,23 @@ Numbers: `scripts/ios26/native-cost.py logs/usblog-20261103-000638.txt` -> [ios2
 
 ### 3.1 What the kernel pays on the default stack
 
-| Window kind | Submissions per 5 s | Names per submission | Pushed per 5 s | Kernel time per submission | GPU per submission | Pool free |
+**Correction of my first version:** the log's "KB out of the cache" is per **submission**: `flushed >> 10 / submissions` [V `RedwoodGPU.cpp` 1603; found by `t3/ios26-gpu-render-effects`].
+
+| Window kind | Submissions per 5 s | Names per submission | Pushed per submission | Kernel time per submission | GPU per submission | Pool free |
 |---|---:|---:|---:|---:|---:|---:|
 | Steady, 02:24 to 02:52, UI on the screen, GPU busy 19-24 % | 61 | **1,537** | **72.6 MB** | **26-33 ms** | about 18 ms | 60 MB (p50 of all) |
 | GPU busy >= 30 % (127 windows), p50 | 73 | 881 | 1.6 MB | 733 us | 33 ms | 134 MB |
 | same, p90 | 127 | | 28 MB | 11 ms | 84 ms | |
 | same, max | 218 | | 154.7 MB | 73 ms | 537 ms | 0 MB |
 
-The first row is a steady cost, not a storm [V]: 61 x 26 ms = 1.6 s of each 5 s, with the GPU lock held [V `a submission: 0 us before the lock, 25761 us with it`]. So **32 % of one core goes to pushing surfaces out of the cache because Turnip names them, and every other client waits for that lock.**
+The first row is a steady cost, not a storm [V]: 61 x 26 ms = 1.6 s of each 5 s, with the GPU lock held [V `a submission: 0 us before the lock, 25761 us with it`], and about 885 MB/s of cache push. So **32 % of one core goes to pushing buffers out of the cache because Turnip names them, and every other client waits for that lock.**
 
 Why [V code, `RedwoodGPU.cpp` `submit`]:
 
+- A scattered buffer the CPU has mapped (the pool is full) is pushed at **every** submission that names it, with no check of a write. [I, `t3/ios26-gpu-render-effects`] that is most of the 72 MB: 8 MB blocks of metal2vulkan's pools.
 - Every listed buffer with a `surface` goes through the push rule. Surface pushes per window: 32,717 of 92,220 names.
 - Laurel 2913: a surface named by a client that is not the window server gets a new seed, because the kernel cannot tell a read from a write, so the window server pushes it again.
-- Turnip lists every buffer of the device (`tu_queue.cc`: the device's whole `bo_list`) [V]. Here that is hundreds of buffers and every imported surface.
+- Turnip lists every buffer of the device (`tu_knl_drm_msm.cc` 956: `.bos = device->submit_bo_list`, the device-wide table) [V]. Here that is hundreds of buffers and every imported surface.
 
 ### 3.2 What `native` changes, and how sure each line is
 
@@ -78,16 +81,41 @@ Why [V code, `RedwoodGPU.cpp` `submit`]:
 |---|---|---|---|
 | Names per submission | 881 to 1,537 | Command chunks (1-3) + surfaces this command buffer touches (0-20) | [V] kernel needs no more: a name only drives push, fence, display wait. [I] count |
 | Kernel time per submission | 0.7 to 33 ms | about 0.1 to 0.3 ms: the low end of the log (185 us with the lock) | [V] floor, [I] that we reach it |
-| Pushes from seeds moved by listing | most of 72.6 MB per 5 s | none, for surfaces this client did not use | [I] |
+| Pushes caused by listing | up to 72.6 MB per submission | none for a buffer this submission did not use; a scattered buffer only after a CPU write | [I] |
 | Lock wait for the others | up to the whole 26-33 ms | short | [I] |
 | Buffers in the kernel | one or more per Metal object, m2v 8 MB blocks | 4 MB slabs + a list of freed large buffers | [V] code, host test; [U] pool use on the phone |
 | Memoryless | real memory per surface | shared | [V] CA asks; [I] saving; [U] the pool number |
 | Descriptor sets | Vulkan pools + updates per draw | words written to the upload ring | [I] |
-| State per submission | Turnip re-emits about 70 registers + WFI + cache invalidate at each command buffer start, 11.6 IBs per submission [V code, log] | one init IB per submission, called, not copied. The kernel's ring is shared with other processes, so one init per submission must stay | [I] |
+| State per submission | Turnip runs `tu6_init_hw` at each primary VkCommandBuffer begin (`tu_cmd_buffer.cc` 2662): about 70 registers + WFI + cache invalidate [V]. How many VkCommandBuffers a submission holds: [U]; the log gives 11.6 IBs per submission, and one VkCommandBuffer can be several IBs | one init IB per submission, called, not copied. The kernel's ring is shared with other processes, so one init per submission must stay | [I] |
 | CCU mode switch | per pass with autotune: flush, invalidate, WFI [V code] | none: always sysmem | [I] |
 | Shader bounds checks | `DevicePolicy` containment on (m2v default) | Off for the compositor: Apple's shaders are trusted. Stage 3 measures the instructions | [I] until stage 3 |
 
-### 3.3 What it does not change
+### 3.3 Where the GPU time goes on the default stack: found on the host
+
+Method [V]: `scripts/laurel/native/ref-capture.sh`: the fixed scene `userland/laurel/metal-native/tests/scene.c` through the **real** default stack (metal2vulkan runtime, bridge, Turnip for FD610 on drm-shim), with a key the phone really asked (`ca-real.txt`, from `pipelines.log`), decoded by Mesa's `cffdump`. One full-screen pass with one quad:
+
+| Mode | Attachments | Tile size | Tiles (`VSC_BIN_COUNT`) | Draw replays | Blits | Note |
+|---|---|---|---:|---:|---:|---|
+| Autotune, plain shader, BGRA8 only | 1 | 192 x 176 | 36 | 37 | | |
+| **Autotune, real CA key (what the phone runs)** | BGRA8 + RGBA16F | **64 x 176** | **108** | **109** | **222** | Tile load/clear and store per tile |
+| `TU_DEBUG=sysmem`, same key | same | none | 0 | 1 | | `SINGLE_PRIM_MODE = FLUSH_PER_OVERLAP_AND_OVERWRITE` |
+
+Three causes, each in code or in the capture [V]:
+
+1. **Every CA key has `fc_framebuffer_fetch` on:** 202 of 202 in this plan, 827 of 827 on the phone [V `pipelines.log`, `t3/ios26-gpu-render-effects`]. m2v turns that into input attachments. Turnip then sets `sysmem_single_prim_mode`, and `tu_autotune_use_bypass` (`tu_autotune.cc` 553) answers "not sysmem". **So each such pass goes to GMEM, whatever its size.**
+2. **The memoryless RGBA16F attachment takes 2/3 of GMEM.** CA binds it as `colorAttachments[1]` (`80,115` in 189 of 202 rows). In this key the shader does not write it: `RB_RENDER_COMPONENTS: RT1 = 0` [V]. It costs: tile width 192 -> 64, so 36 -> 108 tiles [V], and 9.6 MB of real memory (`RB_MRT[1].BASE`, size 9,687,040) [V].
+3. **The flush mode is set though this shader reads no destination:** its fragment code here is one `bary.f` [V capture]. The flag comes from the pipeline's fetch state, not from a read.
+
+So one layer pass replays its draws 108 times on a 1-SP GPU, each with tile setup, and resolves per tile. **This can be a large share of the 121 to 304 ms.** The share is [U]: no timing exists on the host. The phone's `tumode sysmem` bench tells part of it.
+
+What `native` does with this [I until stage 4]:
+
+- Decide by what the compiled fragment shader does, not by the key: an attachment that no pipeline of the pass writes and whose store is don't-care is not bound. No memory, no GMEM, no bandwidth.
+- Always sysmem. `FLUSH_PER_OVERLAP` only for a shader that really reads the destination. How many of the 827 keys read it: stage 3 counts it.
+
+**Faster test for the default stack, with no new driver [I]; not done here, because other agents own that stack:** the env `CA_ENABLE_MEMORYLESS=0`, a switch in Apple's own code (QuartzCore 0x184154b80), should remove the second attachment, so tiles 108 -> 36 and 9.6 MB less per surface. `tumode sysmem` already exists. Whether CA looks the same then: [U]. Phone only.
+
+### 3.4 What it does not change
 
 The pixel work. Same AIR, same ir3, same 1 SP. `glass_background_lph` 837 instructions, `simple_rim_lph` 6,066, `narrow_blur_27` 150 with 14 texture reads per pass [V `ios26-metal.md` 4.2]. A faster driver does not shorten these.
 
@@ -102,6 +130,8 @@ Estimate, **all [I], no number exists**, with the owner's glass figure of 121 to
 | Frames a second, live glass | | | **5 to 14** |
 
 So the owner should expect: **a phone that feels less blocked (CPU, locks, memory), and a modest GPU gain.** Full glass stays slow until the pixel cost falls. If the first bench shows less than 10 % GPU gain, the driver still pays for its CPU and memory saving, but not for glass.
+
+The table above predates section 3.3. If tile replay is a large share of GPU time, the 10-25 % is too low. I do not change the numbers, because no timing exists. [U]
 
 The GPU split by pass is **not in the log** [U]. The first useful bench number is that split: section 8.
 
