@@ -126,6 +126,11 @@ xt_do_metal(const char *what)
 	if (strcmp(what, "off") == 0) {
 		return write_file(XT_METAL_OFF, "powermenu-helper metal off\n") ? 1 : 0;
 	}
+#ifdef XT_IOS26
+	/* No gate job on iOS 26, and a probes-only list leaves the compositor without the GPU: "auto" and "all" both give the root's list and clear "off". */
+	snprintf(text, sizeof(text), "# XNUtils: the root's list\n%s\n", XT_METAL_WIDE);
+	return (write_lists(text) != 0 || remove_file(XT_METAL_OFF) != 0) ? 1 : 0;
+#endif
 	if (strcmp(what, "auto") == 0) {
 		snprintf(text, sizeof(text), XT_GATE_MARK ": XNUtils asked for the gate at the next boot\n" XT_METAL_PROBES "\n");
 		/* the record of an earlier verdict stays out of the way of a new test */

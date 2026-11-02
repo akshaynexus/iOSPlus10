@@ -5189,3 +5189,11 @@ Full text: `docs/laurel_sprout/ios26-touch.md`.
 - Dropbear can stop answering on a loaded phone: TCP connects, no banner, also with 90 s (boot 10, CPU 459 of 480 s busy). Ping and the USB log stay up. Not explained [U].
 - `dual-boot.sh`: `adb` is a function now: no Mi A3 = no adb command. A `timeout 5 adb` in that script would miss the function: use `bounded` with `$ADB_BIN`, or plain `adb`.
 - A tmux job can vanish with no `.exit` file when its folder changes under it: read `tmux ls` and the log, not only the exit file.
+
+## 2026-11-03: Mi A3 iOS 26 boot 11: the compositor lost Metal through XNUtils
+- [V log] pid 66 backboardd: `LAUREL METAL26: on`. XNUtils ran, `powermenu-helper` ran, backboardd restarted with no CRASH line, pid 395: `off: backboardd is not listed`. `WidgetRenderer_Default`, denied by the root's list before, then got a device, so the list had changed. [V code] the helper's only `-backboardd` list is `XT_METAL_WIDE`, and every Metal choice (auto, all, probes) wrote a list with no compositor. [I] which button: the helper does not log its argument. [U] until the file is read on the phone.
+- [V] 23F84 backboardd with no Metal device still draws: "Metal or nothing" in `ios26-userland.md` is wrong as a statement about the picture. backboardd at 126 % CPU, 24 fps on Home/lock.
+- [V] on Metal, earlier in the same boot under heavier start-up load: 7 to 16 fps, GPU 39 ms a submission, 54 % busy. The two numbers are not a fair comparison (other load, other screen).
+- [V] CPUs 96 % busy (461 s of 480) in the minute samples: BackgroundShortcuts, FitnessIntelligence, dasd, healthd, modelcatalogd, searchd. Crash loops: gamepolicyd, deviceaccessd, liveactivitiesd, linkd, cryptexd, intents_helper (memory high watermark kills at 6-10 MB: `crossed memory high watermark`).
+- Fix: on iOS 26, XNUtils offers On / Off (CPU), both "On" verbs write the root's list; the plug-in gives backboardd a device whatever the lists say (kill switches still act). The fix for a phone already holding the bad list comes with the new plug-in.
+- Panic after `exec Preferences` at 2 s: the panic text did not reach the USB log (only `@model_dep.c:1256`, "Debugger synch pending on cpu 5"). `ctl logall` replays the ring, not this text. Open.

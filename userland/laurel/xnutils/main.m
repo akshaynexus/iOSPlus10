@@ -31,7 +31,11 @@
 	title.text = @"  XNUtils";
 	title.font = [UIFont boldSystemFontOfSize:28];
 	self.tableView.tableHeaderView = title;
+#ifdef XT_IOS26
+	self.metal = [[UISegmentedControl alloc] initWithItems:@[ @"On", @"Off (CPU)" ]];
+#else
 	self.metal = [[UISegmentedControl alloc] initWithItems:@[ @"Auto", @"All", @"Probes", @"Off" ]];
+#endif
 	[self.metal addTarget:self action:@selector(metalChanged:) forControlEvents:UIControlEventValueChanged];
 	self.metal.translatesAutoresizingMaskIntoConstraints = NO;
 	self.metalCell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
@@ -110,7 +114,11 @@
 	for (XTSection *s in self.sections) {
 		if ([s.title isEqualToString:@"Metal"]) {
 			NSString *mode = [s value:@"Mode"] ?: @"";
+#ifdef XT_IOS26
+			NSArray *names = @[ @"all", @"off" ];
+#else
 			NSArray *names = @[ @"auto", @"all", @"probes", @"off" ];
+#endif
 			NSInteger at = UISegmentedControlNoSegment;
 
 			for (NSUInteger i = 0; i < names.count; i++) {
@@ -148,7 +156,11 @@
 }
 
 - (void)metalChanged:(UISegmentedControl *)c {
+#ifdef XT_IOS26
+	NSArray *modes = @[ @"all", @"off" ];
+#else
 	NSArray *modes = @[ @"auto", @"all", @"probes", @"off" ];
+#endif
 
 	if (c.selectedSegmentIndex >= 0 && c.selectedSegmentIndex < (NSInteger)modes.count) {
 		[self runVerb:@"metal" arg:modes[(NSUInteger)c.selectedSegmentIndex]];

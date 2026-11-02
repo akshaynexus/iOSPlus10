@@ -225,7 +225,10 @@ main(int argc, char **argv)
 	}
 	const char *verb = argv[1], *arg = argc == 3 ? argv[2] : NULL;
 	int metal = arg != NULL && !strcmp(verb, "metal") &&
-	    (!strcmp(arg, "auto") || !strcmp(arg, "all") || !strcmp(arg, "probes") || !strcmp(arg, "off"));
+	    (!strcmp(arg, "auto") || !strcmp(arg, "all") || !strcmp(arg, "off"));
+#ifndef XT_IOS26
+	metal |= arg != NULL && !strcmp(verb, "metal") && !strcmp(arg, "probes");
+#endif
 	int gl = arg != NULL && !strcmp(verb, "gl") && (!strcmp(arg, "on") || !strcmp(arg, "off"));
 	static const char *const plain[] = { "restart", "shutdown", "bootloader", "check", "strikes-clear", "restart-ui", "stream", "stats", "report" };
 	int plain_ok = 0;

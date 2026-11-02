@@ -77,6 +77,13 @@ if unshare -r true 2>/dev/null; then
     -include sys/types.h -include stdint.h -o "$D/helper26" "$S/helper.c" "$S/helper_files.c" "$S/helper_ios26.c" "$S/test/host_stubs.c" "$S/report_core.c" "$S/report_row.c" "$S/report_gfx.c" "$S/report_sys.c" "$S/report_io.c" 2>"$D/helper26.log" || { cat "$D/helper26.log"; exit 1; }
   h26() { unshare -r "$D/helper26" "$@"; }
   DB=$F/private/var/db/negronimetal; L2=$F/System/Library/Extensions/NegroniMetal.bundle/option.local
+  # iOS 26: no Metal choice may take the compositor off the GPU (boot 11: "* -backboardd" put it on the CPU)
+  W26="* -chronod -cameracaptured -WidgetRenderer_Default -PosterBoard"
+  for m in all auto; do
+    : > "$DB/off"; h26 metal $m; [ "$(tail -1 "$C")" = "$W26" ] && cmp -s "$C" "$L" && [ ! -e "$DB/off" ] && ! grep -q -e '-backboardd' -e laurel-metal-gate "$C" || { echo "xnutils-test: FAIL: iOS 26 metal $m" >&2; fail=1; }
+  done
+  rc=0; h26 metal probes 2>/dev/null || rc=$?; [ $rc = 2 ] && [ "$(tail -1 "$C")" = "$W26" ] || { echo "xnutils-test: FAIL: iOS 26 metal probes gives $rc, not 2, or changes the list" >&2; fail=1; }
+  grep -q "$(printf '%s' "$W26" | sed 's/[*]/[*]/')" "$(dirname "$0")/root-add-metal-ios26.sh" || { echo "xnutils-test: FAIL: XT_METAL_WIDE differs from root-add-metal-ios26.sh" >&2; fail=1; }
   printf 'NEGRONIMETAL_OPEN_MS=60000\nTU_DEBUG=old\n' > "$DB/env"
   mkdir -p "$DB/stack"; echo "hot 2 0" > "$DB/stack/state"; : > "$DB/stack/failed"; : > "$DB/stack/ok"
   h26 metaloption hot; [ "$(cat "$DB/option")" = hot ] && [ "$(cat "$L2")" = hot ] && [ ! -e "$DB/stack/state" ] && [ ! -e "$DB/stack/failed" ] && [ ! -e "$DB/stack/ok" ] || { echo "xnutils-test: FAIL: metaloption hot" >&2; fail=1; }

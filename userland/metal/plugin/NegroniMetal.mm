@@ -1356,12 +1356,15 @@ static void watchdog_start(void)
 			nlog(BBD_TAG ": on: backboardd takes a Metal device; GL stays the fallback (a nil device, a crash, no frame, a black screen, a lost GPU)");
 		} else
 #endif
+#ifdef NMTL_IOS26
+		/* [V boot 11, 2026-11-03] A list with no compositor came from iOS 16's "* -backboardd" and put the window server on the CPU with no line of the reason. The compositor has no other GPU path on 23F84, so it needs no list; the kill switches (the off file, negronimetal=0) still act. */
+		if (process_is_backboardd()) {
+			if (!listed())
+				nlog(BBD_TAG ": the clients files leave out backboardd: ignored, the compositor keeps the GPU");
+		} else
+#endif
 		if (!listed()) {
 			nlog("not listed in %s/clients, %s/clients.local or %s: no Metal device", g_bundle, g_bundle, NMTL_DIR "/clients");
-#ifdef NMTL_IOS26
-			if (process_is_backboardd())
-				nlog(BBD_TAG ": off: backboardd is not listed: no renderer in the window server on 23F84");
-#endif
 			return;
 		}
 		if (bootarg_off()) {
