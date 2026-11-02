@@ -488,7 +488,9 @@ image)
   ro=1; [ "$m" = ro ] || ro=0
   # the app on the phone compares iosroot with this mark (docs/laurel_sprout/boot-menu.md). No record: no mark, the app refuses the image
   _inst=$(sed -n 's/^installed .* \([0-9a-f]\{64\}\)$/\1/p' "$RESULT" 2>/dev/null | tail -1)
-  env UEFI_W="${bi%/*}" LAUREL_READONLY=$ro IOSROOT_HEAD_SHA="$_inst" "$s"
+  # the firmware mark from the backup that `switch` checks against: the pre-write one, not the newest folder (F5). No record yet: uefi-image.sh's own choice
+  _fws=; [ ! -f "$PREWRITE" ] || _fws=$(sed -n 1p "$PREWRITE")/SHA256SUMS
+  env UEFI_W="${bi%/*}" LAUREL_READONLY=$ro IOSROOT_HEAD_SHA="$_inst" FW_B_SUMS="$_fws" "$s"
   [ -f "$bi.dualboot" ] || die "no $bi.dualboot: config/laurel-android-data must exist for this build"
   grep -q "^mode $m\$" "$bi.dualboot" || die "the image was built as $(sed -n 's/^mode //p' "$bi.dualboot"), not $m"
   say "$bi: mode $m, $(sed -n 's/^os //p' "$bi.dualboot")"

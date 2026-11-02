@@ -256,7 +256,7 @@ for tgt in ios16 ios26; do
   check_img "$tgt rw" "$I-rw/laurel-uefi-boot.img" "LAUREL SWITCH: ok: ready" 0
   grep -q '^mode ro$' "$I-ro/laurel-uefi-boot.img.dualboot" && grep -q '^mode rw$' "$I-rw/laurel-uefi-boot.img.dualboot" || { echo "FAIL sidecars"; exit 1; }
   for m in ro rw; do grep -qF "marker $FENCE" "$I-$m/laurel-uefi-boot.img.dualboot" && LC_ALL=C grep -aqF "$FENCE" "$I-$m/laurel-uefi-boot.img" || { echo "FAIL marker $m"; exit 1; }; done
-  LC_ALL=C grep -aqE 'ufsrw=[1-9]|rootrw=[1-9]' "$I-ro/laurel-uefi-boot.img" && { echo "FAIL ro image can write"; exit 1; }
+  if laurel_can_write < "$I-ro/laurel-uefi-boot.img"; then echo "FAIL ro image can write"; exit 1; fi
   LC_ALL=C grep -aqE 'ufsrw=1' "$I-rw/laurel-uefi-boot.img" || { echo "FAIL rw image has no ufsrw"; exit 1; }
   "$OUT/venv/bin/python3" -W ignore - "$I-ro/payload.img" "$I-rw/payload.img" <<'P'
 import sys,tomllib

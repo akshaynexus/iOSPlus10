@@ -50,6 +50,13 @@ LDB_MARKER=$(sed -n 's/^#define LDB_KERNEL_MARKER *"\([^"]*\)".*/\1/p' "$T/laure
 LC_ALL=C grep -aqF "$LDB_MARKER" "$D/test_kernel" || { echo "test-dualboot: FAILED: the kernel object has no marker text $LDB_MARKER" >&2; exit 1; }
 echo "ok   H1 the driver built with the marker holds the text: $LDB_MARKER"
 grep -E 'LAUREL DUALBOOT: (on|off)' "$D/test_kernel.out" | sed 's/^/     /' | sort -u
+# A kernel's own strings must not read as a boot-arg token, or the guard calls each read-only image writable (laurel_can_write). The real files, when they are built.
+. "$REPO/scripts/lib/laurel-layout.sh"
+for k in "$OUT/laurel-kernel/out/kernel.development.sweet.4k" "$OUT/laurel-kernel-ios26/out/kernel.ios26.development.sweet.4k"; do
+  [ -f "$k" ] || { echo "note $k is not built: its strings were not checked"; continue; }
+  if laurel_can_write < "$k"; then echo "test-dualboot: FAILED: $k holds text that reads as ufsrw or rootrw" >&2; exit 1; fi
+  echo "ok   F7 no text in $(basename "$k") reads as a boot-arg token"
+done
 
 echo "== 4. the phone helper"
 HC="$CC -std=gnu11 -O1 -static -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -no-pie -fuse-ld=lld -Wall -Wextra -Wno-unused-parameter"

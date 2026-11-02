@@ -136,7 +136,7 @@ if [ "${MU_ONLY:-0}" != 1 ] && [ "$BOOT_MENU" = 1 ]; then
   # slot b's boot chain, one hash (list and form: fw_b_combined, laurel-layout.sh), and the hash of the kernel fence text: what `dual-boot.sh switch` checks on the host, for the phone alone
   [ -n "${ldb_marker:-}" ] && marks="$marks laurel_ios_fence=$(printf '%s' "$ldb_marker" | { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; } | cut -d' ' -f1)"
   . "$REPO/scripts/lib/laurel-layout.sh"
-  FW_B_SUMS=${FW_B_SUMS:-$(for _d in $(ls -d "$LAUREL_BACKUP"/android-* 2>/dev/null | sort -r); do [ -f "$_d/gpt-sda-head.bin" ] && [ -f "$_d/SHA256SUMS" ] && { echo "$_d/SHA256SUMS"; break; }; done)}
+  FW_B_SUMS=${FW_B_SUMS:-$(for _d in $(ls -d "$LAUREL_BACKUP"/android-* 2>/dev/null | sort -r); do [ -f "$_d/gpt-sda-head.bin" ] && [ -f "$_d/SHA256SUMS" ] && { echo "$_d/SHA256SUMS"; break; }; done; true)}
   if [ -f "${FW_B_SUMS:-}" ] && fwb=$(fw_b_combined "$FW_B_SUMS"); then marks="$marks laurel_ios_fwb=$fwb"; else echo "uefi-image: note: no backup hashes of the slot b firmware: the Android app refuses this image"; fi
   [ "${#marks}" -le 511 ] || { echo "uefi-image: FAILED: the marks are ${#marks} bytes, the header field holds 512 with its NUL: $marks" >&2; exit 1; }
   mk "$marks"
