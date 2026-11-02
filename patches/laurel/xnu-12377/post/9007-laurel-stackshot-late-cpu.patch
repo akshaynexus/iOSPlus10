@@ -1,0 +1,47 @@
+laurel iOS 26: a late CPU costs a stackshot, not the system
+
+[V boot 11] panic(cpu 2): DebuggerXCallEnter>Debugger synch pending on cpu 5 @model_dep.c:1256, 2 s after Preferences started.
+xnu-8796 returned KERN_OPERATION_TIMED_OUT here; xnu-12377 panics. debug-ack is 12.5 ms on this board's timer.
+Why CPU 5 was late: [U]. The line LAUREL DEBUG ACK gives the count and the CPU.
+--- a/osfmk/arm/model_dep.c	2026-11-03 00:18:01.872078882 +0530
++++ b/osfmk/arm/model_dep.c	2026-11-03 00:18:01.904320452 +0530
+@@ -182,7 +182,8 @@
+ #define FP_MAX_NUM_TO_EVALUATE (50)
+ 
+ /* Timeout for all processors responding to debug crosscall */
+-MACHINE_TIMEOUT_ALWAYS_ENABLED(debug_ack_timeout, "debug-ack", 240000, MACHINE_TIMEOUT_UNIT_TIMEBASE);
++/* laurel: 240000 is 10 ms at Apple's 24 MHz and 12.5 ms at this board's 19.2 MHz; a CPU here can hold interrupts longer [V boot 11]. 100 ms. */
++MACHINE_TIMEOUT_ALWAYS_ENABLED(debug_ack_timeout, "debug-ack", 1920000, MACHINE_TIMEOUT_UNIT_TIMEBASE);
+ 
+ /* Forward functions definitions */
+ void panic_display_times(void);
+@@ -1252,6 +1253,20 @@
+ 		if (sync_pending == 0) {
+ 			return KERN_SUCCESS;
+ 		} else if (!proceed_on_sync_failure) {
++			if (is_stackshot) {
++				/*
++				 * laurel: a stackshot is a request of user space: a late CPU costs that stackshot, as in xnu-8796 (KERN_OPERATION_TIMED_OUT),
++				 * not the system. [V boot 11] panic 2 s after Preferences started, CPU 5 late. The caller (handle_debugger_trap) passes the
++				 * error on. A late CPU takes its IPI later and finds mp_kdp_trap clear; the next entry zeroes the counts.
++				 */
++				static unsigned int laurel_late_count;
++				DebuggerXCallReturn(); /* first: printf takes locks, and the other CPUs must not spin while one of them may hold those */
++				if (laurel_late_count++ < 8) {
++					printf("LAUREL DEBUG ACK: on: stackshot given up: cpu %d is late by over %llu ticks (time %u)\n",
++					    timeout_cpu, (unsigned long long)os_atomic_load(&debug_ack_timeout, relaxed), laurel_late_count);
++				}
++				return KERN_OPERATION_TIMED_OUT;
++			}
+ 			panic("%s>Debugger synch pending on cpu %d\n",
+ 			    __FUNCTION__, timeout_cpu);
+ 		}
+@@ -1351,7 +1366,7 @@
+ 	os_atomic_clear_exclusive();
+ 
+ 	// checking debug_ack_timeout != 0 is a workaround for rdar://124242354
+-	if (current_mabs_time >= max_mabs_time && os_atomic_load(&debug_ack_timeout, relaxed) != 0) {
++	if (current_mabs_time >= max_mabs_time && os_atomic_load(&debug_ack_timeout, relaxed) != 0 && !trap_is_stackshot) { /* laurel: a late CPU costs no more than the stackshot */
+ 		panic("Resuming from debugger synchronization failed: waited %llu nanoseconds\n", os_atomic_load(&debug_ack_timeout, relaxed));
+ 	}
+ }
