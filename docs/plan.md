@@ -1157,3 +1157,9 @@ Next: new root + the owner's flash (`ios26-root.sh`, then `dual-boot.md`); read 
 Done: cause found: backboardd's boot-UI spinner, 24 images in 1 s, after a backboardd restart; not a cap and no clock error. Patch 2917: a motion that ends has its LAUREL FRAME lines. post/9008: vsync gives the refresh period, the old value was a tick counter.
 Results [V host]: `frame-pace.py --test` all pass; kernel-ios26-linux.sh builds with both patches. Details: `docs/laurel_sprout/gpu.md` "The 24 fps windows".
 Next: boot the kernel; read `LAUREL FRAME: motion ended` during a Settings scroll, and `oslogstream` at a restart to name the spinner. Open: the 135 s to the end of the spinner in boot 12.
+
+## Mi A3 iOS 26: GPU levels to 950 MHz (2026-11-03, branch t3/57b0d99e; host only, NOTHING RUN ON THE PHONE)
+Done: patch 2961 (`gpu.md` section "All stock levels"): PLL1 320/465, GPLL0 300/600, PLL0 745/820/900/950, stock CX corner, CX iPeak from 900, stock bus level, Android thermal limits, self-check per level, fallback to the 300/600 path. Kill switches `gpudcvs=0`, `gpupll=0`.
+Results [V host]: `scripts/laurel/test-gpu-opp.sh` PASS (table against source and the phone's DTB; 1904 level changes with failures; 4 controls). Series 0 errors. Kernel built (see the branch report).
+Next: a boot. Read `LAUREL GPU CLOCK: on: MHz=GCC/CP` and `LAUREL DDR`. If DDR does not follow: owner decision on `Enab`. Guess [I]: 39 ms a long submission -> 25 to 28 ms.
+

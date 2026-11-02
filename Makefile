@@ -5,7 +5,7 @@
 BG := scripts/bg.sh
 OS := $(shell uname -s)
 
-.PHONY: ipsw-cli laurel-ios26-parity laurel-ios26-diag laurel-ios26-kernel laurel-ios26-image laurel-ios26-root laurel-a64emu-test laurel-a80211-test laurel-mu laurel-kernel laurel-uefi-image laurel-flash-uefi laurel-update help status tools op10tool colima image references backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
+.PHONY: ipsw-cli laurel-gpu-opp-test laurel-ios26-parity laurel-ios26-diag laurel-ios26-kernel laurel-ios26-image laurel-ios26-root laurel-a64emu-test laurel-a80211-test laurel-mu laurel-kernel laurel-uefi-image laurel-flash-uefi laurel-update help status tools op10tool colima image references backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
         kernel kernel-local kernel-ci xcode15 ssh devicetree dmgs boot root simg ios16 flash flash-boot flash-restore boot-debug flash-boot-debug usblog bootlog
 
 help:
@@ -139,6 +139,8 @@ laurel-ios26-diag:
 	scripts/bg.sh ios26-diag python3 -I scripts/laurel/ios26-diag.py
 laurel-a64emu-test:
 	scripts/bg.sh a64emu-test scripts/laurel/test-a64emu.sh
+laurel-gpu-opp-test:
+	scripts/bg.sh gpu-opp-test scripts/laurel/test-gpu-opp.sh
 laurel-a80211-test:
 	scripts/bg.sh a80211-test scripts/laurel/test-apple80211.sh
 laurel-ios26-image:

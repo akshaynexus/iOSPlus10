@@ -1,6 +1,6 @@
 # Mi A3 (laurel_sprout) GPU: Adreno 610 behind CoreAnimation's OpenGL ES renderer
 
-Status 2026-11-01 (branch t3/laurel-clock-perf): 2892 GPU clock by demand 300 <-> 600 MHz + the split 5 s line; built on Linux, **NOT BOOTED** (section "GPU clock by demand").
+Status 2026-11-03: 2961 all stock levels to 950 MHz (section "All stock levels"); built on Linux, **NOT BOOTED**. 2892 (300 <-> 600 MHz) ran on the phone since boot 2026-11-01, and it is the fallback of 2961.
 Status 2026-11-01 16:30 (t3/laurel-metal-everywhere: 2160, 2161, 2851, section "Kernel changes for Metal clients"); 08:30 (branch t3/laurel-gpu-zero-copy): 2158 zero-copy surfaces + cache push per CPU write, 2159 measured GPU busy/clock, eagl 0002, Metal client gate; built on Linux, **NOT BOOTED** (section "Zero copy, cache upkeep, GPU time").
 Status 2026-11-01 06:45: the 06:12/06:17 "GL stall" is lsd's first LaunchServices seed (ADT without /chosen MACs), not the GPU; mkadt.py fix + 2155 GPU watchdog, built, NOT BOOTED (section "GL stall"). Status 2026-11-01 06:10: first boot with the zap files (05:52) hung in the zap SCM calls; 2153 fixes it (section "Zap hang").
 Status 2026-11-01 05:10: review fixes on top of laurel-int-1 (areas A, C, H); built on Linux (kernel, Mesa, userland,
@@ -49,24 +49,9 @@ kernel
 | OPPs | 320 (PLL1 640) 465 (PLL1 930) 600 745 820 900 950 MHz (PLL0 1200-1900) | 320-1260 | trinket-gpu.dtsi pwrlevels |
 | GCC branches | bimc_gpu_axi 0x71154, memnoc_gfx 0x3600c, snoc_dvm_gfx 0x36018, cfg_ahb 0x36004, sys_noc_compute_sf_axi 0x1050c, GPLL0 to GPU 0x79004 bit 15 | same offsets (no cfg_ahb/sf_axi) | gcc-trinket.c, kgsl clocks |
 | GPUCC 0x1060 | no clock there (topaz wrote "gpucc_gx_cxo"): not touched | — | gpucc-trinket.c, mainline gpucc-sm6125.c |
-| GPU clock used | **300 MHz** (GPLL0 / 2, as topaz) | 300 | — |
+| GPU clock used | 300 MHz at start (GPLL0 / 2, as topaz); then by demand: section "All stock levels" | 300 | — |
 
-The core clock is fixed at 300 MHz from GPLL0. gfx3d votes the **CX** rail (gpucc-trinket.c: vdd_cx levels); nothing here votes
-it, and 300 MHz is below the lowest level's 320 MHz limit; the PLLs (VCO above 1 GHz) also need MX nominal. topaz's
-`gpu_mhz` knob is removed (a tuning boot-arg is against the boot-arg rule). For the later CX/MX vote (RPM), the PLL
-values (checked by the review against `clk-alpha-pll.c`): f(PLL) = 19.2 MHz x (L + alpha / 2^40), gfx3d = AUX2 / 2
-(RCG source 2 = PLL0, 4 = PLL1, divider value 3), CONFIG_CTL 0x4001055b, USER_CTL AUX2 = bit 2, ALPHA_EN bit 24, VCO bits
-20-21 (0 = 1-2 GHz, 2 = 0.5-1 GHz), TEST_CTL_U (+0x20) bit 0 = 0; enable: BYPASSNL, 5 us, RESET_N, LOCK (bit 31), OUTCTRL.
-
-| gfx3d MHz | PLL | L | ALPHA_U | ALPHA | VCO |
-| --- | --- | --- | --- | --- | --- |
-| 320 | 1 (+0x100) | 33 | 0x55 | 0x55555555 | 2 |
-| 465 | 1 | 48 | 0x70 | 0 | 2 |
-| 600 | GPLL0 / 1 | — | — | — | — |
-| 745 | 0 (+0x0) | 77 | 0x9a | 0xaaaaaaaa | 0 |
-| 820 | 0 | 85 | 0x6a | 0xaaaaaaaa | 0 |
-| 900 | 0 | 93 | 0xc0 | 0 | 0 |
-| 950 | 0 | 98 | 0xf5 | 0x55555555 | 0 |
+The boot clock is 300 MHz from GPLL0. Levels, PLL values, votes: section "All stock levels" and `laurel_gpu_opp.h` (2961). The numbers of an older table here were rounded down (ALPHA 0xaaaaaaaa); `alpha_pll_round_rate` rounds up.
 
 ## Firmware (never in git)
 
@@ -797,7 +782,7 @@ The zero-copy agent's two fears: nothing reads the CX vote, and a lower vote can
 5. Time per level a minute. Kill switch `gpudcvs=0`. Any failure: 300 MHz, one line, GPU on. Votes already sent stay (they only raise).
 `core_mhz` stays 300 for MSM_PARAM_MAX_FREQ and the `LAUREL GPU` / `LAUREL METAL` lines (the programmed base clock).
 
-Why only 600 now: no PLL (GPLL0 / 1), half the busy time if the work is bound by the core clock [I]. 745-950 MHz need PLL0 (recipe in the table at the top) and, above 745, a corner that goes up and down. Add them only when the 2892 lines show busy above about 60 % at 600 MHz while the UI moves.
+Levels above 600 MHz: section "All stock levels" (2961). Items 2, 3 and the thermal limits above are the 2892 rules; 2961 replaces them.
 
 ### DDR: held low? [U, the next boot says]
 
@@ -823,6 +808,86 @@ LAUREL GPU CLOCK: on: last minute 300 MHz 41 s, 600 MHz 19 s, 37 raises, 0 hot r
 2. Scroll Settings, open Safari, Control Center for 1 min. Compare the `GPU busy` and `SWEET FPS` lines with this table and with `gpudcvs=0` (kill switch boot) if the result is not clear.
 3. No hang, no panic, no `GPU hang` line. A long game-like load: `gpu N C` in the minute line, a refusal above 90 C.
 4. Reboot, a crash or a frozen panel right after the first scroll: `gpudcvs=0` and report it. That is the one failure the self-check cannot turn off: a clock that passes the check and later breaks a block.
+
+## All stock levels to 950 MHz (2961; built, NOT BOOTED)
+
+Owner decision 2026-11-03. `iokit/Kernel/arm/laurel_gpu_opp.h` (table + rules, no hardware access), `LaurelGpuDcvs.cpp` (the operations and the thread), `laurel_gpu_clock_read.h` (DDR), two hooks in `TopazAdreno.cpp`. Both kernels: `patches/laurel/xnu/2961-laurel-gpu-opp.patch`. Edit in `src/xnu`, then `scripts/laurel/gpu-opp-patch.sh`.
+
+### Table [V]
+
+Sources: `trinket-gpu.dtsi`, the phone's DTB (`boot.img`, TRINKET msm-id 0x18a; 3 DTBs of the SoC have the same levels; no `qcom,gpu-speed-bin`; `dtbo.img` has no GPU levels), `gpucc-trinket.c`, `vdd-level-trinket.h`, `clk-alpha-pll.c`, `adreno-gpulist.h`. `scripts/laurel/test-gpu-opp.sh` checks the table against all of them.
+
+| MHz | Source | RCG src / div | VCO MHz | L | ALPHA_U | ALPHA | VCO range | Stock CX corner | Vote on CX | Bus level, DDR MHz (min-max level) | iPeak |
+|---:|---|---|---:|---:|---|---|---|---|---|---|---|
+| 300 | GPLL0 / 2, **not stock**, fallback | 5 / 2 | | | | | | LOW_SVS 64 | NOM 256 (held) | 451 | no |
+| 320 | PLL1 AUX2 / 2 | 4 / 2 | 640 | 33 | 0x55 | 0x55555600 | 2 | LOW_SVS 64 | NOM 256 (held) | 4, 451 (3-5) | no |
+| 465 | PLL1 AUX2 / 2 | 4 / 2 | 930 | 48 | 0x70 | 0 | 2 | SVS 128 | NOM 256 (held) | 7, 768 (5-8) | no |
+| 600 | GPLL0 / 1 (stock: PLL0 at 1200) | 5 / 1 | | | | | | SVS_PLUS 192 | NOM 256 (held) | 8, 1017 (7-9) | no |
+| 745 | PLL0 AUX2 / 2 | 2 / 2 | 1490 | 77 | 0x9a | 0xaaaaab00 | 0 | NOM 256 | NOM 256 | 9, 1353 (8-10) | no |
+| 820 | PLL0 AUX2 / 2 | 2 / 2 | 1640 | 85 | 0x6a | 0xaaaaab00 | 0 | NOM_PLUS 320 | 320 | 10, 1555 (9-11) | no |
+| 900 | PLL0 AUX2 / 2 | 2 / 2 | 1800 | 93 | 0xc0 | 0 | 0 | TURBO 384 | 384 | 11, 1804 (9-11) | **yes** |
+| 950 | PLL0 AUX2 / 2 | 2 / 2 | 1900 | 98 | 0xf5 | 0x55555600 | 0 | TURBO_NO_CPR 416 | 416 | 11, 1804 (10-11) | **yes** |
+
+- PLL: CONFIG_CTL 0x4001055b; USER_CTL bit 2 (AUX2), bit 24 (alpha), bits 20-21 (VCO); MODE bit 23; TEST_CTL_U bit 0 = 0. Start: BYPASSNL, 5 us, RESET_N, LOCK bit 31 (stock: 100 reads, here 200), OUTCTRL.
+- MX: NOM for a VCO to 2 GHz, held for the boot (2892). All levels are inside it.
+- **The CX vote for 300 to 600 MHz is above the GPU's own corner.** It is the NOM of 2892, held for the other AP blocks, not a GPU need. From 745 MHz the vote is the stock corner. The vote never goes above the stock corner of the level; after a lower it falls back to NOM.
+- 600 MHz stays on GPLL0 / 1: the same frequency, read on the phone, and no PLL to keep running.
+- `qcom,gpu-gaming-bin` is a fuse that only answers a userspace query (`adreno.c`). It limits no level [V].
+
+### CX iPeak [V], not in the earlier notes
+
+`adreno-gpulist.h`: A610 `cx_ipeak_gpu_freq = 900000000`. `kgsl_pwrctrl.c`: before the clock crosses 900 MHz it votes `cx_ipeak_update(true)` ("Hardware damage is possible at peak current if mitigation not done to limit peak power"); if the vote times out, the clock stays. After a lower below 900 MHz it withdraws. `cx_ipeak.c` v2, `cx_ipeak_lm` = TCSR 0x3ed000, client 5: vote at +0x6000 bit 0, wait up to 50 ms for +0x24 (danger) = 0; feature at +0x10; bypass at +0x6004 bit 0. No feature or a bypassed client: stock sends no vote, and neither does 2961. So 900 and 950 MHz are not "just a corner".
+
+### Order [V host test]
+
+| Change | Steps |
+|---|---|
+| Raise | iPeak (from 900), DDR, CX, PLL + lock, RCG, clock read |
+| Lower | PLL + lock, RCG, iPeak off, CX. DDR falls 500 ms later |
+| Level on the same PLL | RCG first to GPLL0 (600 or 300, never above the old clock), PLL stop, program, lock, RCG. A running PLL is never changed: no dynamic update, and no glitch |
+
+Failure: a refused vote or no lock: the clock stays, one line, that level goes out of the table. When a level on the same PLL fails, the old rate comes back; when that also fails, the clock stays on GPLL0.
+
+### Self-check, at start
+
+Temperature, read at 300, MX + CX NOM, 600 (read, CP fence), back to 300 (read): the fallback of 2892; a failure here gives `off`. Then 320, 465 (PLL1), 745, 820, 900, 950 (PLL0), each with lock, read (GCC, else CP; 3 %), CP fence. A level that fails goes out; a PLL0 level above it is not tried. Lowest level after that: 320 when it passed, else 300.
+
+Read tolerance 3 %, not 10 %: 900 and 950 are 5.5 % apart. Boot 11 reads: 298/300, 598/600.
+
+### Governor (50 ms tick)
+
+- Busy >= 90 %: the top level. Busy >= 50 %: the level where the same work takes 45 %, one level at least.
+- Touch in the last 300 ms: 745 MHz at least (no rail above what is held, no iPeak; not the top, so a tap does not vote DDR and TURBO).
+- Lower: when the same work takes 45 % or less on a lower level, for 500 ms without a break. 45 < 50: no ping-pong (host test: each steady load settles).
+
+### Thermal [V trinket-thermal.dtsi, phone's DTB]
+
+Sensor 15. **95 C** (`gpu-step`, no hysteresis): a raise is refused, and one level down per tick. Below 95 C: one level up per tick. **100 C** (`gpu-cx-mon`, hysteresis 5 C): the lowest level until below 95 C. No reading counts as 100 C. Vendor `thermal-engine*.conf` has no GPU rule (only `TEMP_CPU0` for cpu2 and a monitor) [V]. The 90/80 C of 2892 were ours, not stock. `gpu-usr` 110-125 C are reset monitors.
+
+### DDR
+
+Stock vote: `msm_bus` path 26 -> 512, ib of the level, /8 = the DDR clock. Here: RPM `clk2` id 0 `KHz`, at the `bus-freq` of the level. Stock also scales in `bus-min`..`bus-max` by the `bw_vbif` governor; here only `bus-freq`. So at 900 and 950 MHz the vote is **1804 MHz, the stock one** [V].
+
+**What the phone does with it: [U].** All boots read `DDR 1355 MHz` [V], and 2892 sent no vote, because 1355 >= 1017. The RPM has never had a DDR vote from XNU on this phone, and XNU sends no `clk0` `Enab` (`clk_smd_rpm_enable_scaling`), so it may ignore it. `ddr_start` votes 1804 once at start and reads the period register:
+- A rise of 10 % or more: votes per level, never below the boot clock (snapped to the level, 1353).
+- No rise: `LAUREL DDR: off: ...`, the vote goes back to the boot clock, and 820+ MHz run with DDR at 1353. `Enab` stays an owner decision (section "DDR: held low?"); it could also let the RPM lower SNOC and CNOC.
+
+### Lines
+
+```
+LAUREL DDR: on: 1355 MHz at boot, a vote of 1804 gave 1804 MHz, 1353 MHz now; stock bus level of each GPU level, never below 1353 MHz
+LAUREL DDR: off: 1355 MHz at boot, 1355 MHz after a vote of 1804 MHz: the RPM does not follow (no scaling enable); 820+ MHz run on the boot clock
+LAUREL GPU CLOCK: on: MHz=GCC/CP 320=320/320 465=464/465 600=598/600 745=744/745 820=820/820 900=900/900 950=950/950; fence 90 us; iPeak; raise 50 % or touch; hot 95 C
+LAUREL GPU CLOCK: on: MHz=GCC/CP 320=... 820=820/820; fence 90 us; iPeak; out 900 950: 900: RPM refused the CX vote 0/0; raise 50 % or touch; hot 95 C
+LAUREL GPU CLOCK: on: 950 MHz out: the clock read is wrong (read 817/820); now 900 MHz
+LAUREL GPU CLOCK: on: no GPU progress for 1500 ms at 950 MHz; PLL levels out, 300/600 MHz goes on
+LAUREL GPU CLOCK: on: last minute 320 MHz 12 s, 600 MHz 3 s, 950 MHz 44 s, 17 raises, 0 hot refusals; busy 41 % of the time, gpu 61.0 C, DDR 1804 MHz
+```
+(Numbers are examples.) Kill switches: `gpudcvs=0` (300 MHz only, no vote), `gpupll=0` (the 300/600 path of 2892: no PLL, no iPeak register, no DDR vote above what 2892 sent).
+
+### Not proved on the host
+
+Only the phone tells: PLL lock, the reads, the fence at 950 MHz, the RPM's answer to CX 320/384/416 and DDR 1804, the TCSR read, heat. Long load: `gpu N C` in the minute line. Reboot or frozen panel right after the first scroll: `gpupll=0`, and report it.
 
 ## IOSurface formats and blank layers (boot 2026-11-01 20:02; built, NOT BOOTED; widget trace: metal.md section 12)
 

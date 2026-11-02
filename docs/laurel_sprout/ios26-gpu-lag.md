@@ -7,14 +7,14 @@ Marks: [V] read in a log, code or disassembly, or run here. [I] inference. [U] u
 
 | # | Cause | Numbers | State | Mark |
 |---|---|---|---|---|
-| 1 | GPU time per frame is the cap: a long submission takes 25 to 86 ms, and in backboardd the frame waits for it (`NEGRONIMETAL_SYNC=1`) | 7 to 17.5 fps on Metal; section 3 | Not fixed. Clock: section 5 | [V] numbers, [I] cap |
+| 1 | GPU time per frame is the cap: a long submission takes 25 to 86 ms, and in backboardd the frame waits for it (`NEGRONIMETAL_SYNC=1`) | 7 to 17.5 fps on Metal; section 3 | Clock to 950 MHz: patch 2961, not booted. Section 5 | [V] numbers, [I] cap |
 | 2 | Every wait for the GPU was a busy loop of system calls: wrong clock in the deadline | 3,910,567 polls, 1 real wait, in 32 windows of 5 s; up to 468,161 in one window | **Fixed**, commit 7adaaf3 | [V] |
 | 3 | CPUs 96 % busy: 277 to 290 tasks, boot storm, daemons with no use here | 461 s of 480 in a minute; ended tasks 197.5 s and 284.6 s | **Partly fixed**: 33 jobs out, commit 5f153dc. Who the ended tasks were: [U] | [V] numbers |
 | 4 | RenderBox effects have no pipeline: `specializedName` was dropped. Icons lose masks, glow and clamped edges | 13 lines in the replay, over iconservicesagent and SpringBoard | **Fixed**, commit b811ece | [V] host chain, [U] pixels |
 | 5 | GPU pool runs out: buffers go to scattered pages, which need a cache push | Pool 376 -> 12 MB free; surface pushes 1,868 -> 20,617 per 5 s; CPU per submission 356 us -> 6,977 us | Not fixed | [V] numbers, [I] link |
 | 6 | iconservicesagent dies at its 15 MB inactive limit, with a Metal device of 15 to 20 MB | 3 kills | **Fixed**, commit 5f153dc | [V] |
 
-**Expected gain, all [I]:** the fence fix and the job drops free about 15 to 30 % of the CPUs while the GPU is busy. Metal on Home and lock after the boot storm: from 7-17 fps to about 18-28 fps, limited by cause 1. With 745 MHz (section 5, not done): about 22-34 fps. Not 60.
+**Expected gain, all [I]:** the fence fix and the job drops free about 15 to 30 % of the CPUs while the GPU is busy. Metal on Home and lock after the boot storm: from 7-17 fps to about 18-28 fps, limited by cause 1. With 950 MHz (section 5, built, not booted): about 22-34 fps at 745 MHz, more above it if DDR follows. Not 60.
 
 ## 2. Each refusal, and what the UI loses
 
@@ -99,11 +99,12 @@ Memory is not short system-wide: `memorystatus_available_pages` 183,000 x 4 KiB 
 - [V] Stock table `trinket-gpu.dtsi`, `gpucc-trinket.c`: 950, 900, 820, 745, 600, 465, 320 MHz. Above 600 it uses `GPU_CC_PLL0_OUT_AUX2 / 2`. Rails: 745 needs CX NOM, 820 NOM_L1, 900 HIGH, 950 HIGH_L1; PLL up to 2 GHz needs MX NOM.
 - [V] The kernel already holds MX + CX at NOM for the boot. So **745 MHz needs no new rail vote**: 24 % more clock. Stock bus level 9 at 745. DDR reads 1355 MHz now. Thermal in boot 11: GPU 58 to 60 C, limit 90 C: room.
 - Demand: `clock 588 to 600 MHz over the window` while busy [V]. `300 MHz 37 s, 600 MHz 22 s` a minute follows the load; it is not the limit.
-- **Not done here.** It needs PLL0 programming and a clock read on the phone; the host cannot prove it. Next kernel step: level 2 in `LaurelGpuDcvs.cpp`: PLL0 at 1490 MHz, source `GPU_CC_PLL0_OUT_AUX2`, same self-check (`clock_right`, CP fence, watchdog back to 600), one `off` line on failure. GPU time 39 -> 31 ms [I].
+- **Done in the kernel, not booted: patch 2961, `gpu.md` section "All stock levels".** Owner decision 2026-11-03: all stock levels to 950 MHz. New facts: 900 and 950 MHz need a CX iPeak vote; bus level at 900 and 950 MHz is 1804 MHz, and the RPM has never taken a DDR vote from XNU here [U]; thermal limits are 95 and 100 C.
+- GPU time per long submission at 950 MHz [I, no phone number]: 39 ms -> 25 to 28 ms. 0.63 if all of it follows the core clock; 0.66 with 25 % bound by memory and DDR at 1804; 0.72 with DDR at 1353. The rest of the load on the CPU does not change.
 
 ## 6. Not fixed, next
 
-1. Clock 745 MHz: section 5.
+1. Clock: 2961 waits for a boot: section 5.
 2. Pool: why backboardd + clients take 380 of 512 MB when one submission names 123 to 145 MB [U]. Hot reports 416 to 593 of 944 MB at 2.5 times our pixels, so ours is high. To read over SSH: kept buffers, m2v's 8 MB blocks, per-process devices.
 3. Sync: with `NEGRONIMETAL_SYNC=1` a frame is CPU + GPU, not the larger of the two. The kernel has `topaz_surface_drawn` for the same job. Boot 11 shows `14 us GPU fence` after SwapEnd, so the kernel's wait is free now [V]. Removing the user wait needs a phone test for half-drawn frames.
 4. Bench: XNUtils `tumode` sysmem / gmem and `hot` stack, per `ios26-metal.md` 10.5.
@@ -112,6 +113,8 @@ Memory is not short system-wide: `memorystatus_available_pages` 183,000 x 4 KiB 
 ## 7. Next boot: lines to read
 
 ```
+LAUREL GPU CLOCK: on: MHz=GCC/CP ...                         each level's reads; out N: why
+LAUREL DDR: on|off: ...                                      does the RPM follow 1804 MHz
 RedwoodGPU: N waits of M us, K over before they began        K near 0, N large (boot 11: 1 wait, 3.9 M over)
 LAUREL CPU TOP: 60 s, busy B s of 480                        B below 461, no FitnessIntellige
 NMTL[.. iconservicesagent]: pipelines ...                    no line refused ... custom_fn
