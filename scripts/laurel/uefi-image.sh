@@ -58,7 +58,8 @@ fi
 ENTRY_TITLE=${ENTRY_TITLE:-iOS 16 (laurel XNU, TOPAZ_4K)}
 STOCK_DTBO=${STOCK_DTBO:-$HOME/laurel-backup/stock/images/dtbo.img}
 # a panic resets after 30 s, so the menu comes back with no computer (without it the panic hold stays until `op10tool ctl bootloader`); docs/laurel_sprout/usb-debug.md
-[ "$BOOT_MENU" != 1 ] || CMDLINE="$CMDLINE laurelpanic=30"
+# LAUREL_PANIC_SECS=0 keeps a panic on the panel and on USB (bring-up; op10tool ctl bootloader leaves it). The default resets into the menu.
+[ "$BOOT_MENU" != 1 ] || [ "${LAUREL_PANIC_SECS:-30}" = 0 ] || CMDLINE="$CMDLINE laurelpanic=${LAUREL_PANIC_SECS:-30}"
 
 for f in "$FD" "$SHIM" "$STOCK"; do [ -e "$f" ] || { echo "uefi-image: missing $f (scripts/laurel/mu-build.sh)" >&2; exit 1; }; done
 for t in mkbootimg unpack_bootimg gzip python3 uv; do command -v $t >/dev/null || { echo "uefi-image: missing $t" >&2; exit 1; }; done

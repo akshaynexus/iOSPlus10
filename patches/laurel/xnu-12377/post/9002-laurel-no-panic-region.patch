@@ -1,0 +1,17 @@
+--- a/osfmk/arm/model_dep.c	2026-11-02 18:46:24.538588581 +0530
++++ b/osfmk/arm/model_dep.c	2026-11-02 18:46:24.548418429 +0530
+@@ -948,6 +948,14 @@
+ 	 * and see your PC here, look down a few frames to see your
+ 	 * early-boot panic there.
+ 	 */
++	/*
++	 * laurel: this board has no panic region: panic_info stays NULL and debug_buf_size is 0, so the check
++	 * below returns for most panics. A userspace-initiated one (launchd exits) writes a flag first, and the
++	 * compiler drops the empty loop: a NULL write, nested panics, and the first panic text is lost.
++	 */
++	if (panic_info == NULL) {
++		return;
++	}
+ 	while (!panic_info || panic_info->eph_panic_log_offset == 0) {
+ 		// rdar://87170225 (PanicHardening: audit panic code for naked spinloops)
+ 		// rdar://88094367 (Add test hooks for panic at different stages in XNU)
