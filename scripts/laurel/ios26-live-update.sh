@@ -9,7 +9,7 @@
 set -eu
 cd "$(dirname "$0")/../.."
 HOST=root@192.168.7.2
-LIST="* -chronod -cameracaptured -WidgetRenderer_Default -PosterBoard"   # scripts/laurel/root-add-metal-ios26.sh
+LIST="* -chronod -cameracaptured -PosterBoard"   # scripts/laurel/root-add-metal-ios26.sh
 say() { echo "$(date +%H:%M:%S) live-update: $*"; }
 die() { say "STOP: $*"; exit 1; }
 sh_phone() { sshpass -p "${IOS_PASSWORD:-alpine}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=8 "$HOST" "$@"; }

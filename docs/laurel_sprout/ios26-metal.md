@@ -125,7 +125,7 @@ CA draws glass on the server: `CA::OGL::GlassBackgroundFilter::render`, `GlassFo
 | `simple_rim_lph` | 6,066 | 261 | 12 | compiles; do not expect speed |
 | median of all fragments | 91 | | | |
 
-Consequence: **live glass is the cost to remove.** IOS-26-Hot's selective `CABackdropLayer` bypass does that, keeps pre-baked icons and pills, and is not Reduce Transparency. It reports 400 to 500 MB less transient memory on 1080x2400. In the iOS 26 plug-in now, on by default in backboardd and SpringBoard: line `LAUREL GLASS: on: ...`; file `/private/var/db/negronimetal/live-glass` brings live glass back within 5 s. Limit [I]: it goes in at this process's device open, not at exec, because we have no exec injection.
+**Owner decision 2026-11-03: live glass with Apple's shaders is the default; see `ios26-gpu-render.md`.** IOS-26-Hot's selective `CABackdropLayer` bypass reports 400 to 500 MB less transient memory on 1080x2400 and stays only as a kill switch: `NEGRONIMETAL_GLASS=0` or file `/private/var/db/negronimetal/no-live-glass`. Line `LAUREL GLASS: on|off: ...`. Limit [I]: it goes in at this process's device open, not at exec, because we have no exec injection.
 
 ### 4.3 Blockers
 
@@ -280,7 +280,7 @@ Memory: Hot reports a GPU pool of 416 to 593 of 944 MB with the bypass. At 0.4 o
 | Install | **`scripts/bg.sh ios26-root scripts/laurel/ios26-root.sh`**: `ios26-root-spec.py` function `metal()` runs `root-add-metal-ios26.sh` on a stage and takes what it leaves into the image | bundle, probes, clients, env, `stack/`, CAEnable* preferences, jetsam. Audit line `applied metal26` or `off metal26`. No selector, no second stack, no XNUtils in this image |
 | Host chain | `scripts/ios26/metal-corpus.sh all`, `scripts/ios26/turnip-host.sh`, `scripts/ios26/ir3-check.sh` | evidence files |
 
-No launchd job, no wrapper. Clients: `* -chronod -cameracaptured -WidgetRenderer_Default -PosterBoard`: Hot's list on 23F84; those have CPU paths, and `_RB4` render targets remain open there. `METAL_CLIENTS=` replaces it. Lines at boot:
+No launchd job, no wrapper. Clients: `* -chronod -cameracaptured -PosterBoard`: Hot's list on 23F84 without `-WidgetRenderer_Default` (`ios26-gpu-render.md`): those have CPU paths, and `_RB4` render targets remain open there. `METAL_CLIENTS=` replaces it. Lines at boot:
 
 ```
 LAUREL METAL: on: Turnip a610 ...                         (kernel K1)
@@ -395,7 +395,7 @@ Switches section -> **Metal options and bench** (`userland/laurel/xnutils/bench.
 |---|---|---|---|
 | Metal stack (shows the setting, what backboardd runs, and why) | `metaloption` | After Restart UI | `default`, `hot` |
 | Turnip mode: the `TU_DEBUG` line of the env file; both flags exist in Mesa 25.0.7 `tu_util.cc` [V] | `tumode` | After Restart UI; only processes that can read `/var/db` | `auto`, `sysmem`, `gmem` |
-| Glass: the bypass of section 4.2 | `liveglass` | Within 5 s | `off`, `on` |
+| Glass: the kill switch of section 4.2 | `liveglass` | After Restart UI | `on`, `off` |
 | Restart UI | `restart-ui` | - | - |
 
 Host test: `scripts/laurel/xnutils-test.sh`, the verbs on a folder as uid 0 of a user namespace.
@@ -419,7 +419,7 @@ To compare: `default` + bypass, then `hot` + bypass, then each + `sysmem`; each 
 
 | Trick (source) | Fits the A610? | State here |
 |---|---|---|
-| Selective `CABackdropLayer` bypass (Hot) | **Yes, more than on the A640:** GPU time per frame is about 1.8 times at 300 MHz [I section 8], so each capture pass costs more | Ported, on by default, off with `live-glass` (section 4.2) |
+| Selective `CABackdropLayer` bypass (Hot) | Costs the look: the owner took live glass | Only a kill switch now (section 4.2) |
 | Refusal of `MTLStitchedLibraryDescriptor` and dynamic libraries (Hot) | Yes: frontend matter, no GPU part | Ported (section 3.1) |
 | Function and library SHA-256 hashes, `NBResidencySet`, refusing encoders (Hot) | Yes: frontend matter | Ported (section 3.1) |
 | `SwapEnd` selector 5, 0x588 bytes; `IOSurface` sizes (Hot 0141, 0142) | Yes, same 23F84 | Kernel needs K4, K5; checked against the binary [V] |

@@ -2,7 +2,7 @@
  * The iOS 26 verbs of powermenu-helper (built with XT_IOS26: scripts/laurel/xnutils-build.sh, XNUTILS_IOS26=1). docs/laurel_sprout/ios26-metal.md section 10.
  *   metaloption default|hot    which Metal stack NegroniMetal.bundle's selector takes at the next start of a process; clears the selector's counts
  *   tumode auto|sysmem|gmem    the TU_DEBUG line of the env file (Turnip's render mode); next start of a process that reads /var/db
- *   liveglass on|off           the file that brings live CABackdropLayer capture back: within 5 s, no restart
+ *   liveglass on|off           live CABackdropLayer capture is the default; off writes the kill switch file: within 5 s, Restart UI when the kill switch was not there at the device open
  *   metalstate                 KEY=VALUE lines: setting, running stack, why, counts, Turnip mode, glass
  *   bench-begin | bench-end    the compositor counts its frames between them (NegroniMetal.mm bench_serve); bench-end prints the result
  */
@@ -19,7 +19,7 @@
 #define XT_OPTION      XT_DB "/option"
 #define XT_OPTION_LOCAL XT_METAL_BUNDLE "/option.local"
 #define XT_ENV         XT_DB "/env"
-#define XT_GLASS       XT_DB "/live-glass"
+#define XT_GLASS       XT_DB "/no-live-glass"
 #define XT_BENCH_ON    XT_STACK_DIR "/bench-on"
 #define XT_BENCH_OUT   XT_STACK_DIR "/bench-result"
 #define XT_BENCH_WAIT_TICKS 30     /* 100 ms each */
@@ -106,10 +106,10 @@ xt_do_tumode(const char *flag)
 int
 xt_do_liveglass(int on)
 {
-	if (!on) {
+	if (on) {
 		return remove_file(XT_GLASS) ? 1 : 0;
 	}
-	return (ensure_dir(XT_DB, 0755) != 0 || write_file(XT_GLASS, "powermenu-helper liveglass on\n") != 0) ? 1 : 0;
+	return (ensure_dir(XT_DB, 0755) != 0 || write_file(XT_GLASS, "powermenu-helper liveglass off\n") != 0) ? 1 : 0;
 }
 
 /* the first line of a file in stack/, without its end; "" when there is none */
@@ -153,7 +153,7 @@ xt_do_metalstate(void)
 		*why++ = 0;
 	}
 	printf("OPTION=%s\nACTIVE=%s\nWHY=%s\nSTATE=%s\nTUMODE=%s\nGLASS=%s\n", setting[0] ? setting : "default", active[0] ? active : "unknown", why ? why : "", state, tu,
-	    access(XT_GLASS, F_OK) == 0 ? "live" : "bypass");
+	    access(XT_GLASS, F_OK) == 0 ? "bypass" : "live");
 	return 0;
 }
 

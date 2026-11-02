@@ -1,0 +1,125 @@
+laurel iOS 26 frontend: maxTotalThreadsPerThreadgroup within the A610's 16 KiB of threadgroup memory; counters for lost draws and refusals; a lost dispatch names its pipeline. Boot 16.
+
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+index f451512..0da1563 100644
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -84,9 +84,13 @@ static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint
+ // draws the runtime refused and that were skipped (the command buffer goes on), render pipeline settings refused (the encoder skips its
+ // draws until a pipeline is accepted), and whether a completed GPU write bumps the IOSurface seed (off in backboardd, see -finish).
+ static std::atomic<uint64_t> gDrawsSkipped,gPipelineSetsRefused;
++// laurel: what the plug-in's `LAUREL METAL COUNT` line reads: the refusals that lose nothing (heap misses: the caller's next heap or its own texture; no-copy textures: RenderBox's IOSurface path) beside the ones that lose a draw.
++static std::atomic<uint64_t> gHeapMisses,gNoCopyRefused;
+ static bool gSeedBump=true;
+ static std::mutex gSkipLock;
+ static NSMutableSet<NSString *> *gSkipSeen;
++#include "laurel_rules.h"
++extern "C" void native_bridge_metal_loss_counts(uint64_t out[5]);
+ static void noteSkipped(NSString *what,bool draw) {
+  if(draw)gDrawsSkipped++;else gPipelineSetsRefused++;
+  std::lock_guard<std::mutex> lock(gSkipLock);
+@@ -96,6 +100,9 @@ static void noteSkipped(NSString *what,bool draw) {
+  [gSkipSeen addObject:what];
+  NBLOG(@"native-metal: %@ skipped, the command buffer goes on (logged once): %@",draw?@"draw":@"render pipeline",what);
+ }
++extern "C" void native_bridge_metal_loss_counts(uint64_t out[5]) {
++ out[0]=gDrawsSkipped.load();out[1]=gPipelineSetsRefused.load();out[2]=gTextureRefusals.load();out[3]=gHeapMisses.load();out[4]=gNoCopyRefused.load();
++}
+ static void noteFormat(uint32_t format,bool made) {
+  std::lock_guard<std::mutex> lock(gProblemLock);
+  if(!made)gTextureRefusals++;
+@@ -657,7 +664,12 @@ static std::string quartzCoreCallers();
+ @implementation NBComputePipeline
+ - (void)setHandle:(NmbComputePipeline *)handle {if(!_handle && handle)gLivePipelines++;_handle=handle;}
+ - (void)dealloc {if(_handle)gLivePipelines--;nmb_compute_pipeline_release(_handle);}
+-- (NSUInteger)maxTotalThreadsPerThreadgroup {return nmb_compute_pipeline_max_threads(_handle);}
++// laurel (flame-ios26/0003): boot 16, backboardd: `dispatch: ... MaxComputeSharedMemorySize, required: 20480, available: 16384`: laurel_rules.h.
++- (NSUInteger)maxTotalThreadsPerThreadgroup {
++ uint64_t shared=0;
++ if(gDevice)nmb_device_answer(gDevice,"maxThreadgroupMemoryLength",0,&shared);
++ return (NSUInteger)laurel_kernel_max_threads(nmb_compute_pipeline_max_threads(_handle),nmb_compute_pipeline_execution_width(_handle),shared);
++}
+ - (NSUInteger)threadExecutionWidth {return nmb_compute_pipeline_execution_width(_handle);}
+ - (NSUInteger)staticThreadgroupMemoryLength {return 0;}
+ - (MTLSize)requiredThreadsPerThreadgroup {return MTLSizeMake(0,0,0);}
+@@ -917,12 +929,14 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer) {
+ 
+ @interface NBComputeEncoder : NBEncoder {
+  BOOL _skipDispatches;
++ NSString *_computeName;   // laurel (flame-ios26/0003): the pipeline a lost dispatch names
+ }
+ @end
+ @implementation NBComputeEncoder
+ - (MTLDispatchType)dispatchType {return MTLDispatchTypeSerial;}
+ - (void)setVisibleFunctionTable:(id)table atBufferIndex:(NSUInteger)i {(void)table;(void)i;noteSkipped(@"visible function tables not supported",true);}
+ - (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
++ _computeName=[(id)state respondsToSelector:@selector(label)]?[(NBObject *)state label]:nil;
+  if(![(id)state isKindOfClass:[NBComputePipeline class]]){_skipDispatches=YES;noteSkipped(state?@"foreign compute pipeline":@"nil compute pipeline",false);return;}
+  if(!nmb_compute_set_pipeline(self.handle,[(NBComputePipeline *)state handle])) {
+   _skipDispatches=YES;noteSkipped([@"setComputePipelineState: " stringByAppendingString:lastError()],false);return;
+@@ -959,7 +973,7 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer) {
+  if(![self dispatchAllowed])return;
+  const uint64_t s[3]={size.width,size.height,size.depth},g[3]={group.width,group.height,group.depth};
+  if(!nmb_compute_dispatch(self.handle,s,g,threads))
+-  noteSkipped([@"dispatch: " stringByAppendingString:lastError()],true);
++  noteSkipped([NSString stringWithFormat:@"dispatch %lux%lux%lu of '%@': %@",(unsigned long)g[0],(unsigned long)g[1],(unsigned long)g[2],_computeName?:@"?",lastError()],true);
+ }
+ - (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:true];}
+ - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
+@@ -1831,6 +1845,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
+   static std::atomic<bool> told{false};
+   if(!told.exchange(true))NBLOG(@"native-metal: first heap texture refused: fmt %lu %lux%lu, heap %lu bytes, %lu used",(unsigned long)d.pixelFormat,(unsigned long)d.width,
+     (unsigned long)d.height,(unsigned long)nmb_heap_size(_handle),(unsigned long)nmb_heap_used_size(_handle));
++  gHeapMisses++;
+   noteRefused(@"heap texture",lastError());
+   return nil;
+  }
+@@ -2231,7 +2246,9 @@ static bool pipelinesStopped(NSError **error) {
+ - (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator {
+  const size_t page=(size_t)getpagesize();
+  if(!bytes || !d || !length || ((uintptr_t)bytes&(page-1)) || d.textureType!=MTLTextureType2D || d.mipmapLevelCount>1 || d.arrayLength>1 || d.sampleCount>1){
+-  NBLOG(@"native-metal: newTextureWithBytesNoCopy refused (%p %lu type %lu levels %lu)",bytes,(unsigned long)length,(unsigned long)d.textureType,(unsigned long)d.mipmapLevelCount);
++  // laurel (flame-ios26/0003): length 0 is what CGImageTextureDataGetDataWithBlock gives RenderBox when the provider names no length [V 23F84 0x1842ccf9c], and its layout is the asset's, which may be Apple's tiled one:
++  // no image may lie over it as a linear one. A nil costs no picture: RB::TextureCache::prepare goes to CGImageProviderCopyIOSurface, then to its CPU decode [V 0x1969e2540, 0x1969e26a8]. One line, then the counter.
++  if(gNoCopyRefused++==0)NBLOG(@"native-metal: newTextureWithBytesNoCopy refused (%p %lu %lux%lu fmt %lu type %lu levels %lu): the caller takes its IOSurface or CPU path, logged once, counted in LAUREL METAL COUNT",bytes,(unsigned long)length,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,(unsigned long)d.textureType,(unsigned long)d.mipmapLevelCount);
+   return nil;
+  }
+  uint32_t bw=0,bh=0,bb=0;
+@@ -2708,7 +2725,7 @@ static std::string mslOptions(MTLCompileOptions *o) {
+  const uint64_t pipelineBegan=nowUs();
+  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);gTimePipeline.add(pipelineBegan);
+  if(!handle)return failWith<id<MTLComputePipelineState>>(error,[NSString stringWithFormat:@"compute pipeline '%@' (%@)",d.label?:@"",d.computeFunction.name?:@"-"],nil);
+- NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;gPipelines++;
++ NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label?:d.computeFunction.name;gPipelines++;
+  if(error)*error=nil;return (id<MTLComputePipelineState>)state;
+ }
+ - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
+diff --git a/phone/metal2/laurel_rules.h b/phone/metal2/laurel_rules.h
+new file mode 100644
+index 0000000..1bcc8e4
+--- /dev/null
++++ b/phone/metal2/laurel_rules.h
+@@ -0,0 +1,23 @@
++/* Plain rules of the Mi A3's iOS 26 frontend, with no Objective-C: the frontend includes this file, and so does the host test (userland/laurel/metal/tests/ca-pipelines.c). */
++#ifndef LAUREL_RULES_H
++#define LAUREL_RULES_H
++#include <stdint.h>
++/* maxTotalThreadsPerThreadgroup on a GPU with less threadgroup memory than Apple's 32 KiB. [V 23F84] CA::OGL::MetalContext::compute_surface_apl_dimming_factor takes threadExecutionWidth x
++ * (maxTotal / width) threads and setThreadgroupMemoryLength: 16 bytes per thread. A610: 16 KiB (Mesa cs_shared_mem_size). With the runtime's 1024: 16 KiB + the module's arena: the dispatch is refused, the draw is lost.
++ * The answer keeps 16 bytes per thread and a 4 KiB arena inside the limit, and stays a power of two as Apple's 1024 is (sum_apl_and_compute_dimming_factor's group size is one, capped by this answer; A610: 512 = 32 x 16).
++ * A lower answer is a valid Metal answer: every caller that asks divides its work by it. */
++#define LAUREL_THREADGROUP_BYTES_PER_THREAD 16u
++#define LAUREL_THREADGROUP_ARENA 4096u
++static inline uint64_t laurel_kernel_max_threads(uint64_t runtime_max, uint64_t width, uint64_t shared)
++{
++	if (shared == 0 || shared >= 32768 || shared <= LAUREL_THREADGROUP_ARENA)
++		return runtime_max;
++	uint64_t room = (shared - LAUREL_THREADGROUP_ARENA) / LAUREL_THREADGROUP_BYTES_PER_THREAD;
++	if (room >= runtime_max)
++		return runtime_max;
++	uint64_t answer = 1;
++	while (answer * 2 <= room)
++		answer *= 2;
++	return answer >= width ? answer : runtime_max;
++}
++#endif

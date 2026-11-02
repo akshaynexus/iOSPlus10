@@ -5255,3 +5255,16 @@ Full text: `docs/laurel_sprout/gpu.md` section "All stock levels". Patch 2961, b
 - Lesson: a class in UIKitCore can have a twin in SystemStatusUI (STUI prefix). Find which process uses which before a hook. `strings` of one image is not enough: read `dsc-image.py DIR images`.
 - [U] The look of FixedSplit on 26; apps (own process, UIKit path, the pref applies [I]).
 
+
+## 2026-11-03: Mi A3 iOS 26: white, empty and glyph-less icons are old store entries; live glass default (branch t3/ios26-gpu-render-effects; host and read-only SSH, no flash)
+Full text: `docs/laurel_sprout/ios26-gpu-render.md`.
+- **Read the phone's pixels before you guess:** `com.apple.IconsCache/*/*.isdata` copies over SSH (`tar cf -`); `scripts/ios26/isdata-dump.py` draws them. An icon bug that survives a fix: look at the store's file times. The store is keyed by build and language only.
+- **`pipelines.log` has the real keys** (`fc_*`, `#0`), so the host can compile what the phone asked: `scripts/ios26/test-real-pipelines.sh DIR`. 218 CA + 175 RB made for FD610.
+- **"KB out of the cache" in the RedwoodGPU line is per submission**, not per window.
+- A scattered (pool full) buffer the CPU mapped is pushed at each submission with no check, and Turnip names every buffer each time. So pool empty = 70 to 127 MB of cache maintenance per submission, inside `gGPULock`.
+- Under 64 MiB free, any client's `gemNew` gives back all kept buffers of all clients. `given again` near 0 while the pool is short is this.
+- `tu_cs_reset` frees all but the last BO per stream; 7 streams a command buffer.
+- `-[CABackdropLayer _copyRenderLayer:...]` reads `isEnabled`, `scale`, `reducesCaptureBitDepth`, etc through objc_msgSend, so an IMP swap reaches the commit. `glass` hook acts only in the process that owns the layer: apps kept live glass all along.
+- `newTextureWithBytesNoCopy` length 0 from RenderBox: refused is right. Hot's repair has `!deallocator`, RenderBox passes one. Do not treat the memory as linear: it may be Apple's tiled layout.
+- A worktree build also needs the commit of `external/hackios-xnu-userland`: `git -C external/hackios-xnu-userland fetch MAIN/external/hackios-xnu-userland SHA`. `rm -rf out/ios26/metal/build` after a reflink copy (CMake cache has the old path). In zsh `$VAR` with spaces is one word and globs that miss are errors: run through `bash -c`.
+- [U] why backboardd spends 2.5 to 4.2 s of 5 s in RedwoodGPU requests with live glass. Add time per selector.

@@ -21,7 +21,7 @@
 #define XT_METAL_PROBES  "metalprobe m2vtest carenderprobe layerprobe"
 #ifdef XT_IOS26
 /* [V boot 11, 2026-11-03] "* -backboardd" here took the compositor off the GPU: 23F84 has no GL path. Same list as scripts/laurel/root-add-metal-ios26.sh */
-#define XT_METAL_WIDE    "* -chronod -cameracaptured -WidgetRenderer_Default -PosterBoard"
+#define XT_METAL_WIDE    "* -chronod -cameracaptured -PosterBoard"
 #else
 #define XT_METAL_WIDE    "* -backboardd"
 #endif

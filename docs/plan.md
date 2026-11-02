@@ -1163,3 +1163,6 @@ Done: patch 2961 (`gpu.md` section "All stock levels"): PLL1 320/465, GPLL0 300/
 Results [V host]: `scripts/laurel/test-gpu-opp.sh` PASS (table against source and the phone's DTB; 1904 level changes with failures; 4 controls). Series 0 errors. Kernel built (see the branch report).
 Next: a boot. Read `LAUREL GPU CLOCK: on: MHz=GCC/CP` and `LAUREL DDR`. If DDR does not follow: owner decision on `Enab`. Guess [I]: 39 ms a long submission -> 25 to 28 ms.
 
+
+## 2026-11-03: Mi A3 iOS 26: icons, glass, pool (branch `t3/ios26-gpu-render-effects`, not merged, not on the phone)
+Done on the host: `LAUREL ICONS`, live glass default, `LAUREL TEXTURE POOL`, Turnip 0104, threadgroup answer, `LAUREL METAL COUNT`, WidgetRenderer_Default on Metal. Results and costs: `docs/laurel_sprout/ios26-gpu-render.md`. Next: install, read `LAUREL METAL COUNT`, `RedwoodGPU: buffers`; pool and flush rules in the kernel (owner); wallpaper (Autobahn + cpbitmap, as Hot); why no widget extension runs; BlastDoor.

@@ -25,7 +25,7 @@ done
 python3 -I "$REPO/scripts/ios26/abi-check.py" "$S" > /dev/null || { echo "laurel-root: metal26: off: the stage fails scripts/ios26/abi-check.py"; exit 1; }
 D=$R/private/var/db/negronimetal
 # All of iOS but four processes with a CPU path on 23F84 (IOS-26-Hot d249939 --mtl2-clients, reported on an A640: RenderBox _RB4 render targets; cameracaptured): less GPU work and memory on the A610. METAL_CLIENTS=... replaces it.
-CLIENTS=${METAL_CLIENTS:-"* -chronod -cameracaptured -WidgetRenderer_Default -PosterBoard"}
+CLIENTS=${METAL_CLIENTS:-"* -chronod -cameracaptured -PosterBoard"}
 METAL_CLIENTS="$CLIENTS" METAL=1 PLUGIN_NAME=NegroniMetal METAL_STAGE=$S sh "$REPO/scripts/metal/root-add-metal.sh" "$R"
 {
   echo "# Processes that get the NegroniMetal device, iOS 26 root (scripts/laurel/root-add-metal-ios26.sh). Every process: the compositor has no GL path on 23F84."

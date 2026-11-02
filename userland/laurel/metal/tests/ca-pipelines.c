@@ -5,6 +5,9 @@
  *   ca-pipelines LOADER CACHE_DIR METALLIB PLAN
  * PLAN (text, made by scripts/ios26/ir3-plan.py), one pipeline per line, fields separated by tabs:
  *   K NAME CONSTANTS                  a compute pipeline
+ *   D NAME CONSTANTS X,Y[,B][;...]    a compute pipeline and one encoded dispatch per threadgroup size X,Y, with B bytes of threadgroup memory per thread at index 0 (CoreAnimation's APL: 16).
+ *                                     0,0: the size CoreAnimation takes from the frontend's answers: threadExecutionWidth, maxTotal / width, with the frontend's rule on maxTotal (laurel_rules.h).
+ *                                     Prints the answers, and for each size "dispatch ... ok" or the refusal. No GPU runs: the check is the runtime's bind step.
  *   R LABEL VERTEX FRAGMENT COLORS VERTEXDESC CONSTANTS   a render pipeline
  *   L LABEL VERTEX FRAGMENT COLORS VERTEXDESC FUNCTION LINKNAME METALLIB CONSTANTS   a render pipeline whose fragment stage links FUNCTION of METALLIB under LINKNAME
  *     (MTLFunctionDescriptor.specializedName, RenderBox's custom_fn; LINKNAME "-": under its own name), with depth + stencil format 260 as RenderBox
@@ -21,6 +24,7 @@
 #include <unistd.h>
 struct NmbTextureDescriptor;
 #include "NativeMetalObjects.h"
+#include "../laurel_rules.h"
 
 /* the bridge imports it (Darwin libSystem; its self-test only, not run here) */
 void sys_dcache_flush(void *start, size_t length) { (void)start; (void)length; }
@@ -172,7 +176,42 @@ int main(int argc, char **argv)
 		const char *label = field[1];
 		fprintf(stderr, "=== PIPELINE %s\n", label); /* ir3's statistics follow in the same stream: scripts/ios26/ir3-stats.py */
 		fflush(stderr);
-		if (field[0][0] == 'K' && nf >= 3) {
+		if (field[0][0] == 'D' && nf >= 4) {
+			uint32_t n = parse_constants(field[2], cons, 128, pool);
+			NmbFunction *fn = n ? nmb_function_new_specialized(lib, field[1], cons, n) : nmb_function_new(lib, field[1]);
+			NmbComputePipeline *p = fn ? nmb_compute_pipeline_new(dev, fn) : NULL;
+			if (!p)
+				why = nmb_last_error();
+			else {
+				uint64_t shared = 0;
+				nmb_device_answer(dev, "maxThreadgroupMemoryLength", 0, &shared);
+				const unsigned long long runtime_max = nmb_compute_pipeline_max_threads(p), width = nmb_compute_pipeline_execution_width(p);
+				const unsigned long long max = laurel_kernel_max_threads(runtime_max, width, shared);
+				printf("kernel\t%s\tmax=%llu\tanswer=%llu\twidth=%llu\tshared=%llu\n", label, runtime_max, max, width, (unsigned long long)shared);
+				static NmbQueue *queue;
+				if (!queue)
+					queue = nmb_queue_new(dev);
+				for (char *size = strtok(field[3], ";"); size; size = strtok(NULL, ";")) {
+					unsigned long long x = 0, y = 0, per_thread = 0;
+					sscanf(size, "%llu,%llu,%llu", &x, &y, &per_thread);
+					if (!x && width) {
+						x = width;
+						y = max / width;
+					}
+					NmbCommandBuffer *cb = nmb_command_buffer_new(queue);
+					NmbEncoder *e = cb ? nmb_compute_encoder_new(cb) : NULL;
+					const uint64_t groups[3] = { 1, 1, 1 }, per[3] = { x, y, 1 };
+					const bool done = e && nmb_compute_set_pipeline(e, p) && (!per_thread || nmb_compute_set_threadgroup_memory(e, (uint32_t)(x * y * per_thread), 0)) &&
+							  nmb_compute_dispatch(e, groups, per, false);
+					printf("dispatch\t%s\t%llu,%llu,%llu\t%s\n", label, x, y, per_thread, done ? "ok" : nmb_last_error());
+					if (e)
+						nmb_encoder_discard(e);
+				}
+				nmb_compute_pipeline_release(p);
+			}
+			if (fn)
+				nmb_function_release(fn);
+		} else if (field[0][0] == 'K' && nf >= 3) {
 			uint32_t n = parse_constants(field[2], cons, 128, pool);
 			NmbFunction *fn = n ? nmb_function_new_specialized(lib, field[1], cons, n) : nmb_function_new(lib, field[1]);
 			if (!fn)
