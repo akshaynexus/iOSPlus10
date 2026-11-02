@@ -5301,3 +5301,6 @@ Details: `docs/laurel_sprout/ios26-wallpaper-widgets.md`.
 
 ## 2026-11-03: `LAUREL BACKLIGHT: off: DSI command DMA does not complete` was a 32-bit truncation
 [V boot 17 and older logs] `SWEET FB: DSI cmd 0x3 not done ... buf 0x1b4664000`. The one-page buffer is above 4 GiB in spite of `inTaskWithPhysicalMask(0xfffff000)`; DSI 0x048 is 32 bits. Patch 2979. post/9009 (retry) cannot help this cause; it stays for other transient causes. The panel can still show frames with this failure (boot 17: Apple logo), so a failed self-check is not a black panel by itself. [U] why boots 14 and 15 were black.
+
+## 2026-11-03: live glass ended in `DeviceLost`: submission limit
+[V boots 16, 17] `a submission of 144 command buffers in 2885 buffers: not taken` (limit 128), errno 22 in Turnip's winsys, then every `commandBuffer` in backboardd is refused with `DeviceLost`. Patch 2980: limit 1024, arrays on the heap. [I] A submission above 1024 would end the same way. [U] the black flash per update on boot 17; the same boot has `gpu fence` 20-39 ms and 24.9 frames/s moving at best.

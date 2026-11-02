@@ -1,0 +1,54 @@
+laurel 2980: a submission may have 1024 command buffers
+
+[V boots 16, 17] RedwoodGPU: a submission of 144 command buffers in 2885 buffers: not taken; negronigl: msm submit: errno 22; then backboardd: commandBuffer refused: DeviceLost, tens of thousands of times: the compositor draws nothing more until it restarts. Live glass makes these submissions. 1024 is half of the ring. Above it the same refusal stays.
+
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp	2026-11-03 05:07:10.890754829 +0530
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp	2026-11-03 05:07:10.912936278 +0530
+@@ -217,7 +217,11 @@
+ #define GPU_BUFFERS             8192            /* a client's, at most */
+ #define GPU_BUFFER_MAX          (256u << 20)
+ #define GPU_CLIENT_HOST_BYTES   (1024ull << 20)         /* laurel 2160: a client's own pages wired by host imports, at most */
+-#define GPU_SUBMIT_CMDS         128
++/*
++ * laurel 2980: [V boots 16, 17] live glass: a submission of 142 and of 144 command buffers was refused at 128; Turnip takes a refused submission as a lost device, and
++ * then backboardd draws nothing more. 1024: 4 ring dwords each, half of the 8192-dword ring (TopazAdreno RB_DWORDS), so it always fits an empty ring.
++ */
++#define GPU_SUBMIT_CMDS         1024
+ #define GPU_SUBMIT_BOS          8192
+ #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
+ #define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
+@@ -1684,8 +1688,8 @@
+ {
+ 	struct msm_gem_submit_bo * bos = NULL;
+ 	struct msm_gem_submit_cmd * cmds = NULL;
+-	uint64_t addresses[GPU_SUBMIT_CMDS];
+-	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
++	uint64_t * addresses = NULL;            /* laurel 2980: on the heap: 12 KiB does not fit a kernel stack */
++	uint32_t * words = NULL, count = 0;
+ 	uint64_t began, nanos, again, lock_began;
+ 	IOReturn ret = kIOReturnBadArgument;
+ 	uint32_t pushing = 0;                   /* laurel 2977: places in fPush */
+@@ -1697,7 +1701,9 @@
+ 	}
+ 	bos = IONew(struct msm_gem_submit_bo, request->nr_bos);
+ 	cmds = IONew(struct msm_gem_submit_cmd, request->nr_cmds);
+-	if (bos == NULL || cmds == NULL) {
++	addresses = IONew(uint64_t, request->nr_cmds);
++	words = IONew(uint32_t, request->nr_cmds);
++	if (bos == NULL || cmds == NULL || addresses == NULL || words == NULL) {
+ 		ret = kIOReturnNoMemory;
+ 		goto out;
+ 	}
+@@ -2006,6 +2012,12 @@
+ 	if (cmds != NULL) {
+ 		IODelete(cmds, struct msm_gem_submit_cmd, request->nr_cmds);
+ 	}
++	if (addresses != NULL) {
++		IODelete(addresses, uint64_t, request->nr_cmds);
++	}
++	if (words != NULL) {
++		IODelete(words, uint32_t, request->nr_cmds);
++	}
+ 	return ret;
+ }
+ 
