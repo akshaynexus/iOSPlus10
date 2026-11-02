@@ -1,0 +1,1130 @@
+laurel 2961: GPU DCVS with all stock levels to 950 MHz. PLL1 320/465, GPLL0 300/600, PLL0 745/820/900/950 (new iokit/Kernel/arm/laurel_gpu_opp.h: table, governor, order of the votes, tested on the host by scripts/laurel/test-gpu-opp.sh). Raise: CX iPeak (from 900 MHz, stock), DDR at the stock bus level, CX at the stock corner, PLL lock, RCG, clock read. Lower: the reverse. A PLL is programmed only while it is stopped: the RCG waits on GPLL0. Self-check at each level; a failed level goes out of the table, a failed fallback gives off. Thermal: Android gpu-step 95 C, gpu-cx-mon 100 C. Kill switches gpudcvs=0, gpupll=0.
+
+diff --git a/iokit/Kernel/arm/LaurelGpuDcvs.cpp b/iokit/Kernel/arm/LaurelGpuDcvs.cpp
+index 39bfc58..142203f 100644
+--- a/iokit/Kernel/arm/LaurelGpuDcvs.cpp
++++ b/iokit/Kernel/arm/LaurelGpuDcvs.cpp
+@@ -1,26 +1,21 @@
+ /*
+- * laurel 2892: GPU clock by demand on the Mi A3 (Adreno 610, SM6125 "trinket"): 300 MHz (GPLL0 / 2, today's clock) <-> 600 MHz (GPLL0 / 1).
+- * Why [V boot 19:34, the "the GPU worked N us on each of M" fields]: GPU busy at 300 MHz is 20-83 % in the 5 s windows while the UI moves.
++ * laurel 2892 + 2961: GPU clock by demand on the Mi A3 (Adreno 610, SM6125 "trinket"), all stock levels to 950 MHz (table: laurel_gpu_opp.h, how it
++ * was read: docs/laurel_sprout/gpu.md). 300 MHz (GPLL0 / 2, the boot clock) and 600 MHz (GPLL0 / 1) are the fallback; 320 and 465 MHz come from PLL1,
++ * 745 to 950 MHz from PLL0.
+  *
+- * Rails [V external/laurel-kernel-los]: gfx3d votes vdd_cx (gpucc-trinket.c rate_max: 320 LOW_SVS, 465 SVS, 600 SVS_PLUS, 745 NOM, ...);
+- * stock runs 600 from PLL0, so also MX NOM (PLL VCO above 1 GHz). pm6125-rpm-regulator.dtsi: VDD_CX = RPM "rwcx" id 0, VDD_MX = "rwmx" id 0,
+- * key "vlvl" (rpm-smd-regulator.c), levels qcom,rpm-smd-regulator.h: NOM = 256.
+- * The vote is NOM on both, once, before the first raise, and it is held for the boot: never lowered, so no later vote can take a rail
+- * from another block. Why NOM and not 192: XNU leaves the AP's other clocks as ABL set them and votes nothing for them; UFS AXI 200 MHz,
+- * ICE 300, UniPro 150, USB master 200 need NOM in gcc-trinket.c; the camera's VFE 403-576 MHz needs SVS_PLUS and more. A vote can only
+- * raise (the RPM takes the maximum over its masters), but a vote lower than what the rail holds now could let it fall
+- * as soon as the RPM aggregates again. Order: rails up first, then the clock; the clock goes down first (the rails stay).
++ * Rails [V external/laurel-kernel-los]: gfx3d votes vdd_cx (gpucc-trinket.c), PLL VCO to 2 GHz votes MX NOM. pm6125-rpm-regulator.dtsi: VDD_CX = RPM
++ * "rwcx" id 0, VDD_MX = "rwmx" id 0, key "vlvl". MX NOM and CX NOM come once, before the first raise, and are held for the boot (2892): XNU leaves
++ * the AP's other clocks as ABL set them, and UFS AXI, ICE, UniPro and USB master need NOM in gcc-trinket.c. Above 745 MHz the CX vote is the stock
++ * corner of the level, and it falls back to NOM after the clock came down. Order: laurel_gpu_opp.h opp_go.
++ * CX iPeak [V adreno-gpulist.h, kgsl_pwrctrl.c, cx_ipeak.c]: stock votes it before the clock crosses 900 MHz ("Hardware damage is possible at peak
++ * current if mitigation not done") and stays below when the vote times out. Client 5 of cx_ipeak_lm (TCSR 0x3ed000, v2).
++ * Bus [V trinket-gpu.dtsi]: the stock qcom,bus-freq of each level, on "clk2" (ddr_start in laurel_gpu_clock_read.h).
+  *
+  * Clock check: the GCC clock counter (debugcc-trinket.c: GCC mux 0xDD, GPUCC mux 0xB, GPUCC post divider 2; clk-debug.c run_measurement).
+- * It needs no GPU work and also runs when the CP counter of laurel 2159 is gated. The CP counter is logged next to it and is the check
+- * only when the GCC counter does not count.
+- * DDR: the MCCC period register (0x447d200 + 0x20, ps) reads the clock [V clk-debug.c]. Stock bus levels: 320 MHz = 451, 600 MHz = 1017
+- * (trinket-gpu.dtsi). RPM "clk2" id 0 key "KHz". Sent only when the read says it is lower than wanted, never below the boot clock, and
+- * only while a read shows that the RPM follows. XNU sends no "clk0" id 2 "Enab" (clk_smd_rpm_enable_scaling): that message
+- * lets the RPM lower all its bus clocks that nobody votes for, so it stays out until the DDR line of a boot asks for it.
+- *
+- * Lines: LAUREL GPU CLOCK: on|off: ..., LAUREL DDR: on|off: ..., and the time per level once a minute. Kill switch gpudcvs=0.
+- * Any failure: 300 MHz, one line, the GPU stays on.
++ * The CP counter is logged next to it and is the check only when the GCC counter does not count.
++ * Self-check at start: each level with its PLL lock, a clock read, a CP fence. A level that fails goes out of the table, and the levels above it are
++ * not tried. Lines: LAUREL GPU CLOCK: on|off: ..., LAUREL DDR: on|off: ..., the time per level once a minute.
++ * Kill switches: gpudcvs=0 (300 MHz), gpupll=0 (the 300/600 path of 2892). Any failure: the GPU stays on.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -39,7 +34,8 @@ extern uint64_t laurel_touch_at;
+ void laurel_gpu_dcvs_start(void);
+ bool laurel_gpu_dcvs_stall(void);
+ /* TopazAdreno.cpp */
+-bool laurel_gpu_core_div(uint32_t div);
++bool laurel_gpu_core_src(uint32_t src, uint32_t div);
++void laurel_gpu_core_pin(bool pin);
+ bool laurel_gpu_counters(uint64_t *busy, uint64_t *ticks, uint64_t *cycles);
+ bool laurel_gpu_fence_check(uint64_t *us);
+ bool redwood_gpu_ready(void);
+@@ -51,42 +47,216 @@ bool redwood_gpu_ready(void);
+ #define RPM_VLVL        0x6c766c76u     /* "vlvl" */
+ #define RPM_MEMC        0x326b6c63u     /* "clk2" */
+ #define RPM_KHZ         0x007a484bu     /* "KHz" */
+-#define LEVEL_NOM       256u
+-
+-#define TICK_MS         50u
+-#define RAISE_PCT       50u             /* over one tick */
+-#define LOWER_PCT       20u             /* of 600 MHz = 40 % of 300 MHz: below the raise mark, no ping-pong */
+-#define LOWER_MS        500u
+ #define TOUCH_MS        300u
+-#define HOT_DC          900             /* no 600 MHz; the Linux trip gpu-step is 95 C */
+-#define COOL_DC         800
+-#define DDR_LOW_MHZ     451u            /* stock bus level for 320 MHz */
+-#define DDR_HIGH_MHZ    1017u           /* stock bus level for 600 MHz */
++#define DDR_GOLD_MHZ    1017u           /* a fast Gold cluster: the stock bus level of 600 MHz, as in 2892 */
++#define DDR_TOP_MHZ     1804u           /* stock bus level 11 */
+ #define GOLD_DDR_MHZ    1400u
+ 
+-static volatile uint8_t *gcc, *gpucc, *mccc;
+-static uint32_t level;                  /* 0: 300 MHz, 1: 600 MHz */
++/* PLL registers (clk-alpha-pll.c); PLL0 at GPUCC +0x0, PLL1 at +0x100 */
++#define PLL_BASE(p)     ((p) ? 0x100u : 0u)
++#define PLL_MODE        0x00u
++#define PLL_L           0x04u
++#define PLL_ALPHA       0x08u
++#define PLL_ALPHA_U     0x0cu
++#define PLL_USER        0x10u
++#define PLL_CONFIG      0x18u
++#define PLL_TEST_U      0x20u
++#define MODE_OUTCTRL    (1u << 0)
++#define MODE_BYPASSNL   (1u << 1)
++#define MODE_RESET_N    (1u << 2)
++#define MODE_FSM_ENA    (1u << 20)
++#define MODE_HW_UPDATE  (1u << 23)
++#define MODE_LOCK       (1u << 31)
++#define USER_AUX2       (1u << 2)
++#define USER_VCO_SHIFT  20
++#define USER_ALPHA_EN   (1u << 24)
++#define PLL_CONFIG_VAL  0x4001055bu     /* gpu_pll0_config, gpu_pll1_config */
++
++/* CX iPeak v2, client 5 (cx_ipeak_register_v2: (5 + 1) x 0x1000) */
++#define IPEAK_ENABLE    0x10u
++#define IPEAK_DANGER    0x24u
++#define IPEAK_VOTE      0x6000u
++#define IPEAK_BYPASS    0x6004u
++
++#include "laurel_gpu_opp.h"             /* the table, the governor, the order of the votes */
++
++static volatile uint8_t *gcc, *gpucc, *mccc, *tcsr;
++static volatile uint32_t level;         /* index in opp_table: the clock now */
+ static volatile bool stalled;
+-static uint32_t ddr_boot, ddr_vote;     /* MHz; ddr_vote 0: no vote is sent (no need, or the RPM does not follow) */
++static uint32_t stall_mhz;
++static uint32_t usable;                 /* bit per level: not taken out */
++static bool ipeak_used, pll_allowed;
++static struct opp_state st;
++static uint16_t read_gcc[OPP_N], read_cp[OPP_N];
++static uint32_t ddr_boot, ddr_floor, ddr_vote;  /* MHz; ddr_floor: the boot clock as a bus level; ddr_vote 0: no vote is sent (no need, or the RPM does not follow) */
+ 
+ #include "laurel_gpu_clock_read.h"      /* gfx3d_mhz, cp_mhz, clock_right, ddr_mhz, ddr_want, ddr_start */
+ 
++/* --------------------------------------------------------------- the operations of opp_go */
++
++static bool
++ipeak_vote(bool on)
++{
++	if (!ipeak_used) {
++		return true;
++	}
++	if (!on) {
++		WR(tcsr, IPEAK_VOTE, 0);
++		return true;
++	}
++	WR(tcsr, IPEAK_VOTE, 1);
++	/* cx_ipeak_update_v2: the danger bit must clear in 50 ms, else no raise */
++	for (int i = 0; i < 500; i++) {
++		if (RD(tcsr, IPEAK_DANGER) == 0) {
++			return true;
++		}
++		IODelay(100);
++	}
++	WR(tcsr, IPEAK_VOTE, 0);
++	return false;
++}
++
++static bool
++cx_vote(uint32_t corner)
++{
++	return topaz_rpm_write(RPM_ACTIVE, RPM_RWCX, 0, RPM_VLVL, corner);
++}
++
++/* clk_alpha_pll_disable */
++static void
++pll_off(int pll)
++{
++	uint32_t b = PLL_BASE(pll);
++
++	WR(gpucc, b + PLL_MODE, RD(gpucc, b + PLL_MODE) & ~MODE_OUTCTRL);
++	IODelay(1);
++	WR(gpucc, b + PLL_MODE, RD(gpucc, b + PLL_MODE) & ~(MODE_RESET_N | MODE_BYPASSNL));
++}
++
++/* A stopped PLL: clk_alpha_pll_configure with this level's L and alpha (clk_alpha_pll_set_rate), then clk_alpha_pll_enable */
++static bool
++pll_on(const struct laurel_opp *o)
++{
++	uint32_t b = PLL_BASE(o->pll);
++
++	if (RD(gpucc, b + PLL_MODE) & MODE_FSM_ENA) {
++		return false;                   /* not the mode that stock sets up: not ours to change */
++	}
++	WR(gpucc, b + PLL_L, o->l);
++	WR(gpucc, b + PLL_ALPHA, o->alpha);
++	WR(gpucc, b + PLL_ALPHA_U, o->alpha_u);
++	WR(gpucc, b + PLL_CONFIG, PLL_CONFIG_VAL);
++	WR(gpucc, b + PLL_USER, (RD(gpucc, b + PLL_USER) & ~(3u << USER_VCO_SHIFT)) | USER_AUX2 | USER_ALPHA_EN | ((uint32_t)o->vco << USER_VCO_SHIFT));
++	WR(gpucc, b + PLL_MODE, RD(gpucc, b + PLL_MODE) | MODE_HW_UPDATE);
++	WR(gpucc, b + PLL_TEST_U, RD(gpucc, b + PLL_TEST_U) & ~1u);
++	WR(gpucc, b + PLL_MODE, RD(gpucc, b + PLL_MODE) | MODE_BYPASSNL);
++	IODelay(5);
++	WR(gpucc, b + PLL_MODE, RD(gpucc, b + PLL_MODE) | MODE_RESET_N);
++	for (int i = 0; (RD(gpucc, b + PLL_MODE) & MODE_LOCK) == 0; i++) {
++		if (i >= 200) {                 /* stock: 100 reads with 1 us */
++			pll_off(o->pll);
++			return false;
++		}
++		IODelay(1);
++	}
++	WR(gpucc, b + PLL_MODE, RD(gpucc, b + PLL_MODE) | MODE_OUTCTRL);
++	return true;
++}
++
++static bool
++rcg_take(const struct laurel_opp *o)
++{
++	return laurel_gpu_core_src(o->src, o->div);
++}
++
++static bool
++check_read(uint32_t i)
++{
++	uint32_t g = 0, c = 0;
++	bool ok = clock_right(opp_table[i].mhz, &g, &c);
++
++	read_gcc[i] = (uint16_t)g;
++	read_cp[i] = (uint16_t)c;
++	return ok;
++}
++
++static const struct opp_ops ops = { ipeak_vote, ddr_want, cx_vote, pll_on, pll_off, rcg_take, check_read };
++
++static bool
++set_level(uint32_t to, const char **why)
++{
++	bool ok = opp_go(&ops, &st, to, why);
++
++	level = st.cur;
++	return ok;
++}
++
++/* the clock back to 300 MHz past all else (the watchdog's way), the PLLs off, the votes down */
++static void
++all_down(void)
++{
++	laurel_gpu_core_pin(true);
++	pll_off(0);
++	pll_off(1);
++	st.cur = OPP_300;
++	st.broken = false;
++	level = OPP_300;
++	opp_votes_down(&ops, &st);
++	(void)ddr_want(opp_table[OPP_300].bus_mhz);
++}
++
+ static bool
+ off(uint32_t back, const char *why, uint32_t a, uint32_t b)
+ {
+ 	if (back) {
+-		(void)laurel_gpu_core_div(2);
++		all_down();
+ 	}
+-	level = 0;
+ 	IOLog("LAUREL GPU CLOCK: off: %s (%u, %u MHz); 300 MHz stays\n", why, a, b);
+ 	return false;
+ }
+ 
++/* --------------------------------------------------------------- self-check */
++
++static void
++ipeak_start(void)
++{
++	/* cx_ipeak_register_v2: no feature or a bypassed client: stock has no client and sends no vote */
++	ipeak_used = tcsr != NULL && RD(tcsr, IPEAK_ENABLE) != 0 && (RD(tcsr, IPEAK_BYPASS) & 1u) == 0;
++}
++
+ static bool
+-self_check(void)
++try_level(uint32_t i, uint64_t *fence_max, char *note, size_t n)
+ {
+-	uint32_t g300 = 0, c300 = 0, g600 = 0, c600 = 0, g_back = 0, c_back = 0;
++	const char *why = "";
++	uint32_t from = level;
+ 	uint64_t us = 0;
++	int dc = laurel_thermal_gpu_dC();
++
++	if (dc <= -1000 || dc >= OPP_HOT_DC) {
++		scnprintf(note, n, "%u: hot, %d C", opp_table[i].mhz, dc / 10);
++		return false;
++	}
++	if (!set_level(i, &why)) {
++		scnprintf(note, n, "%u: %s %u/%u", opp_table[i].mhz, why, read_gcc[i], read_cp[i]);
++		return false;
++	}
++	if (!laurel_gpu_fence_check(&us)) {
++		scnprintf(note, n, "%u: no CP fence", opp_table[i].mhz);
++		(void)set_level(from, &why);
++		return false;
++	}
++	*fence_max = us > *fence_max ? us : *fence_max;
++	usable |= 1u << i;
++	return true;
++}
++
++static bool
++self_check(void)
++{
++	uint32_t g = 0, c = 0;
++	uint64_t fence = 0;
++	const char *why = "";
++	char note[48] = "", line[300];
+ 
+ 	for (int i = 0; laurel_thermal_gpu_dC() <= -1000; i++) {
+ 		if (i >= 60) {
+@@ -94,50 +264,130 @@ self_check(void)
+ 		}
+ 		IOSleep(500);
+ 	}
+-	if (!clock_right(300, &g300, &c300)) {
+-		return off(0, "the clock at 300 does not measure 300", g300, c300);
++	if (!clock_right(300, &g, &c)) {
++		return off(0, "the clock at 300 does not measure 300", g, c);
+ 	}
++	read_gcc[OPP_300] = (uint16_t)g;
++	read_cp[OPP_300] = (uint16_t)c;
+ 	/* MX before CX: the order of the stock clock path (PLL first, then the RCG) */
+-	if (!topaz_rpm_write(RPM_ACTIVE, RPM_RWMX, 0, RPM_VLVL, LEVEL_NOM) ||
+-	    !topaz_rpm_write(RPM_ACTIVE, RPM_RWCX, 0, RPM_VLVL, LEVEL_NOM)) {
+-		return off(0, "RPM refused the MX/CX vote NOM (TopazRpm lines)", g300, c300);
++	if (!topaz_rpm_write(RPM_ACTIVE, RPM_RWMX, 0, RPM_VLVL, CX_NOM) || !cx_vote(CX_NOM)) {
++		return off(0, "RPM refused the MX/CX vote NOM (TopazRpm lines)", g, c);
+ 	}
+-	if (!laurel_gpu_core_div(1)) {
+-		return off(1, "the RCG did not take GPLL0 / 1", g300, c300);
++	st.cx = CX_NOM;
++	st.cur = OPP_300;
++	level = OPP_300;
++	usable = 1u << OPP_300;
++	/* The fallback first: the 300/600 path of 2892, with no PLL */
++	if (!try_level(OPP_600, &fence, note, sizeof(note))) {
++		return off(1, note, read_gcc[OPP_600], read_cp[OPP_600]);
+ 	}
+-	if (!clock_right(600, &g600, &c600)) {
+-		return off(1, "the clock at 600 does not measure 600", g600, c600);
++	if (!set_level(OPP_300, &why) || !clock_right(300, &g, &c)) {
++		return off(1, "the clock did not come back to 300", g, c);
+ 	}
+-	if (!laurel_gpu_fence_check(&us)) {
+-		return off(1, "no CP fence at 600 MHz", g600, c600);
++	pll_off(0);
++	pll_off(1);
++	if (!pll_allowed) {
++		strlcpy(note, "boot-arg gpupll=0", sizeof(note));
++	} else {
++		ipeak_start();
++		/* PLL1 from 300; PLL0 from 600. A level above one that failed is not tried. */
++		if (try_level(1, &fence, note, sizeof(note))) {
++			(void)try_level(2, &fence, note, sizeof(note));
++		}
++		if (st.broken) {
++			/* below */
++		} else if (!set_level(OPP_600, &why)) {
++			scnprintf(note, sizeof(note), "PLL0 not tried: 600: %s", why);
++		} else {
++			for (uint32_t i = OPP_TOUCH; i < OPP_N; i++) {
++				if (!try_level(i, &fence, note, sizeof(note))) {
++					break;
++				}
++			}
++		}
+ 	}
+-	if (!laurel_gpu_core_div(2) || !clock_right(300, &g_back, &c_back)) {
+-		return off(1, "the clock did not come back to 300", g_back, c_back);
++	if (st.broken) {
++		usable = 1u << OPP_300;
++		return off(1, note, 0, 0);
+ 	}
+-	IOLog("LAUREL GPU CLOCK: on: GPLL0 300/600 MHz, measured GCC %u/%u CP %u/%u MHz, CP fence at 600 in %llu us; MX+CX NOM held; raise at %u %% busy or touch, lower below %u %% for %u ms; no 600 from %d C to %d C\n",
+-	    g300, g600, c300, c600, us, RAISE_PCT, LOWER_PCT, LOWER_MS, HOT_DC / 10, COOL_DC / 10);
++	if (usable & (1u << 1)) {
++		usable &= ~(1u << OPP_300);     /* the stock floor works: 300 MHz waits for a fallback */
++	}
++	if (!set_level(opp_lowest(usable), &why)) {
++		return off(1, "no way back to the lowest level", 0, 0);
++	}
++	(void)opp_on_line(line, sizeof(line), usable, read_gcc, read_cp, fence, ipeak_used, note);
++	IOLog("%s\n", line);
++	return true;
++}
++
++/* --------------------------------------------------------------- the run */
++
++/* The watchdog holds 300 MHz (laurel_gpu_dcvs_stall). A stall on a PLL level: the 300/600 path goes on. A stall on GPLL0: off, as in 2892. */
++static bool
++after_stall(void)
++{
++	bool was_pll = stall_mhz != opp_table[OPP_600].mhz;
++
++	all_down();
++	if (!was_pll) {
++		IOLog("LAUREL GPU CLOCK: off: no GPU progress for 1500 ms at %u MHz; 300 MHz stays\n", stall_mhz);
++		return false;
++	}
++	usable = OPP_GPLL0_ONLY;
++	stalled = false;
++	laurel_gpu_core_pin(false);
++	IOLog("LAUREL GPU CLOCK: on: no GPU progress for 1500 ms at %u MHz; PLL levels out, 300/600 MHz goes on\n", stall_mhz);
++	return true;
++}
++
++/* A level failed in the run: out of the table, one line, the clock as opp_go left it. false: GPLL0 itself failed. */
++static bool
++take_out(uint32_t i, const char *why)
++{
++	if (opp_table[i].pll == OPP_NO_PLL) {
++		(void)off(1, why, opp_table[i].mhz, read_gcc[i]);
++		return false;
++	}
++	usable &= ~(1u << i);
++	usable |= i == 1 ? 1u << OPP_300 : 0;   /* the floor goes back to GPLL0 */
++	IOLog("LAUREL GPU CLOCK: on: %u MHz out: %s (read %u/%u); now %u MHz\n", opp_table[i].mhz, why, read_gcc[i], read_cp[i], opp_table[level].mhz);
+ 	return true;
+ }
+ 
+ /* one minute's time per level, when the GPU worked in it */
+ static void
+-minute_line(uint64_t ms[2], uint32_t raises, uint32_t busy_pct, uint32_t blocks)
++minute_line(uint64_t *ms, uint32_t raises, uint32_t busy_pct, uint32_t blocks)
+ {
+-	int dc = laurel_thermal_gpu_dC();
++	char s[160] = "";
++	int at = 0, dc = laurel_thermal_gpu_dC();
++	uint64_t above_floor = 0;
+ 
+-	if (raises != 0 || ms[1] != 0 || busy_pct != 0) {
+-		IOLog("LAUREL GPU CLOCK: on: last minute 300 MHz %llu s, 600 MHz %llu s, %u raises, %u hot refusals; busy %u %% of the time, gpu %d.%d C, DDR %u MHz\n",
+-		    ms[0] / 1000, ms[1] / 1000, raises, blocks, busy_pct, dc / 10, (dc < 0 ? -dc : dc) % 10, ddr_mhz());
++	for (uint32_t i = 0; i < OPP_N; i++) {
++		if (i != opp_lowest(usable)) {
++			above_floor += ms[i];
++		}
++		if (ms[i] >= 1000) {
++			at += scnprintf(s + at, sizeof(s) - at, "%u MHz %llu s, ", opp_table[i].mhz, ms[i] / 1000);
++		}
++	}
++	if (raises != 0 || above_floor != 0 || busy_pct != 0) {
++		IOLog("LAUREL GPU CLOCK: on: last minute %s%u raises, %u hot refusals; busy %u %% of the time, gpu %d.%d C, DDR %u MHz\n",
++		    s, raises, blocks, busy_pct, dc / 10, (dc < 0 ? -dc : dc) % 10, ddr_mhz());
+ 	}
+ }
+ 
+ static void
+ dcvs_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+-	uint64_t b0 = 0, t0 = 0, c = 0, lm_b0 = 0, lm_t0 = 0, ms[2] = { 0, 0 }, t_line = 0, touch_ns = (uint64_t)TOUCH_MS * NSEC_PER_MSEC;
+-	uint32_t low_ms = 0, ddr_low_ms = 0, raises = 0, blocks = 0, g = 0, cp = 0;
+-	bool hot = false;
++	uint64_t b0 = 0, t0 = 0, c = 0, lm_b0 = 0, lm_t0 = 0, ms[OPP_N] = { 0 }, t_line = 0, touch_ns = (uint64_t)TOUCH_MS * NSEC_PER_MSEC;
++	uint32_t low_ms = 0, ddr_low_ms = 0, raises = 0, blocks = 0;
++	struct opp_thermal th = { (uint32_t)OPP_N - 1, false };
++
++	uint32_t pll_arg = 1;
+ 
++	(void)PE_parse_boot_argn("gpupll", &pll_arg, sizeof(pll_arg));
++	pll_allowed = pll_arg != 0;
+ 	ddr_start();
+ 	if (!self_check()) {
+ 		return;
+@@ -146,9 +396,8 @@ dcvs_thread(void *arg __unused, wait_result_t wr __unused)
+ 	lm_b0 = b0;
+ 	lm_t0 = t0;
+ 	while (redwood_gpu_ready()) {
+-		IOSleep(TICK_MS);
+-		if (stalled) {
+-			IOLog("LAUREL GPU CLOCK: off: no GPU progress for 1500 ms at 600 MHz; 300 MHz stays\n");
++		IOSleep(OPP_TICK_MS);
++		if (stalled && !after_stall()) {
+ 			return;
+ 		}
+ 		uint64_t b1, t1, ns = 0, now = mach_absolute_time();
+@@ -156,78 +405,77 @@ dcvs_thread(void *arg __unused, wait_result_t wr __unused)
+ 		if (!laurel_gpu_counters(&b1, &t1, &c) || t1 <= t0) {
+ 			continue;
+ 		}
+-		uint32_t pct = (uint32_t)((b1 - b0) * 100 / (t1 - t0));
++		uint32_t pct = (uint32_t)((b1 - b0) * 100 / (t1 - t0)), cur = level;
+ 
+ 		b0 = b1;
+-		ms[level] += (t1 - t0) / 19200;
++		ms[cur] += (t1 - t0) / 19200;
+ 		t_line += (t1 - t0) / 19200;
+ 		t0 = t1;
+-		int dc = laurel_thermal_gpu_dC();
++		bool hot = opp_thermal_tick(&th, laurel_thermal_gpu_dC(), cur, usable);
+ 
+-		/* no reading counts as hot */
+-		hot = dc <= -1000 || dc >= HOT_DC ? true : (dc < COOL_DC ? false : hot);
+ 		absolutetime_to_nanoseconds(now - laurel_touch_at, &ns);
+ 		bool touch = laurel_touch_at != 0 && ns < touch_ns;
+-		bool want_up = pct >= RAISE_PCT || touch;
++		uint32_t to = opp_decide(cur, pct, touch, usable, th.cap, &low_ms);
+ 
+-		if (level == 0 && want_up && hot) {
++		if (hot && to <= cur && (pct >= OPP_RAISE_PCT || touch)) {
+ 			blocks++;
+-		} else if (level == 0 && want_up) {
+-			if (!laurel_gpu_core_div(1)) {
+-				off(1, "the RCG did not take GPLL0 / 1", 0, 0);
+-				return;
++		}
++		if (to != cur) {
++			const char *why = "";
++			bool ok = set_level(to, &why);
++
++			if (stalled) {
++				continue;       /* the next tick cleans up */
+ 			}
+-			if (!clock_right(600, &g, &cp)) {
+-				off(1, "the clock at 600 does not measure 600", g, cp);
++			if (st.broken) {
++				(void)off(1, "the RCG takes no source", opp_table[to].mhz, opp_table[level].mhz);
+ 				return;
+ 			}
+-			level = 1;
+-			low_ms = 0;
+-			raises++;
+-		} else if (level == 1) {
+-			low_ms = pct < LOWER_PCT && !touch ? low_ms + TICK_MS : 0;
+-			if (hot || low_ms >= LOWER_MS) {
+-				if (!laurel_gpu_core_div(2)) {
+-					off(0, "the RCG did not take GPLL0 / 2", 0, 0);
+-					return;
+-				}
+-				level = 0;
++			if (!ok && !take_out(to, why)) {
++				return;
+ 			}
++			raises += ok && to > cur ? 1 : 0;
+ 		}
+-		unsigned gold = laurel_cpufreq_gold_mhz();
++		uint32_t want = opp_table[level].bus_mhz;
+ 
+-		/* DDR up at once, down only after LOWER_MS (each vote is one RPM message) */
+-		if (level == 1 || gold >= GOLD_DDR_MHZ) {
++		/* DDR up before the raise (opp_go) or at once for Gold, down only after OPP_LOWER_MS (each vote is one RPM message) */
++		want = laurel_cpufreq_gold_mhz() >= GOLD_DDR_MHZ && want < DDR_GOLD_MHZ ? DDR_GOLD_MHZ : want;
++		if (want >= ddr_vote) {
+ 			ddr_low_ms = 0;
+-			ddr_want(DDR_HIGH_MHZ);
+-		} else if ((ddr_low_ms += TICK_MS) >= LOWER_MS) {
++			(void)ddr_want(want);
++		} else if ((ddr_low_ms += OPP_TICK_MS) >= OPP_LOWER_MS) {
+ 			ddr_low_ms = 0;
+-			ddr_want(DDR_LOW_MHZ);
++			(void)ddr_want(want);
+ 		}
+ 		if (t_line >= 60000) {
+ 			minute_line(ms, raises, t1 > lm_t0 ? (uint32_t)((b1 - lm_b0) * 100 / (t1 - lm_t0)) : 0, blocks);
+-			ms[0] = ms[1] = t_line = 0;
++			bzero(ms, sizeof(ms));
++			t_line = 0;
+ 			raises = blocks = 0;
+ 			lm_b0 = b1;
+ 			lm_t0 = t1;
+ 		}
+ 	}
+-	IOLog("LAUREL GPU CLOCK: off: the GPU went off at %u MHz\n", level ? 600 : 300);
++	uint32_t was = opp_table[level].mhz;
++
++	all_down();
++	IOLog("LAUREL GPU CLOCK: off: the GPU went off at %u MHz\n", was);
+ }
+ 
+ /*
+- * From the GPU watchdog (TopazAdreno.cpp) when the fence has not moved for 1500 ms: at 600 MHz go back to 300 MHz at once, long before the
+- * watchdog's 3 s turn the GPU off. true: the clock came down (the watchdog starts counting again).
++ * From the GPU watchdog (TopazAdreno.cpp) when the fence has not moved for 1500 ms: above 320 MHz go back to 300 MHz at once, long before the
++ * watchdog's 3 s turn the GPU off. true: the clock came down (the watchdog starts counting again). Only the RCG here: the DCVS thread cleans up.
+  */
+ bool
+ laurel_gpu_dcvs_stall(void)
+ {
+-	if (level == 0 || stalled) {
++	if (opp_table[level].mhz <= opp_table[1].mhz || stalled) {
+ 		return false;
+ 	}
++	stall_mhz = opp_table[level].mhz;
+ 	stalled = true;
+-	(void)laurel_gpu_core_div(2);
+-	level = 0;
++	laurel_gpu_core_pin(true);
++	level = OPP_300;
+ 	return true;
+ }
+ 
+@@ -245,6 +493,7 @@ laurel_gpu_dcvs_start(void)
+ 	gcc = (volatile uint8_t *)ml_io_map(0x01400000u, 0x80000);
+ 	gpucc = (volatile uint8_t *)ml_io_map(0x05990000u, 0x9000);
+ 	mccc = (volatile uint8_t *)ml_io_map(0x0447d000u, 0x1000);
++	tcsr = (volatile uint8_t *)ml_io_map(0x003ed000u, 0xd000);      /* cx_ipeak_lm */
+ 	if (gcc == NULL || gpucc == NULL || mccc == NULL) {
+ 		IOLog("LAUREL GPU CLOCK: off: clock registers not mapped; 300 MHz stays\n");
+ 		return;
+@@ -261,7 +510,7 @@ extern "C" int laurel_gpu_dcvs_stats(char *s, size_t n);
+ int
+ laurel_gpu_dcvs_stats(char *s, size_t n)
+ {
+-	return scnprintf(s, n, "gpu.level_mhz=%u\nddr.boot_mhz=%u\nddr.vote_mhz=%u\n", level ? 600 : 300, ddr_boot, ddr_vote);
++	return scnprintf(s, n, "gpu.level_mhz=%u\nddr.boot_mhz=%u\nddr.vote_mhz=%u\n", opp_table[level].mhz, ddr_boot, ddr_vote);
+ }
+ #else
+ extern "C" int laurel_gpu_dcvs_stats(char *s, size_t n) { (void)s; (void)n; return 0; }
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index bdc1e6d..51fd4f7 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1846,22 +1846,41 @@ ts_account(void)
+ }
+ 
+ /* laurel 2892: what LaurelGpuDcvs.cpp needs from here; hw_lock around all of it */
+-extern "C" bool laurel_gpu_core_div(uint32_t div);
++extern "C" bool laurel_gpu_core_src(uint32_t src, uint32_t div);
++extern "C" void laurel_gpu_core_pin(bool pin);
+ extern "C" bool laurel_gpu_counters(uint64_t *busy, uint64_t *ticks, uint64_t *cycles);
+ extern "C" bool laurel_gpu_fence_check(uint64_t *us);
+ 
++static bool clock_pinned;                       /* laurel 2961: the watchdog or a failure holds GPLL0 / 2 */
++
++/* laurel 2961: the gfx3d source of a level; false: no, or the clock is held */
+ bool
+-laurel_gpu_core_div(uint32_t div)
++laurel_gpu_core_src(uint32_t src, uint32_t div)
+ {
+ 	if (!ready || hw_lock == NULL) {
+ 		return false;
+ 	}
+ 	IOLockLock(hw_lock);
+-	bool ok = rcg_set(0x101c, SRC_GPLL0, div);
++	bool ok = !clock_pinned && rcg_set(0x101c, src, div);
+ 	IOLockUnlock(hw_lock);
+ 	return ok;
+ }
+ 
++/* laurel 2961: hold GPLL0 / 2 past all else: from the watchdog, while the DCVS thread may be in the middle of a change */
++void
++laurel_gpu_core_pin(bool pin)
++{
++	if (hw_lock == NULL) {
++		return;
++	}
++	IOLockLock(hw_lock);
++	clock_pinned = pin;
++	if (pin) {
++		(void)rcg_set(0x101c, SRC_GPLL0, 2);
++	}
++	IOLockUnlock(hw_lock);
++}
++
+ bool
+ laurel_gpu_counters(uint64_t *busy, uint64_t *ticks, uint64_t *cycles)
+ {
+@@ -2161,7 +2180,7 @@ laurel_gpu_watchdog(void)
+ 			continue;
+ 		}
+ 		absolutetime_to_nanoseconds(now - since, &ns);
+-		/* laurel 2892: no progress at 600 MHz: first the clock back to today's speed, and the 3 s count again */
++		/* laurel 2892, 2961: no progress above 320 MHz: first the clock back to 300 MHz, and the 3 s count again */
+ 		if (ns / NSEC_PER_MSEC >= 1500 && laurel_gpu_dcvs_stall()) {
+ 			since = now;
+ 			continue;
+diff --git a/iokit/Kernel/arm/laurel_gpu_clock_read.h b/iokit/Kernel/arm/laurel_gpu_clock_read.h
+index 4a7a7a6..2668052 100644
+--- a/iokit/Kernel/arm/laurel_gpu_clock_read.h
++++ b/iokit/Kernel/arm/laurel_gpu_clock_read.h
+@@ -73,7 +73,7 @@ clock_right(uint32_t want, uint32_t *gcc_read, uint32_t *cp_read)
+ 	*cp_read = cp_mhz();
+ 	uint32_t got = *gcc_read ? *gcc_read : *cp_read;
+ 
+-	return got >= want * 9 / 10 && got <= want * 11 / 10;
++	return opp_read_right(want, got);       /* laurel 2961: 3 %, a read must tell 900 from 950 */
+ }
+ 
+ static uint32_t
+@@ -84,40 +84,51 @@ ddr_mhz(void)
+ 	return ps >= 200 && ps <= 100000 ? 1000000u / ps : 0;   /* 10 MHz .. 5 GHz, else not a clock */
+ }
+ 
+-static void
++/* laurel 2961: true also when no vote is needed; false: the RPM refused it */
++static bool
+ ddr_want(uint32_t mhz)
+ {
+-	mhz = mhz > ddr_boot ? mhz : ddr_boot;
+-	if (ddr_vote != 0 && mhz != ddr_vote && topaz_rpm_write(RPM_ACTIVE, RPM_MEMC, 0, RPM_KHZ, mhz * 1000)) {
+-		ddr_vote = mhz;
++	mhz = mhz > ddr_floor ? mhz : ddr_floor;
++	if (ddr_vote == 0 || mhz == ddr_vote) {
++		return true;
+ 	}
++	if (!topaz_rpm_write(RPM_ACTIVE, RPM_MEMC, 0, RPM_KHZ, mhz * 1000)) {
++		return false;
++	}
++	ddr_vote = mhz;
++	return true;
+ }
+ 
++/*
++ * The stock bus levels go to DDR_TOP_MHZ, so a boot clock below it needs a vote that the RPM must follow. Stock votes bus level 11 at 900 and 950
++ * MHz through msm_bus: path 26 -> 512, ib 14432000 KBps / 8 = 1804 MHz, which is "clk2" 1804000 KHz here. No "clk0" Enab (2892).
++ */
+ static void
+ ddr_start(void)
+ {
++	uint32_t top = pll_allowed ? DDR_TOP_MHZ : DDR_GOLD_MHZ;       /* gpupll=0: no new vote, as 2892 */
++
+ 	ddr_boot = ddr_mhz();
++	ddr_floor = opp_ddr_snap(ddr_boot);
+ 	if (ddr_boot == 0) {
+ 		IOLog("LAUREL DDR: off: the MCCC period register reads %u: no DDR clock known, no vote\n", RD(mccc, 0x220));
+-	} else if (ddr_boot >= DDR_HIGH_MHZ) {
+-		IOLog("LAUREL DDR: on: %u MHz measured, not lower than the GPU's bus level (%u MHz at 600 MHz): no vote needed\n",
+-		    ddr_boot, DDR_HIGH_MHZ);
+-	} else if (!topaz_rpm_write(RPM_ACTIVE, RPM_MEMC, 0, RPM_KHZ, DDR_HIGH_MHZ * 1000)) {
+-		IOLog("LAUREL DDR: off: %u MHz measured, RPM refused a vote of %u MHz\n", ddr_boot, DDR_HIGH_MHZ);
++	} else if (ddr_boot >= top) {
++		IOLog("LAUREL DDR: on: %u MHz measured, not lower than the top bus level %u MHz: no vote needed\n", ddr_boot, top);
++	} else if (!topaz_rpm_write(RPM_ACTIVE, RPM_MEMC, 0, RPM_KHZ, top * 1000)) {
++		IOLog("LAUREL DDR: off: %u MHz measured, RPM refused a vote of %u MHz; clock as it is\n", ddr_boot, top);
+ 	} else {
+ 		IOSleep(5);
+ 		uint32_t now = ddr_mhz();
+ 
+-		/* (the register may read the controller clock, not the DDR clock: a clear rise also counts as "it follows") */
+-		if (now >= DDR_HIGH_MHZ * 9 / 10 || now >= ddr_boot * 6 / 5) {
+-			ddr_vote = DDR_HIGH_MHZ;
+-			ddr_want(DDR_LOW_MHZ);
+-			IOLog("LAUREL DDR: on: %u MHz at boot, a vote gave %u MHz, %u MHz now; %u MHz with GPU 600 MHz or Gold above %u MHz, never below the boot clock\n",
+-			    ddr_boot, now, ddr_mhz(), DDR_HIGH_MHZ, GOLD_DDR_MHZ);
++		if (now >= ddr_boot * 11 / 10) {
++			ddr_vote = top;
++			(void)ddr_want(opp_table[OPP_300].bus_mhz);
++			IOLog("LAUREL DDR: on: %u MHz at boot, a vote of %u gave %u MHz, %u MHz now; stock bus level of each GPU level, never below %u MHz\n",
++			    ddr_boot, top, now, ddr_mhz(), ddr_floor);
+ 		} else {
+-			(void)topaz_rpm_write(RPM_ACTIVE, RPM_MEMC, 0, RPM_KHZ, ddr_boot * 1000);
+-			IOLog("LAUREL DDR: off: %u MHz at boot, %u MHz after a vote of %u MHz: the RPM does not follow (AP sent no scaling enable); clock as it is\n",
+-			    ddr_boot, now, DDR_HIGH_MHZ);
++			(void)topaz_rpm_write(RPM_ACTIVE, RPM_MEMC, 0, RPM_KHZ, ddr_floor * 1000);
++			IOLog("LAUREL DDR: off: %u MHz at boot, %u MHz after a vote of %u MHz: the RPM does not follow (no scaling enable); 820+ MHz run on the boot clock\n",
++			    ddr_boot, now, top);
+ 		}
+ 	}
+ }
+diff --git a/iokit/Kernel/arm/laurel_gpu_opp.h b/iokit/Kernel/arm/laurel_gpu_opp.h
+new file mode 100644
+index 0000000..815d34f
+--- /dev/null
++++ b/iokit/Kernel/arm/laurel_gpu_opp.h
+@@ -0,0 +1,394 @@
++/*
++ * laurel 2961 (a piece of LaurelGpuDcvs.cpp): the stock OPP table of the Mi A3's Adreno 610 and the rules that use it. No hardware access:
++ * the kernel gives the operations in struct opp_ops, and the host test scripts/laurel/test-gpu-opp.sh runs this same text with fakes.
++ *
++ * Sources [V]: trinket-gpu.dtsi and the phone's own DTB (boot.img, TRINKET msm-id 0x18a; no overlay in dtbo.img changes it): frequency and
++ * bus level. gpucc-trinket.c: source, divider, CX limit of each rate, VCO table. clk-alpha-pll.c alpha_pll_round_rate: L and alpha.
++ * vdd-level-trinket.h + qcom,rpm-smd-regulator.h: corner numbers. adreno-gpulist.h: CX iPeak from 900 MHz. trinket-thermal.dtsi: limits.
++ */
++#define OPP_SRC_PLL0    2u
++#define OPP_SRC_PLL1    4u
++#define OPP_SRC_GPLL0   5u
++#define OPP_NO_PLL      (-1)
++
++#define CX_LOW_SVS      64u
++#define CX_SVS          128u
++#define CX_SVS_PLUS     192u
++#define CX_NOM          256u
++#define CX_NOM_PLUS     320u
++#define CX_TURBO        384u
++#define CX_TURBO_NO_CPR 416u
++
++struct laurel_opp {
++	uint16_t mhz;
++	uint8_t src, div;       /* gfx3d RCG */
++	int8_t pll;             /* 0, 1, or OPP_NO_PLL: GPLL0 */
++	uint8_t l, alpha_u;
++	uint32_t alpha;
++	uint8_t vco;            /* USER_CTL bits 20-21: 0 = 1-2 GHz, 2 = 0.5-1 GHz */
++	uint16_t cx;            /* stock corner of this rate */
++	uint16_t bus_mhz;       /* stock bus level of this rate (qcom,bus-freq), as a DDR clock */
++	uint8_t ipeak;          /* stock CX iPeak vote: rate >= 900 MHz */
++};
++
++/*
++ * VCO = 2 x rate. 300 MHz is not a stock rate: the GPLL0 / 2 of laurel 2892, the fallback when PLL1 fails. 600 MHz is the stock rate, from
++ * GPLL0 / 1 in place of PLL0 at 1200 MHz: the same frequency, measured on the phone since boot 2026-11-01, and no PLL to keep running.
++ */
++static const struct laurel_opp opp_table[] = {
++	{ 300, OPP_SRC_GPLL0, 2, OPP_NO_PLL,  0, 0x00, 0x00000000, 0, CX_LOW_SVS,       451, 0 },
++	{ 320, OPP_SRC_PLL1,  2, 1,          33, 0x55, 0x55555600, 2, CX_LOW_SVS,       451, 0 },
++	{ 465, OPP_SRC_PLL1,  2, 1,          48, 0x70, 0x00000000, 2, CX_SVS,           768, 0 },
++	{ 600, OPP_SRC_GPLL0, 1, OPP_NO_PLL,  0, 0x00, 0x00000000, 0, CX_SVS_PLUS,     1017, 0 },
++	{ 745, OPP_SRC_PLL0,  2, 0,          77, 0x9a, 0xaaaaab00, 0, CX_NOM,          1353, 0 },
++	{ 820, OPP_SRC_PLL0,  2, 0,          85, 0x6a, 0xaaaaab00, 0, CX_NOM_PLUS,     1555, 0 },
++	{ 900, OPP_SRC_PLL0,  2, 0,          93, 0xc0, 0x00000000, 0, CX_TURBO,        1804, 1 },
++	{ 950, OPP_SRC_PLL0,  2, 0,          98, 0xf5, 0x55555600, 0, CX_TURBO_NO_CPR, 1804, 1 },
++};
++#define OPP_N           (sizeof(opp_table) / sizeof(opp_table[0]))
++#define OPP_300         0u
++#define OPP_600         3u
++#define OPP_GPLL0_ONLY  ((1u << OPP_300) | (1u << OPP_600))
++#define OPP_CHECK_PCT   3u              /* the read of a clock: 900 and 950 are 5.5 % apart. Boot 11 read 298/300 and 598/600 */
++
++/* The vote on CX: the stock corner of the rate, not below the NOM that laurel 2892 holds for the other AP blocks */
++static inline uint32_t
++opp_cx_vote(uint32_t i)
++{
++	return opp_table[i].cx > CX_NOM ? opp_table[i].cx : CX_NOM;
++}
++
++/* The boot clock as a stock bus level: the period register reads 1355 for level 1353, and a vote of 1355 could round up to 1555 */
++static inline uint32_t
++opp_ddr_snap(uint32_t mhz)
++{
++	for (uint32_t i = 0; i < OPP_N; i++) {
++		uint32_t b = opp_table[i].bus_mhz;
++
++		if (mhz * 100 >= b * 99 && mhz * 100 <= b * 101) {
++			return b;
++		}
++	}
++	return mhz;
++}
++
++static inline bool
++opp_read_right(uint32_t want, uint32_t got)
++{
++	return got * 100 >= want * (100 - OPP_CHECK_PCT) && got * 100 <= want * (100 + OPP_CHECK_PCT);
++}
++
++static inline uint32_t
++opp_lowest(uint32_t usable)
++{
++	for (uint32_t i = 0; i < OPP_N; i++) {
++		if (usable & (1u << i)) {
++			return i;
++		}
++	}
++	return OPP_300;
++}
++
++/* highest usable level, not above cap */
++static inline uint32_t
++opp_top(uint32_t usable, uint32_t cap)
++{
++	uint32_t top = opp_lowest(usable);
++
++	for (uint32_t i = top; i <= cap && i < OPP_N; i++) {
++		if (usable & (1u << i)) {
++			top = i;
++		}
++	}
++	return top;
++}
++
++/*
++ * Thermal rule of Android [V trinket-thermal.dtsi and the phone's DTB, sensor 15; the vendor thermal-engine files have no GPU rule]: gpu-step 95 C,
++ * no hysteresis: one level down at each tick at or above it (step_wise holds on a stable trend; here it goes on, the safe side), one level up at
++ * each tick below it. gpu-cx-mon 100 C, hysteresis 5 C: the lowest level. No reading counts as the worst. true: hot: no raise.
++ */
++#define OPP_HOT_DC      950
++#define OPP_CRIT_DC     1000
++#define OPP_CRIT_CLR_DC 950
++
++struct opp_thermal {
++	uint32_t cap;   /* highest level allowed */
++	bool crit;
++};
++
++static inline bool
++opp_thermal_tick(struct opp_thermal *t, int dc, uint32_t cur, uint32_t usable)
++{
++	uint32_t low = opp_lowest(usable);
++
++	if (dc <= -1000 || dc >= OPP_CRIT_DC) {
++		t->crit = true;
++	} else if (dc < OPP_CRIT_CLR_DC) {
++		t->crit = false;
++	}
++	if (t->crit) {
++		t->cap = low;
++		return true;
++	}
++	if (dc >= OPP_HOT_DC) {
++		uint32_t top = cur < t->cap ? cur : t->cap;
++
++		t->cap = top > low ? opp_top(usable, top - 1) : low;
++		return true;
++	}
++	for (uint32_t i = t->cap + 1; i < OPP_N; i++) {
++		if (usable & (1u << i)) {
++			t->cap = i;
++			break;
++		}
++	}
++	return false;
++}
++
++/*
++ * The governor. Raise at once: busy >= OPP_RAISE_PCT over a tick goes to the level where this work takes OPP_AIM_PCT, one level at least;
++ * busy >= OPP_FULL_PCT says nothing about the real demand and goes to the top; a touch goes to OPP_TOUCH at least, the highest rate that needs no
++ * rail above what is held [V 2892]. Lower only when the work would take OPP_AIM_PCT or less on the lower level (below the raise mark, so no
++ * ping-pong), for OPP_LOWER_MS without a break, and during a touch not below OPP_TOUCH. Above the thermal cap: down at once.
++ */
++#define OPP_TICK_MS     50u
++#define OPP_RAISE_PCT   50u
++#define OPP_FULL_PCT    90u
++#define OPP_AIM_PCT     45u
++#define OPP_LOWER_MS    500u
++#define OPP_TOUCH       4u
++
++static inline uint32_t
++opp_for_load(uint32_t mhz, uint32_t pct, uint32_t usable)
++{
++	uint32_t need = mhz * pct / OPP_AIM_PCT, top = opp_top(usable, OPP_N - 1);
++
++	for (uint32_t i = 0; i <= top; i++) {
++		if ((usable & (1u << i)) && opp_table[i].mhz >= need) {
++			return i;
++		}
++	}
++	return top;
++}
++
++static inline uint32_t
++opp_decide(uint32_t cur, uint32_t pct, bool touch, uint32_t usable, uint32_t cap, uint32_t *low_ms)
++{
++	uint32_t top = opp_top(usable, cap), want = cur;
++
++	if (cur > top || !(usable & (1u << cur))) {
++		*low_ms = 0;
++		return opp_top(usable, cur < cap ? cur : cap);
++	}
++	if (pct >= OPP_FULL_PCT) {
++		want = top;
++	} else if (pct >= OPP_RAISE_PCT) {
++		want = opp_for_load(opp_table[cur].mhz, pct, usable);
++		if (want <= cur) {
++			want = cur;
++			for (uint32_t i = cur + 1; i < OPP_N; i++) {
++				if (usable & (1u << i)) {
++					want = i;
++					break;
++				}
++			}
++		}
++	} else {
++		want = opp_for_load(opp_table[cur].mhz, pct, usable);
++		if (want > cur) {
++			want = cur;
++		}
++	}
++	if (touch) {
++		uint32_t t = opp_top(usable, OPP_TOUCH);
++
++		want = want > t ? want : t;
++	}
++	if (want > top) {
++		want = top;
++	}
++	if (want >= cur) {
++		*low_ms = 0;
++		return want;
++	}
++	*low_ms += OPP_TICK_MS;
++	if (*low_ms < OPP_LOWER_MS) {
++		return cur;
++	}
++	*low_ms = 0;
++	return want;
++}
++
++/* --------------------------------------------------------------- one change of level */
++
++struct opp_ops {
++	bool (*ipeak)(bool on);                         /* stock: vote before the raise over 900 MHz, withdraw after the lower */
++	bool (*ddr)(uint32_t mhz);                      /* before the raise; the governor lowers it later */
++	bool (*cx)(uint32_t level);
++	bool (*pll_on)(const struct laurel_opp *o);     /* programs a stopped PLL, waits for the lock; false: no lock, PLL stopped */
++	void (*pll_off)(int pll);
++	bool (*rcg)(const struct laurel_opp *o);        /* false: the source did not take, or the watchdog holds the clock */
++	bool (*check)(uint32_t i);                      /* the read of the clock; only after a raise */
++};
++
++struct opp_state {
++	uint32_t cur;           /* the level the RCG is on */
++	uint32_t cx;            /* the CX vote held */
++	bool ipeak;             /* the iPeak vote held */
++	bool broken;            /* the clock could not go anywhere: the caller turns the feature off */
++};
++
++/* Parked on GPLL0 with a stopped PLL: the old rate back. When that also fails: stay on GPLL0, lower than before, with the rails held. */
++static void
++opp_back(const struct opp_ops *ops, struct opp_state *st, uint32_t from)
++{
++	const struct laurel_opp *f = &opp_table[from];
++
++	if (ops->pll_on(f)) {
++		if (ops->rcg(f)) {
++			st->cur = from;
++		} else {
++			ops->pll_off(f->pll);
++		}
++	}
++}
++
++/*
++ * RCG from level `from` to `to`, both sources running. A PLL is programmed only while it is stopped, so a level on the same PLL waits on GPLL0
++ * (`park`, never above `from`), and that is why this gives no glitch and needs no latch of the running PLL. false: st->cur tells where it is.
++ */
++static bool
++opp_clock(const struct opp_ops *ops, struct opp_state *st, uint32_t to)
++{
++	uint32_t from = st->cur;
++	const struct laurel_opp *f = &opp_table[from], *t = &opp_table[to];
++
++	if (t->pll != OPP_NO_PLL && t->pll == f->pll) {
++		uint32_t park = f->mhz >= opp_table[OPP_600].mhz ? OPP_600 : OPP_300;
++
++		if (!ops->rcg(&opp_table[park])) {
++			return false;
++		}
++		st->cur = park;
++		ops->pll_off(t->pll);
++		if (!ops->pll_on(t)) {
++			opp_back(ops, st, from);
++			return false;
++		}
++	} else if (t->pll != OPP_NO_PLL && !ops->pll_on(t)) {
++		return false;
++	}
++	if (!ops->rcg(t)) {
++		if (t->pll != OPP_NO_PLL && t->pll != f->pll) {
++			ops->pll_off(t->pll);
++		} else if (t->pll != OPP_NO_PLL) {
++			ops->pll_off(t->pll);
++			opp_back(ops, st, from);
++		} else {
++			st->broken = !ops->rcg(f);      /* a dead RCG: the caller turns the feature off */
++		}
++		return false;
++	}
++	st->cur = to;
++	if (f->pll != OPP_NO_PLL && f->pll != t->pll) {
++		ops->pll_off(f->pll);
++	}
++	return true;
++}
++
++/* The votes for the level the clock is on after a failed raise or after a lower: iPeak first off, then the rail. A refused lower vote only keeps the rail. */
++static void
++opp_votes_down(const struct opp_ops *ops, struct opp_state *st)
++{
++	uint32_t c = opp_cx_vote(st->cur);
++
++	if (st->ipeak && !opp_table[st->cur].ipeak) {
++		(void)ops->ipeak(false);
++		st->ipeak = false;
++	}
++	if (c < st->cx && ops->cx(c)) {
++		st->cx = c;
++	}
++}
++
++/*
++ * The order (stock kgsl_pwrctrl_pwrlevel_change and clk_set_rate). Raise: iPeak, DDR, CX, PLL + lock, RCG, read of the clock. Lower: PLL + lock,
++ * RCG, iPeak off, CX. A refused vote or no lock: the clock stays, *why says what. true: the level is `to`.
++ */
++static bool
++opp_go(const struct opp_ops *ops, struct opp_state *st, uint32_t to, const char **why)
++{
++	uint32_t from = st->cur;
++	const struct laurel_opp *t = &opp_table[to];
++
++	if (to == from) {
++		return true;
++	}
++	if (to > from) {
++		uint32_t c = opp_cx_vote(to);
++
++		if (t->ipeak && !st->ipeak) {
++			if (!ops->ipeak(true)) {
++				*why = "CX iPeak vote refused";
++				return false;
++			}
++			st->ipeak = true;
++		}
++		if (!ops->ddr(t->bus_mhz)) {
++			*why = "RPM refused the DDR vote";
++			opp_votes_down(ops, st);
++			return false;
++		}
++		if (c > st->cx) {
++			if (!ops->cx(c)) {
++				*why = "RPM refused the CX vote";
++				opp_votes_down(ops, st);
++				return false;
++			}
++			st->cx = c;
++		}
++	}
++	if (!opp_clock(ops, st, to)) {
++		*why = "no PLL lock or the RCG did not take";
++		opp_votes_down(ops, st);
++		return false;
++	}
++	if (to > from && ops->check != NULL && !ops->check(to)) {
++		*why = "the clock read is wrong";
++		if (!opp_clock(ops, st, from)) {
++			st->broken = st->cur == to;
++		}
++		opp_votes_down(ops, st);
++		return false;
++	}
++	if (to < from) {
++		opp_votes_down(ops, st);
++	}
++	return true;
++}
++
++/* The one self-check line. One kernel log line ends after 255 bytes: the host test builds the longest case. */
++static int
++opp_on_line(char *s, size_t n, uint32_t usable, const uint16_t *gcc, const uint16_t *cp, uint64_t fence_us, bool ipeak, const char *why)
++{
++	int at = scnprintf(s, n, "LAUREL GPU CLOCK: on: MHz=GCC/CP");
++
++	for (uint32_t i = 0; i < OPP_N; i++) {
++		if (usable & (1u << i)) {
++			at += scnprintf(s + at, n - at, " %u=%u/%u", opp_table[i].mhz, gcc[i], cp[i]);
++		}
++	}
++	at += scnprintf(s + at, n - at, "; fence %llu us; %s", (unsigned long long)fence_us, ipeak ? "iPeak" : "no iPeak");
++	if (why[0] != 0) {
++		at += scnprintf(s + at, n - at, "; out");
++		for (uint32_t i = 0; i < OPP_N; i++) {
++			if (i != OPP_300 && !(usable & (1u << i))) {
++				at += scnprintf(s + at, n - at, " %u", opp_table[i].mhz);
++			}
++		}
++		at += scnprintf(s + at, n - at, ": %s", why);
++	}
++	at += scnprintf(s + at, n - at, "; raise %u %% or touch; hot %d C", OPP_RAISE_PCT, OPP_HOT_DC / 10);
++	return at;
++}
