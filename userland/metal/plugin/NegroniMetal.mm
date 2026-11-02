@@ -1238,6 +1238,29 @@ static void glass_bypass_start(void)
 	g_cabd_init = method_setImplementation(init, (IMP)glass_init);
 	nlog("LAUREL GLASS: on: live CABackdropLayer capture off in %s (touch %s/live-glass to bring it back)", name, NMTL_DIR);
 }
+#include "icon_store_rule.h"
+/* See icon_store_rule.h. In iconservicesagent, before its first draw on this device. A store of another generation empties, and this process ends once so that nothing it has read stays: launchd starts it at the next ask. */
+static void icon_store_start(void)
+{
+	if (strcmp(getprogname() ?: "", "iconservicesagent") != 0)
+		return;
+	const char *kill = getenv("NEGRONIMETAL_ICON_STORE");
+	if (kill != NULL && kill[0] == '0') {
+		nlog("LAUREL ICONS: off: NEGRONIMETAL_ICON_STORE=0: the store keeps what older stacks drew");
+		return;
+	}
+	const int removed = laurel_icon_store_refresh(LAUREL_ICON_STORE, LAUREL_ICON_GENERATION);
+	if (removed < 0) {
+		nlog("LAUREL ICONS: off: the store %s cannot be read or stamped: it keeps what older stacks drew", LAUREL_ICON_STORE);
+		return;
+	}
+	if (removed == 0) {
+		nlog("LAUREL ICONS: on: the store is generation %d", LAUREL_ICON_GENERATION);
+		return;
+	}
+	nlog("LAUREL ICONS: on: %d icons of older stacks taken out of the store (now generation %d): this process starts again and draws them at their next use", removed, LAUREL_ICON_GENERATION);
+	_exit(0);
+}
 extern "C" void native_bridge_metal_loss_counts(uint64_t out[8]);
 extern "C" void native_bridge_metal_texture_pool_limit(uint64_t bytes);
 extern "C" void native_bridge_metal_texture_pool_trim(bool all, uint64_t *held);
@@ -1698,6 +1721,7 @@ static void watchdog_start(void)
 			first_completion_watch(strike, CFAbsoluteTimeGetCurrent());
 			memory_watch();
 #ifdef NMTL_IOS26
+			icon_store_start();
 			metal_count_start();
 #endif
 			const long wd = env_num("NEGRONIMETAL_WATCHDOG", -1); /* 1 / 0 force it on / off; default: backboardd only */
