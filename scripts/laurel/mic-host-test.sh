@@ -22,6 +22,13 @@ cp "$SRC/audio_plugin.c" "$SRC/redwood_audio.h" "$W/hal/"
 "$CC" -O1 -g -Wall -Wno-multichar -Wno-four-char-constants -Wno-unused-function -Wno-format -I"$T/stub" -I"$W/hal" -I"$T" \
   "$T/hal_test.c" -lm -o "$W/hal_test"
 "$W/hal_test"
+# the iOS 26 build: the same source + ios26-devices.patch: five devices, four channels (userland/laurel/audio/build.sh IOS26=1)
+mkdir -p "$W/hal26"
+cp "$W/hal/audio_plugin.c" "$W/hal/redwood_audio.h" "$W/hal26/"
+(cd "$W/hal26" && patch -s -p1 < "$REPO/userland/laurel/audio/ios26-devices.patch")
+"$CC" -O1 -g -fsanitize=address,undefined -Wall -Wno-multichar -Wno-four-char-constants -Wno-unused-function -Wno-format -I"$T/stub" -I"$W/hal26" -I"$T" \
+  "$T/hal_test_ios26.c" -lm -o "$W/hal_test_ios26"
+"$W/hal_test_ios26"
 
 # the new files of the patch, as the patch has them
 python3 -I - "$PATCH" "$W/inc" <<'PY'

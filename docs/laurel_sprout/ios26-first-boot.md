@@ -2,7 +2,7 @@
 
 Date: 2026-11-02. **Nothing here has run on the phone.** Labels: [V] measured here (code, disassembly or a host test), [I] inference, [U] unknown. Lines marked "iOS 16" were seen on this phone on iOS 16 (`logs/usblog-20261101-165828.txt`); on iOS 26 they are expected, not seen.
 
-23F84 has no GL path. If the Metal stack fails, there is no picture. So every diagnosis below works with no screen.
+23F84 has no GL path. If the Metal stack fails, there is no picture. The GPU firmware is on the root since `ios26-parity.md` (hook `gpu-firmware`); before it the kernel said `LAUREL GPU: off` with no firmware. So every diagnosis below works with no screen.
 
 ## 1. One command
 
@@ -88,6 +88,7 @@ Read `logs/usblog-*.txt`, or `kernel-log.txt` of the tool. The first 3 rows are 
 | 4 Root and launchd | `SWEET HFS:`, `LAUREL DUALBOOT:` (`dual-boot.md`); `load_init_program: attempting to load /sbin/launchd`; `exec launchd`; `LAUREL STATE: on: ...`; `libignition: ...`; `<Notice>: boot-args = ...` | No `exec launchd`: root mount, or dyld (`CRASH launchd`, then a panic) | `ctl state`: `launchd=no`, `root ...` |
 | 5 Boot tasks | `[System Event] ... [Subsystem: launchd] [Event: mount-phase-1] Doing boot task`, also `data-protection`, `mount-phase-2`, `keybag`, ...; `exec mount`, `exec launchd_cache_loader`; `Early boot complete. Continuing system boot.` [string V] | `Boot task failed: ...`, `Panicking in 3 seconds`; or the last `Doing boot task` with no next line | `ctl state`: the `bad` lines |
 | 6 Daemons, SSH | `exec configd`, `exec logd`, `exec dropbearmulti`; **`LAUREL SSH: on: dropbear pid P, T s after launchd, on the USB address only`** (iOS 16: 4 s); `LAUREL NET: on: ...` | `LAUREL SSH: off: ...` at 300 s | `scripts/laurel/phone-ssh.sh wait 300`, then `phone-ssh.sh 'ps ax'` |
+| 6b Features | `LAUREL NOTCH: on`, `LAUREL CELLBAR: on`, `LAUREL RINGER: on` (syslog and `/var/tmp/laurel-notch.log`), `LAUREL FLASHLIGHT: on`, `exec bluetoothd`, `exec laurel-celld` | One `off` line per feature; each stops only itself (`ios26-parity.md` section 3) | The audit of the root: `ssh-root.txt` |
 | 7 Compositor | `exec backboardd`; `NMTL[<pid> backboardd]: ...`; `LAUREL METAL26: on: Metal device ... for the compositor`; `LAUREL METAL26: first frame on a screen surface (...)`; `LAUREL FB CANVAS: first frame on the panel: ...`; `LAUREL METAL26: screen: N of 64 samples lit ...`; `LAUREL FRAME: ...`; `exec SpringBoard` | See section 5 | The tool. `SWEET FPS` prints only with GL: do not wait for it |
 | Each stage | `exec NAME` per process; `CRASH name[pid] sig N ...` per crash; from 90 s, `SMP name[pid] ...` for SpringBoard and backboardd every 120 s | | `scripts/debug/crash-symbolize.sh`, `smp-symbolize.sh`: set `DSC` to `~/op10-apple/ios26/23F84-n104ap/lowered/dyld_shared_cache_arm64e` (their default is the iOS 16 cache) |
 
@@ -122,6 +123,7 @@ Previous boot, when this boot says nothing: from Android, `scripts/laurel/log-pu
 
 ```sh
 scripts/bg.sh ios26-debug-build scripts/laurel/ios26-debug-build.sh    # ksysctl + injected check of all tools (some minutes)
+scripts/bg.sh ios26-parity scripts/laurel/ios26-parity-build.sh        # audio, Bluetooth, status bar, cell, flashlight, HEVC, XNUtils + their check (docs/laurel_sprout/ios26-parity.md)
 scripts/bg.sh ios26-metal scripts/laurel/ios26-metal-build.sh          # the Metal stage; if absent the root has no compositor, SSH stays
 scripts/bg.sh ios26-kernel scripts/laurel/kernel-ios26-linux.sh        # stamp for LAUREL BUILD: root
 scripts/bg.sh ios26-root env FORCE=1 scripts/laurel/ios26-root.sh

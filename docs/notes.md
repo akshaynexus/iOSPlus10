@@ -5091,3 +5091,26 @@ Full text: `docs/laurel_sprout/boot-menu.md`.
 - bootctl: no = stdout 0, exit 70; a HAL error also exits 70. `|| refuse` hides the difference: use a three-way answer.
 - A helper's `return 1` inside a pipeline's left side loses the status and hashes nothing: e3b0c442 is the hash of empty. Seen in zsh by hand: `for x in $VAR` does not split in zsh.
 - Next: owner decisions O1, O3, O4, O5; then section 9.
+
+## Mi A3 iOS 26: parity with the iOS 16 root (2026-11-02, branch t3/laurel-ios26-parity; host only, NOTHING RUN ON THE PHONE)
+Doc: `docs/laurel_sprout/ios26-parity.md`: the table, generated (`scripts/laurel/ios26-parity-audit.py`), and the reasons.
+Facts [V 23F84]:
+- `/usr/share/firmware/laurel` was not on the iOS 26 root: `root-add-gpu.sh` installs it on iOS 16, and the iOS 26 path dropped that script. No firmware: `LAUREL GPU: off`, no compositor. Hook `gpu-firmware`.
+- 23F84 has 49 apps in `/private/var/staged_system_apps`, each with a placeholder. `com.apple.aggregated` is gone (only `.addaily`).
+- VideoToolbox: slot `/System/Library/VideoDecoders/HEVCH8.videodecoder` + `HEVCH8Register` stays on the list; VCPHEVC is in the cache; vtable: base class version 1, decoder class version 3, the same shape as 20H392.
+- bluetoothd has `BT_HCI_TRANSPORT`, `H4BC`, `POSIX`, `uart.sk.bluetooth`.
+- SpringBoard: `SBHScreenTypeForCurrentDevice` exported, `__sb__mainScreenReferenceBounds` exported, `+[UISDisplaySingleRectShape(SpringBoard) sb_displayShapeForScreenType:]` is in SpringBoard.framework of the cache. The notch code asks the screen type in force: no iPhone10,3 in it.
+- `com.apple.coremedia.flashlight` is a MachService of cameracaptured, under the feature flag `CameraCapture/cameracaptured`. `+sharedCaptureDeviceVendor` at 0x1ae2d0b34 is a tail call of `...WithDefaultDeviceCreateFunction:` with nil. FigFlashlight's messages changed: doc section 5. `kFigCaptureStreamProperty_TorchLevel` is still "TorchLevel".
+- `initWithDeviceCreateFunction:` is gone; `-[BWGraph _logActiveSinkNodesAfterGraphStopTimeout]` has no symbol. Camera plug-in: not ported, doc section 6.
+- launchd's plist: 25 Boot tasks, 16 with `RequireSuccess`, 13 programs. No hook touches them.
+- Lowered cache keeps the header UUID 6EF96C18-8234-33E0-A1FA-E8AAC6342568.
+Gotchas:
+- `ios26-injected-check.py` maps the cache through ipsw: 13 at once killed the tmux job with no exit file (the host's memory killer [I]). `ios26-parity-build.sh` runs one at a time, about 90 s each, and keeps a result by sha256.
+- A killed hevc-build leaves a stale FUSE mount at `out/heic/re/sys` ("Transport endpoint is not connected"): `fusermount3 -uz`.
+- `apfs-fuse` gave EIO on one file, 8 tries, with two kernel builds running and a second mount of the donor images: run the root alone.
+- `DYLD_INSERT_LIBRARIES` takes dylibs only, so the iOS 26 LaurelFlashlight is a dylib, with no plug-in type in `Info.plist`, at the HAL path the kernel's button test reads.
+- UBSan on the plug-in found 5 devices in `words[4]` of `struct value`: run new plug-in code under the host test.
+- `audio` needs `VirtualAudio.plugin`: `tweaks()` no longer removes it; `audio()` decides.
+- IOS-26-Hot removes 41 jobs on 23F84; 32 stay on our root (doc section 10). First list to read if the first boot shows a crash loop.
+Not proven: all of it on the phone. dyld with opcode fixups, the wrappers' insert, the type encodings (self-checks say), BlueTool XPC on 26, VirtualAudio's route, thermal monitor's torch level.
+

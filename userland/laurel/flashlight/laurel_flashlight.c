@@ -54,10 +54,23 @@
 #define LF_OFF_FILE     "/var/db/laurel/flashlight-off"
 #define LF_CAMERA       "/System/Library/Audio/Plug-Ins/HAL/NegroniCamera.driver/NegroniCamera"
 #define LF_CAMERA_OFF   "/var/db/negronicam/off"        /* NEGRONICAM_OFF_FILE: that plug-in then does nothing */
-#define LF_CACHE_UUID   "8F970452-C9E3-3E88-B114-FEB1864BC9E0"  /* iOS 16.7.x 20H392 dyld_shared_cache_arm64 */
 #define LF_CACHE_BASE   0x180000000UL
+#ifdef LF_IOS26
+/*
+ * iOS 26.5.2 23F84 N104AP (the lowered cache keeps the header UUID) [V: docs/laurel_sprout/ios26-parity.md "Flashlight"]: no mediaserverd, so no HAL host for this. com.apple.coremedia.flashlight is a
+ * MachService of cameracaptured, which starts FigFlashlightServerStart itself. /usr/local/libexec/laurel-cameracaptured (cc_wrap.c) inserts this bundle there. The file stays in the HAL folder, because the
+ * kernel's button test reads that path (patch 2783). audiomxd also loads it from there; there this constructor stops at the process name and the factory gives the HAL no driver.
+ */
+#define LF_HOST         "cameracaptured"
+#define LF_CACHE_UUID   "6EF96C18-8234-33E0-A1FA-E8AAC6342568"
+#define LF_VENDOR_IMP   0x1ae2d0b34UL   /* +[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor]: a tail call of ...WithDefaultDeviceCreateFunction: with nil */
+#define LF_VENDOR_FIRST 0xd2800002u     /* mov x2, #0 */
+#else
+#define LF_HOST         "mediaserverd"
+#define LF_CACHE_UUID   "8F970452-C9E3-3E88-B114-FEB1864BC9E0"  /* iOS 16.7.x 20H392 dyld_shared_cache_arm64 */
 #define LF_VENDOR_IMP   0x1a1f40c84UL   /* +[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor] */
 #define LF_VENDOR_FIRST 0xa9bd57f6u     /* stp x22, x21, [sp, #-0x30]! */
+#endif
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
@@ -71,11 +84,20 @@ static Class lf_vendor_class, lf_device_class, lf_stream_class;
 static id lf_vendor;
 static unsigned lf_said;
 
-/* FigFlashlight code that asks for the vendor (unslid 20H392; negroni userland/flashlight/negroni_flashlight.c) */
+/* FigFlashlight code that asks for the vendor (unslid; 20H392: negroni userland/flashlight/negroni_flashlight.c; 23F84: CMCapture symbols of the cache) */
 static const struct { uintptr_t from, to; } lf_callers[] = {
+#ifdef LF_IOS26
+	{ 0x1ae2f6f40UL, 0x1ae2f7100UL },       /* FigFlashlightCreate block 2 */
+	{ 0x1ae2f77b8UL, 0x1ae2f802cUL },       /* the availability listener block */
+	{ 0x1ae2f9104UL, 0x1ae2f92d4UL },       /* teardownDevice */
+	{ 0x1ae33bf28UL, 0x1ae33bf7cUL },       /* PowerOff */
+	{ 0x1ae446aa4UL, 0x1ae446de8UL },       /* FigFlashlightCreate blocks 1, 3 */
+	{ 0x1ae44700cUL, 0x1ae447960UL },       /* IsAvailable .. setBeamWidthInternal */
+#else
 	{ 0x1a20007b0UL, 0x1a2000bdcUL },       /* IsAvailable .. setupDevice */
 	{ 0x1a1f3e540UL, 0x1a1f3e668UL },       /* teardownDevice */
 	{ 0x1a1fa9e70UL, 0x1a1faa0f8UL },       /* the availability listener block */
+#endif
 };
 
 static void
@@ -143,6 +165,32 @@ fv_copy_stream(id self, SEL sel, int position, int type, id device)
 {
 	return device != NULL && object_getClass(device) == lf_device_class ? class_createInstance(lf_stream_class, 0) : NULL;
 }
+
+#ifdef LF_IOS26
+/* 23F84: -copyStreamWithoutControlFromDevice:position:deviceType:error: [V flashlight_createDeviceAndStream] */
+static id
+fv_copy_stream_26(id self, SEL sel, id device, int position, int type, int *error)
+{
+	if (error != NULL) {
+		*error = 0;
+	}
+	return device != NULL && object_getClass(device) == lf_device_class ? class_createInstance(lf_stream_class, 0) : NULL;
+}
+
+/* 23F84: -takeBackDevice:forClient:informClientWhenDeviceAvailableAgain:prefersDeviceInvalidatedImmediately: */
+static void
+fv_take_back_26(id self, SEL sel, id device, int client, BOOL inform, BOOL now)
+{
+	lf_set(0);
+}
+
+/* 23F84: -isActiveDefaultDeviceAvailableToFlashlight: [V flashlight_IsAvailable, FigFlashlightCreate block 3]: no other client of this LED exists on this root */
+static BOOL
+fv_available_26(id self, SEL sel, id device)
+{
+	return YES;
+}
+#endif
 
 static void
 fv_take_back(id self, SEL sel, id device, int client, BOOL inform)
@@ -245,6 +293,13 @@ static void
 lf_make_classes(void)
 {
 	static const struct lf_method vendor[] = {
+#ifdef LF_IOS26
+		{ "registerClientWithPID:clientDescription:clientPriority:canStealFromClientsWithSamePriority:"
+		  "deviceSharingWithOtherClientsAllowed:clientType:deviceAvailabilityChangedHandler:", "i@:i@iBBi@", (IMP)fv_register },
+		{ "copyStreamWithoutControlFromDevice:position:deviceType:error:", "@@:@ii^i", (IMP)fv_copy_stream_26 },
+		{ "takeBackDevice:forClient:informClientWhenDeviceAvailableAgain:prefersDeviceInvalidatedImmediately:", "v@:@iBB", (IMP)fv_take_back_26 },
+		{ "isActiveDefaultDeviceAvailableToFlashlight:", "B@:@", (IMP)fv_available_26 },
+#endif
 		{ "registerClientWithPID:clientDescription:clientPriority:canStealFromClientsWithSamePriority:"
 		  "deviceSharingWithOtherClientsAllowed:deviceAvailabilityChangedHandler:", "i@:i@iBB@", (IMP)fv_register },
 		{ "copyDeviceForClient:informClientWhenDeviceAvailableAgain:error:", "@@:iB^i", (IMP)fv_copy_device },
@@ -310,6 +365,7 @@ lf_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 	lf_hooked = true;
 }
 
+#ifndef LF_IOS26
 /* the stock rule (MediaToolbox feServer_ShouldStartSubServer): no plist or no key = start; else the key's value */
 static int
 lf_stock_starts_servers(void)
@@ -360,6 +416,7 @@ lf_start_server(__unused void *context)
 	say("LAUREL FLASHLIGHT: on: FigFlashlight server started (com.apple.coremedia.flashlight), vendor hook in, %s open: "
 	    "Control Center TorchLevel 0..1 -> 0..100 %% (kernel cap 150 mA)", LF_DEVICE);
 }
+#endif /* !LF_IOS26 */
 
 static bool
 lf_pin_self(void)
@@ -380,7 +437,7 @@ lf_init(void)
 	uuid_string_t text = "?";
 	size_t length = 0;
 
-	if (name == NULL || strcmp(name, "mediaserverd") != 0) {
+	if (name == NULL || strcmp(name, LF_HOST) != 0) {
 		return;
 	}
 	if (access(LF_OFF_FILE, F_OK) == 0) {
@@ -395,7 +452,7 @@ lf_init(void)
 		uuid_unparse_upper(uuid, text);
 	}
 	if (strcmp(text, LF_CACHE_UUID) != 0) {
-		say("LAUREL FLASHLIGHT: off: dyld shared cache %s is not 20H392 (%s)", text, LF_CACHE_UUID);
+		say("LAUREL FLASHLIGHT: off: dyld shared cache %s is not the build this file is for (%s)", text, LF_CACHE_UUID);
 		return;
 	}
 	lf_fd = open(LF_DEVICE, O_WRONLY | O_CLOEXEC);
@@ -411,8 +468,16 @@ lf_init(void)
 	}
 	lf_slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - LF_CACHE_BASE;
 	lf_make_classes();
+#ifdef LF_IOS26
+	/* cameracaptured links CMCapture and starts FigFlashlightServerStart in its main(): the hook goes in now, before that. No server start here */
+	lf_image_added(NULL, 0);
+	if (lf_hooked) {
+		say("LAUREL FLASHLIGHT: on: vendor hook in, cameracaptured starts com.apple.coremedia.flashlight, %s open: TorchLevel 0..1 -> 0..100 %% (kernel cap 150 mA)", LF_DEVICE);
+	}
+#else
 	/* the main queue runs once mediaserverd's main() is in its run loop: after FigMediaServerStart */
 	dispatch_async_f(dispatch_get_main_queue(), NULL, lf_start_server);
+#endif
 }
 
 /* the CFPlugIn factory the HAL calls (Info.plist): no audio driver in this bundle */

@@ -12,11 +12,13 @@
 # Output: out/laurel/audio/RedwoodAudio.driver/{RedwoodAudio,Info.plist} (arm64, minos 16.0, ad hoc
 #         signed, one export: _RedwoodAudio_Create) + out/laurel/audio/SHA256SUMS.
 # Install into a root: scripts/laurel/root-audio.sh (root.sh calls it).
+# IOS26=1: the iOS 26.5.2 23F84 copy, with userland/laurel/audio/ios26-devices.patch on top: output out/ios26/audio/RedwoodAudio.driver; audiomxd loads it; ios26-root-spec.py audio() installs it.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
 SRC=$REPO/external/ios-topaz/userland/audio
 OUT=$REPO/out/laurel/audio
+[ "${IOS26:-0}" != 1 ] || OUT=$REPO/out/ios26/audio
 B=$OUT/RedwoodAudio.driver
 W=$OUT/build
 MINOS=16.0
@@ -27,6 +29,9 @@ mkdir -p "$B" "$W/src"
 # our change to the external source goes in as a patch on a copy (CLAUDE.md: nothing is committed inside external/)
 cp "$SRC/audio_plugin.c" "$SRC/redwood_audio.h" "$W/src/"
 (cd "$W/src" && patch -s -p1 < "$HERE/mic-input.patch") || { echo "audio: mic-input.patch does not apply" >&2; exit 1; }
+if [ "${IOS26:-0}" = 1 ]; then
+  (cd "$W/src" && patch -s -p1 < "$HERE/ios26-devices.patch") || { echo "audio: ios26-devices.patch does not apply" >&2; exit 1; }
+fi
 
 if [ "$(uname -s)" = Darwin ] && xcrun -sdk iphoneos --show-sdk-path >/dev/null 2>&1; then
   SDK=$(xcrun -sdk iphoneos --show-sdk-path)

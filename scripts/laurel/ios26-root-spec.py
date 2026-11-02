@@ -54,6 +54,7 @@ class Tree:
         self.audit_lines = []
         self.skipped = 0
         self.links_extra = 0
+        self.undo = None    # while a hook runs: overlay path -> bytes it had (None: no file). A hook that fails leaves no trace
 
     def scan(self, base, prefix):
         """All entries under BASE (bytes path) into the tree at PREFIX."""
@@ -104,6 +105,8 @@ class Tree:
         self.mkdirs(os.path.dirname(p))
         dst = os.path.join(self.overlay, p)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if self.undo is not None and dst not in self.undo:
+            self.undo[dst] = open(dst, 'rb').read() if os.path.exists(dst) else None
         with open(dst, 'wb') as f:
             f.write(data)
         self.n[p] = Node('f', mode if mode is not None else old.mode, uid if uid is not None else old.uid, gid if gid is not None else old.gid, old.mtime if old else self.mtime, dst)
@@ -196,12 +199,7 @@ def tweaks(t, a):
     else:
         t.audit('activation data ark', 'not-found', 'no mobileactivationd system container in the 23F84 OS volume; the kernel path (ADT security-status) stays. Whether that is enough on 26: [U]')
 
-    # audio
-    if t.exists('Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin'):
-        t.remove(b'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin')
-        t.audit('VirtualAudio HAL plug-in', 'applied', 'removed (iOS 16: mediaserverd crash); on 26 [U]')
-    else:
-        t.audit('VirtualAudio HAL plug-in', 'not-found', 'not in the OS volume')
+    # audio: VirtualAudio.plugin is decided in audio(): it stays only with our devices under it
     confs = [k for k in t.n if k.startswith(b'System/Library/Frameworks/MediaToolbox.framework/') and k.endswith(b'/SubServerConfiguration.plist')]
     for c in confs:
         d = plist_load(t, c)
@@ -746,7 +744,7 @@ def debug_self_test(d):
     root_manifest(t, os.path.join(d, 'no-stamp'))
     first = t.read(b'usr/share/laurel/root-manifest').decode().splitlines()
     import re
-    checks += [bool(re.fullmatch(r'\S+ \S+ kernel-series none features 3 installed 1 off 2 missing 0', first[0])), t.n[b'usr/share/laurel/root-manifest'].mode == 0o644]
+    checks += [bool(re.fullmatch(r'\S+ \S+ kernel-series none features %d installed 1 off %d missing 0' % (len(FEATURES), len(FEATURES) - 1), first[0])), t.n[b'usr/share/laurel/root-manifest'].mode == 0o644]
     # kill switch and a missing tool: off, the tree stays
     os.environ['DEBUG26'] = '0'
     t, work = tree()
@@ -769,6 +767,458 @@ def debug_self_test(d):
     return all(checks)
 
 
+# ---- parity with the iOS 16 root: one hook per feature (docs/laurel_sprout/ios26-parity.md) ----
+# Each hook: one audit line, and a failure leaves no trace: the tree, the launchd jobs and the overlay go back to what they were before it. So a failed stage cannot remove SSH or debug. Same switch names as iOS 16.
+class HookOff(Exception):
+    """A hook cannot work: the text is its audit line."""
+
+
+CHECK_LIST = 'out/ios26/parity-check.tsv'       # scripts/laurel/ios26-parity-build.sh: sha256 + path of each binary that passed armv80-check and ios26-injected-check on 23F84
+
+
+def main_checkout():
+    import subprocess
+    out = subprocess.run(['git', '-C', REPO, 'worktree', 'list', '--porcelain'], capture_output=True, text=True).stdout.splitlines()
+    return out[0].split(' ', 1)[1] if out else REPO
+
+
+def stage_src(rel):
+    """A build product: of this checkout, else of the main checkout (a worktree has none of its own, as root-debug-ios26.sh)."""
+    here = os.path.join(REPO, rel)
+    if os.path.exists(here):
+        return here
+    other = os.path.join(main_checkout(), rel)
+    return other if os.path.exists(other) else here
+
+
+def checked_binaries():
+    """sha256 values that passed the check of this root's binaries."""
+    if os.environ.get('PARITY_CHECK_LIST'):
+        path = os.environ['PARITY_CHECK_LIST']
+    else:
+        path = stage_src(CHECK_LIST)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return {x.split('\t')[0] for x in f if x.strip() and not x.startswith('#')}
+
+
+def need_binary(path, filetype=None):
+    """Binary rules: thin plain arm64, signed, page size 4096, and this exact file passed ios26-injected-check. Else the hook is off."""
+    rel = os.path.relpath(path, REPO)
+    if not os.path.isfile(path):
+        raise HookOff(f'no {rel} (scripts/laurel/ios26-parity-build.sh)')
+    with open(path, 'rb') as f:
+        d = f.read()
+    magic, cpu, sub, ftype, ncmds = struct.unpack_from('<IIIII', d) if len(d) >= 32 else (0, 0, 0, 0, 0)
+    if magic != 0xfeedfacf or cpu != 0x0100000c or sub & 0xff != 0:
+        raise HookOff(f'{rel} is not thin plain arm64: refused')
+    if filetype is not None and ftype != filetype:
+        raise HookOff(f'{rel}: Mach-O type {ftype}, not {filetype}: refused')
+    o, cs = 32, None
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from('<II', d, o)
+        if cmd == 0x1d:
+            cs = struct.unpack_from('<I', d, o + 8)[0]
+        o += size
+    if cs is None:
+        raise HookOff(f'{rel} has no code signature: refused')
+    n = struct.unpack_from('>I', d, cs + 8)[0]
+    pages = [d[cs + bo + 39] for _, bo in (struct.unpack_from('>II', d, cs + 12 + i * 8) for i in range(n)) if struct.unpack_from('>I', d, cs + bo)[0] == 0xfade0c02]
+    if not pages or any(x != 12 for x in pages):
+        raise HookOff(f'{rel}: signature page shift {pages}, not 12 (4096 bytes): refused')
+    ok = checked_binaries()
+    if ok is None:
+        raise HookOff(f'no {CHECK_LIST} (scripts/laurel/ios26-parity-build.sh): {rel} is not checked against 23F84: refused')
+    if hashlib.sha256(d).hexdigest() not in ok:
+        raise HookOff(f'{rel} is not the file {CHECK_LIST} checked (scripts/laurel/ios26-parity-build.sh again): refused')
+    return d
+
+
+def merge_home(t, home, uid, name, values):
+    """Keys into HOME/Library/Preferences/NAME.plist (owner uid, 0600); new folders get that owner, as iOS makes them."""
+    q = os.path.join(home, b'Library/Preferences')
+    for i in range(1, len(q.split(b'/')) + 1):
+        d = b'/'.join(q.split(b'/')[:i])
+        if d not in t.n:
+            t.n[d] = Node('d', 0o755, uid, uid, t.mtime, b'')
+    p = os.path.join(q, name.encode() + b'.plist')
+    data = plist_load(t, p) if t.exists(p) else {}
+    data.update(values)
+    t.write(p, plistlib.dumps(data, fmt=plistlib.FMT_BINARY), 0o600, uid, uid)
+
+
+USERS = ((b'private/var/mobile', MOBILE), (b'private/var/root', 0))
+
+
+def make_stage(t, work, name, files=(), dirs=()):
+    """A stage for a script of the iOS 16 root: the files it edits, with their bytes in this tree."""
+    import shutil
+    stage = os.path.join(work, name + '-stage')
+    shutil.rmtree(stage, ignore_errors=True)
+    os.makedirs(stage)
+    for d in dirs:
+        os.makedirs(os.path.join(stage, d), exist_ok=True)
+    for f in files:
+        q = os.path.join(stage, f)
+        os.makedirs(os.path.dirname(q), exist_ok=True)
+        with open(q, 'wb') as g:
+            g.write(t.read(f))
+        os.chmod(q, 0o644)
+    return stage
+
+
+def run_script(cmd, env=None):
+    import subprocess
+    e = dict(os.environ, **(env or {}))
+    r = subprocess.run(cmd, capture_output=True, text=True, env=e, preexec_fn=lambda: os.umask(0o022))
+    lines = (r.stdout + r.stderr).strip().splitlines()
+    if r.returncode != 0:
+        raise HookOff((lines or ['no output'])[-1])
+    return lines
+
+
+def apply_with_prefs(t, stage):
+    """apply_stage + the preferences of a home folder: merged with its owner, not copied as root's. Returns the count of files."""
+    import shutil
+    n = 0
+    for home, uid in USERS:
+        d = os.path.join(stage.encode(), home, b'Library/Preferences')
+        if os.path.isdir(d):
+            for name in sorted(os.listdir(d)):
+                if name.endswith(b'.plist'):
+                    with open(os.path.join(d, name), 'rb') as f:
+                        merge_home(t, home, uid, name[:-6].decode(), plistlib.load(f))
+                    n += 1
+            shutil.rmtree(os.path.join(stage.encode(), home))
+    n += apply_stage(t, stage)
+    shutil.rmtree(stage, ignore_errors=True)
+    return n
+
+
+def feature(t, name, switch, fn, *args):
+    """Runs one hook. Returns True when it is in the root. Its switch =0, a HookOff or any other error: one line `off NAME: why`, nothing of it stays."""
+    import shutil
+    if switch and os.environ.get(switch, '1') == '0':
+        t.audit(name, 'off', f'{switch}=0')
+        return False
+    saved = dict(t.n)
+    copies = {k: (v.kind, v.mode, v.uid, v.gid, v.mtime, v.src, v.flags) for k, v in saved.items() if v.kind == 'd'}
+    t.undo = {}
+    try:
+        note = fn(t, *args)
+    except Exception as e:      # noqa: BLE001 (a hook must not stop the root: that is the point)
+        for dst, data in t.undo.items():
+            if data is None:
+                os.unlink(dst)
+            else:
+                with open(dst, 'wb') as f:
+                    f.write(data)
+        t.n = saved
+        for k, v in copies.items():
+            t.n[k].mode, t.n[k].uid, t.n[k].gid = v[1], v[2], v[3]
+        t.audit(name, 'off', str(e) if isinstance(e, HookOff) else f'{type(e).__name__}: {e}')
+        return False
+    finally:
+        t.undo = None
+    t.audit(name, 'applied', note + '. Not proven until it runs on the phone')
+    return True
+
+
+def set_job_program(t, label, wrap, stock):
+    """ProgramArguments[0] of a job in launchd.plist. Only from Apple's own start program."""
+    plist = plist_load(t, XPC)
+    k = f'/System/Library/LaunchDaemons/{label}.plist'
+    job = plist['LaunchDaemons'].get(k)
+    if job is None:
+        raise HookOff(f'no {label} job in launchd.plist')
+    args = job.get('ProgramArguments') or []
+    if 'Program' in job or not args or args[0] != stock:
+        raise HookOff(f'{label} starts {job.get("Program") or args[:1]}, not {stock}: left as it is')
+    job['ProgramArguments'] = [wrap] + args[1:]
+    t.write(XPC, plistlib.dumps(plist, fmt=plistlib.FMT_BINARY))
+
+
+def gpu_firmware(t):
+    """The kernel reads /usr/share/firmware/laurel/ (TopazAdreno.cpp FW_DIR): without it `LAUREL GPU: off`, so no Metal device, so no compositor. The phone's own files, from the stage of iOS 16 (gpu-firmware.sh)."""
+    d = stage_src('out/laurel/gpu/firmware')
+    if not os.path.isdir(d):
+        raise HookOff('no out/laurel/gpu/firmware (scripts/laurel/gpu-firmware.sh): the kernel says LAUREL GPU: off, no compositor on this root')
+    names = sorted(x for x in os.listdir(d) if x.startswith('a610_zap.') and not x.endswith('.elf') or x == 'a630_sqe.fw')
+    if 'a610_zap.mdt' not in names or 'a630_sqe.fw' not in names or not any(x.startswith('a610_zap.b') for x in names):
+        raise HookOff(f'{d}: not all of a610_zap.mdt, a610_zap.bNN, a630_sqe.fw: {names}')
+    sums = {}
+    if os.path.exists(os.path.join(d, 'SHA256SUMS')):
+        with open(os.path.join(d, 'SHA256SUMS')) as f:
+            sums = {x.split()[1]: x.split()[0] for x in f if x.strip()}
+    for x in names:
+        with open(os.path.join(d, x), 'rb') as f:
+            b = f.read()
+        if x in sums and hashlib.sha256(b).hexdigest() != sums[x]:
+            raise HookOff(f'{x} does not match its SHA256SUMS')
+        t.write(os.path.join(b'usr/share/firmware/laurel', x.encode()), b, 0o644, 0, 0)
+    return f'{len(names)} files in /usr/share/firmware/laurel, the phone\'s own: a610 zap shader + SQE. The kernel reads them for the Metal device'
+
+
+def statusbar(t, work):
+    """Part 1 of root-statusbar.py: the same UIKit override. _UIStatusBarVisualProvider_FixedSplit reads the notch from the screen, so no iPhone model is in it [V 23F84 UIKitCore has the class and the key]."""
+    stage = make_stage(t, work, 'statusbar', dirs=('private/var/mobile/Library/Preferences', 'private/var/root/Library/Preferences'))
+    os.makedirs(os.path.join(stage, os.path.dirname(XPC)))
+    with open(os.path.join(stage, XPC), 'wb') as f:
+        f.write(t.read(XPC))
+    for home, _ in USERS:
+        for name in (b'com.apple.UIKit.plist', b'.GlobalPreferences.plist'):
+            p = os.path.join(home, b'Library/Preferences', name)
+            if t.exists(p):
+                with open(os.path.join(stage.encode(), p), 'wb') as f:
+                    f.write(t.read(p))
+    run_script(['python3', '-I', os.path.join(REPO, 'scripts/laurel/root-statusbar.py'), stage], {'NOTCH': '0', 'STATUSBAR': '1'})
+    os.unlink(os.path.join(stage, XPC))
+    n = apply_with_prefs(t, stage)
+    return f'UIStatusBarVisualProviderClassName = _UIStatusBarVisualProvider_FixedSplit in com.apple.UIKit and .GlobalPreferences of mobile and root ({n} files): 360x780 pt matches no notched table of UIKit'
+
+
+def notch(t, work):
+    """Part 2 of root-statusbar.py: the waterdrop for the screen type in force: laurel_notch.c asks SBHScreenTypeForCurrentDevice and needs 360x780 @2, no iPhone model. Self-check on the phone: one LAUREL NOTCH line."""
+    need_binary(stage_src('out/laurel/notch/root/usr/local/lib/liblaurel-notch.dylib'), 6)
+    need_binary(stage_src('out/laurel/notch/root/usr/local/libexec/laurel-springboard'), 2)
+    stage = make_stage(t, work, 'notch', files=(XPC,))
+    lines = run_script(['python3', '-I', os.path.join(REPO, 'scripts/laurel/root-statusbar.py'), stage], {'NOTCH': '1', 'STATUSBAR': '1'})
+    said = [x for x in lines if x.startswith('statusbar: notch: ')]
+    if not said or 'notch: on' not in said[-1]:
+        raise HookOff((said[-1] if said else 'root-statusbar.py gave no line')[len('statusbar: notch: '):])
+    import shutil
+    shutil.rmtree(os.path.join(stage, 'private'), ignore_errors=True)
+    apply_stage(t, stage)
+    shutil.rmtree(stage, ignore_errors=True)
+    return 'liblaurel-notch.dylib + laurel-springboard; job com.apple.SpringBoard starts the wrapper (crash guard: 2 fast exits = Apple\'s shape for this boot; notch=0). Waterdrop {135.2, 0, 89.6, 26.5} pt'
+
+
+def cell(t, work):
+    """root-cell.sh: the bar and the data session. Kernel: 2786, 2940-2943 are in the 12377 series. The classes and methods of the bar are in the 23F84 cache by name [V]; types: its self-check on the phone (one LAUREL CELLBAR line)."""
+    need_binary(stage_src('out/laurel/cell/root/usr/local/lib/liblaurel-cellbar.dylib'), 6)
+    need_binary(stage_src('out/laurel/cell/root/usr/local/libexec/laurel-celld'), 2)
+    stage = make_stage(t, work, 'cell', files=(XPC,))
+    run_script(['bash', os.path.join(REPO, 'scripts/laurel/root-cell.sh'), stage], {'CELL': '1', 'NOTCH': '1', 'STATUSBAR': '1'})
+    n = apply_stage(t, stage)
+    import shutil
+    shutil.rmtree(stage, ignore_errors=True)
+    return f'{n} files: liblaurel-cellbar.dylib for laurel-springboard, laurel-celld + job com.laurel.celld (KeepAlive false; exits with no kern.laurel_cell_net). CommCenter stays out: as iOS 16, no Settings > Cellular, SMS or voice'
+
+
+def audio(t):
+    """RedwoodAudio.driver for audiomxd: the HAL folder and VirtualAudio.plugin are in 23F84 [V]. Hot's D421AP plug-in runs in the same process with the same factory type [self-reported]."""
+    src = stage_src('out/ios26/audio/RedwoodAudio.driver')
+    need_binary(os.path.join(src, 'RedwoodAudio'), 8)
+    hal = b'System/Library/Audio/Plug-Ins/HAL'
+    if not t.exists(hal):
+        raise HookOff('no /System/Library/Audio/Plug-Ins/HAL in the tree')
+    va = b'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin'
+    if not t.exists(va):
+        raise HookOff('no VirtualAudio.plugin: no speaker route')
+    for f, m in (('RedwoodAudio', 0o755), ('Info.plist', 0o644)):
+        with open(os.path.join(src, f), 'rb') as g:
+            t.write(os.path.join(hal, b'RedwoodAudio.driver', f.encode()), g.read(), m, 0, 0)
+    # BTAudioHALPlugin: its factory's XPC trapped the host on negroni; no port ran it with bluetoothd. A trap stops all audio. BTAUDIO=1 keeps it (the test of system-features.md)
+    bt = 'kept (BTAUDIO=1)'
+    if os.environ.get('BTAUDIO', '0') != '1' and t.exists(os.path.join(hal, b'BTAudioHALPlugin.driver')):
+        move(t, os.path.join(hal, b'BTAudioHALPlugin.driver'), b'System/Library/Audio/Plug-Ins/HAL.disabled/BTAudioHALPlugin.driver')
+        bt = 'moved to HAL.disabled'
+    left = [x for x in ('Library/Audio/Tunings/N104', 'System/Library/Audio/UISounds', 'Library/Ringtones') if not t.exists(x)]
+    return f'RedwoodAudio.driver: Speaker, Hawking, Actuator, Codec (4 channels, the one microphone in each: /dev/redwood-mic, kernel 2920), Baseband Voice (no call path); VirtualAudio.plugin stays; BTAudioHALPlugin {bt}; missing of tunings and sounds: {left or "none"}'
+
+
+def move(t, src, dst):
+    """A tree moves in this tree: nodes keep owner, mode and source."""
+    pre = src + b'/'
+    t.mkdirs(os.path.dirname(dst))
+    for k in [k for k in t.n if k == src or k.startswith(pre)]:
+        t.n[dst + k[len(src):]] = t.n.pop(k)
+
+
+def ringer(t):
+    d = need_binary(stage_src('out/ios26/ringer/usr/local/lib/liblaurel-ringer.dylib'), 6)
+    t.write('usr/local/lib/liblaurel-ringer.dylib', d, 0o755, 0, 0)
+    return 'liblaurel-ringer.dylib for laurel-springboard: -[SBRingerControl isRingerMuted] = NO (no mute switch here; idea of IOS-26-Hot 504d74c); ringer=0'
+
+
+def virtual_audio_off(t):
+    """Without our devices VirtualAudio crashed the audio host on iOS 16: it goes, as before."""
+    p = b'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin'
+    if t.exists(p):
+        t.remove(p)
+        t.audit('VirtualAudio HAL plug-in', 'applied', 'removed: no audio devices on this root (iOS 16: a host crash without them); on 26 [U]')
+
+
+def bluetooth(t, work):
+    """root-bt.sh: the job back + the BlueTool stand-in. 23F84 bluetoothd has BT_HCI_TRANSPORT, H4BC and POSIX [V strings]."""
+    need_binary(stage_src('out/laurel/bt/negroni-bluetool'), 2)
+    plist = 'System/Library/LaunchDaemons/com.apple.bluetoothd.plist'
+    if not t.exists(plist):
+        raise HookOff(f'no /{plist}')
+    stage = make_stage(t, work, 'bt', files=(XPC, plist))
+    run_script(['bash', os.path.join(REPO, 'scripts/laurel/root-bt.sh'), stage], {'BT': '1'})
+    os.unlink(os.path.join(stage, plist))
+    p = os.path.join(stage, XPC)
+    with open(p, 'rb') as f:
+        d = plistlib.load(f)
+    job = d['LaunchDaemons']['/' + plist]
+    if '_PanicOnCrash' in job:      # same rule as all jobs of this root
+        job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
+    with open(p, 'wb') as f:
+        plistlib.dump(d, f, fmt=plistlib.FMT_BINARY)
+    apply_stage(t, stage)
+    import shutil
+    shutil.rmtree(stage, ignore_errors=True)
+    return 'job com.apple.bluetoothd with BT_HCI_TRANSPORT=H4BC:POSIX:com.apple.uart.bluetooth,3000000; BlueTool job runs /usr/libexec/negroni-bluetool. With no ADT node or laurelbt=0: bluetoothd exits 0 once (SuccessfulExit false: no restart) [20H392; 26: U]'
+
+
+def hevc(t, work):
+    """root-hevc.sh: the empty slot of VideoToolbox's list: /System/Library/VideoDecoders/HEVCH8.videodecoder + HEVCH8Register are in 23F84 VTLoadVideoDecoders [V strings]; the decoder class has the same shape: base class version 1, decoder class version 3 [V VCPHEVC vtable]."""
+    need_binary(stage_src('out/laurel/hevc/HEVCH8.videodecoder'), 6)
+    if not t.exists('System/Library/VideoDecoders'):
+        raise HookOff('no /System/Library/VideoDecoders')
+    stage = make_stage(t, work, 'hevc', dirs=('System/Library/VideoDecoders',))
+    lines = run_script(['bash', os.path.join(REPO, 'scripts/laurel/root-hevc.sh'), stage], {'HEVC': '1'})
+    apply_stage(t, stage)
+    import shutil
+    shutil.rmtree(stage, ignore_errors=True)
+    return (lines[-1] if lines else '').replace('laurel-root: hevc: ', '') + '; it runs in videocodecd; Apple\'s VCPHEVC stays behind it; laurel_hevc=0'
+
+
+def xnutils(t, work):
+    """root-xnutils.sh with the iOS 26 copy (XNUTILS_IOS26=1): stats, Metal options, bench. A system app: the first LaunchServices seed registers it."""
+    root = stage_src('out/ios26/xnutils/root')
+    app = os.path.join(root, 'Applications/XNUtils.app/XNUtils')
+    helper = os.path.join(root, 'usr/local/libexec/powermenu-helper')
+    need_binary(app, 2)
+    need_binary(helper, 2)
+    need_binary(os.path.join(root, 'usr/local/bin/pmregister'), 2)
+    stage = make_stage(t, work, 'xnutils', files=(XPC,), dirs=('Applications',))
+    run_script(['bash', os.path.join(REPO, 'scripts/laurel/root-xnutils.sh'), stage], {'XNUTILS': '1', 'XNUTILS_ROOT': root})
+    os.unlink(os.path.join(stage, XPC))
+    n = apply_stage(t, stage)
+    import shutil
+    shutil.rmtree(stage, ignore_errors=True)
+    h = t.n[b'usr/local/libexec/powermenu-helper']
+    h.mode, h.uid, h.gid = 0o4750, 0, MOBILE      # the script runs as the user here; this image has no mount: the bit and the owner are set in the catalog
+    return f'{n} files: /Applications/XNUtils.app, powermenu-helper root:mobile 4750, pmregister: stats, Metal options, bench'
+
+
+def flashlight(t, work):
+    """The kernel's button test (2783) reads HAL/LaurelFlashlight.driver/LaurelFlashlight. 23F84: cameracaptured owns com.apple.coremedia.flashlight [V launchd.plist], so laurel-cameracaptured inserts it there."""
+    hal = b'System/Library/Audio/Plug-Ins/HAL'
+    src = stage_src('out/ios26/flashlight')
+    d = need_binary(os.path.join(src, 'LaurelFlashlight.driver/LaurelFlashlight'), 6)
+    w = need_binary(os.path.join(src, 'laurel-cameracaptured'), 2)
+    with open(os.path.join(src, 'LaurelFlashlight.driver/Info.plist'), 'rb') as f:
+        info = f.read()
+    if 'CFPlugInTypes' in plistlib.loads(info):
+        raise HookOff('LaurelFlashlight.driver/Info.plist names a plug-in type: audiomxd would load it')
+    set_job_program(t, 'com.apple.cameracaptured', '/usr/local/libexec/laurel-cameracaptured', '/usr/libexec/cameracaptured')
+    t.write(os.path.join(hal, b'LaurelFlashlight.driver/LaurelFlashlight'), d, 0o755, 0, 0)
+    t.write(os.path.join(hal, b'LaurelFlashlight.driver/Info.plist'), info, 0o644, 0, 0)
+    t.write('usr/local/libexec/laurel-cameracaptured', w, 0o755, 0, 0)
+    return 'LaurelFlashlight (23F84 vendor messages, cache UUID + first word checked) in cameracaptured through laurel-cameracaptured (crash guard, torch=0, /var/db/laurel/flashlight-off); kernel 2781 + 2783 publish the button'
+
+
+def flashlight_off_mark(t):
+    """TORCH=0: as iOS 16: the kernel publishes no button."""
+    t.write('System/Library/Audio/Plug-Ins/HAL/laurel-flashlight-off', b'', 0o644, 0, 0)
+
+
+def camera_tables(t):
+    """Steps 1 and 5 of root-camera.sh: what the kernel reads (2771, 2773) is not tied to iOS. The plug-in of step 2 and its knob folder are another line: `camera-plugin`. No MobileGestalt cache to remove: a new root has none."""
+    import subprocess
+    lib = stage_src('out/laurel/camera/lib')
+    if not os.path.isdir(lib):
+        raise HookOff('no out/laurel/camera/lib (scripts/laurel/camera-inventory.sh): the kernel says rear stream off')
+    n = 0
+    for s in ('imx586_qtech', 'imx586_sunny', 'imx582_qtech'):
+        f = os.path.join(lib, f'libmmcamera_laurus_{s}.so')
+        if os.path.isfile(f) and subprocess.run(['python3', '-I', os.path.join(REPO, 'scripts/laurel/camera-tables.py'), f], capture_output=True).returncode == 0:
+            with open(f, 'rb') as g:
+                t.write(f'usr/share/firmware/laurel-camera/{os.path.basename(f)}', g.read(), 0o644, 0, 0)
+            n += 1
+    if n == 0:
+        raise HookOff(f'no sensor library in {lib} passes camera-tables.py')
+    m = 0
+    for a in ('dw9800', 'laurus_dw9800w_qtech'):
+        f = os.path.join(lib, f'libactuator_{a}.so')
+        if os.path.isfile(f):
+            with open(f, 'rb') as g:
+                t.write(f'usr/share/firmware/laurel-camera/{os.path.basename(f)}', g.read(), 0o644, 0, 0)
+            m += 1
+    return f'{n} sensor and {m} lens libraries in /usr/share/firmware/laurel-camera (the phone\'s own: the kernel reads them)'
+
+
+CAMERA_REASON = ('not ported before a boot: 20H392 hook table (11 fixed addresses), initWithDeviceCreateFunction: is gone in 23F84 (initWithDefaultDeviceCreateFunction:cmioExtensionDeviceCreateFunction:cmioDiscoverySession:), '
+                 'the plug-in ran in mediaserverd and 23F84 captures in cameracaptured, FigCaptureDevice ABI not read, and no frame with light on iOS 16 to compare with. Evidence needed: docs/laurel_sprout/ios26-parity.md "Camera"')
+
+
+def brightness(t):
+    for home, uid in USERS:
+        merge_home(t, home, uid, 'com.apple.backboardd', {'BKEnableALS': False})
+    return 'BKEnableALS false in com.apple.backboardd of mobile and root: no ambient light sensor for iOS; the key is in 23F84 [V strings]; the slider sets the level (kernel 2201)'
+
+
+def bold_text(t):
+    merge_home(t, b'private/var/mobile', MOBILE, 'com.apple.Accessibility', {'EnhancedTextLegibilityEnabled': False})
+    return 'EnhancedTextLegibilityEnabled false in com.apple.Accessibility of mobile, as iOS 16. The iOS 16 reason (CoreImage GL) has no proof on 26; the key is in 23F84 [V strings]'
+
+
+def staged_apps(t):
+    """As root-system-features.py: a real phone installs these in its first-boot migration, and this root skips that. So they move to /Applications and the placeholder of the same name goes."""
+    staged = b'private/var/staged_system_apps/'
+    names = sorted({k[len(staged):].split(b'/')[0] for k in t.n if k.startswith(staged)})
+    apps = [x for x in names if x.endswith(b'.app')]
+    if not apps:
+        raise HookOff(f'no app in /{staged.decode()}')
+    for a in apps:
+        dst = b'Applications/' + a
+        if t.exists(dst):
+            t.remove(dst)
+        t.remove(b'System/Library/AppPlaceholders/' + a)
+        move(t, staged + a, dst)
+    return f'{len(apps)} apps moved to /Applications, their placeholders gone; the first LaunchServices seed registers them. Same volume: no size change'
+
+
+def parity(t, work):
+    """Every hook of docs/laurel_sprout/ios26-parity.md. None needs another to work, unless its line says so. After debug(), air(), metal(): each one adds to their launchd.plist."""
+    feature(t, 'gpu-firmware', 'GPU', gpu_firmware)
+    bar = feature(t, 'statusbar', 'STATUSBAR', statusbar, work)
+    drop = feature(t, 'notch', 'NOTCH', notch, work) if bar else False
+    if not bar:
+        t.audit('notch', 'off', 'STATUSBAR=0 or its stage failed: laurel-springboard goes with it, as iOS 16')
+    if drop:
+        feature(t, 'cell', 'CELL', cell, work)
+        feature(t, 'ringer', 'RINGER', ringer)
+    else:
+        t.audit('cell', 'off', 'needs the notch hook: laurel-springboard inserts it, as iOS 16')
+        t.audit('ringer', 'off', 'needs the notch hook: laurel-springboard inserts it')
+    if not feature(t, 'audio', 'AUDIO', audio):
+        virtual_audio_off(t)
+    feature(t, 'bluetooth', 'BT', bluetooth, work)
+    feature(t, 'camera-tables', 'CAMERA', camera_tables)
+    t.audit('camera-plugin', 'off', CAMERA_REASON)
+    if os.environ.get('TORCH', '1') == '0':
+        flashlight_off_mark(t)
+        t.audit('flashlight', 'off', 'TORCH=0: mark HAL/laurel-flashlight-off: no button')
+    else:
+        feature(t, 'flashlight', None, flashlight, work)
+    feature(t, 'hevc', 'HEVC', hevc, work)
+    feature(t, 'xnutils', 'XNUTILS', xnutils, work)
+    feature(t, 'brightness', 'BRIGHTNESS', brightness)
+    feature(t, 'bold-text', None, bold_text)
+    feature(t, 'staged-apps', 'STAGED_APPS', staged_apps)
+    t.audit('aggregated', 'not-found', 'com.apple.aggregated is not in 23F84 [V launchd.plist has only .addaily]: nothing to bring back; its limit of root-system-features.py has no job')
+    t.audit('mesa-eagl', 'not-found', 'no GL path on 23F84: CA::WindowServer::AccelServer::renderer is Metal or nothing [V ios26-userland.md 8.1]. Not missing: metal26 is the compositor')
+    t.audit('root-update', 'off', 'not ported before a boot: the update path needs SSH on a booted iOS 26 root and has never written on a phone on iOS 16. Evidence needed: docs/laurel_sprout/ios26-parity.md "No-wipe update"')
+
+
+FEATURES = ('debug-ios26', 'air-ios26', 'metal26', 'gpu-firmware', 'statusbar', 'notch', 'cell', 'ringer', 'audio', 'bluetooth', 'camera-tables', 'camera-plugin', 'flashlight', 'hevc', 'xnutils', 'brightness', 'bold-text', 'staged-apps', 'root-update')
+
+
 def root_manifest(t, stamp=None):
     """/usr/share/laurel/root-manifest: the kernel prints its first line, `LAUREL BUILD: root ...` (patch 2912). The time is the commit's, so the same commit gives the same bytes. Features: the hooks of this root, from their audit lines."""
     import importlib.util
@@ -780,7 +1230,7 @@ def root_manifest(t, stamp=None):
     series = (bs.read_stamp(stamp) or {}).get('series', 'none')
     when = subprocess.run(['git', '-C', REPO, 'log', '-1', '--format=%cd', '--date=format:%Y%m%dT%H%M%S'], capture_output=True, text=True).stdout.strip() or 'none'
     rows = []
-    for name in ('debug-ios26', 'air-ios26', 'metal26'):
+    for name in FEATURES:
         hit = [x for x in t.audit_lines if x.split(None, 1)[1].startswith(name + ':')]
         rows.append((name, 'installed' if hit and hit[-1].startswith('applied') else 'off', hit[-1].split(': ', 1)[1] if hit else 'no audit line'))
     n = {w: sum(r[1] == w for r in rows) for w in ('installed', 'off')}
@@ -788,6 +1238,207 @@ def root_manifest(t, stamp=None):
     text += ''.join('feature\t%s\t%s\t%s\n' % r for r in rows)
     t.write('usr/share/laurel/root-manifest', text.encode(), 0o644, 0, 0)
     t.audit('root-manifest', 'built', text.splitlines()[0])
+
+
+def parity_self_test(d):
+    """The parity hooks. Real scripts, real stages of this checkout when they exist; a made-up root. Checks: one audit line per hook; a failure leaves nothing and keeps SSH; owners, modes, jobs; no boot task with RequireSuccess touched."""
+    import shutil
+    import subprocess
+
+    def tree():
+        work = os.path.join(d, 'pw')
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(os.path.join(work, 'overlay'))
+        t = Tree(work)
+        t.mtime = 5
+        src = os.path.join(d, 'pl.plist')
+        jobs = {'LaunchDaemons': {
+            '/System/Library/LaunchDaemons/dev.iosplus10.dropbear.plist': {'Label': 'dev.iosplus10.dropbear', 'ProgramArguments': ['/usr/local/bin/dropbear']},
+            '/System/Library/LaunchDaemons/com.apple.SpringBoard.plist': {'Label': 'com.apple.SpringBoard', 'ProgramArguments': ['/System/Library/CoreServices/SpringBoard.app/SpringBoard']},
+            '/System/Library/LaunchDaemons/com.apple.cameracaptured.plist': {'Label': 'com.apple.cameracaptured', 'ProgramArguments': ['/usr/libexec/cameracaptured'], 'KeepAlive': {'#Then': True}},
+            '/System/Library/LaunchDaemons/com.apple.BlueTool.plist': {'Label': 'com.apple.BlueTool', 'ProgramArguments': ['/usr/sbin/BlueTool', '-R']},
+        }}
+        with open(src, 'wb') as f:
+            plistlib.dump(jobs, f, fmt=plistlib.FMT_BINARY)
+        bt = os.path.join(d, 'btd.plist')
+        with open(bt, 'wb') as f:
+            plistlib.dump({'Label': 'com.apple.bluetoothd', 'ProgramArguments': ['/usr/sbin/bluetoothd'], '_PanicOnCrash': {}}, f, fmt=plistlib.FMT_XML)
+        for x in (b'System/Library/xpc', b'System/Library/LaunchDaemons', b'Applications', b'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin', b'Library/Audio/Tunings/N104', b'Library/Ringtones',
+                  b'System/Library/Audio/UISounds', b'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver', b'System/Library/VideoDecoders', b'System/Library/AppPlaceholders/MobileCal.app',
+                  b'private/var/staged_system_apps/MobileCal.app/sub', b'private/var/staged_system_apps/MobileNotes.app'):
+            t.mkdirs(x)
+        for x in (b'private/var/mobile', b'private/var/mobile/Library', b'private/var/mobile/Library/Preferences'):
+            t.n[x] = Node('d', 0o755, MOBILE, MOBILE, 5, b'')
+        t.n[XPC.encode()] = Node('f', 0o644, 0, 0, 5, src.encode())
+        t.n[b'System/Library/LaunchDaemons/com.apple.bluetoothd.plist'] = Node('f', 0o644, 0, 0, 5, bt.encode())
+        t.n[b'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio'] = Node('f', 0o755, 0, 0, 5, src.encode())
+        t.n[b'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/BTAudioHALPlugin'] = Node('f', 0o755, 0, 0, 5, src.encode())
+        t.n[b'private/var/staged_system_apps/MobileCal.app/MobileCal'] = Node('f', 0o755, 0, 0, 5, src.encode())
+        t.n[b'private/var/staged_system_apps/MobileNotes.app/MobileNotes'] = Node('f', 0o755, 0, 0, 5, src.encode())
+        return t, work
+
+    def line(t, name):
+        hit = [x for x in t.audit_lines if x.split(None, 1)[1].startswith(name + ':')]
+        return hit[-1] if hit else ''
+
+    def jobs_of(t):
+        return plist_load(t, XPC)['LaunchDaemons']
+
+    SSH = '/System/Library/LaunchDaemons/dev.iosplus10.dropbear.plist'
+    checks = []
+    names = []
+
+    def ok(name, v):
+        names.append(name)
+        checks.append(bool(v))
+
+    # 1. a hook that fails half way leaves nothing: tree, launchd.plist bytes, overlay
+    t, work = tree()
+    first = t.read(XPC)
+    before = {k: (n.kind, n.mode, n.uid, n.gid, n.src) for k, n in t.n.items()}
+
+    def half(t):
+        set_job_program(t, 'com.apple.cameracaptured', '/x', '/usr/libexec/cameracaptured')
+        t.write('usr/local/bin/new', b'x', 0o755, 0, 0)
+        t.remove(b'private/var/staged_system_apps')
+        merge_home(t, b'private/var/mobile', MOBILE, 'com.apple.test', {'a': 1})
+        raise HookOff('half way')
+    ok('fail: returns False', feature(t, 'half', None, half) is False)
+    ok('fail: launchd.plist bytes', t.read(XPC) == first)
+    ok('fail: tree the same', {k: (n.kind, n.mode, n.uid, n.gid, n.src) for k, n in t.n.items()} == before)
+    ok('fail: one off line', line(t, 'half').startswith('off') and 'half way' in line(t, 'half'))
+
+    def boom(t):
+        raise KeyError('x')
+    ok('error: any exception is off, not a stop', feature(t, 'boom', None, boom) is False and 'KeyError' in line(t, 'boom'))
+    os.environ['PARITY_T'] = '0'
+    ok('switch: =0 is off', feature(t, 'sw', 'PARITY_T', boom) is False and 'PARITY_T=0' in line(t, 'sw'))
+    del os.environ['PARITY_T']
+
+    # 2. no check list: every hook with a binary is off, the rest stays, SSH stays, no second order effect
+    os.environ['PARITY_CHECK_LIST'] = os.path.join(d, 'no-list')
+    t, work = tree()
+    parity(t, work)
+    for name in ('notch', 'audio', 'bluetooth', 'flashlight', 'hevc', 'xnutils', 'cell', 'ringer'):
+        ok(f'no list: {name} off', line(t, name).startswith('off'))
+    ok('no list: SSH job stays', SSH in jobs_of(t))
+    ok('no list: SpringBoard job is Apple\'s', jobs_of(t)['/System/Library/LaunchDaemons/com.apple.SpringBoard.plist']['ProgramArguments'][0].endswith('/SpringBoard'))
+    ok('no list: cameracaptured job is Apple\'s', jobs_of(t)['/System/Library/LaunchDaemons/com.apple.cameracaptured.plist']['ProgramArguments'][0] == '/usr/libexec/cameracaptured')
+    ok('no audio: VirtualAudio goes, as iOS 16 without devices', not t.exists('Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin'))
+    ok('no audio: BTAudio stays', t.exists('System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver'))
+    ok('pref hooks work with no binary at all', line(t, 'brightness').startswith('applied') and line(t, 'bold-text').startswith('applied') and line(t, 'staged-apps').startswith('applied') and line(t, 'statusbar').startswith('applied'))
+    p = b'private/var/mobile/Library/Preferences/com.apple.backboardd.plist'
+    ok('brightness: mobile owner, 0600', t.n[p].uid == MOBILE and t.n[p].mode == 0o600 and plist_load(t, p)['BKEnableALS'] is False)
+    p = b'private/var/root/Library/Preferences/com.apple.backboardd.plist'
+    ok('brightness: root home', t.n[p].uid == 0 and plist_load(t, p)['BKEnableALS'] is False)
+    p = b'private/var/mobile/Library/Preferences/com.apple.Accessibility.plist'
+    ok('bold text', t.n[p].uid == MOBILE and plist_load(t, p)['EnhancedTextLegibilityEnabled'] is False)
+    p = b'private/var/mobile/Library/Preferences/com.apple.UIKit.plist'
+    ok('status bar: provider, mobile owner', t.n[p].uid == MOBILE and plist_load(t, p)['UIStatusBarVisualProviderClassName'] == '_UIStatusBarVisualProvider_FixedSplit')
+    p = b'private/var/root/Library/Preferences/.GlobalPreferences.plist'
+    ok('status bar: root global', t.n[p].uid == 0 and t.n[p].mode == 0o600)
+    ok('staged apps: moved with their files', t.exists('Applications/MobileCal.app/MobileCal') and t.exists('Applications/MobileCal.app/sub') and not t.exists('private/var/staged_system_apps/MobileCal.app'))
+    ok('staged apps: placeholder gone', not t.exists('System/Library/AppPlaceholders/MobileCal.app'))
+    ok('manifest row for each hook', all(line(t, x) for x in FEATURES if x not in ('debug-ios26', 'air-ios26', 'metal26')))
+    ok('notes of what is not a build here', line(t, 'mesa-eagl').startswith('not-found') and line(t, 'aggregated').startswith('not-found') and 'camera-plugin' in ' '.join(t.audit_lines))
+    # switches
+    for sw, name in (('AUDIO', 'audio'), ('BT', 'bluetooth'), ('HEVC', 'hevc'), ('XNUTILS', 'xnutils'), ('STATUSBAR', 'statusbar'), ('BRIGHTNESS', 'brightness'), ('CAMERA', 'camera-tables'), ('GPU', 'gpu-firmware')):
+        os.environ[sw] = '0'
+        t, work = tree()
+        parity(t, work)
+        ok(f'{sw}=0: {name} off', f'{sw}=0' in line(t, name))
+        del os.environ[sw]
+    os.environ['TORCH'] = '0'
+    t, work = tree()
+    parity(t, work)
+    ok('TORCH=0: the mark, no button, job stays', t.exists('System/Library/Audio/Plug-Ins/HAL/laurel-flashlight-off') and jobs_of(t)['/System/Library/LaunchDaemons/com.apple.cameracaptured.plist']['ProgramArguments'][0] == '/usr/libexec/cameracaptured')
+    del os.environ['TORCH']
+    del os.environ['PARITY_CHECK_LIST']
+
+    # 3. a binary that is not on the list is refused, one line; a wrong file type too
+    ok('need_binary: not a Mach-O', _refused(os.path.join(d, 'pl.plist')))
+
+    # 4. the real stages, when this checkout has them
+    if checked_binaries() is None:
+        print(f'parity hook self-test: {sum(checks)} of {len(checks)}; real stages not run: no {CHECK_LIST} (scripts/laurel/ios26-parity-build.sh)')
+    else:
+        t, work = tree()
+        parity(t, work)
+        said = {n: line(t, n).split(None, 1)[0] if line(t, n) else 'none' for n in FEATURES if n not in ('debug-ios26', 'air-ios26', 'metal26')}
+        print('  real stages: ' + ' '.join(f'{k}={v}' for k, v in said.items()))
+        jobs = jobs_of(t)
+        J = '/System/Library/LaunchDaemons/'
+        ok('real: all on but the two with a reason', all(v == 'applied' for k, v in said.items() if k not in ('camera-plugin', 'root-update')))
+        ok('real: SSH job stays', SSH in jobs)
+        ok('real: SpringBoard wrapper', jobs[J + 'com.apple.SpringBoard.plist']['ProgramArguments'][0] == '/usr/local/libexec/laurel-springboard')
+        ok('real: notch files', t.n[b'usr/local/lib/liblaurel-notch.dylib'].mode == 0o755 and t.n[b'usr/local/libexec/laurel-springboard'].uid == 0)
+        ok('real: cell job', jobs[J + 'com.laurel.celld.plist']['KeepAlive'] is False and t.exists('usr/local/libexec/laurel-celld') and t.exists('usr/local/lib/liblaurel-cellbar.dylib'))
+        ok('real: ringer file', t.exists('usr/local/lib/liblaurel-ringer.dylib'))
+        B = b'System/Library/Audio/Plug-Ins/HAL/'
+        ok('real: audio plug-in', t.n[B + b'RedwoodAudio.driver/RedwoodAudio'].mode == 0o755 and t.n[B + b'RedwoodAudio.driver/Info.plist'].mode == 0o644)
+        ok('real: VirtualAudio stays, BTAudio moved', t.exists('Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio') and not t.exists(B + b'BTAudioHALPlugin.driver') and t.exists(b'System/Library/Audio/Plug-Ins/HAL.disabled/BTAudioHALPlugin.driver/BTAudioHALPlugin'))
+        j = jobs[J + 'com.apple.bluetoothd.plist']
+        ok('real: bluetoothd job', j['EnvironmentVariables']['BT_HCI_TRANSPORT'] == 'H4BC:POSIX:com.apple.uart.bluetooth,3000000' and '_PanicOnCrash' not in j and '_PanicOnCrasX' in j)
+        ok('real: BlueTool stand-in', jobs[J + 'com.apple.BlueTool.plist']['ProgramArguments'] == ['/usr/libexec/negroni-bluetool'] and t.n[b'usr/libexec/negroni-bluetool'].mode == 0o755)
+        ok('real: flashlight', jobs[J + 'com.apple.cameracaptured.plist']['ProgramArguments'][0] == '/usr/local/libexec/laurel-cameracaptured' and t.exists(B + b'LaurelFlashlight.driver/LaurelFlashlight') and jobs[J + 'com.apple.cameracaptured.plist']['KeepAlive'] == {'#Then': True})
+        ok('real: hevc slot', t.n[b'System/Library/VideoDecoders/HEVCH8.videodecoder'].mode == 0o755)
+        h = t.n[b'usr/local/libexec/powermenu-helper']
+        ok('real: xnutils helper 4750 root:mobile', h.mode == 0o4750 and h.uid == 0 and h.gid == MOBILE)
+        ok('real: xnutils app', t.n[b'Applications/XNUtils.app/XNUtils'].mode == 0o755 and t.n[b'Applications/XNUtils.app/Info.plist'].mode == 0o644)
+        ok('real: firmware for the kernel', t.n[b'usr/share/firmware/laurel/a630_sqe.fw'].mode == 0o644 and t.exists('usr/share/firmware/laurel/a610_zap.mdt') and not t.exists('usr/share/firmware/laurel/a610_zap.elf'))
+        ok('real: camera tables for the kernel', t.exists('usr/share/firmware/laurel-camera/libmmcamera_laurus_imx586_sunny.so') and t.exists('usr/share/firmware/laurel-camera/libactuator_dw9800.so'))
+        # 5. boot tasks: launchd's own plist: none of these hooks writes a program of a task with RequireSuccess; new jobs have no such key
+        lw = os.path.expanduser('~/op10-apple/ios26/23F84-n104ap/tree/root/os/sbin/launchd')
+        if os.path.exists(lw):
+            tasks = boot_tasks(lw)
+            req = {v['Program'].lstrip('/') for v in tasks.values() if v.get('RequireSuccess')}
+            ok(f'boot tasks: {len(req)} programs with RequireSuccess, none written', req and not [p for p in req if t.exists(p)])
+            ok('new jobs: no boot-task key', not any(x in v for v in jobs.values() for x in ('RequireSuccess', 'AllowCrash', 'PerformInRestore')))
+        # one failed stage does not stop the others: audio's file is broken
+        real = stage_src('out/ios26/audio/RedwoodAudio.driver/RedwoodAudio')
+        os.environ['PARITY_CHECK_LIST'] = _list_without(d, real)
+        t2, work = tree()
+        parity(t2, work)
+        ok('one failed hook: audio off, others on', line(t2, 'audio').startswith('off') and line(t2, 'bluetooth').startswith('applied') and line(t2, 'xnutils').startswith('applied') and SSH in jobs_of(t2) and not t2.exists('Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin'))
+        del os.environ['PARITY_CHECK_LIST']
+    print(f'parity hook self-test: {sum(checks)} of {len(checks)}')
+    print('  ' + ' '.join(f'{i}:{"ok" if c else "FAIL(" + names[i] + ")"}' for i, c in enumerate(checks)))
+    return all(checks)
+
+
+def _refused(path):
+    try:
+        need_binary(path)
+    except HookOff:
+        return True
+    return False
+
+
+def _list_without(d, path):
+    q = os.path.join(d, 'list-without')
+    with open(stage_src(CHECK_LIST)) as f, open(q, 'w') as g:
+        drop = hashlib.sha256(open(path, 'rb').read()).hexdigest()
+        g.writelines(x for x in f if not x.startswith(drop))
+    return q
+
+
+def boot_tasks(launchd_path):
+    """The Boot dictionary of the plist inside launchd [V 23F84: 24 tasks]."""
+    with open(launchd_path, 'rb') as f:
+        data = f.read()
+    at = 0
+    while True:
+        at = data.find(b'<?xml', at)
+        if at < 0:
+            return {}
+        end = data.find(b'</plist>', at)
+        try:
+            d = plistlib.loads(data[at:end + 8])
+        except Exception:
+            d = None
+        if isinstance(d, dict) and 'Boot' in d:
+            return {k: v for k, v in d['Boot'].items() if isinstance(v, dict) and 'Program' in v}
+        at = end
 
 
 def self_test():
@@ -850,7 +1501,8 @@ echo "laurel-root: air-ios26: fake"
         print(f'air hook self-test: {sum(checks)} of {len(checks)}')
         ok_metal = metal_self_test(d)
         ok_debug = debug_self_test(d)
-    sys.exit(0 if all(checks) and ok_metal and ok_debug else 1)
+        ok_parity = parity_self_test(d)
+    sys.exit(0 if all(checks) and ok_metal and ok_debug and ok_parity else 1)
 
 
 def main():
@@ -940,6 +1592,7 @@ def main():
     debug(t, work)
     air(t, work)
     metal(t, work)
+    parity(t, work)
     trust(t, a, work)
     root_manifest(t)
     # a place for the reader of the first boot

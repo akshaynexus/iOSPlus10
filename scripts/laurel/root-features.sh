@@ -3,7 +3,7 @@
 #   scripts/laurel/root-features.sh MOUNTED_ROOT --inputs FILE --sidecar PATH
 # A step that fails or skips does not stop the next one: each feature gets its row. Exit 1 = a feature is missing (not by its own =0 switch).
 # Switches (one each; =0 = off): GPU METAL HEVC AUDIO BT CAMERA STATUSBAR NOTCH CELL TORCH BRIGHTNESS XNUTILS AIRPLAY AWDL SSH. Runs as the user too (test on a copy: no chown).
-# A new feature: one `feature` line here, one row in root-manifest.py FEATURES.
+# A new feature: one `feature` line here, one row in root-manifest.py FEATURES, one row in ios26-parity-audit.py ROWS (that script fails until it has one).
 set -uo pipefail
 R=${1:?usage: $0 MOUNTED_ROOT --inputs FILE --sidecar PATH}
 INPUTS=${3:?}; SIDECAR=${5:?}

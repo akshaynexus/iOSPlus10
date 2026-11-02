@@ -2,6 +2,7 @@
 # Mi A3 iOS 26.5.2 (23F84, iPhone12,1 N104AP) root: an HFS+ image, built on Linux with no Apple tool and no root access. It writes nothing to a device.
 #   scripts/bg.sh ios26-root scripts/laurel/ios26-root.sh
 #   ROOT_OUT=DIR    another output folder   FORCE=1     build again when the inputs did not change      VAR_GIB=8   refuse less free space
+# Binaries of the parity hooks: scripts/laurel/ios26-parity-build.sh first (docs/laurel_sprout/ios26-parity.md); a missing one is one line `off NAME`, the rest of the root stays.
 # Steps: 1. read-only apfs-fuse mounts of the three donor images; 2. scripts/laurel/ios26-root-spec.py: layout, lowered files, tweaks with an audit line per item,
 # trust data, spec; 3. op10tool hfs-build; 4. checks: op10tool hfs-verify (every file against its SHA-256), fsck.hfsplus -n, a real read-only kernel mount (udisks) with
 # scripts/laurel/ios26-root-check.py. Inputs: scripts/ios26/fetch-os.sh, sysos-tree.sh, lower-userland.sh with DEV=n104ap (docs/laurel_sprout/ios26-userland.md section 2).
@@ -96,11 +97,13 @@ cleanup; LOOP=; trap - EXIT
   echo "kernel read-only mount: $kmount"
   [ -f "$W/mount-check.txt" ] && cat "$W/mount-check.txt"
   echo "tweak audit:"; cat "$W/audit.txt"
-  echo "not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, audio HAL, Bluetooth userland, camera, HEVC, status bar, XNUtils. SSH and the debug tools: the debug-ios26 line above"
+  echo "not in this image: each line that starts with off above, with its reason; the full table: docs/laurel_sprout/ios26-parity.md"
 } > "$R/report.txt"
 ln -sfn "$R" "$OUT/ios26/root-$DEV"
 grep ' debug-ios26:' "$W/audit.txt" || echo "off       debug-ios26: no audit line"
 grep ' metal26:' "$W/audit.txt" || echo "off       metal26: no audit line"
+# the other hooks: only the ones that are off (the report has all)
+grep '^off ' "$W/audit.txt" | grep -v -E ' (debug-ios26|metal26):' | cut -c1-200 || true
 sha256sum "$IMG.manifest" "$W/spec"
 ls -l "$IMG"; du -h "$IMG"
 [ "$kmount" = ok ] && [ "$fsck_rc" = 0 ] && echo "ios26-root: done, all checks OK: $R/report.txt" || { echo "ios26-root: FINISHED with a failed check: $R/report.txt"; exit 1; }
