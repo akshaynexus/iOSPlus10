@@ -40,9 +40,54 @@ enum GptCmd {
         tail: PathBuf,
         #[arg(short = 'o')]
         out: PathBuf,
-        /// the plan back from the new table to the old one
+    },
+    /// Prints what this binary does (dual-boot.sh asks; a stale binary has no answer)
+    Features,
+    /// One word for the table in the dumps: new, old, old-backup-differs, torn-backup-new, torn-backup-old, broken, unknown
+    State {
         #[arg(long)]
-        reverse: bool,
+        head: PathBuf,
+        #[arg(long)]
+        tail: PathBuf,
+        #[arg(long)]
+        ref_head: PathBuf,
+        #[arg(long)]
+        ref_tail: PathBuf,
+    },
+    /// The plan back, from the table on the disk: only the last LBA of userdata and the iosroot slot change (attributes and type GUIDs stay); proves that diff
+    PlanRestore {
+        #[arg(long)]
+        head: PathBuf,
+        #[arg(long)]
+        tail: PathBuf,
+        #[arg(long)]
+        ref_head: PathBuf,
+        #[arg(long)]
+        ref_tail: PathBuf,
+        #[arg(short = 'o')]
+        out: PathBuf,
+    },
+    /// A plan that writes a torn primary from a valid backup, and nothing else
+    PlanRepair {
+        #[arg(long)]
+        head: PathBuf,
+        #[arg(long)]
+        tail: PathBuf,
+        #[arg(long)]
+        ref_head: PathBuf,
+        #[arg(long)]
+        ref_tail: PathBuf,
+        #[arg(short = 'o')]
+        out: PathBuf,
+    },
+    /// A dump read back holds each new block of this plan, and both copies are valid and equal
+    VerifyPlan {
+        #[arg(long)]
+        head: PathBuf,
+        #[arg(long)]
+        tail: PathBuf,
+        #[arg(long)]
+        plan: PathBuf,
     },
     /// Two dumps hold the same table, byte for byte
     Same {
@@ -312,7 +357,15 @@ fn parse_u64(s: &str) -> Result<u64, String> {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Gpt { cmd } => match cmd {
-            GptCmd::Plan { head, tail, out, reverse } => gpt::plan(&head, &tail, &out, reverse),
+            GptCmd::Plan { head, tail, out } => gpt::plan(&head, &tail, &out),
+            GptCmd::Features => {
+                println!("{}", gpt::FEATURES);
+                Ok(())
+            }
+            GptCmd::State { head, tail, ref_head, ref_tail } => gpt::state(&head, &tail, &ref_head, &ref_tail),
+            GptCmd::PlanRestore { head, tail, ref_head, ref_tail, out } => gpt::plan_restore(&head, &tail, &ref_head, &ref_tail, &out),
+            GptCmd::PlanRepair { head, tail, ref_head, ref_tail, out } => gpt::plan_repair(&head, &tail, &ref_head, &ref_tail, &out),
+            GptCmd::VerifyPlan { head, tail, plan } => gpt::verify_plan(&head, &tail, &plan),
             GptCmd::Same { head, tail, ref_head, ref_tail } => gpt::same(&head, &tail, &ref_head, &ref_tail),
             GptCmd::VerifyNew { head, tail, ref_head, ref_tail } => gpt::verify_new(&head, &tail, &ref_head, &ref_tail),
             GptCmd::Image { head, tail, out } => gpt::image(&head, &tail, &out),

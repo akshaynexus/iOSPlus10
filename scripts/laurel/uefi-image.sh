@@ -103,7 +103,7 @@ else
     [ -n "$ldb_marker" ] && LC_ALL=C grep -aqF "$ldb_marker" "$KERNEL" || { echo "uefi-image: FAILED: kernel $KERNEL has no patch 2950 of this version (text $ldb_marker): no boot image" >&2; exit 1; }
     # dual-boot.sh image: the read-only first boot. No write command can leave the kernel, and the root mounts read-only.
     [ "${LAUREL_READONLY:-0}" != 1 ] || CMDLINE=${CMDLINE/ ufsrw=1 rootrw=1/}
-    case " $CMDLINE " in *" ufsrw=1 "*|*" rootrw=1 "*) IMG_MODE=rw ;; *) IMG_MODE=ro ;; esac
+    if printf '%s\n' "$CMDLINE" | laurel_can_write; then IMG_MODE=rw; else IMG_MODE=ro; fi
     [ "${LAUREL_READONLY:-0}" != 1 ] || [ "$IMG_MODE" = ro ] || { echo "uefi-image: FAILED: LAUREL_READONLY=1, and the command line can write: $CMDLINE" >&2; exit 1; }
   fi
   python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot gold --dram "$DRAM" --mu-fd "$FD" --darwinboot --build-stamp "$STAMP_LINE" ${MKADT_EXTRA:-}   # laurel 2016: Gold 0x100 is the boot CPU after the PSCI hand-off
@@ -136,7 +136,7 @@ if [ "${MU_ONLY:-0}" != 1 ] && [ "$BOOT_MENU" = 1 ]; then
   # slot b's boot chain, one hash (list and form: fw_b_combined, laurel-layout.sh), and the hash of the kernel fence text: what `dual-boot.sh switch` checks on the host, for the phone alone
   [ -n "${ldb_marker:-}" ] && marks="$marks laurel_ios_fence=$(printf '%s' "$ldb_marker" | { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; } | cut -d' ' -f1)"
   . "$REPO/scripts/lib/laurel-layout.sh"
-  FW_B_SUMS=${FW_B_SUMS:-$(for _d in $(ls -d "$LAUREL_BACKUP"/android-* 2>/dev/null | sort -r); do [ -f "$_d/gpt-sda-head.bin" ] && [ -f "$_d/SHA256SUMS" ] && { echo "$_d/SHA256SUMS"; break; }; done)}
+  FW_B_SUMS=${FW_B_SUMS:-$(for _d in $(ls -d "$LAUREL_BACKUP"/android-* 2>/dev/null | sort -r); do [ -f "$_d/gpt-sda-head.bin" ] && [ -f "$_d/SHA256SUMS" ] && { echo "$_d/SHA256SUMS"; break; }; done; true)}
   if [ -f "${FW_B_SUMS:-}" ] && fwb=$(fw_b_combined "$FW_B_SUMS"); then marks="$marks laurel_ios_fwb=$fwb"; else echo "uefi-image: note: no backup hashes of the slot b firmware: the Android app refuses this image"; fi
   [ "${#marks}" -le 511 ] || { echo "uefi-image: FAILED: the marks are ${#marks} bytes, the header field holds 512 with its NUL: $marks" >&2; exit 1; }
   mk "$marks"

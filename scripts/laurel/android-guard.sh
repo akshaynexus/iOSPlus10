@@ -98,9 +98,9 @@ boot-image)
   lb=$(laurel_backup_dir 'lineage-*')/boot.img
   [ -f "$lb" ] || refuse "no Lineage boot image in $LAUREL_BACKUP/lineage-*: the header of $img cannot be compared"
   [ "$(boot_os_raw "$img")" = "$(boot_os_raw "$lb")" ] || refuse "$img has OS version field $(boot_os_raw "$img"), Lineage ($lb) has $(boot_os_raw "$lb"): build it again with dual-boot.sh image"
-  # The read-only first boot: an image with ufsrw=1 needs the recorded result. The boot-args lie as plain text in the payload FAT. A sidecar with no mode line counts as writable.
+  # The read-only first boot: an image that can write needs the recorded result. The boot-args lie as plain text in the payload FAT: laurel_can_write. A sidecar with no mode line counts as writable.
   mode=$(sed -n 's/^mode //p' "$img.dualboot")
-  if [ "$mode" != ro ] || LC_ALL=C grep -aqE 'ufsrw=[1-9]|rootrw=[1-9]' "$img"; then
+  if [ "$mode" != ro ] || laurel_can_write < "$img"; then
     r=$REPO/out/laurel/dualboot/first-boot.result
     grep -q "^ro-on $m " "$r" 2>/dev/null || refuse "$img can write (ufsrw=1), and no read-only boot of this kernel fence has a recorded result (dual-boot.sh ro-result LOG; $r)"
     grep -q '^android-opened-after-ro ' "$r" 2>/dev/null || refuse "$img can write (ufsrw=1), and Android has not opened its data after the read-only iOS boot (dual-boot.sh android-check; $r)"

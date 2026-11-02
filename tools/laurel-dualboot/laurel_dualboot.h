@@ -16,7 +16,7 @@
 #define LDB_ALIGN_BLOCKS    512u                /* 2 MiB */
 #define LDB_LOG_BLOCKS      1025u               /* SWEET_LOG_BLOCKS: the console log takes the end of the partition */
 /* Patch 2950 is in this kernel. uefi-image.sh and android-guard.sh search a kernel and a boot image for this exact text: a kernel without it takes userdata as its root. */
-#define LDB_KERNEL_MARKER   "LAUREL-2950-IOSROOT-FENCE-V3"
+#define LDB_KERNEL_MARKER   "LAUREL-2950-IOSROOT-FENCE-V4"
 
 static inline uint32_t
 ldb_crc32(const uint8_t *d, uint32_t len, uint32_t skip_at)

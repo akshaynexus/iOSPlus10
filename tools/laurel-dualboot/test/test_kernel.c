@@ -59,7 +59,9 @@ fake_scsi(const uint8_t *cdb, uint8_t lun, uint32_t len, bool write, uint8_t *bo
 }
 
 /* ---- the fake machine ---- */
-static int arg_ufsrw = 1, arg_dualboot = -1;
+/* The text after ufsrw= on the boot line. NULL: no such token. "": the bare name, no =. As pexpert/gen/bootargs.c: the number parser takes hex and octal, a bare name is 1; the string parser gives the text, and "1" for a bare name. */
+static const char *arg_ufsrw = "1";
+static int arg_dualboot = -1;
 static int restarts;
 static jmp_buf log_out;
 static int log_rounds;
@@ -82,7 +84,10 @@ bool
 PE_parse_boot_argn(const char *n, void *out, int len)
 {
 	if (strcmp(n, "ufsrw") == 0) {
-		*(uint32_t *)out = (uint32_t)arg_ufsrw;
+		if (arg_ufsrw == NULL) {
+			return false;
+		}
+		*(uint32_t *)out = arg_ufsrw[0] ? (uint32_t)strtoull(arg_ufsrw, NULL, 0) : 1;
 		return true;
 	}
 	if (strcmp(n, "laureldualboot") == 0 && arg_dualboot >= 0) {
@@ -91,6 +96,15 @@ PE_parse_boot_argn(const char *n, void *out, int len)
 	}
 	(void)len;
 	return false;
+}
+bool
+PE_parse_boot_arg_str(const char *n, char *out, int len)
+{
+	if (strcmp(n, "ufsrw") != 0 || arg_ufsrw == NULL) {
+		return false;
+	}
+	snprintf(out, (size_t)len, "%s", arg_ufsrw[0] ? arg_ufsrw : "1");
+	return true;
 }
 void lck_mtx_lock(int *m) { (void)m; }
 void lck_mtx_unlock(int *m) { (void)m; }
@@ -288,7 +302,7 @@ reset_driver(void)
 	gpt_alt = 0;
 	writes = sync_count = 0;
 	restarts = 0;
-	arg_ufsrw = 1;
+	arg_ufsrw = "1";
 	arg_dualboot = -1;
 }
 static uint64_t
@@ -347,10 +361,12 @@ test_on(void)
 	CHECK(su.ready && su.writable && laurel_dualboot_on == 1 && su.lun == 0, "boot state");
 	CHECK(su.first_block == IOS_FIRST && su.nblocks == IOS_BLOCKS && ldb.first == IOS_FIRST && ldb.blocks == IOS_BLOCKS, "the root is iosroot");
 	CHECK(restarts == 0 && writes == 0, "a boot wrote %llu blocks", (unsigned long long)writes);
-	/* random I/O through the real strategy: 512-byte units, any size, near both ends often, and past the end */
+	/* random I/O through the real strategy: 512-byte units, any size, near both ends often, and past the end. su.secsize is the driver's; this test uses 512 here */
+	uint32_t ssz = 512;
+	CHECK(sweet_ufs_ioctl(0, DKIOCSETBLOCKSIZE, (caddr_t)&ssz, 0, NULL, 0) == 0, "block size 512");
 	uint32_t ios = 0, rejected = 0;
 	char *data = malloc(4u << 20), *back = malloc(4u << 20);
-	uint64_t total_secs = su.nblocks * 8;
+	uint64_t total_secs = (su.nblocks - SWEET_LOG_BLOCKS) * 8;      /* the BSD disk ends before the log */
 	for (int i = 0; i < 40000; i++) {
 		uint32_t secs = (rnd() % 8 == 0) ? (uint32_t)(rnd() % 8192 + 1) : (uint32_t)(rnd() % 64 + 1);
 		uint64_t at = rnd() % total_secs;
@@ -438,7 +454,7 @@ test_on(void)
 	/* read-only boot: no write at all, the line says so */
 	fresh_disk(hfs);
 	reset_driver();
-	arg_ufsrw = 0;
+	arg_ufsrw = "0";
 	uint64_t d0 = disk_hash();
 	CHECK(sweet_ufs_rootdev(&dev) == 0 && ldb.on && !su.writable && writes == 0 && disk_hash() == d0, "ufsrw=0: %s", ldb.why ? ldb.why : "");
 	struct fake_buf b = { .blkno = 0, .count = 4096, .flags = B_WRITE, .data = data };
@@ -447,6 +463,97 @@ test_on(void)
 	CHECK(ufs_write_blocks(IOS_FIRST + 7, 1) == EPERM && disk_hash() == d0, "fence in a read-only boot");
 	printf("ok   ufsrw=0: on, read-only, no write\n");
 	free(shadow); free(before); free(data); free(back); free(logb); free(rest);
+}
+
+/* F8: HFS writes its alternate volume header 1024 bytes before the end of the disk it is told of. The console log must not be there. */
+static void
+test_bsd_disk(void)
+{
+	static const uint32_t sizes[] = { 512, 4096 };
+	uint64_t log_first = IOS_FIRST + IOS_BLOCKS - SWEET_LOG_BLOCKS;
+	/* a small volume (spare room behind it), and the largest one */
+	const uint32_t vols[] = { 4096, IOS_BLOCKS - SWEET_LOG_BLOCKS };
+	for (unsigned v = 0; v < 2; v++) {
+		for (unsigned z = 0; z < 2; z++) {
+			fresh_disk(vols[v]);
+			reset_driver();
+			dev_t dev = 0;
+			CHECK(sweet_ufs_rootdev(&dev) == 0, "F8 no root");
+			uint32_t ssz = sizes[z];
+			CHECK(sweet_ufs_ioctl(0, DKIOCSETBLOCKSIZE, (caddr_t)&ssz, 0, NULL, 0) == 0, "F8 block size %u", ssz);
+			uint64_t count = 0;
+			CHECK(sweet_ufs_ioctl(0, DKIOCGETBLOCKCOUNT, (caddr_t)&count, 0, NULL, 1) == 0, "F8 block count");
+			CHECK(count * ssz == (IOS_BLOCKS - SWEET_LOG_BLOCKS) * 4096ull, "F8 the BSD disk has %llu bytes, iosroot minus the log has %llu", (unsigned long long)(count * ssz), (IOS_BLOCKS - SWEET_LOG_BLOCKS) * 4096ull);
+			CHECK((uint64_t)sweet_ufs_psize(0) == MIN(count, (uint64_t)INT_MAX), "F8 psize");
+			/* hfs_vfsutils.c, hfs.h: HFS_ALT_SECTOR(blksize, blkcnt) = ((blkcnt) - 1) - (512 / (blksize)); hfs_partition_avh_sector, rounded down to the physical block */
+			uint64_t avh = (count - 1) - 512 / ssz;
+			uint64_t avh_lba = IOS_FIRST + avh * ssz / 4096;
+			CHECK(avh_lba < log_first, "F8 the alternate header of HFS goes to LBA %llu, the log starts at %llu", (unsigned long long)avh_lba, (unsigned long long)log_first);
+			/* the log, for real, then the write HFS makes: the ring stays */
+			char line[256], blk[4096];
+			memset(line, 'L', sizeof(line));
+			for (int j = 0; j < 64; j++) {
+				sweet_log_append(line, sizeof(line));
+			}
+			log_rounds = 2;
+			if (setjmp(log_out) == 0) {
+				sweet_log_thread(NULL, 0);
+			}
+			uint64_t lh0 = 0xcbf29ce484222325ull;
+			for (uint64_t i = log_first * 4096ull; i < (IOS_FIRST + IOS_BLOCKS) * 4096ull; i++) {
+				lh0 = (lh0 ^ disk[i]) * 0x100000001b3ull;
+			}
+			memset(blk, 0xa5, sizeof(blk));
+			struct fake_buf w = { .blkno = (int64_t)(avh / (4096 / ssz) * (4096 / ssz)), .count = 4096, .flags = B_WRITE, .data = blk };
+			sweet_ufs_strategy(&w);
+			CHECK(w.error == 0 && w.done == 1, "F8 the alternate header write: error %d", w.error);
+			/* the first block of the log and the last one, through the BSD disk: no read, no write */
+			for (uint64_t lba = log_first; lba <= log_first + SWEET_LOG_BLOCKS - 1; lba += SWEET_LOG_BLOCKS - 1) {
+				struct fake_buf x = { .blkno = (int64_t)((lba - IOS_FIRST) * 4096 / ssz), .count = 4096, .flags = B_WRITE, .data = blk };
+				sweet_ufs_strategy(&x);
+				CHECK(x.error == EINVAL, "F8 a write to log block %llu through the BSD disk: error %d", (unsigned long long)lba, x.error);
+				struct fake_buf r = { .blkno = (int64_t)((lba - IOS_FIRST) * 4096 / ssz), .count = 4096, .flags = B_READ, .data = blk };
+				sweet_ufs_strategy(&r);
+				CHECK(r.error == EINVAL, "F8 a read of log block %llu through the BSD disk: error %d", (unsigned long long)lba, r.error);
+			}
+			uint64_t lh1 = 0xcbf29ce484222325ull;
+			for (uint64_t i = log_first * 4096ull; i < (IOS_FIRST + IOS_BLOCKS) * 4096ull; i++) {
+				lh1 = (lh1 ^ disk[i]) * 0x100000001b3ull;
+			}
+			CHECK(lh0 == lh1, "F8 the log changed");
+			CHECK(memcmp(disk + log_first * 4096ull, "SWEETLOG", 8) == 0, "F8 no log header");
+		}
+	}
+	printf("ok   F8 the BSD disk ends before the console log: the alternate header of HFS, 512- and 4096-byte blocks, stays out of it, no BSD I/O reaches it\n");
+}
+/* F7: only the text 1 opens writes. */
+static void
+test_rw_args(void)
+{
+	static const char *const no[] = { "0x1", "01", "2", "1k", "0", "00", "0x0", NULL };
+	for (unsigned i = 0; i < sizeof(no) / sizeof(no[0]); i++) {
+		fresh_disk(4096);
+		reset_driver();
+		arg_ufsrw = no[i];
+		dev_t dev = 0;
+		uint64_t d0 = disk_hash();
+		CHECK(sweet_ufs_rootdev(&dev) == 0 && ldb.on, "F7 ufsrw=%s: no root", no[i] ? no[i] : "(none)");
+		CHECK(!su.writable, "F7 ufsrw=%s opens writes", no[i] ? no[i] : "(none)");
+		char blk[4096];
+		struct fake_buf w = { .blkno = 0, .count = 4096, .flags = B_WRITE, .data = blk };
+		sweet_ufs_strategy(&w);
+		CHECK(w.error == EROFS && disk_hash() == d0, "F7 ufsrw=%s: a write gave error %d", no[i] ? no[i] : "(none)", w.error);
+		CHECK(ufs_write_blocks(IOS_FIRST + 7, 1) == EPERM && disk_hash() == d0, "F7 ufsrw=%s: the fence is open", no[i] ? no[i] : "(none)");
+	}
+	static const char *const yes[] = { "1", "" };
+	for (unsigned i = 0; i < 2; i++) {
+		fresh_disk(4096);
+		reset_driver();
+		arg_ufsrw = yes[i];
+		dev_t dev = 0;
+		CHECK(sweet_ufs_rootdev(&dev) == 0 && su.writable, "F7 ufsrw token '%s' does not write", yes[i]);
+	}
+	printf("ok   F7 only the text 1 and the bare name open writes; ufsrw=0x1, 01, 2, 1k, 0, 00, 0x0 and no token: read-only\n");
 }
 
 static void
@@ -492,6 +599,8 @@ main(void)
 	setvbuf(stdout, NULL, _IONBF, 0);
 	disk = malloc(DISK_BLOCKS * 4096ull);
 	test_on();
+	test_bsd_disk();
+	test_rw_args();
 	test_off();
 	printf("test_kernel: %d checks passed, %d failed\n", passes, fails);
 	return fails ? 1 : 0;

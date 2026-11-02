@@ -4,7 +4,7 @@
 #   1. op10tool unit tests: the GPT plan: layout numbers, every wrong table refused, the real layout when the backup is on this machine (no GPT bytes in git).
 #   2. The patch carries laurel_dualboot.h.
 #   3. The real bsd/dev/sweet_ufs.c (the tree of `AUDIT=1 scripts/laurel/kernel-linux.sh` or a build) over a RAM disk: 0 blocks outside iosroot change; the fence; each unexpected GPT = off, no block changed.
-#   4. The phone helper, built for this host: scripts/laurel/ldbhelper-test.sh: the real gpt-write on a sparse disk, a power cut after each step. (aarch64 build: compile check only.)
+#   4. The phone helper, built for this host: scripts/laurel/ldbhelper-test.sh: the real gpt-write on a sparse disk, a power cut after each step, a torn primary, one writer; and the phone's own code with real O_DIRECT and the block rules of 4.14 (test/dio_check.c). (aarch64 build: compile check only.)
 #   5. The numbers of scripts/lib/laurel-layout.sh = what the tool prints; the real backup through the tool and an independent reader (python, no op10tool).
 #   6. scripts/laurel/android-guard-test.sh and scripts/laurel/dual-boot-test.sh: the scripts themselves, with a fake adb and fastboot. PATH holds no real adb or fastboot there.
 # Proves the code on the host. Nothing here proves anything about the phone.
@@ -50,6 +50,13 @@ LDB_MARKER=$(sed -n 's/^#define LDB_KERNEL_MARKER *"\([^"]*\)".*/\1/p' "$T/laure
 LC_ALL=C grep -aqF "$LDB_MARKER" "$D/test_kernel" || { echo "test-dualboot: FAILED: the kernel object has no marker text $LDB_MARKER" >&2; exit 1; }
 echo "ok   H1 the driver built with the marker holds the text: $LDB_MARKER"
 grep -E 'LAUREL DUALBOOT: (on|off)' "$D/test_kernel.out" | sed 's/^/     /' | sort -u
+# A kernel's own strings must not read as a boot-arg token, or the guard calls each read-only image writable (laurel_can_write). The real files, when they are built.
+. "$REPO/scripts/lib/laurel-layout.sh"
+for k in "$OUT/laurel-kernel/out/kernel.development.sweet.4k" "$OUT/laurel-kernel-ios26/out/kernel.ios26.development.sweet.4k"; do
+  [ -f "$k" ] || { echo "note $k is not built: its strings were not checked"; continue; }
+  if laurel_can_write < "$k"; then echo "test-dualboot: FAILED: $k holds text that reads as ufsrw or rootrw" >&2; exit 1; fi
+  echo "ok   F7 no text in $(basename "$k") reads as a boot-arg token"
+done
 
 echo "== 4. the phone helper"
 HC="$CC -std=gnu11 -O1 -static -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -no-pie -fuse-ld=lld -Wall -Wextra -Wno-unused-parameter"
@@ -59,7 +66,11 @@ file "$D/ldbhelper-arm64" | cut -d, -f1-3
 LC_ALL=C grep -aq 'LDB_TEST_STOP' "$D/ldbhelper-arm64" && { echo "test-dualboot: FAILED: the phone binary holds the test hook" >&2; exit 1; }
 echo "ok   the phone binary has no test hook"
 H=$D/ldbhelper
-LDB_TEST_DIR=$D sh "$REPO/scripts/laurel/ldbhelper-test.sh" "$H" "$TOOL" || { echo "test-dualboot: FAILED: ldbhelper-test" >&2; exit 1; }
+# the phone's own code for this host, no test define: it runs under dio_check.c, with real O_DIRECT and the block rules of 4.14 (ldbhelper-test.sh, F1). x86_64 Linux: the tracer knows that ABI.
+$HC -o "$D/ldbhelper-direct" "$T/ldbhelper.c"
+LC_ALL=C grep -aq 'LDB_TEST_STOP' "$D/ldbhelper-direct" && { echo "test-dualboot: FAILED: the direct binary holds the test hook" >&2; exit 1; }
+$CC -std=gnu11 -O1 -Wall -o "$D/dio_check" "$T/test/dio_check.c"
+LDB_DIRECT=$D/ldbhelper-direct LDB_DIO=$D/dio_check LDB_TEST_DIR=$D sh "$REPO/scripts/laurel/ldbhelper-test.sh" "$H" "$TOOL" || { echo "test-dualboot: FAILED: ldbhelper-test" >&2; exit 1; }
 echo "== 5. the numbers in one place"
 . "$REPO/scripts/lib/laurel-layout.sh"
 python3 -I "$REPO/scripts/laurel/gpt-fake.py" dumps "$D/fh" "$D/ft"

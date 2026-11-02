@@ -16,6 +16,11 @@ LAUREL_BACKUP=$HOME/laurel-backup
 # slot b firmware that the boot LUN switch makes live (dual-boot.sh check_fw_b, the app's mark). boot_b, dtbo_b have their own check. vendor_b, system_b: not firmware of the boot chain, and big.
 FW_B="abl bluetooth cmnlib cmnlib64 devcfg dsp hyp imagefv keymaster modem qupfw rpm storsec tz uefisecapp xbl xbl_config vbmeta"
 
+# stdin: a boot-arg line or a boot image. Exit 0 when a token of ufsrw or rootrw can write: any value but the literal 0, also the bare name. [V pexpert/gen/bootargs.c PE_parse_boot_argn] the number parser takes
+# 0x1, 01, 1k; a bare name is 1; the last token wins. The kernel opens writes only for the text 1 (patch 2950), so a token this misses cannot write. A kernel holds these names only between NUL bytes.
+laurel_can_write() {
+  [ -n "$(LC_ALL=C grep -aoE '(^|[[:space:]"])(ufsrw|rootrw)([[:space:]"]|$)|(ufsrw|rootrw)=[^[:space:]"]*' | LC_ALL=C grep -avE '^(ufsrw|rootrw)=0$' | head -1 | tr -d '\000' || true)" ]
+}
 # the newest folder with this name pattern in the backup, or nothing
 laurel_backup_dir() { ls -d "$LAUREL_BACKUP"/$1 2>/dev/null | sort | tail -1; }
 # os_version field of a boot image header (v0-v2: byte 44): a 32-bit value: (A<<25 | B<<18 | C<<11 | year-2000<<4 | month)
