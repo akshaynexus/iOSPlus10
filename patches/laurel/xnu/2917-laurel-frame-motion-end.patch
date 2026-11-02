@@ -1,0 +1,32 @@
+laurel 2917: a motion that ends before its window has its LAUREL FRAME lines at the pause (over 500 ms), from 10 frames up. The 10 s window dropped it: boot 00:49 had 25 windows from the boot-UI spinner of backboardd (24 images in 1 s) and none from the real UI. Kill switch sweetfps=0, as 2152. docs/laurel_sprout/gpu.md "Frame budget".
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3867fc3..d3abfe0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1355,7 +1355,7 @@ sweet_fps_count(void)
+ 	}
+ 	static uint64_t last, window, gap_max;
+ 	static uint32_t frames, late, lines;
+-	uint64_t now = mach_absolute_time(), ns = 0, gap = 0;
++	uint64_t now = mach_absolute_time(), ns = 0, gap = 0, before = last;
+ 
+ 	if (last != 0) {
+ 		absolutetime_to_nanoseconds(now - last, &gap);
+@@ -1366,6 +1366,16 @@ sweet_fps_count(void)
+ 	 * frame 40446 us in present + latch" is 14.4 s of one thread's waits in 10 s; the 26 ms "after the tick" (ticks are 17.5 ms apart) comes from the same sum.
+ 	 */
+ 	if (window == 0 || gap > 500000000ull) {
++		/*
++		 * laurel 2917: a motion that ends before its window (a scroll, a launch) has its report now. Until now a pause dropped it, so these lines
++		 * came only from something that draws for 10 s without a pause. On 23F84 that is backboardd's boot UI after a restart, 24 images a second,
++		 * and the real UI had no number at all (docs/laurel_sprout/gpu.md "Frame budget").
++		 */
++		if (window != 0 && frames >= 10) {
++			absolutetime_to_nanoseconds(before - window, &ns);
++			IOLog("LAUREL FRAME: motion ended: %u frames in %llu ms\n", frames, ns / 1000000);
++			laurel_frame_line(ns);
++		}
+ 		window = now;
+ 		frames = late = 0;
+ 		gap_max = 0;

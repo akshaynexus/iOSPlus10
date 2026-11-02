@@ -1,0 +1,44 @@
+laurel iOS 26: vsync gives CoreAnimation the refresh period, as 23F84 reads it
+
+[V 23F84] IOMobileFramebufferVsyncNotifyFunc: (a1, a2, a3) = the three 64-bit numbers of the message. IOMFBServer::vsync_callback: a1 only to kdebug,
+a2 = host time of this refresh, a2 + a3 = the next one, a3 = videoRefreshPeriod. This kernel sent (refresh, refresh, tick counter).
+[V] 19.2 MHz: 3.1 us of period per tick: 3.75 ms after 20 min, right after 89 min, 135 ms after 12 h. IOS-26-Hot 0121 reports 15.8 -> 21 fps on a swipe for a3 = 0 -> period.
+The iOS 16 kernel keeps its order: its QuartzCore is not checked. Kill switch sweetfb_period=0.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -978,11 +978,33 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			refresh = now - back;
+ 		}
+ 	}
++	/*
++	 * laurel 9008: on 23F84 the third number is the refresh period, not a counter [V IOMobileFramebufferVsyncNotifyFunc, IOMFBServer::vsync_callback]:
++	 * a1 goes only to kdebug, a2 is the host time of this refresh, a2 + a3 the next one: the time CoreAnimation renders for and compares with its
++	 * next update; a3 is also videoRefreshPeriod. The counter was there: 3.1 us of period per tick since the display came up. Kill switch sweetfb_period=0.
++	 */
++	static int period_on = -1;
++	if (period_on < 0) {
++		uint32_t v = 1;
++
++		(void)PE_parse_boot_argn("sweetfb_period", &v, sizeof(v));
++		period_on = v != 0;
++		IOLog("LAUREL FRAME: %s: vsync gives CoreAnimation the refresh period, %u us (kill switch sweetfb_period=0)\n", period_on ? "on" : "off", fb->fPanelUS);
++	}
++	uint64_t period = 0;
++
++	nanoseconds_to_absolutetime((uint64_t)fb->fPanelUS * 1000, &period);
+ 	uint64_t values[6] = {
+-		(uint32_t)refresh, (uint32_t)(refresh >> 32),
+-		(uint32_t)refresh, (uint32_t)(refresh >> 32),
+ 		(uint32_t)count, (uint32_t)(count >> 32),
++		(uint32_t)refresh, (uint32_t)(refresh >> 32),
++		(uint32_t)period, (uint32_t)(period >> 32),
+ 	};
++	if (!period_on) {
++		values[0] = values[2];
++		values[1] = values[3];
++		values[4] = (uint32_t)count;
++		values[5] = (uint32_t)(count >> 32);
++	}
+ 
+ 	IOLockLock(fb->fLock);
+ 	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
