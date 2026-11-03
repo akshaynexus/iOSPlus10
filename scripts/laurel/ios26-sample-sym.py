@@ -74,7 +74,7 @@ class Image:
         return (self.table[i][1] if i >= 0 else "?") + " [" + self.leaf + "]"
 
 
-KEEP = {"QuartzCore", "libsystem_kernel.dylib", "libsystem_platform.dylib", "libsystem_malloc.dylib", "libsystem_pthread.dylib", "Metal", "IOKit", "IOSurface", "libobjc.A.dylib", "libdispatch.dylib", "CoreFoundation"}
+KEEP = {"libdyld.dylib", "libsystem_c.dylib", "dyld", "libc++.1.dylib", "libc++abi.dylib", "QuartzCore", "libsystem_kernel.dylib", "libsystem_platform.dylib", "libsystem_malloc.dylib", "libsystem_pthread.dylib", "Metal", "IOKit", "IOSurface", "libobjc.A.dylib", "libdispatch.dylib", "CoreFoundation"}
 
 
 def cache_images():
@@ -96,6 +96,9 @@ def main():
     want = None
     top = 45
     under = None
+    callers = False
+    if "--callers" in args:
+        i = args.index("--callers"); under = args[i + 1]; callers = True; del args[i:i + 2]
     if "--bins" in args:
         i = args.index("--bins"); ms = int(args[i + 1]); del args[i:i + 2]
         rows = collections.defaultdict(collections.Counter)
@@ -158,7 +161,10 @@ def main():
             if at is None:
                 continue
             hits += 1
-            kids[names[at - 1] if at > 0 else "(self)"] += 1
+            if callers:
+                kids[names[at + 1] if at + 1 < len(names) else "(top)"] += 1
+            else:
+                kids[names[at - 1] if at > 0 else "(self)"] += 1
         print(f"under {under}: {hits} samples, {100 * hits / len(use):.1f} % of the thread")
         for k, v in kids.most_common(top):
             print(f"{100 * v / hits:5.1f}  {k[:120]}")

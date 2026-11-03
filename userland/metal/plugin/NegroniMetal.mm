@@ -41,6 +41,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
+#include <atomic>
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
 #include <mach-o/loader.h>
@@ -1745,9 +1746,18 @@ static void watchdog_start(void)
 								    void *caller = __builtin_return_address(0);
 
 								    if (family >= 1003 && family <= 1009) {
-									    Dl_info info = { 0 };
-
-									    if (dladdr(caller, &info) != 0 && info.dli_fname != NULL && strstr(info.dli_fname, "RenderBox") != NULL) {
+									    /* laurel: one word per call site: whether it is in RenderBox. dladdr at each call took 2 % of CoreAnimation's render thread [V phone] */
+									    static std::atomic<uintptr_t> sites[256];
+									    const uintptr_t at = (uintptr_t)caller;
+									    std::atomic<uintptr_t> &site = sites[(at >> 2) % 256];
+									    uintptr_t known = site.load(std::memory_order_relaxed);
+									    if ((known & ~(uintptr_t)1) != at) {
+										    Dl_info info = { 0 };
+										    const bool rb = dladdr(caller, &info) != 0 && info.dli_fname != NULL && strstr(info.dli_fname, "RenderBox") != NULL;
+										    known = at | (rb ? 1 : 0);
+										    site.store(known, std::memory_order_relaxed);
+									    }
+									    if (known & 1) {
 										    static bool told;
 										    if (!told) {
 											    told = true;

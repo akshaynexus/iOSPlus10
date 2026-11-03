@@ -1,0 +1,18 @@
+metal2vulkan (Mi A3, iOS 26): surfaces get rows of a multiple of 64 bytes: CoreAnimation takes its alignment from iosurfaceTextureAlignmentBytes, and an Adreno's image lies only on such rows, so a surface with other rows was a shadow, copied per use (8.6 % of CA's render thread) [V phone 2026-11-03]. Docs: docs/laurel_sprout/ios26-default-speed.md.
+
+--- a/crates/metal2vulkan-runtime/src/private_properties.rs
++++ b/crates/metal2vulkan-runtime/src/private_properties.rs
+@@ -232,9 +232,11 @@
+             C::MaxVertexAmplificationCount => ("maxVertexAmplificationCount", 2),
+             C::DeviceLinearTextureAlignmentBytes => ("deviceLinearTextureAlignmentBytes", 16),
+             C::LinearTextureAlignmentBytes => ("linearTextureAlignmentBytes", 16),
+-            C::IosurfaceTextureAlignmentBytes => ("iosurfaceTextureAlignmentBytes", 16),
++            // laurel (Mi A3, iOS 26): CoreAnimation asks surfaces with rows this aligned (CADeviceSetMinimumAlignment, CARenderServerGetNeededAlignment). An Adreno's
++            // image lies on rows of a multiple of 64 bytes: a surface with other rows is a shadow, copied per use (8.6 % of CA's thread [V phone]).
++            C::IosurfaceTextureAlignmentBytes => ("iosurfaceTextureAlignmentBytes", 64),
+             C::IosurfaceReadOnlyTextureAlignmentBytes => {
+-                ("iosurfaceReadOnlyTextureAlignmentBytes", 16)
++                ("iosurfaceReadOnlyTextureAlignmentBytes", 64)
+             }
+             C::MaxVertexBuffers => ("maxVertexBuffers", 31),
+             C::MaxFragmentBuffers => ("maxFragmentBuffers", 31),
