@@ -15,7 +15,7 @@ Why CPU 5 was late: [U]. The line LAUREL DEBUG ACK gives the count and the CPU.
  
  /* Forward functions definitions */
  void panic_display_times(void);
-@@ -1252,6 +1253,20 @@
+@@ -1252,6 +1253,21 @@
  		if (sync_pending == 0) {
  			return KERN_SUCCESS;
  		} else if (!proceed_on_sync_failure) {
@@ -26,9 +26,10 @@ Why CPU 5 was late: [U]. The line LAUREL DEBUG ACK gives the count and the CPU.
 +				 * error on. A late CPU takes its IPI later and finds mp_kdp_trap clear; the next entry zeroes the counts.
 +				 */
 +				static unsigned int laurel_late_count;
-+				DebuggerXCallReturn(); /* first: printf takes locks, and the other CPUs must not spin while one of them may hold those */
++				DebuggerXCallReturn();
++				/* [V 2026-11-03 06:15] printf here panics: "Console I/O from interrupt-disabled context": interrupts stay off in this path. kprintf, as this function does. */
 +				if (laurel_late_count++ < 8) {
-+					printf("LAUREL DEBUG ACK: on: stackshot given up: cpu %d is late by over %llu ticks (time %u)\n",
++					kprintf("LAUREL DEBUG ACK: on: stackshot given up: cpu %d is late by over %llu ticks (time %u)\n",
 +					    timeout_cpu, (unsigned long long)os_atomic_load(&debug_ack_timeout, relaxed), laurel_late_count);
 +				}
 +				return KERN_OPERATION_TIMED_OUT;
@@ -36,7 +37,7 @@ Why CPU 5 was late: [U]. The line LAUREL DEBUG ACK gives the count and the CPU.
  			panic("%s>Debugger synch pending on cpu %d\n",
  			    __FUNCTION__, timeout_cpu);
  		}
-@@ -1351,7 +1366,7 @@
+@@ -1351,7 +1367,7 @@
  	os_atomic_clear_exclusive();
  
  	// checking debug_ack_timeout != 0 is a workaround for rdar://124242354

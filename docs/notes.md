@@ -5348,3 +5348,6 @@ Full text: `docs/laurel_sprout/ios26-control-center.md`.
 
 ## 2026-11-03: Control Center works after post/9011 (boot 20); test of Turnip sysmem
 [V owner] Control Center modules are back. [V log 06:12-06:14] motion 35 frames in 799 ms, 19 in 962, 37 in 967, 49 in 4841; `LAUREL FLIP` waits over 100 ms up to 322 ms, 2 surfaces not drawn after 900 ms, 0 surfaces shown again; one window 10 submissions of 265 ms GPU each; CPU 360 of 480 s with widgets starting first time; GPU at 320 MHz 37 s of a minute. Test: `TU_DEBUG=sysmem` + `CA_ENABLE_MEMORYLESS=0` in `/var/db/negronimetal/env` (no root change).
+
+## 2026-11-03: panic `Console I/O from interrupt-disabled context @serial_console.c:175`
+[V 06:15:41] First line `DebuggerXCallEnter>Debugger synch pending on cpu 5`, then the panic. post/9007's printf ran with interrupts off in the stackshot path. Now kprintf, as the function around it. So a stackshot with a late CPU panicked on every kernel from 9007 on, under load. Agent's error and mine: no host test runs that path. [U] why CPU 5 is late.
