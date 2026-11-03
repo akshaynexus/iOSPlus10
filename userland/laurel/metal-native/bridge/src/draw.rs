@@ -364,7 +364,8 @@ pub(crate) fn new_texture(gpu: &Arc<Gpu>, d: &NmbTextureDescriptor, over: Option
     // private and memoryless render targets take the GPU's own layout; everything the CPU can touch stays linear, so replace and getBytes are plain copies
     let tiled = over.is_none() && mode >= 2;
     // a row this GPU cannot read as it lies: the image gets its own memory, with an aligned pitch
-    let unaligned = over.is_some_and(|o| o.2 & 63 != 0);
+    // ... or a first byte it cannot name: a base address is in units of 64 bytes, and the low bits are lost (icons moved by 4 pixels, over host pages that start inside a page)
+    let unaligned = over.is_some_and(|o| o.2 & 63 != 0 || (o.0.backing.iova() + o.1) & 63 != 0);
     let stride = over.map_or(0, |o| if unaligned { ((o.2 + 63) & !63) as u32 } else { o.2 as u32 });
     let layers = if d.kind == 5 || d.kind == 6 { (d.array_length.max(1) * 6) as u32 } else { d.array_length.max(1) as u32 };
     let image = unsafe { nmn_image_new(gpu.gpu, pipe, kind, d.width as u32, d.height.max(1) as u32, d.depth.max(1) as u32, d.levels.max(1) as u32, layers, d.samples.max(1) as u32, tiled, stride) };
