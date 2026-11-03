@@ -12,7 +12,7 @@ The native Metal stack hangs on a read at a wild address (FAR 0x1_1264_04822902)
 -	    rd(smmu, SMMU_CB0 + 0x58), rd(smmu, SMMU_CB0 + 0x64), rd(smmu, SMMU_CB0 + 0x60), rd(smmu, SMMU_CB0 + 0x68));
 +	/* laurel 9014: who made the access: FSYNR1's low byte is the GPU's client (0 the CP, 4 the CCU, 6 the CDP prefetcher; others through the UCHE, whose client register then names the block: VFD, SP, VSC, VPC, HLSQ, PC, LRZ by the low 3 bits, values as the a6xx register file and the upstream driver's reading of them) */
 +	IOLog("TopazGPU: [%s] SMMU gfsr %08x CB0 FSR %08x FAR %08x%08x FSYNR0 %08x FSYNR1 %08x UCHE_CLIENT_PF %08x\n", tag, rd(smmu, 0x48),
-+	    rd(smmu, SMMU_CB0 + 0x58), rd(smmu, SMMU_CB0 + 0x64), rd(smmu, SMMU_CB0 + 0x60), rd(smmu, SMMU_CB0 + 0x68), rd(smmu, SMMU_CB0 + 0x6c), gpu_rd(0x0e3c));
++	    rd(smmu, SMMU_CB0 + 0x58), rd(smmu, SMMU_CB0 + 0x64), rd(smmu, SMMU_CB0 + 0x60), rd(smmu, SMMU_CB0 + 0x68), rd(smmu, SMMU_CB0 + 0x6c), gpu_rd(0x0e19));
  }
  
  static bool
