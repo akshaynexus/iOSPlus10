@@ -9,7 +9,7 @@ O=$REPO/logs/stability-$(date +%H%M%S).txt
 A=${AUTOTEST_DIR:-$REPO}
 for i in $(seq 1 "$N"); do
   keep=--keep; [ "$i" = "$N" ] && keep=
-  flight=--no-flight; [ "${FLIGHT:-0}" = 1 ] && flight=
+  flight=--no-flight; [ "${FLIGHT:-0}" = 1 ] && flight=; [ "${FLIGHT:-0}" = lite ] && flight=--flight-lite
   touch "$O.start"
   # a hang leaves the GPU off until a reboot: only then, each boot of slot b counts
   U=$(ls -t /home/akshay/Documents/GitHub/iOSPlus10/logs/usblog-*.txt | head -1); up=$(grep -an 'exec hangtelemetryd' "$U" | tail -1 | cut -d: -f1); hang=$(grep -an 'watchdog: GPU hang' "$U" | tail -1 | cut -d: -f1); R=; [ "${hang:-0}" -gt "${up:-0}" ] && R=--reboot

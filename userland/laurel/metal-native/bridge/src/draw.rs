@@ -1330,6 +1330,7 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
     if crate::flight::on() {
         let at = unsafe { e.draws.start_iova + (e.draws.cur as u64).wrapping_sub(e.draws.start as u64) };
         crate::flight::line(&format!("draw {} prim {primitive} counts {counts:?} at {at:#x} id {}", device_pipeline.names, mark.map_or(0, |m| m.1)));
+        if !crate::flight::lite() {
         for (i, s) in set_memory.iter().enumerate() {
             crate::flight::line(&crate::flight::set_words(i, s.0, s.1, entry.set_slots.get(i).copied().unwrap_or(0)));
         }
@@ -1364,6 +1365,7 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
         for w in &commands.push_constants {
             crate::flight::line(&format!("  push at {} stages {:?}: {}", w.offset, w.stages, crate::flight::hex(&w.bytes)));
         }
+            }
     }
 
     let cs: *mut NwCs = &mut *e.draws;

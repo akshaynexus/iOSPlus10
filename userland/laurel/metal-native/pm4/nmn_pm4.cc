@@ -453,10 +453,7 @@ void nmn_cmd_init(struct nw_cs *cs, struct nmn_gpu *g)
 	REGS(cs, A6XX_HLSQ_SHARED_CONSTS(.enable = false));
 	emit_reg(cs, REG_A6XX_UCHE_UNKNOWN_0E12, i->a6xx.magic.UCHE_UNKNOWN_0E12);
 	/* with the flight recorder on: the value that makes this register latch the client of a fault (kgsl 1, msm BIT(7) | 1), so that the kernel's line names the block; Mesa's magic value does not [V log 10:11:31: it read back 4] */
-	static int capture = -1;
-	if (capture < 0)
-		capture = access("/private/var/db/negronimetal/stack/flight-on", F_OK) == 0;
-	emit_reg(cs, REG_A6XX_UCHE_CLIENT_PF, capture ? (1u << 7) | 1u : i->a6xx.magic.UCHE_CLIENT_PF);
+	emit_reg(cs, REG_A6XX_UCHE_CLIENT_PF, i->a6xx.magic.UCHE_CLIENT_PF);
 	emit_reg(cs, REG_A6XX_RB_UNKNOWN_8E01, i->a6xx.magic.RB_UNKNOWN_8E01);
 	emit_reg(cs, REG_A6XX_SP_UNKNOWN_A9A8, 0);
 	REGS(cs, A6XX_SP_MODE_CONTROL(.constant_demotion_enable = true, .isammode = ISAMMODE_GL, .shared_consts_enable = false));
@@ -1556,8 +1553,7 @@ static enum pc_di_primtype primtype(uint32_t metal)
 }
 
 /*
- * After each draw. The hang of this stack (SP, HLSQ, RB busy, no fault, in a large program) came in every start with no recorder and in no run with its per-draw event: 2 of 2 against 0 of 8 [V logs/stability-*.txt]. Cause not known.
- * The event makes no wait in the stream.
+ * After each draw: the recorder's event, with no recorder too, for one stream in both. By itself it did not stop the hang (SP, HLSQ, RB busy, no fault): 13:42:54 [V]. The event makes no wait in the stream.
  */
 void nmn_cmd_draw_end(struct nw_cs *cs)
 {

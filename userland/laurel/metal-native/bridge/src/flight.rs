@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The flight recorder: text lines in a memory-mapped ring (the stack folder's flight-PROCESS), written with no system call, so they survive what kills the process at a GPU hang: the kernel does that first [V logs 06:47:15, 08:03:15]. Each draw: its program, its descriptor words, its constants; each submission: its fence, which the kernel's hang line names.
-//! On only while the file stack/flight-on exists (scripts/laurel/native/compositor-round.sh): it formats text for each draw. Read: scripts/laurel/native/flight-read.py.
+//! On only while the file stack/flight-on exists (scripts/laurel/native/compositor-round.sh; `lite` in it: see lite()): it formats text for each draw. Read: scripts/laurel/native/flight-read.py.
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -36,6 +36,12 @@ fn ring() -> Option<&'static Ring> {
 
 pub(crate) fn on() -> bool {
     ring().is_some()
+}
+
+/// `lite` in the file flight-on: for each draw only its name and id: the marks with almost no CPU time.
+pub(crate) fn lite() -> bool {
+    static LITE: OnceLock<bool> = OnceLock::new();
+    *LITE.get_or_init(|| std::fs::read_to_string("/private/var/db/negronimetal/stack/flight-on").is_ok_and(|t| t.starts_with("lite")))
 }
 
 pub(crate) fn line(text: &str) {
