@@ -5366,3 +5366,6 @@ Full text: `docs/laurel_sprout/ios26-control-center.md`.
 - A test of a phone tool: count its words against the kernel's `RedwoodGPU: submission` line: same size = same stream, which makes the host capture evidence.
 - Reflink a worktree's `out/` with `cp -a --reflink=always`: 13 GB in 3 s; hot needs `rm -rf out/ios26/metal-hot/build` after that (CMake's old path).
 
+
+## 2026-11-03: first compositor run on `native`
+[V logs/native-compositor-1.txt, 06:47] `LAUREL METAL: on: stack native`, then `TopazGPU: watchdog: GPU hang: fence 2708 done 2705 ... IB1 83db042c`, SMMU FSR 80000402 FAR 0000000001068000. The selector fell back as designed: `LAUREL METAL NATIVE: off: option native failed in 2 starts`. The GPU is off until a reboot.
