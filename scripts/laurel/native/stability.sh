@@ -10,6 +10,7 @@ A=${AUTOTEST_DIR:-$REPO}
 for i in $(seq 1 "$N"); do
   keep=--keep; [ "$i" = "$N" ] && keep=
   flight=--no-flight; [ "${FLIGHT:-0}" = 1 ] && flight=
+  touch "$O.start"
   # a hang leaves the GPU off until a reboot: only then, each boot of slot b counts
   U=$(ls -t /home/akshay/Documents/GitHub/iOSPlus10/logs/usblog-*.txt | head -1); up=$(grep -an 'exec hangtelemetryd' "$U" | tail -1 | cut -d: -f1); hang=$(grep -an 'watchdog: GPU hang' "$U" | tail -1 | cut -d: -f1); R=; [ "${hang:-0}" -gt "${up:-0}" ] && R=--reboot
   "$REPO/scripts/laurel/native/compositor-round.sh" $R $keep $flight --test unlock,home-swipe,control-center,settings-scroll 40 > "$O.round" 2>&1
@@ -17,7 +18,7 @@ for i in $(seq 1 "$N"); do
   T=$(ls -t "$A"/logs/autotest-*.txt | head -1)
   H=$(grep -ac 'TopazGPU: watchdog: GPU hang' "$D/usblog.txt")
   echo "$(date +%H:%M:%S) round $i of $N: $(basename "$D"), hangs $H, table $(basename "$T")" | tee -a "$O"
-  [ "$T" -nt "$D" ] && grep -E '^\| (unlock|home-swipe|control-center|settings-scroll)' "$T" | cut -c1-135 | tee -a "$O"
+  [ "$(stat -c %Y "$T")" -ge "$(stat -c %Y "$O.start" 2>/dev/null || echo 0)" ] && grep -E '^\| (unlock|home-swipe|control-center|settings-scroll)' "$T" | cut -c1-135 | tee -a "$O"
   if [ "$H" != 0 ]; then grep -a -m2 -E 'watchdog: GPU hang|SMMU gfsr' "$D/usblog.txt" | cut -c1-170 | tee -a "$O"; echo "stopped at a hang" | tee -a "$O"; exit 1; fi
 done
 echo "no hang in $N rounds" | tee -a "$O"
