@@ -1028,7 +1028,8 @@ static const char *bbd_gl_reason(char *why, size_t size)
  */
 #ifdef NMTL_IOS26
 #include "../../laurel/metal/option/present_stats.h"
-/* The selector's marks (userland/laurel/metal/option/option_rule.h). A stack other than the default ends this start on a failure: the next start takes the default. The default has nothing to go to, so it only logs. */
+#include "../../laurel/metal/option/option_store.h"
+/* The selector's marks (userland/laurel/metal/option/option_rule.h, option_store.h). On the disk before this returns: a CTL reboot is a reset with no sync. A stack other than the default ends this start on a failure: the next start takes the default. The default has nothing to go to, so it only logs. */
 static bool option_is_default(void)
 {
 	const char *o = getenv("NEGRONIMETAL_OPTION");
@@ -1036,12 +1037,11 @@ static bool option_is_default(void)
 }
 static void option_mark(const char *name, const char *text)
 {
-	char p[300];
-	snprintf(p, sizeof(p), NMTL_DIR "/stack/%s", name);
-	if (FILE *f = fopen(p, "w")) {
-		fprintf(f, "%s\n", text);
-		fclose(f);
-	}
+	char line[256];
+	snprintf(line, sizeof(line), "%s\n", text);
+	const int e = nmtl_store_write(NMTL_DIR "/stack", name, line);
+	if (e != 0)
+		nlog("LAUREL METAL: stack/%s cannot be written: errno %d", name, e);
 }
 static void option_failed(const char *why)
 {

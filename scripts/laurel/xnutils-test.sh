@@ -85,9 +85,11 @@ if unshare -r true 2>/dev/null; then
   rc=0; h26 metal probes 2>/dev/null || rc=$?; [ $rc = 2 ] && [ "$(tail -1 "$C")" = "$W26" ] || { echo "xnutils-test: FAIL: iOS 26 metal probes gives $rc, not 2, or changes the list" >&2; fail=1; }
   grep -q "$(printf '%s' "$W26" | sed 's/[*]/[*]/')" "$(dirname "$0")/root-add-metal-ios26.sh" || { echo "xnutils-test: FAIL: XT_METAL_WIDE differs from root-add-metal-ios26.sh" >&2; fail=1; }
   printf 'NEGRONIMETAL_OPEN_MS=60000\nTU_DEBUG=old\n' > "$DB/env"
-  mkdir -p "$DB/stack"; echo "hot 2 0" > "$DB/stack/state"; : > "$DB/stack/failed"; : > "$DB/stack/ok"
+  mkdir -p "$DB/stack"; echo "hot 2 0" > "$DB/stack/state"; : > "$DB/stack/failed"; : > "$DB/stack/ok"; echo "ABC no device" > "$DB/stack/failed-native"
+  ST=$(h26 metalstate); printf '%s\n' "$ST" | grep -qxF 'FAILED_NATIVE=ABC no device' || { echo "xnutils-test: FAIL: metalstate does not show the failed mark" >&2; fail=1; }
   h26 metaloption native; [ "$(cat "$DB/option")" = native ] || { echo "xnutils-test: FAIL: metaloption native"; exit 1; }
-  h26 metaloption hot; [ "$(cat "$DB/option")" = hot ] && [ "$(cat "$L2")" = hot ] && [ ! -e "$DB/stack/state" ] && [ ! -e "$DB/stack/failed" ] && [ ! -e "$DB/stack/ok" ] || { echo "xnutils-test: FAIL: metaloption hot" >&2; fail=1; }
+  echo "ABC no device" > "$DB/stack/failed-hot"
+  h26 metaloption hot; [ "$(cat "$DB/option")" = hot ] && [ "$(cat "$L2")" = hot ] && [ ! -e "$DB/stack/state" ] && [ ! -e "$DB/stack/failed" ] && [ ! -e "$DB/stack/ok" ] && [ ! -e "$DB/stack/failed-native" ] && [ ! -e "$DB/stack/failed-hot" ] || { echo "xnutils-test: FAIL: metaloption hot" >&2; fail=1; }
   h26 tumode sysmem; [ "$(grep -c '^TU_DEBUG=' "$DB/env")" = 1 ] && grep -qx TU_DEBUG=sysmem "$DB/env" && grep -qx NEGRONIMETAL_OPEN_MS=60000 "$DB/env" || { echo "xnutils-test: FAIL: tumode sysmem" >&2; fail=1; }
   h26 tumode auto; ! grep -q '^TU_DEBUG=' "$DB/env" && grep -qx NEGRONIMETAL_OPEN_MS=60000 "$DB/env" || { echo "xnutils-test: FAIL: tumode auto" >&2; fail=1; }
   h26 liveglass on; [ ! -e "$DB/no-live-glass" ] || { echo "xnutils-test: FAIL: liveglass on" >&2; fail=1; }

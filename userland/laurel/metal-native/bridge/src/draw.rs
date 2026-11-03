@@ -1334,7 +1334,7 @@ pub(crate) fn console_line(text: &str) {
     }
 }
 
-/// ENODEV from a fence: the kernel turned the GPU off (a hang), for every stack, until a reboot. The compositor marks this stack as failed: the next start takes the default and stays on it until the setting is written again (option_rule.h). Without this, a stack that hangs after the screen was lit would hang again at each boot: the lit screen has already cleared its count.
+/// ENODEV from a fence: the kernel turned the GPU off (a hang), for every stack, until a reboot. The compositor reports it; the next start marks this build as failed (option_store.h). The kernel kills backboardd at a hang, often first [V logs 06:47:15, 06:49:22: no line of this function]: then the selector's own count and "no device" do it.
 fn mark_gpu_off() {
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -1342,7 +1342,18 @@ fn mark_gpu_off() {
     }
     let compositor = std::env::current_exe().ok().is_some_and(|p| p.file_name().is_some_and(|n| n == "backboardd"));
     if compositor {
-        let _ = std::fs::write("/private/var/db/negronimetal/stack/failed", "the kernel turned the GPU off\n");
+        // on the disk before the next start: option_store.h turns it into this build's mark
+        let written = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let dir = "/private/var/db/negronimetal/stack";
+            let mut f = std::fs::File::create(format!("{dir}/failed"))?;
+            f.write_all(b"the kernel turned the GPU off\n")?;
+            f.sync_all()?;
+            std::fs::File::open(dir)?.sync_all()
+        })();
+        if let Err(x) = written {
+            console_line(&format!("LAUREL METAL NATIVE: stack/failed cannot be written: {x}"));
+        }
         console_line("LAUREL METAL NATIVE: off: the kernel turned the GPU off: the next start takes stack default");
     }
 }

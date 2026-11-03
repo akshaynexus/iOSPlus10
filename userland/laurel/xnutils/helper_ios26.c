@@ -1,6 +1,6 @@
 /*
  * The iOS 26 verbs of powermenu-helper (built with XT_IOS26: scripts/laurel/xnutils-build.sh, XNUTILS_IOS26=1). docs/laurel_sprout/ios26-metal.md section 10.
- *   metaloption default|hot|native    which Metal stack NegroniMetal.bundle's selector takes at the next start of a process; clears the selector's counts
+ *   metaloption default|hot|native    which Metal stack NegroniMetal.bundle's selector takes at the next start of a process; clears the selector's counts and the failed marks of a build: the owner's reset
  *   tumode auto|sysmem|gmem    the TU_DEBUG line of the env file (Turnip's render mode); next start of a process that reads /var/db
  *   liveglass on|off           live CABackdropLayer capture is the default; off writes the kill switch file: within 5 s, Restart UI when the kill switch was not there at the device open
  *   metalstate                 KEY=VALUE lines: setting, running stack, why, counts, Turnip mode, glass
@@ -65,7 +65,8 @@ xt_do_metaloption(const char *name)
 	if (stat(XT_METAL_BUNDLE, &st) == 0 && write_file(XT_OPTION_LOCAL, text) != 0) {
 		printf("OPTION_LOCAL=not written\n");
 	}
-	if (remove_file(XT_STACK_DIR "/state") != 0 || remove_file(XT_STACK_DIR "/ok") != 0 || remove_file(XT_STACK_DIR "/failed") != 0) {
+	/* the owner's reset: a build that failed may be tried again, whichever option this writes (option_store.h) */
+	if (remove_file(XT_STACK_DIR "/state") != 0 || remove_file(XT_STACK_DIR "/ok") != 0 || remove_file(XT_STACK_DIR "/failed") != 0 || remove_file(XT_STACK_DIR "/failed-hot") != 0 || remove_file(XT_STACK_DIR "/failed-native") != 0) {
 		return 1;
 	}
 	return 0;
@@ -132,7 +133,7 @@ first_line(const char *path, char *out, size_t size)
 int
 xt_do_metalstate(void)
 {
-	char setting[64], active[240], state[64], line[1024], tu[64] = "auto";
+	char setting[64], active[240], state[96], mark[240], line[1024], tu[64] = "auto";
 	FILE *f = fopen(XT_ENV, "r");
 
 	if (f != NULL) {
@@ -147,6 +148,14 @@ xt_do_metalstate(void)
 	first_line(XT_OPTION, setting, sizeof(setting));    /* XT_DB: root's folder, but the same rules cost nothing */
 	first_line(XT_STACK_DIR "/active", active, sizeof(active));
 	first_line(XT_STACK_DIR "/state", state, sizeof(state));
+	first_line(XT_STACK_DIR "/failed-native", mark, sizeof(mark));
+	if (mark[0] != 0) {
+		printf("FAILED_NATIVE=%s\n", mark);
+	}
+	first_line(XT_STACK_DIR "/failed-hot", mark, sizeof(mark));
+	if (mark[0] != 0) {
+		printf("FAILED_HOT=%s\n", mark);
+	}
 	char *why = strchr(active, ' ');
 
 	if (why != NULL) {
