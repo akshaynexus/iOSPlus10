@@ -1,0 +1,82 @@
+laurel 2992: LAUREL GPU SMMU: the GPU's SMMU takes no broadcast TLB maintenance (sCR0.PTM | VMIDPNE), as the stock driver; both kernels. docs/laurel_sprout/watchdog.md section 11.
+
+[V 2026-11-03, logs/usblog-20261103-071332.txt] Boot line: IDR0 0x4c017e04 (BTM, bit 13: a DVM slave), sCR0 0x00240406 (PTM, bit 12, clear). LineageOS
+arm-smmu.c arm_smmu_device_reset: "Disable TLB broadcasting": reg |= sCR0_VMIDPNE | sCR0_PTM; the kgsl_smmu node has no qcom,skip-init, so stock
+runs it. With PTM clear every `tlbi ...is` of a CPU goes to the GPU's SMMU and the CPU's `dsb ish` waits for its answer. Four catches of 2986-2991
+on one silver core: each in a VM system call (madvise 18:47, mmap through vm_map_enter 18:51) where the pmap invalidates TLB entries, the core
+answering no interrupt for 19 s: a dsb that never ends fits all of it [I: the frames of 2989 are the proof]. The driver's own TLB upkeep is
+tlb_flush() (TLBIALL + TLBSYNC) after each table change: nothing of ours needs the broadcast. Self-check: the bits must read back (single security
+state, IDR0.SES 0: offset 0 is the register); else off with the reason. Kill switch gpusmmuptm=0. One line at the SMMU setup.
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 64a20ae..f8f0c3b 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -144,6 +144,7 @@ static struct kbuf ring, sqe, mem;
+ /* ---------------------------------------------------------------- MMIO */
+ 
+ static inline uint32_t rd(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static void smmu_private_tlb(void);         /* laurel 2992 */
+ static inline void wr(volatile uint8_t *b, uint32_t o, uint32_t v)
+ {
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+@@ -982,12 +983,60 @@ smmu_setup(void)
+ 	wr(smmu, 0x800, (1u << 31) | (1u << 16));       /* SMR0: SID 0 mask 1 */
+ 	smmu_on = true;
+ 	tlb_flush();
++	smmu_private_tlb();
+ 	IOLog("TopazGPU: SMMU TTBR0 %08x%08x SCTLR %08x TCR %08x TCR2 %08x IDR0 %08x IDR2 %08x sCR0 %08x%s\n",
+ 	    rd(smmu, SMMU_CB0 + 0x24), rd(smmu, SMMU_CB0 + 0x20), rd(smmu, SMMU_CB0), rd(smmu, SMMU_CB0 + 0x30),
+ 	    rd(smmu, SMMU_CB0 + 0x10), rd(smmu, 0x20), rd(smmu, 0x28), rd(smmu, 0x0), gpu_identity ? " (identity)" : "");
+ 	return true;
+ }
+ 
++/*
++ * laurel 2992: LAUREL GPU SMMU: the GPU's SMMU takes no broadcast TLB maintenance. IDR0.BTM (bit 13) says this SMMU is a DVM slave: every
++ * `tlbi ...is` of a CPU is sent to it and the CPU's `dsb ish` waits until it answers. The stock driver (arm_smmu_device_reset, LineageOS
++ * arm-smmu.c: "Disable TLB broadcasting") sets sCR0.VMIDPNE and sCR0.PTM at reset; the firmware leaves them clear (boot: sCR0 0x00240406) and
++ * this port kept that. [V 2026-11-03] Four hangs on one silver core, each inside a VM system call (madvise, mmap) at the point where the pmap
++ * invalidates TLB entries, with the core answering no interrupt: a `dsb ish` that never completes. This driver keeps the SMMU's own TLB fresh
++ * by tlb_flush() (TLBIALL + TLBSYNC) after each table change, so nothing needs the broadcast. Self-check: the two bits must read back; else
++ * nothing changes and the line says why. Kill switch gpusmmuptm=0.
++ */
++#define SMMU_sCR0               0x000u
++#define SMMU_sCR0_VMIDPNE       (1u << 11)
++#define SMMU_sCR0_PTM           (1u << 12)
++#define SMMU_IDR0_BTM           (1u << 13)
++static bool smmu_ptm_said;
++
++static void
++smmu_private_tlb(void)
++{
++	uint32_t on = 1;
++
++	(void)PE_parse_boot_argn("gpusmmuptm", &on, sizeof(on));
++	uint32_t idr0 = rd(smmu, 0x20), before = rd(smmu, SMMU_sCR0), after;
++	const char *why = NULL;
++
++	if (!on) {
++		why = "kill switch gpusmmuptm=0";
++	} else if (!(idr0 & SMMU_IDR0_BTM)) {
++		why = "IDR0.BTM is 0: this SMMU takes no broadcast TLB maintenance anyway";
++	} else {
++		wr(smmu, SMMU_sCR0, before | SMMU_sCR0_VMIDPNE | SMMU_sCR0_PTM);
++		after = rd(smmu, SMMU_sCR0);
++		if ((after & (SMMU_sCR0_VMIDPNE | SMMU_sCR0_PTM)) != (SMMU_sCR0_VMIDPNE | SMMU_sCR0_PTM)) {
++			wr(smmu, SMMU_sCR0, before);
++			why = "sCR0.PTM does not hold (a Secure-owned register)";
++		}
++	}
++	if (!smmu_ptm_said || why != NULL) {
++		smmu_ptm_said = true;
++		if (why != NULL) {
++			IOLog("LAUREL GPU SMMU: off: %s: sCR0 %08x, the CPUs' broadcast TLB invalidates wait for this SMMU\n", why, before);
++		} else {
++			IOLog("LAUREL GPU SMMU: on: private TLB maintenance, as the stock driver: sCR0 %08x -> %08x; a CPU's tlbi/dsb no longer waits for the GPU's SMMU (kill switch gpusmmuptm=0)\n",
++			    before, rd(smmu, SMMU_sCR0));
++		}
++	}
++}
++
+ static bool
+ kbuf_map(struct kbuf *b)
+ {
