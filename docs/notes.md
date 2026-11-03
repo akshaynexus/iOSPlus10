@@ -5369,3 +5369,4 @@ Full text: `docs/laurel_sprout/ios26-control-center.md`.
 
 ## 2026-11-03: first compositor run on `native`
 [V logs/native-compositor-1.txt, 06:47] `LAUREL METAL: on: stack native`, then `TopazGPU: watchdog: GPU hang: fence 2708 done 2705 ... IB1 83db042c`, SMMU FSR 80000402 FAR 0000000001068000. The selector fell back as designed: `LAUREL METAL NATIVE: off: option native failed in 2 starts`. The GPU is off until a reboot.
+[V 06:49] The fallback does not hold across a reboot: at the next boot the setting `native` was tried again, and it hung the GPU again. So the setting is back to `default` on the phone until `native` runs the compositor. Fix for the selector: a GPU hang must keep a mark that survives a reboot (native agent's task).
