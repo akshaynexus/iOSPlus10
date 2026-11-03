@@ -1,49 +1,15 @@
 laurel (Mi A3, iOS 26): an image for a host allocation needs no dedicated import: it is bound at an offset of the imported pages. With the old answer metal2vulkan made no image over a no-copy buffer's pages: every texture over an IOSurface was a shadow, with a copy in and a word-by-word merge per pass (m2v-ios26/0002). Docs: docs/laurel_sprout/ios26-default-speed.md.
 
-diff --git a/external/Mu-Silicium-negroni b/external/Mu-Silicium-negroni
---- a/external/Mu-Silicium-negroni
-+++ b/external/Mu-Silicium-negroni
-@@ -1 +1 @@
--Subproject commit 4b524aba9bbb615f33722ba44054d11a3097fa00
-+Subproject commit 4b524aba9bbb615f33722ba44054d11a3097fa00-dirty
-diff --git a/external/UniXNU b/external/UniXNU
-index 74aa94d..16e592a 160000
---- a/external/UniXNU
-+++ b/external/UniXNU
-@@ -1 +1 @@
--Subproject commit 74aa94d57e1681709b1ba1594522ae9bee2d224f
-+Subproject commit 16e592abee8a550dec8154ed1f38b5ebc4f16213-dirty
-diff --git a/external/hackios-xnu-userland b/external/hackios-xnu-userland
-index a79ff07..2573c4a 160000
---- a/external/hackios-xnu-userland
-+++ b/external/hackios-xnu-userland
-@@ -1 +1 @@
--Subproject commit a79ff0772a3454fd1ef127e181e5b3bce6c9ce18
-+Subproject commit 2573c4a8d80ed143e534d16b5a386efa5b06ccbb-dirty
-diff --git a/external/ios-flame b/external/ios-flame
---- a/external/ios-flame
-+++ b/external/ios-flame
-@@ -1 +1 @@
--Subproject commit 745c4341af86089efb0df851fa8a27fb8face624
-+Subproject commit 745c4341af86089efb0df851fa8a27fb8face624-dirty
-diff --git a/scripts/laurel/ios26-default-bench.sh b/scripts/laurel/ios26-default-bench.sh
-index 44cd73b..a8aa56b 100755
---- a/scripts/laurel/ios26-default-bench.sh
-+++ b/scripts/laurel/ios26-default-bench.sh
-@@ -33,6 +33,7 @@ phone "cp $DB/env $DB/env.bench-saved" || { say "no SSH"; exit 2; }
- restore() {
-   [ "${NO_RESTORE:-0}" = 1 ] && { say "stays: option default, env and files of this run"; return; }
-   back "$B/libvulkan_freedreno.dylib"; back "$B/options/default/NegroniMetal"
-+  phone "tail -c +${meta_at:-1} $DB/metal.log; rm -f $DB/telemetry" > "$REPO/logs/bench-$name.metal.log" 2>/dev/null
-   phone "mv -f $DB/env.bench-saved $DB/env; printf '%s\n' '$old_option' > $DB/option"
-   say "restored: option $old_option, env"
-   restart_ui
-@@ -40,7 +41,7 @@ restore() {
- trap restore EXIT
- [ -z "${TURNIP:-}" ] || put "$TURNIP" "$B/libvulkan_freedreno.dylib"
- [ -z "${PLUGIN:-}" ] || put "$PLUGIN" "$B/options/default/NegroniMetal"
--{ phone "printf '%s\n' default > $DB/option"; for e in ${extra[@]+"${extra[@]}"}; do phone "printf '%s\n' '$e' >> $DB/env"; done; }
-+{ phone "printf '%s\n' default > $DB/option; touch $DB/telemetry"; meta_at=$(phone "wc -c < $DB/metal.log"); for e in ${extra[@]+"${extra[@]}"}; do phone "printf '%s\n' '$e' >> $DB/env"; done; }
- # Another agent's test can leave the GPU off until a reboot (LAUREL GPU: off, then NoDevice at each open). Then this run reboots the phone once: the standing order allows it.
- main_log() { local m; m=$(git -C "$REPO" worktree list --porcelain | sed -n '1s/^worktree //p'); ls -t "$REPO"/logs/usblog-*.txt "$m"/logs/usblog-*.txt 2>/dev/null | head -1; }
- LOG=$(main_log)
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -1006,8 +1006,9 @@
+       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
+          VkMemoryDedicatedRequirements *req =
+             (VkMemoryDedicatedRequirements *) ext;
++         /* laurel: a host allocation is imported whole and bound at an offset: no dedicated import (metal2vulkan's texture in place over host pages) */
+          req->requiresDedicatedAllocation =
+-            image->vk.external_handle_types != 0;
++            (image->vk.external_handle_types & ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) != 0;
+          req->prefersDedicatedAllocation = req->requiresDedicatedAllocation;
+          break;
+       }
