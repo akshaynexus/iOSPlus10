@@ -422,6 +422,32 @@ int main(int argc, char **argv)
 	printf("scene: pixel (0,0) %08x, (360,780) %08x, (719,1559) %08x; copied byte %02x (a GPU writes 5a)\n", px[0], px[780 * 720 + 360], px[1559 * 720 + 719], cp[128]);
 	/* The clear gives ff000000. A pixel that differs proves that the draw reached the target: a texture on a quad over the whole target. */
 	printf("scene: the draw wrote: %s\n", px[780 * 720 + 360] != 0xff000000u && px[780 * 720 + 360] != 0 ? "yes" : "no");
+	/* 2D copies with rows the hardware cannot express: 40-byte rows from an unaligned offset, then 44-byte rows back. On a phone the bytes must match (a row of 40 read as 0 gave icons as stripes) */
+	{
+		enum { W = 30, H = 8, ROW_IN = 40, AT_IN = 8, ROW_OUT = 44, AT_OUT = 12 };
+		struct NmbTextureDescriptor rd = {.type = 2, .format = 10, .width = W, .height = H, .depth = 1, .levels = 1, .samples = 1, .array_length = 1, .usage = 5, .options = 0};
+		NmbTexture *small_texture = nmb_texture_new(dev, &rd);
+		NmbBuffer *row_in = nmb_buffer_new(dev, 4096, 0, NULL), *row_out = nmb_buffer_new(dev, 4096, 0, NULL);
+		NmbCommandBuffer *b3 = nmb_command_buffer_new(queue);
+		NmbEncoder *e3 = b3 ? nmb_blit_encoder_new(b3) : NULL;
+		if (small_texture == NULL || row_in == NULL || row_out == NULL || e3 == NULL)
+			FAIL("row copy objects");
+		unsigned char *in = nmb_buffer_contents(row_in);
+		for (int y = 0; y < H; y++)
+			for (int x = 0; x < W; x++)
+				in[AT_IN + y * ROW_IN + x] = (unsigned char)(y * 16 + x + 1);
+		const uint64_t size_rows[3] = {W, H, 1};
+		if (!nmb_blit_buffer_to_texture(e3, row_in, AT_IN, ROW_IN, 0, size_rows, small_texture, 0, 0, origin) || !nmb_blit_texture_to_buffer(e3, small_texture, 0, 0, origin, size_rows, row_out, AT_OUT, ROW_OUT, 0))
+			FAIL("row copy blit");
+		if (!nmb_encoder_end(e3) || !nmb_command_buffer_commit(b3) || nmb_command_buffer_wait(b3, 20000) != 0)
+			FAIL("row copy commit");
+		const unsigned char *out = nmb_buffer_contents(row_out);
+		int wrong = 0;
+		for (int y = 0; y < H; y++)
+			for (int x = 0; x < W; x++)
+				wrong += out[AT_OUT + y * ROW_OUT + x] != (unsigned char)(y * 16 + x + 1);
+		printf("scene: row copy: %d of %d bytes differ (rows of %d and %d, offsets %d and %d)\n", wrong, W * H, ROW_IN, ROW_OUT, AT_IN, AT_OUT);
+	}
 	/* compute: the first kernel of the library that compiles with no arguments bound */
 	/* NMN_SCENE_NO_SURFACES: pm4-compare.sh's runs against Turnip: its register comparison reads the last draw */
 	if (nmn_note_surface != NULL && scene_make_surface != NULL && getenv("NMN_SCENE_NO_SURFACES") == NULL && scene_surfaces(dev, queue, pipe, memoryless, image, sampler, ib) != 0)

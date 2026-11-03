@@ -197,7 +197,7 @@ pub unsafe extern "C" fn nmb_buffer_new_no_copy(d: *mut NmbDevice, pointer: *mut
             // a surface the kernel takes no import by ID of: its mapping in this process is whole pages too, as in Turnip's redwood_drm_host_import
         }
         // the kernel takes whole pages of this process (hostPages: its PAGE_MASK, 16 KiB here); the caller's range can start and end inside one, as Metal allows for newBufferWithBytesNoCopy on this device [V log: 6400 bytes at 0x...9c00]
-        let page = (unsafe { libc::getpagesize() } as u64).max(4096);
+        let page = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64).max(4096);
         let first = pointer as u64 & !(page - 1);
         let whole = ((pointer as u64 + length + page - 1) & !(page - 1)) - first;
         let bo = unsafe { nw_bo_import_host(gpu.dev, first as *mut c_void, whole, false) };
