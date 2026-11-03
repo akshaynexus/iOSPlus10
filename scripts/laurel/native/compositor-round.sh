@@ -8,6 +8,7 @@ set -uo pipefail
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 MAIN=/home/akshay/Documents/GitHub/iOSPlus10
 if [ "${ROUND_LOCKED:-0}" != 1 ]; then
+  "$MAIN/scripts/laurel/phone-ensure-ios.sh" 2>&1 | tail -1     # it takes the lock itself when it must act: before ours
   export ROUND_LOCKED=1
   exec "$MAIN/scripts/laurel/phone-lock.sh" native "$0" "$@"
 fi
@@ -25,11 +26,11 @@ if [ "$REBOOT" = 1 ]; then
   "$OP" ctl reboot 2>&1 | tail -1
   sleep 15
   # at most 3 min: the lock is shared; a phone that does not come back is not a reason to hold it
-  wait_ssh 20 || { "$MAIN/scripts/laurel/phone-ensure-ios.sh" 2>&1 | tail -2; wait_ssh 20 || { say "STOP: no SSH after the reboot"; exit 1; }; }
+  wait_ssh 20 || { say "STOP: no SSH after the reboot: phone-ensure-ios.sh, then again"; exit 1; }
   say "SSH is back"
 fi
-# (the phone can be still coming up: the recorder's file must be there before the stack starts; the slot's boots are few, so no reboot here: phone-ensure-ios.sh when SSH stays down)
-wait_ssh 20 || { "$MAIN/scripts/laurel/phone-ensure-ios.sh" 2>&1 | tail -2; wait_ssh 20 || { say "STOP: no SSH"; exit 1; }; }
+# (the phone can be still coming up: the recorder's file must be there before the stack starts)
+wait_ssh 20 || { say "STOP: no SSH: phone-ensure-ios.sh, then again"; exit 1; }
 L=$(usblog); FROM=$(wc -l < "$L")
 sh_phone 'touch /private/var/db/negronimetal/stack/flight-on; chmod 644 /private/var/db/negronimetal/stack/flight-on; chown 501 /private/var/db/negronimetal/stack/flight-on' 2>/dev/null
 "$REPO/scripts/laurel/ios26-metal-install-options.sh" native 2>&1 | tail -1
