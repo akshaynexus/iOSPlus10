@@ -6,6 +6,7 @@
 mod compile;
 mod diskcache;
 mod ffi;
+mod flight;
 mod draw;
 mod misc;
 mod objects;

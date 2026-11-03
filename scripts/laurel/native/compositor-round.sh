@@ -27,6 +27,7 @@ if [ "$REBOOT" = 1 ]; then
   say "SSH is back"
 fi
 L=$(usblog); FROM=$(wc -l < "$L")
+sh_phone 'touch /private/var/db/negronimetal/stack/flight-on; chmod 644 /private/var/db/negronimetal/stack/flight-on; chown 501 /private/var/db/negronimetal/stack/flight-on' 2>/dev/null
 "$REPO/scripts/laurel/ios26-metal-install-options.sh" native 2>&1 | tail -1
 say "on native; waiting $WAIT s"
 for _ in $(seq 1 $((WAIT / 5))); do
@@ -42,7 +43,19 @@ grep -E 'RedwoodGPU: [0-9]+ submissions' "$D/usblog.txt" | tail -3 | cut -c1-200
 cp "${AUTOTEST_DIR:-$REPO}/logs/autotest-shots/round-$(basename "$D").png" "$D/screen.png" 2>/dev/null
 sh_phone 'grep -E "native-metal: (program|compute program)" /private/var/db/negronimetal/metal.log | tail -6; grep -E "this (draw|dispatch)|refused" /private/var/db/negronimetal/metal.log | tail -20; cat /private/var/db/negronimetal/stack/state' 2>/dev/null > "$D/metal-log.txt"
 tail -n 30 "$D/metal-log.txt" | cut -c1-230
+# the hang: the words of the failed submissions, and who wrote the address it read
+H=$(grep -m1 'watchdog: GPU hang' "$D/usblog.txt" || true)
+if [ -n "$H" ]; then
+  for p in backboardd SpringBoard; do sh_phone "cat /private/var/db/negronimetal/stack/flight-$p" > "$D/flight-$p" 2>/dev/null || true; done
+  FAR=$(grep -m1 'SMMU gfsr' "$D/usblog.txt" | sed -n 's/.*FAR \([0-9a-f]*\).*/\1/p')
+  say "hang: FAR $FAR; words: ${FAR:8}, ${FAR:0:8}"
+  for p in backboardd SpringBoard; do
+    [ -s "$D/flight-$p" ] || continue
+    echo "--- $p"; python3 -I "$REPO/scripts/laurel/native/flight-read.py" "$D/flight-$p" --find "${FAR:8:5}" --find "${FAR:4:4}${FAR:8:4}" | tail -8 | cut -c1-400
+    python3 -I "$REPO/scripts/laurel/native/flight-read.py" "$D/flight-$p" > "$D/flight-$p.txt" 2>/dev/null; tail -n 12 "$D/flight-$p.txt" | cut -c1-260
+  done
+fi
 if [ "$KEEP" = 0 ]; then
-  sh_phone "echo default > /private/var/db/negronimetal/option; echo default > $B/option.local; sync" 2>/dev/null && say "the setting is default again: acts at the next start" || say "the setting is NOT back: no SSH"
+  sh_phone "rm -f /private/var/db/negronimetal/stack/flight-on; echo default > /private/var/db/negronimetal/option; echo default > $B/option.local; sync" 2>/dev/null && say "the setting is default again: acts at the next start" || say "the setting is NOT back: no SSH"
 fi
 say "folder $D"

@@ -196,11 +196,14 @@ pub unsafe extern "C" fn nmb_buffer_new_no_copy(d: *mut NmbDevice, pointer: *mut
             unsafe { (*bo).map = pointer };
             return Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Bo { gpu: gpu.clone(), bo: bo as usize, offset: offset as u64 }, length, surface_id: id }) }));
         }
-        let bo = unsafe { nw_bo_import_host(gpu.dev, pointer, length, false) };
+        // the kernel takes whole pages (hostPages); the caller's range can start and end inside one, as Metal allows for newBufferWithBytesNoCopy on this device [V log: 6400 bytes at 0x...9c00]
+        let first = pointer as u64 & !4095;
+        let whole = ((pointer as u64 + length + 4095) & !4095) - first;
+        let bo = unsafe { nw_bo_import_host(gpu.dev, first as *mut c_void, whole, false) };
         if bo.is_null() {
-            return Err("the kernel refused the host pages".into());
+            return Err(format!("the kernel refused the host pages {first:#x} + {whole}: {}", unsafe { std::ffi::CStr::from_ptr(nw_last_refusal(gpu.dev)) }.to_string_lossy()));
         }
-        Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Bo { gpu: gpu.clone(), bo: bo as usize, offset: 0 }, length, surface_id: 0 }) }))
+        Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Bo { gpu: gpu.clone(), bo: bo as usize, offset: pointer as u64 - first }, length, surface_id: 0 }) }))
     })
 }
 
@@ -607,6 +610,7 @@ pub extern "C" fn nmb_command_buffer_commit(c: *mut NmbCommandBuffer) -> bool {
                 nw_submit_name(&mut s, b as *mut NwBoHead);
             }
             let e = nw_submit_go(&mut s, &mut fence);
+            crate::flight::line(&format!("submit fence={fence} errno {e}, {} names", s.name_count));
             cb.gpu.names_total.fetch_add(s.name_count as u64, Ordering::Relaxed);
             nw_submit_end(&mut s);
             if e != 0 {
@@ -1102,9 +1106,8 @@ fn plan_entry(e: &mut NmbEncoder, device_pipeline: &NmbRenderPipeline, state: &B
     let outputs = program.stage_info(1).map_or(0, |i| i.color_outputs);
     // the file only: one line a program, at its first use in this process. The last of these before a GPU hang names the suspect; a hang's process is killed, so nothing later can say it
     {
-        let names: Vec<&str> = pipeline.stages.iter().map(|m| m.entry_point.as_str()).collect();
         let f = program.stage_info(1).unwrap_or_default();
-        file_line(&format!("native-metal: program {} key {}: {} fragment instructions, {} texture reads, reads the target: {reads_fb}", names.join(" + "), &device_pipeline.key[..device_pipeline.key.len().min(48)], f.instructions, f.tex_ops));
+        file_line(&format!("native-metal: program {}: {} fragment instructions, {} texture reads, reads the target: {reads_fb}", device_pipeline.names, f.instructions, f.tex_ops));
     }
     let entry = Arc::new(PlanEntry { plan, baked: Arc::new(Baked { gpu: e.gpu.clone(), b: baked as usize, reads_fb, program }), offsets, set_slots, outputs });
     device_pipeline.plans.lock().unwrap().insert(key.1.clone(), entry.clone());
@@ -1246,6 +1249,15 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
     cb.held_baked.push(entry.baked.clone());
 
     let set_memory = write_descriptors(e, cb, &entry.plan.descriptors, &commands.descriptor_ranges, &entry.offsets, &entry.set_slots, &device_pipeline.pipeline.layout)?;
+    if crate::flight::on() {
+        crate::flight::line(&format!("draw {} prim {primitive} counts {counts:?}", device_pipeline.names));
+        for (i, s) in set_memory.iter().enumerate() {
+            crate::flight::line(&crate::flight::set_words(i, s.0, s.1, entry.set_slots.get(i).copied().unwrap_or(0)));
+        }
+        for w in &commands.push_constants {
+            crate::flight::line(&format!("  push at {} stages {:?}: {}", w.offset, w.stages, crate::flight::hex(&w.bytes)));
+        }
+    }
 
     let cs: *mut NwCs = &mut *e.draws;
     unsafe {

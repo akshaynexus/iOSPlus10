@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: MIT
+//! The flight recorder: text lines in a memory-mapped ring (the stack folder's flight-PROCESS), written with no system call, so they survive what kills the process at a GPU hang: the kernel does that first [V logs 06:47:15, 08:03:15]. Each draw: its program, its descriptor words, its constants; each submission: its fence, which the kernel's hang line names.
+//! On only while the file stack/flight-on exists (scripts/laurel/native/compositor-round.sh): it formats text for each draw. Read: scripts/laurel/native/flight-read.py.
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const SIZE: usize = 4 << 20;
+const HEAD: usize = 64;
+
+struct Ring {
+    base: usize,
+    pos: AtomicUsize,
+}
+
+fn ring() -> Option<&'static Ring> {
+    static RING: OnceLock<Option<Ring>> = OnceLock::new();
+    RING.get_or_init(|| {
+        const DIR: &str = "/private/var/db/negronimetal/stack";
+        if std::fs::metadata(format!("{DIR}/flight-on")).is_err() {
+            return None;
+        }
+        let name = std::env::current_exe().ok()?.file_name()?.to_string_lossy().into_owned();
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(format!("{DIR}/flight-{name}")).ok()?;
+        f.set_len(SIZE as u64).ok()?;
+        use std::os::fd::AsRawFd;
+        let m = unsafe { libc::mmap(std::ptr::null_mut(), SIZE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, f.as_raw_fd(), 0) };
+        if m == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Ring { base: m as usize, pos: AtomicUsize::new(0) })
+    })
+    .as_ref()
+}
+
+pub(crate) fn on() -> bool {
+    ring().is_some()
+}
+
+pub(crate) fn line(text: &str) {
+    let Some(r) = ring() else { return };
+    let bytes = text.as_bytes();
+    let n = bytes.len() + 1;
+    let room = SIZE - HEAD;
+    let at = r.pos.fetch_add(n, Ordering::Relaxed);
+    unsafe {
+        let base = r.base as *mut u8;
+        for (i, b) in bytes.iter().chain(std::iter::once(&b'\n')).enumerate() {
+            *base.add(HEAD + (at + i) % room) = *b;
+        }
+        // the end of the text, for the reader
+        std::ptr::write_volatile(base as *mut u64, (at + n) as u64);
+    }
+}
+
+/// The words of a descriptor set that hold an address or a size: 0, 1, 2 (a buffer's or a UBO's) and 4, 5 (an image's).
+pub(crate) fn set_words(set: usize, iova: u64, words: *const u32, slots: u32) -> String {
+    let mut s = format!("  set {set} at {iova:#x}, {slots} slots:");
+    for slot in 0..slots.min(64) as usize {
+        let w = unsafe { std::slice::from_raw_parts(words.add(slot * 16), 16) };
+        if w.iter().any(|x| *x != 0) {
+            s.push_str(&format!(" [{slot}] {:08x} {:08x} {:08x} {:08x} {:08x}", w[0], w[1], w[2], w[4], w[5]));
+        }
+    }
+    s
+}
+
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2 + 8);
+    for c in bytes.chunks(4) {
+        for b in c.iter().rev() {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s.push(' ');
+    }
+    s
+}

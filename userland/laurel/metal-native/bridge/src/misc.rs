@@ -78,7 +78,11 @@ pub unsafe extern "C" fn nmb_device_answer(_d: *const NmbDevice, selector: *cons
     guard(false, || {
         let want = unsafe { CStr::from_ptr(selector) };
         let row = answers().iter().find(|r| r.selector.as_c_str() == want).ok_or_else(|| format!("no answer for {want:?}"))?;
-        let v = if row.kind >= 2 { *row.args.get(&arg).unwrap_or(&0) } else { row.value.ok_or_else(|| format!("{want:?} has no answer on this device"))? };
+        let mut v = if row.kind >= 2 { *row.args.get(&arg).unwrap_or(&0) } else { row.value.ok_or_else(|| format!("{want:?} has no answer on this device"))? };
+        // this stack samples linear memory as it lies, and an a6xx reads a pitch of 64 bytes at the least (fdl6_layout). The default stack can copy behind the caller's back: the table's 16 is its answer. A caller that asks gets rows this GPU can read: SpringBoard's icons came with rows of 240 and 400 [V log]
+        if want.to_bytes().starts_with(b"minimumLinearTextureAlignmentForPixelFormat") || want.to_bytes().starts_with(b"minimumTextureBufferAlignmentForPixelFormat") {
+            v = v.max(64);
+        }
         unsafe { *out = v };
         Ok(true)
     })

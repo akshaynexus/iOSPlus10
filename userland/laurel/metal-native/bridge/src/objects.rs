@@ -252,6 +252,7 @@ pub struct NmbComputePipeline {
 /// The translator's pipeline; the fixed state of its descriptor; its programs per bind shape (a plan and a specialization: the second use is a lookup).
 pub struct NmbRenderPipeline {
     pub(crate) key: String,
+    pub(crate) names: String,
     pub(crate) pipeline: std::sync::Arc<metal2vulkan::pipeline::RenderPipeline>,
     pub(crate) fixed: PipelineFixed,
     pub(crate) device: *const NmbDevice,
@@ -512,7 +513,9 @@ pub extern "C" fn nmb_render_pipeline_new(d: *mut NmbDevice, descriptor: *const 
                 }
             }
         }
-        Ok(boxed(NmbRenderPipeline { key, pipeline: std::sync::Arc::new(pipeline), fixed, device: d, plans: std::sync::Mutex::new(std::collections::HashMap::new()) }))
+        let function_name = |f: *mut NmbFunction| get(f).map_or(String::new(), |x| x.0.function.info().name.to_string());
+        let names = format!("{} + {}", function_name(source.vertex), function_name(source.fragment));
+        Ok(boxed(NmbRenderPipeline { key, names, pipeline: std::sync::Arc::new(pipeline), fixed, device: d, plans: std::sync::Mutex::new(std::collections::HashMap::new()) }))
     })
 }
 

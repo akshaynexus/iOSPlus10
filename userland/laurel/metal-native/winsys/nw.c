@@ -376,8 +376,11 @@ struct nw_bo *nw_bo_import_host(struct nw_device *d, void *pointer, uint64_t siz
 {
 	struct nw_userptr_request r = {.pointer = (uint64_t)(uintptr_t)pointer, .size = size, .flags = read_only ? 1u : 0u};
 	struct nw_bo *b;
-	if (d->ops->call(d->ctx, NW_SEL_USERPTR, &r, sizeof(r)) != 0)
+	const int e = d->ops->call(d->ctx, NW_SEL_USERPTR, &r, sizeof(r));
+	if (e != 0) {
+		snprintf(d->refusal, sizeof(d->refusal), "errno %d", e);
 		return NULL;
+	}
 	b = calloc(1, sizeof(*b));
 	if (b == NULL || bo_iova(d, r.handle, &b->iova) != 0) {
 		bo_close_handle(d, r.handle);
