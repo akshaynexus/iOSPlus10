@@ -1195,3 +1195,9 @@ Results [V phone, 4 runs of 8, no hang]: `scene: wait 0 status 4 error ''`; `cop
 Not proven: a texture read on the GPU (the run did not start: the phone was in another kernel's panic), an IOSurface target, the compositor.
 Next: the owner's step `ios26-native-metal.md` section 11.7; then the `refused` lines of section 11.6.
 
+
+## 2026-11-03: Mi A3 iOS 26: agents test the UI with no finger (branch `t3/ios26-ui-autotest`, not merged)
+Done [V phone, no flash]: `scripts/laurel/ios26-autotest.sh`: synthetic touch and keys reach SpringBoard (`contact 0 presence: touching`, `Sending UIEvent`), PNG of the frame on the panel, app start, sequence shot, one fixed scenario with a table. Docs: `docs/laurel_sprout/ios26-autotest.md`.
+Baseline [V], stack default, no-flash input, `NEGRONIMETAL_TEXTURE_POOL=0`: unlock 10.1 fps, Home swipe 9.5, Control Center no motion line (7 frames in 11 s), Settings scroll 4.1; 0 flash frames (surface inferred), 0 black, 0 crashes of the compositor in that run. One backboardd crash in an earlier run (07:07:45), not explained.
+Built, not booted: kernel patch 2983 (`LAUREL SYNTH`): the input through the kernel's HID path, so the CPU and GPU clock answer to touch as for a finger, and `kern.laurel_scan_surface`. iOS 26 kernel 350 patches, iOS 16 kernel 332 patches: all checks pass. Needs a flash.
+Next: the owner's goal: stable 60 fps on `native`, with the native Metal agent; each build through the fixed scenario.

@@ -16,7 +16,7 @@ scripts/laurel/ios26-autotest.sh open com.apple.Preferences
 scripts/laurel/ios26-autotest.sh home                    # an edge swipe from the bottom
 scripts/laurel/ios26-autotest.sh settle 700 8000 [change]  # waits until the picture holds still
 scripts/laurel/ios26-autotest.sh seq 60 3000             # sequence shot: frames that equal an older frame, black frames
-scripts/bg.sh autotest scripts/laurel/ios26-autotest.sh run [--only settings,safari] [--scenario FILE]
+scripts/bg.sh autotest scripts/laurel/ios26-autotest.sh run [--only home-swipe,control-center] [--scenario FILE]
 scripts/laurel/ios26-autotest.sh test                    # no phone
 ```
 
@@ -32,7 +32,7 @@ The tool never flashes, reboots, restarts a process, or changes a setting. A los
 | Frame | Finds the surfaces of 720x1560 with `IOSurfaceLookup` and reads the one on the panel. No lock (a lock can change a seed), no write, no display code | No |
 | Which surface | From the in-use marks: see below | No |
 | App start | `SBSLaunchApplicationWithIdentifier`, then `LSApplicationWorkspace` | No |
-| Kernel path for input | Patch 2983: USB command server words `touch F D X Y`, `key K D`, `synth`; `op10tool input ...`. The script takes it by itself when `op10tool input check` says `synth on`. `AUTOTEST_INPUT=ssh`: not this way | **Yes. Built, not booted** |
+| Kernel path for input | Patch 2983: USB command server words `touch F D X Y`, `key K D`, `synth`; `op10tool input ...`. The script takes it by itself when `op10tool input check` says `synth on`. `AUTOTEST_INPUT=ssh`: not this way; use it to compare with runs before the flash | **Yes. Built, not booted** |
 | Exact surface | Patch 2983: `kern.laurel_scan_surface`, written after the latch. The tool reads it first | **Yes. Built, not booted** |
 
 ### Limits
