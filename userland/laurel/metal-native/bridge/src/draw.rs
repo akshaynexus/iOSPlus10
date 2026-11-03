@@ -861,6 +861,7 @@ pub struct NmbEncoder {
     pub(crate) raster: NmnRaster,
     plan_cache: HashMap<(usize, Vec<u8>), Arc<PlanEntry>>,
     attachment_written: u32,
+    target_dirty: bool, // a draw of this pass wrote an attachment since the last flush: a draw that reads the target needs that flush
     pub(crate) compute: Option<ComputeState>,
 }
 
@@ -953,13 +954,13 @@ pub extern "C" fn nmb_render_encoder_new(c: *mut NmbCommandBuffer, d: *const Nmb
         unsafe { nw_cs_init(&mut *draws, cb.gpu.dev) };
         cb.open = true;
         let raster = default_raster(w, h);
-        Ok(boxed(NmbEncoder { cb: c, gpu: cb.gpu.clone(), kind: 0, pass: Some(PassRecord { colors, depth, depth_load: d.depth.load, clear_z: d.depth.clear[0], stencil, stencil_load: d.stencil.load, clear_s: d.stencil.clear[0] as u32, w, h, samples: d.samples.max(1) as u32 }), draws, stages: Default::default(), pipeline: None, raster, plan_cache: HashMap::new(), attachment_written: 0, compute: None }))
+        Ok(boxed(NmbEncoder { cb: c, gpu: cb.gpu.clone(), kind: 0, pass: Some(PassRecord { colors, depth, depth_load: d.depth.load, clear_z: d.depth.clear[0], stencil, stencil_load: d.stencil.load, clear_s: d.stencil.clear[0] as u32, w, h, samples: d.samples.max(1) as u32 }), draws, stages: Default::default(), pipeline: None, raster, plan_cache: HashMap::new(), attachment_written: 0, target_dirty: false, compute: None }))
     })
 }
 
 impl NmbEncoder {
     pub(crate) fn plain(cb: *mut NmbCommandBuffer, gpu: Arc<Gpu>, kind: u32, draws: Box<NwCs>) -> NmbEncoder {
-        NmbEncoder { cb, gpu, kind, pass: None, draws, stages: Default::default(), pipeline: None, raster: default_raster(1, 1), plan_cache: HashMap::new(), attachment_written: 0, compute: None }
+        NmbEncoder { cb, gpu, kind, pass: None, draws, stages: Default::default(), pipeline: None, raster: default_raster(1, 1), plan_cache: HashMap::new(), attachment_written: 0, target_dirty: false, compute: None }
     }
 }
 
@@ -1366,6 +1367,13 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
 
     let cs: *mut NwCs = &mut *e.draws;
     unsafe {
+        // In sysmem the fragment reads the target through the texture path while the pixels of the draws before it are in the CCU: Metal's rule is that it sees them. GRAS_SC_CNTL's per-overlap flush covers the primitives
+        // of one draw. Without this: wrong pixels in blocks of a cache line (RenderBox's paths: stripes, no text). In GMEM Turnip has no such need; a Vulkan self-dependency does the same.
+        if entry.baked.reads_fb && e.target_dirty {
+            nmn_cmd_barrier(cs);
+            e.target_dirty = false;
+        }
+        e.target_dirty |= entry.outputs != 0;
         // program first: its stream invalidates constants and state, and what follows is the draw's own
         nmn_cmd_program(cs, entry.baked.b as *const NmnBaked);
         let sets: Vec<u64> = set_memory.iter().map(|s| s.0).collect();
