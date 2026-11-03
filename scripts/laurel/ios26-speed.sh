@@ -2,7 +2,7 @@
 # Mi A3 iOS 26: measure what the CPU, the memory and the kernel give to one process (userland/laurel/speed). Nothing is flashed; nothing is restarted.
 #   scripts/laurel/ios26-speed.sh [all|clock|chase|copy|sys|wake|timer|fault|time] [THREADS]     builds, copies to /usr/local/bin, runs; result in logs/speed-DATE.txt
 #   scripts/laurel/ios26-speed.sh --run-only [...]                                            no build, no copy
-# Takes the phone lock for the run only (about 20 s of CPU). Needs SSH to the phone. Docs: docs/laurel_sprout/ios26-default-speed.md.
+# Takes the phone lock for the run only (about 20 s of CPU). Waits up to WAIT_S (3600) for SSH first. Docs: docs/laurel_sprout/ios26-default-speed.md.
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 . "$REPO/scripts/lib/env.sh"
@@ -11,6 +11,8 @@ SCP="sshpass -p ${IOS_PASSWORD:-alpine} scp -O -o StrictHostKeyChecking=no -o Us
 build=1
 if [ "${1:-}" = --run-only ]; then build=0; shift; fi
 what=${1:-all}; threads=${2:-8}
+up() { [ "$(timeout 10 $SSH uname -s 2>/dev/null)" = Darwin ]; }
+c=0; until up; do [ "$c" -lt "$((${WAIT_S:-3600} / 10))" ] || { echo "speed: no SSH in ${WAIT_S:-3600} s"; exit 1; }; sleep 10; c=$((c + 1)); done
 mkdir -p "$REPO/logs"
 out=$REPO/logs/speed-$(date +%Y%m%d-%H%M%S).txt
 if [ $build = 1 ]; then
