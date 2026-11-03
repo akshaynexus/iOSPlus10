@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Mi A3 iOS 26: reads `laurel-autotest sample` output: where the running threads of a process spend their time. Docs: docs/laurel_sprout/ios26-default-speed.md.
-  scripts/laurel/ios26-sample-sym.py SAMPLES [--thread N] [--top N]
+  scripts/laurel/ios26-sample-sym.py SAMPLES [--thread N] [--top N] [--under TEXT]   --under: only the callees of the first frame whose symbol holds TEXT, one level
 Symbols: NegroniMetal (dSYM of out/ios26/metal-impl), Turnip (out/ios26/gpu/turnip/build-ios), the dyld cache (scripts/laurel/dsc-image.py, kept in out/ios26/dis). Self = the pc; inclusive = anywhere on the walked stack."""
 import bisect
 import collections
@@ -94,6 +94,9 @@ def main():
     args = sys.argv[1:]
     want = None
     top = 45
+    under = None
+    if "--under" in args:
+        i = args.index("--under"); under = args[i + 1]; del args[i:i + 2]
     if "--thread" in args:
         i = args.index("--thread"); want = args[i + 1]; del args[i:i + 2]
     if "--top" in args:
@@ -124,6 +127,20 @@ def main():
         want = by_thread.most_common(1)[0][0]
     use = [s for t, s in samples if t == want]
     print(f"thread {want}: {len(use)} samples")
+    if under:
+        kids = collections.Counter()
+        hits = 0
+        for s in use:
+            names = [sym(pc) for pc in s]
+            at = next((i for i in range(len(names) - 1, -1, -1) if under in names[i]), None)
+            if at is None:
+                continue
+            hits += 1
+            kids[names[at - 1] if at > 0 else "(self)"] += 1
+        print(f"under {under}: {hits} samples, {100 * hits / len(use):.1f} % of the thread")
+        for k, v in kids.most_common(top):
+            print(f"{100 * v / hits:5.1f}  {k[:120]}")
+        return
     selfs = collections.Counter(sym(s[0]) for s in use)
     incl = collections.Counter()
     img = collections.Counter(sym(s[0]).split("[")[-1].rstrip("]") for s in use)

@@ -1,0 +1,15 @@
+laurel iOS 26: a render encoder's calls are lowered on the runtime's own thread (RenderLoweringPolicy::Worker, metal2vulkan's own): encoding took 40 % of CoreAnimation's render thread [V phone 2026-11-03]. Kill switch NEGRONIMETAL_LOWERING=call. Docs: docs/laurel_sprout/ios26-default-speed.md.
+
+--- a/phone/metal2/bridge/NativeMetalObjects.rs
++++ b/phone/metal2/bridge/NativeMetalObjects.rs
+@@ -161,6 +161,10 @@
+ pub(crate) fn negroni_policy() -> metal2vulkan::device::DevicePolicy {
+     use metal2vulkan::device::{ContainmentPolicy, DevicePolicy, GuestIsolation};
+     let mut policy = DevicePolicy::default();
++    // laurel iOS 26: a render encoder's calls lowered on the runtime's own thread: encoding took 40 % of CoreAnimation's render thread [V phone, ios26-sample-sym.py]. Kill switch NEGRONIMETAL_LOWERING=call.
++    if std::env::var("NEGRONIMETAL_LOWERING").map_or(true, |v| v != "call") {
++        policy.render_lowering = metal2vulkan::device::RenderLoweringPolicy::Worker;
++    }
+     let name = std::env::var("NEGRONIMETAL_POLICY").unwrap_or_default();
+     if name == "exact" {
+         return policy.exact_answers();

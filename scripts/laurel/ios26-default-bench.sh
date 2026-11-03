@@ -66,6 +66,11 @@ while :; do
 done
 active=$(phone "head -c 100 $DB/stack/active 2>/dev/null")
 case "$active" in default*) ;; *) say "NOT stack default: $active"; exit 3 ;; esac
+# WARMUP=1: the test once before the measure: a new Turnip file means no pipeline cache, and pipelines compiled in the middle of a motion measure the compiler.
+if [ "${WARMUP:-1}" = 1 ]; then
+  "$REPO/scripts/laurel/ios26-autotest.sh" run "$@" > /dev/null 2>&1 || true
+  say "warm-up done"
+fi
 rc=0
 t=$(mktemp)
 start=$(log_at)
@@ -74,6 +79,7 @@ cpu0=$(cpu)
 # SAMPLE_S=N: where backboardd's running threads spend their time, for N seconds (scripts/laurel/ios26-sample-sym.py logs/bench-NAME.samples)
 if [ -n "${SAMPLE_S:-}" ]; then
   phone 'for w in $(ps -ax -o pid=,comm= | grep "/backboardd$"); do /usr/local/bin/laurel-autotest sample $w '"$SAMPLE_S"' 100; break; done' > "$REPO/logs/bench-$name.samples" 2>/dev/null &
+  phone 'for w in $(ps -ax -o pid=,comm= | grep "/SpringBoard$"); do /usr/local/bin/laurel-autotest sample $w '"$SAMPLE_S"' 100; break; done' > "$REPO/logs/bench-$name.sb.samples" 2>/dev/null &
 fi
 "$REPO/scripts/laurel/ios26-autotest.sh" run "$@" 2>&1 | tee "$t" || rc=$?
 { echo "bench $name: env + ${extra[*]:-nothing}"; sed -n '/^Mi A3 iOS 26 UI test/,$p' "$t"; } > "$REPO/logs/bench-$name.txt"

@@ -12,7 +12,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#define LAUREL_ICON_GENERATION 1
+/* 2: 227 entries with no picture on the phone, all from the first compositor runs of stack native [V isdata-dump.py, 2026-11-03]: Wallet, Settings, the Dock and the Settings list.
+ * A stack that draws otherwise has a stamp of its own, so the store empties at each change of stack. */
+#ifdef NMTL_NATIVE
+#define LAUREL_ICON_GENERATION 1002
+#else
+#define LAUREL_ICON_GENERATION 2
+#endif
 #define LAUREL_ICON_STORE "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.lsd.iconscache/Library/Caches/com.apple.IconsCache"
 /* >= 0: entries removed (0: the store has this generation). -1: the store cannot be read or stamped: nothing changes for the next start's sake. */
 static inline int laurel_icon_store_refresh(const char *base, int generation)
