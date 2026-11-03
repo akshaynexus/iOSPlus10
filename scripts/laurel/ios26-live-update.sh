@@ -23,6 +23,9 @@ out/ios26/xnutils/root/usr/local/libexec/powermenu-helper|/usr/local/libexec/pow
 out/laurel/notch/root/usr/local/lib/liblaurel-notch.dylib|/usr/local/lib/liblaurel-notch.dylib|0:0|755
 out/ios26/live-jetsam.plist|/System/Library/LaunchDaemons/com.apple.jetsamproperties.N104.plist|0:0|644'
 
+# ONLY_JETSAM=1: only the limits; the stacks of ios26-metal-install-options.sh stay on the phone
+[ "${ONLY_JETSAM:-0}" != 1 ] || FILES='out/ios26/live-jetsam.plist|/System/Library/LaunchDaemons/com.apple.jetsamproperties.N104.plist|0:0|644'
+
 phone_sha() { sh_phone "shasum -a 256 '$1' 2>/dev/null || sha256sum '$1' 2>/dev/null" | cut -d' ' -f1; }
 
 old_ifs=$IFS
@@ -77,6 +80,7 @@ for line in $FILES; do
 done
 IFS=$old_ifs
 if [ $check_only = 1 ]; then say "$differ file(s) differ"; exit 0; fi
+if [ "${ONLY_JETSAM:-0}" = 1 ]; then say "done: the limits act at the next boot"; exit 0; fi
 sh_phone "printf '%s\n' '# laurel: the root list' '$LIST' > /private/var/db/negronimetal/clients && printf '%s\n' '$LIST' > /System/Library/Extensions/NegroniMetal.bundle/clients.local && rm -f /private/var/db/negronimetal/off /private/var/db/negronimetal/strikes/gpu-lost"
 say "Metal list: $LIST"
 if [ "${NO_RESTART:-0}" = 1 ]; then say "done: no restart; the files act at the next boot"; exit 0; fi
