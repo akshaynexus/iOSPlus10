@@ -36,7 +36,8 @@ PY
 TARGET="-target arm64-apple-ios16.0 -isysroot $SDK $LAUREL_CPU_FLAGS -fno-strict-aliasing -O2 -g"
 INC="@$W/flags.rsp -I$S/src/freedreno -I$S/include -I$B/src/compiler -I$S/src/compiler -I$S/src/freedreno/fdl -I$N/winsys -I$N/pm4 -I$B/src/freedreno/registers/adreno -I$B/src/freedreno/registers"
 pids=()
-clang -std=gnu11 $TARGET $INC -c "$N/shader/nmn_shader.c" -o "$W/nmn_shader.o" & pids+=($!)
+CACHE_ID=$("$REPO/scripts/laurel/native/cache-id.sh" "$REPO" "$M2V" "$S")
+clang -std=gnu11 $TARGET -DNMN_CACHE_ID="\"$CACHE_ID\"" $INC -c "$N/shader/nmn_shader.c" -o "$W/nmn_shader.o" & pids+=($!)
 clang -std=gnu11 $TARGET $INC -c "$N/winsys/nw.c" -o "$W/nw.o" & pids+=($!)
 clang -std=gnu11 $TARGET $INC -c "$N/winsys/nw_check.c" -o "$W/nw_check.o" & pids+=($!)
 clang -std=gnu11 $TARGET $INC -c "$N/winsys/winsys_iokit.c" -o "$W/winsys_iokit.o" & pids+=($!)

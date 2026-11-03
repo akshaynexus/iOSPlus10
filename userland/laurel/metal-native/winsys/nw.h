@@ -156,8 +156,8 @@ void nw_submit_end(struct nw_submit *);
 bool nw_stream_check(struct nw_device *, const uint32_t *words, uint32_t dwords, uint64_t iova, int level, char *why, size_t why_size);
 /* The registers of one submission, across its IBs: what a blit or a draw writes must fit its buffer. Program streams hold none of these registers, so a known IB2 needs no second read. */
 struct nw_check_state {
-	uint64_t dst, src, depth, mrt_base[8];
-	uint32_t dst_pitch, dst_br, src_pitch, src_br_x, src_br_y, depth_pitch, mrt_pitch[8], window_rows;
+	uint64_t dst, src, depth, stencil, mrt_base[8];
+	uint32_t dst_pitch, dst_br, src_pitch, src_br_x, src_br_y, depth_pitch, stencil_pitch, mrt_pitch[8], window_rows;
 	bool blit_solid;
 };
 bool nw_stream_check_with(struct nw_device *, struct nw_check_state *, const uint32_t *words, uint32_t dwords, uint64_t iova, int level, char *why, size_t why_size);

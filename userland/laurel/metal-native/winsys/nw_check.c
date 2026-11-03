@@ -86,6 +86,9 @@ static void shadow_reg(struct nw_check_state *st, uint32_t r, uint32_t v)
 	case NW_GRAS_2D_SRC_BR_X: st->src_br_x = v; break;
 	case NW_GRAS_2D_SRC_BR_Y: st->src_br_y = v; break;
 	case NW_GRAS_SC_WINDOW_SCISSOR_BR: st->window_rows = ((v >> 16) & 0x3fffu) + 1; break;
+	case NW_RB_STENCIL_BUFFER_PITCH: st->stencil_pitch = v << 6; break;
+	case NW_RB_STENCIL_BUFFER_BASE: st->stencil = (st->stencil & ~0xffffffffull) | v; break;
+	case NW_RB_STENCIL_BUFFER_BASE + 1: st->stencil = (st->stencil & 0xffffffffull) | ((uint64_t)v << 32); break;
 	case NW_RB_DEPTH_BUFFER_PITCH: st->depth_pitch = v << 6; break;
 	case NW_RB_DEPTH_BUFFER_BASE: st->depth = (st->depth & ~0xffffffffull) | v; break;
 	case NW_RB_DEPTH_BUFFER_BASE + 1: st->depth = (st->depth & 0xffffffffull) | ((uint64_t)v << 32); break;
@@ -126,6 +129,8 @@ static bool check_targets(struct nw_device *d, const struct nw_check_state *st, 
 	}
 	if (st->depth != 0 && !range_fits(d, st->depth, rect_bytes(st->window_rows, st->depth_pitch, 1)))
 		return refuse(why, why_size, at, "depth: %u rows, pitch %u, at %#" PRIx64 " runs past its buffer", st->window_rows, st->depth_pitch, st->depth);
+	if (st->stencil != 0 && !range_fits(d, st->stencil, rect_bytes(st->window_rows, st->stencil_pitch, 1)))
+		return refuse(why, why_size, at, "stencil: %u rows, pitch %u, at %#" PRIx64 " runs past its buffer", st->window_rows, st->stencil_pitch, st->stencil);
 	return true;
 }
 
@@ -234,6 +239,7 @@ bool nw_stream_check_with(struct nw_device *d, struct nw_check_state *st, const 
 				if (op == CP_SET_MARKER && (p[0] & 0xfu) == NW_MARKER_DIRECT_RENDER) {
 					memset(st->mrt_base, 0, sizeof(st->mrt_base));
 					st->depth = 0;
+					st->stencil = 0;
 				}
 				break;
 			case CP_REG_WRITE:

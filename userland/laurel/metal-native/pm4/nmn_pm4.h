@@ -61,7 +61,8 @@ struct nmn_color_target {
 struct nmn_pass {
 	struct nmn_color_target colors[8];
 	uint32_t color_count;
-	const struct nmn_image *depth;
+	const struct nmn_image *depth, *stencil;      /* the same image for Depth32Float_Stencil8, in its two planes */
+	uint32_t depth_level, depth_layer, stencil_level, stencil_layer;
 	bool clear_depth, clear_stencil;
 	double clear_z;
 	uint32_t clear_s;
@@ -103,6 +104,7 @@ struct nmn_raster {
 	uint32_t stencil_front, stencil_back;
 	uint32_t depth_func;    /* 7: always */
 	bool depth_write, depth_test, reads_framebuffer;
+	bool early_z;           /* tu6_build_depth_plane_z_mode: the bridge decides it per draw, from the program and this state */
 	uint32_t pass_width, pass_height;
 	bool stencil_enable;
 	uint32_t st_func[2], st_fail[2], st_zpass[2], st_zfail[2], st_read[2], st_write[2]; /* front, back; Metal's raw values */

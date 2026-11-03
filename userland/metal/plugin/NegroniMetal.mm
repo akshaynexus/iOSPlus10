@@ -1111,7 +1111,13 @@ static void *bbd_screen_check(void *arg)
 		native_bridge_metal_progress(p);
 		IOSurfaceRef screen = native_bridge_metal_copy_screen_surface();
 		if (!screen) {
-			if (now - t0 >= 240) {
+#ifdef NMTL_NATIVE
+			/* a cold start of the native stack compiles each pipeline on the render thread: 3 min [V log 07:22:04 to 07:25:20]; its disk cache makes the later starts short */
+			const double no_frame_limit = 480;
+#else
+			const double no_frame_limit = 240;
+#endif
+			if (now - t0 >= no_frame_limit) {
 				nlog(BBD_TAG ": %s: no frame on a screen surface %.0f s after the device opened (%llu command buffers completed, %llu pending)",
 #ifdef NMTL_IOS26
 				     "problem",
@@ -1123,7 +1129,7 @@ static void *bbd_screen_check(void *arg)
 				bbd_mark_off("no frame in 240 s");
 				_exit(0);
 #else
-				option_failed("no frame in 240 s");
+				option_failed("no frame on a screen surface in time");
 				return NULL;
 #endif
 			}
@@ -1177,8 +1183,14 @@ static void *bbd_screen_check(void *arg)
 			return NULL;
 		}
 #else
+#ifdef NMTL_NATIVE
+		/* a cold start: the boot screen is black with a spinner the samples miss, while the render thread compiles [V log 07:38:18] */
+		else if (now - first_lit_wait >= 240)
+			option_failed("the screen surface stayed black for 240 s after a frame");
+#else
 		else if (now - first_lit_wait >= 30)
 			option_failed("the screen surface stayed black for 30 s after a frame");
+#endif
 		if (now - t0 >= 300)
 			return NULL;
 #endif

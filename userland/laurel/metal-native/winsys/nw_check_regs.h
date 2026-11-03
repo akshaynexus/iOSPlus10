@@ -14,6 +14,8 @@
 #define NW_GRAS_SC_WINDOW_SCISSOR_BR    0x80f1u
 #define NW_RB_DEPTH_BUFFER_PITCH        0x8873u
 #define NW_RB_DEPTH_BUFFER_BASE         0x8875u
+#define NW_RB_STENCIL_BUFFER_PITCH      0x8882u
+#define NW_RB_STENCIL_BUFFER_BASE       0x8884u
 #define NW_RB_MRT                       0x8820u  /* 8 registers each: pitch + 3, base + 5 */
 #define NW_MARKER_DIRECT_RENDER         1u
 #endif

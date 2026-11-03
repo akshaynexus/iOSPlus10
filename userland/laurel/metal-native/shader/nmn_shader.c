@@ -468,6 +468,8 @@ static bool finish_stage(struct nmn_compiler *c, const struct nmn_layout *layout
 	i->loops = v->loops;
 	i->instrlen = v->instrlen;
 	i->has_kill = v->has_kill;
+	i->early_tests = v->fs.early_fragment_tests;
+	i->no_early_z = v->writes_pos || v->no_earlyz || v->writes_stencilref || v->writes_smask;  /* tu_shader.cc force_late_z */
 	i->writes_z = v->writes_pos;
 	i->needs_full_quad = v->need_full_quad;
 	i->color_outputs = 0;
@@ -552,42 +554,14 @@ struct nmn_program *nmn_program_load(struct nmn_compiler *c, const void *data, s
 	return p;
 }
 
-#ifdef __APPLE__
-#include <dlfcn.h>
-#include <mach-o/loader.h>
-const char *nmn_cache_id(void)
-{
-	static char id[40];
-	if (id[0] != 0)
-		return id;
-	Dl_info info;
-	snprintf(id, sizeof(id), "no-uuid");
-	if (dladdr((const void *)nmn_cache_id, &info) != 0 && info.dli_fbase != NULL) {
-		const struct mach_header_64 *h = info.dli_fbase;
-		const struct load_command *lc = (const struct load_command *)(h + 1);
-		for (uint32_t i = 0; i < h->ncmds; i++) {
-			if (lc->cmd == LC_UUID) {
-				const uint8_t *u = ((const struct uuid_command *)lc)->uuid;
-				for (int b = 0; b < 16; b++)
-					snprintf(id + b * 2, sizeof(id) - b * 2, "%02x", u[b]);
-				break;
-			}
-			lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
-		}
-	}
-	return id;
-}
-#else
-#include <sys/stat.h>
-const char *nmn_cache_id(void)
-{
-	static char id[40];
-	struct stat st;
-	if (id[0] == 0)
-		snprintf(id, sizeof(id), "%llx-%llx", stat("/proc/self/exe", &st) == 0 ? (unsigned long long)st.st_size : 0ull, stat("/proc/self/exe", &st) == 0 ? (unsigned long long)st.st_mtime : 0ull);
-	return id;
-}
+/* A hash of what the compile path is made from (the build scripts: this file, compile.rs, the translator's and Mesa's versions). A change in the stream code keeps the cache; a change here starts a new one. */
+#ifndef NMN_CACHE_ID
+#error NMN_CACHE_ID: scripts/laurel/native/cache-id.sh
 #endif
+const char *nmn_cache_id(void)
+{
+	return NMN_CACHE_ID;
+}
 
 struct nmn_program *nmn_program_render(struct nmn_compiler *c, const struct nmn_layout *layout, const struct nmn_stage_input *vertex, const struct nmn_stage_input *fragment, char *why, size_t why_size)
 {

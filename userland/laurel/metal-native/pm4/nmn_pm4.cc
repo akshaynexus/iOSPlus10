@@ -26,6 +26,7 @@
 static_assert(NW_RB_2D_BLIT_CNTL == REG_A6XX_RB_2D_BLIT_CNTL && NW_RB_2D_BLIT_CNTL_SOLID == A6XX_RB_2D_BLIT_CNTL_SOLID_COLOR && NW_RB_2D_DST == REG_A6XX_RB_2D_DST && NW_RB_2D_DST_PITCH == REG_A6XX_RB_2D_DST_PITCH, "nw_check_regs.h");
 static_assert(NW_GRAS_2D_DST_BR == REG_A6XX_GRAS_2D_DST_BR && NW_GRAS_2D_SRC_BR_X == REG_A6XX_GRAS_2D_SRC_BR_X && NW_GRAS_2D_SRC_BR_Y == REG_A6XX_GRAS_2D_SRC_BR_Y && NW_SP_PS_2D_SRC == REG_A6XX_SP_PS_2D_SRC && NW_SP_PS_2D_SRC_PITCH == REG_A6XX_SP_PS_2D_SRC_PITCH, "nw_check_regs.h");
 static_assert(NW_GRAS_SC_WINDOW_SCISSOR_BR == REG_A6XX_GRAS_SC_WINDOW_SCISSOR_BR && NW_RB_DEPTH_BUFFER_PITCH == REG_A6XX_RB_DEPTH_BUFFER_PITCH && NW_RB_DEPTH_BUFFER_BASE == REG_A6XX_RB_DEPTH_BUFFER_BASE && NW_RB_MRT == REG_A6XX_RB_MRT(0) && NW_MARKER_DIRECT_RENDER == RM6_DIRECT_RENDER, "nw_check_regs.h");
+static_assert(NW_RB_STENCIL_BUFFER_PITCH == REG_A6XX_RB_STENCIL_BUFFER_PITCH && NW_RB_STENCIL_BUFFER_BASE == REG_A6XX_RB_STENCIL_BUFFER_BASE, "nw_check_regs.h");
 static_assert(A6XX_SP_PS_2D_SRC_PITCH_PITCH__SHIFT == 9 && A6XX_GRAS_SC_WINDOW_SCISSOR_BR_Y__SHIFT == 16, "nw_check_regs.h");
 
 struct fd_reg_pair {
@@ -63,6 +64,8 @@ struct nmn_gpu {
 struct nmn_image {
 	struct nmn_gpu *gpu;
 	struct fdl_layout layout;
+	struct fdl_layout stencil;      /* Z32_FLOAT_S8X24: the stencil plane, after the depth plane (tu_image.cc): layout is then the depth plane's */
+	uint64_t stencil_offset;        /* 0: one plane */
 	uint32_t format;
 	enum nmn_image_type type;
 	uint32_t layers;
@@ -241,6 +244,7 @@ uint32_t nmn_format_from_metal(uint64_t f)
 	case 253: return PIPE_FORMAT_S8_UINT;
 	case 255: return PIPE_FORMAT_Z24_UNORM_S8_UINT;
 	case 260: return PIPE_FORMAT_Z32_FLOAT_S8X24_UINT;
+	case 261: return PIPE_FORMAT_X32_S8X24_UINT;
 	default: return PIPE_FORMAT_NONE;
 	}
 }
@@ -266,14 +270,26 @@ struct nmn_image *nmn_image_new(struct nmn_gpu *g, uint32_t format, enum nmn_ima
 		pl = &plane;
 	}
 	im->layout.ubwc = false;        /* the first version has no UBWC: fewer flushes to get right, and an erratum to read first (doc section 5) */
-	if (!fdl6_layout(&im->layout, &g->info, (enum pipe_format)format, samples, width, height, depth, levels, layers, type == NMN_IMAGE_3D, false, false, pl)) {
+	/* a depth or stencil target is tiled: RB_DEPTH_BUFFER_INFO and RB_STENCIL_INFO say TILE6_3 (tu6_emit_zs) */
+	if (util_format_is_depth_or_stencil((enum pipe_format)format) && stride == 0)
+		im->layout.tile_mode = TILE6_3;
+	const bool separate = format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT;
+	if (!fdl6_layout(&im->layout, &g->info, separate ? PIPE_FORMAT_Z32_FLOAT : (enum pipe_format)format, samples, width, height, depth, levels, layers, type == NMN_IMAGE_3D, false, false, pl)) {
 		free(im);
 		return NULL;
+	}
+	if (separate) {
+		im->stencil.tile_mode = TILE6_3;
+		if (!fdl6_layout(&im->stencil, &g->info, PIPE_FORMAT_S8_UINT, samples, width, height, depth, levels, layers, type == NMN_IMAGE_3D, false, false, NULL)) {
+			free(im);
+			return NULL;
+		}
+		im->stencil_offset = ALIGN(im->layout.size, 4096);
 	}
 	return im;
 }
 void nmn_image_free(struct nmn_image *im) { free(im); }
-uint64_t nmn_image_size(const struct nmn_image *im) { return im->layout.size; }
+uint64_t nmn_image_size(const struct nmn_image *im) { return im->stencil_offset ? im->stencil_offset + im->stencil.size : im->layout.size; }
 uint32_t nmn_image_pitch(const struct nmn_image *im, uint32_t level) { return fdl_pitch(&im->layout, level); }
 uint64_t nmn_image_layer_offset(const struct nmn_image *im, uint32_t level, uint32_t layer) { return fdl_surface_offset(&im->layout, level, layer); }
 uint32_t nmn_image_format(const struct nmn_image *im) { return im->format; }
@@ -291,6 +307,16 @@ void nmn_descriptor_image(const struct nmn_image *im, uint32_t format, enum nmn_
 	struct fdl_view_args args = {};
 	args.chip = 6;
 	args.iova = im->iova;
+	/* the plane this view reads: Depth32Float_Stencil8 as depth, X32_Stencil8 as stencil (tu_image_view_init) */
+	if (im->stencil_offset != 0) {
+		if (format == PIPE_FORMAT_X32_S8X24_UINT) {
+			l = &im->stencil;
+			args.iova = im->iova + im->stencil_offset;
+			format = PIPE_FORMAT_S8_UINT;
+		} else {
+			format = PIPE_FORMAT_Z32_FLOAT;
+		}
+	}
 	args.base_miplevel = base_level;
 	args.level_count = levels;
 	args.base_array_layer = base_layer;
@@ -515,15 +541,20 @@ static void clear_values(enum pipe_format f, enum a6xx_2d_ifmt ifmt, const doubl
 	}
 }
 
-static void r2d_dst_image(struct nw_cs *cs, const struct nmn_image *im, uint32_t level, uint32_t layer, enum pipe_format f, enum a6xx_format fmt)
+static void r2d_dst_plane(struct nw_cs *cs, const struct fdl_layout *l, uint64_t iova, uint32_t level, uint32_t layer, enum pipe_format f, enum a6xx_format fmt)
 {
-	REGS(cs, A6XX_RB_2D_DST_INFO(.color_format = fmt, .tile_mode = tile_of(&im->layout, level), .color_swap = fd6_color_swap(f, tile_of(&im->layout, level), false), .srgb = util_format_is_srgb(f), .samples = (enum a3xx_msaa_samples)util_logbase2(im->layout.nr_samples)),
-	     A6XX_RB_2D_DST(.qword = im->iova + fdl_surface_offset(&im->layout, level, layer)),
-	     A6XX_RB_2D_DST_PITCH(fdl_pitch(&im->layout, level)));
+	REGS(cs, A6XX_RB_2D_DST_INFO(.color_format = fmt, .tile_mode = tile_of(l, level), .color_swap = fd6_color_swap(f, tile_of(l, level), false), .srgb = util_format_is_srgb(f), .samples = (enum a3xx_msaa_samples)util_logbase2(l->nr_samples)),
+	     A6XX_RB_2D_DST(.qword = iova + fdl_surface_offset(l, level, layer)),
+	     A6XX_RB_2D_DST_PITCH(fdl_pitch(l, level)));
 	pkt4(cs, REG_A6XX_RB_2D_DST_FLAGS, 3);
 	nw_cs_emit(cs, 0);
 	nw_cs_emit(cs, 0);
 	nw_cs_emit(cs, 0);
+}
+
+static void r2d_dst_image(struct nw_cs *cs, const struct nmn_image *im, uint32_t level, uint32_t layer, enum pipe_format f, enum a6xx_format fmt)
+{
+	r2d_dst_plane(cs, &im->layout, im->iova, level, layer, f, fmt);
 }
 
 /* A 2D write reaches memory and the next read through the texture cache sees it (Turnip: FD_CCU_CLEAN_COLOR, FD_CCU_INVALIDATE_COLOR, FD_CACHE_INVALIDATE, WFI). */
@@ -536,9 +567,9 @@ static void flush_color(struct nw_cs *cs)
 }
 
 /* tu_clear_sysmem_attachment over r2d */
-static void clear_image(struct nw_cs *cs, const struct nmn_image *im, enum pipe_format f, uint32_t level, uint32_t layer, uint32_t w, uint32_t h, const uint32_t solid[4], enum a6xx_2d_ifmt ifmt)
+static void clear_plane(struct nw_cs *cs, const struct fdl_layout *l, uint64_t iova, enum pipe_format f, uint32_t level, uint32_t layer, uint32_t w, uint32_t h, const uint32_t solid[4], enum a6xx_2d_ifmt ifmt)
 {
-	enum a6xx_tile_mode tile = tile_of(&im->layout, level);
+	enum a6xx_tile_mode tile = tile_of(l, level);
 	enum a6xx_format fmt = fd6_color_format(f, tile);
 	r2d_common(cs, f, fmt, ifmt, true);
 	REGS(cs, A6XX_GRAS_2D_DST_TL(.x = 0, .y = 0), A6XX_GRAS_2D_DST_BR(.x = w - 1, .y = h - 1));
@@ -546,9 +577,14 @@ static void clear_image(struct nw_cs *cs, const struct nmn_image *im, enum pipe_
 	pkt4(cs, REG_A6XX_RB_2D_SRC_SOLID_C0, 4);
 	for (int i = 0; i < 4; i++)
 		nw_cs_emit(cs, solid[i]);
-	r2d_dst_image(cs, im, level, layer, f, fmt);
+	r2d_dst_plane(cs, l, iova, level, layer, f, fmt);
 	pkt7(cs, CP_BLIT, 1);
 	nw_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
+}
+
+static void clear_image(struct nw_cs *cs, const struct nmn_image *im, enum pipe_format f, uint32_t level, uint32_t layer, uint32_t w, uint32_t h, const uint32_t solid[4], enum a6xx_2d_ifmt ifmt)
+{
+	clear_plane(cs, &im->layout, im->iova, f, level, layer, w, h, solid, ifmt);
 }
 
 void nmn_cmd_pass_begin(struct nw_cs *cs, struct nmn_gpu *g, const struct nmn_pass *p)
@@ -588,12 +624,17 @@ void nmn_cmd_pass_begin(struct nw_cs *cs, struct nmn_gpu *g, const struct nmn_pa
 		clear_image(cs, c->image, f, c->level, c->layer, w, h, solid, ifmt);
 		any_clear = true;
 	}
-	if (p->depth != NULL && (p->clear_depth || p->clear_stencil)) {
-		enum pipe_format f = (enum pipe_format)p->depth->format;
-		uint32_t solid[4] = {fui((float)p->clear_z), p->clear_s, 0, 0};
-		if (p->clear_depth)
-			clear_image(cs, p->depth, PIPE_FORMAT_Z32_FLOAT, 0, 0, w, h, solid, R2D_FLOAT32);
-		(void)f;
+	/* depth and stencil clears go through the 2D engine, one plane each (tu_clear_sysmem_attachment); Depth24Unorm_Stencil8 is not on this path: Metal has no such target on iOS */
+	if (p->depth != NULL && p->clear_depth) {
+		const struct nmn_image *d = p->depth;
+		const uint32_t solid[4] = {d->format == PIPE_FORMAT_Z16_UNORM ? (uint32_t)(CLAMP(p->clear_z, 0.0, 1.0) * 65535.0 + 0.5) : fui((float)p->clear_z), 0, 0, 0};
+		clear_plane(cs, &d->layout, d->iova, d->format == PIPE_FORMAT_Z16_UNORM ? PIPE_FORMAT_Z16_UNORM : PIPE_FORMAT_Z32_FLOAT, p->depth_level, p->depth_layer, w, h, solid, d->format == PIPE_FORMAT_Z16_UNORM ? R2D_UNORM8 : R2D_FLOAT32);
+		any_clear = true;
+	}
+	if (p->stencil != NULL && p->clear_stencil) {
+		const struct nmn_image *x = p->stencil;
+		const uint32_t solid[4] = {p->clear_s & 0xff, 0, 0, 0};
+		clear_plane(cs, x->stencil_offset ? &x->stencil : &x->layout, x->iova + x->stencil_offset, PIPE_FORMAT_S8_UINT, p->stencil_level, p->stencil_layer, w, h, solid, R2D_INT8);
 		any_clear = true;
 	}
 	if (any_clear)
@@ -603,17 +644,33 @@ void nmn_cmd_pass_begin(struct nw_cs *cs, struct nmn_gpu *g, const struct nmn_pa
 	if (p->depth == NULL) {
 		REGS(cs, RB_DEPTH_BUFFER_INFO(CHIP, .depth_format = DEPTH6_NONE), A6XX_RB_DEPTH_BUFFER_PITCH(0), A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH(0), A6XX_RB_DEPTH_BUFFER_BASE(0), A6XX_RB_DEPTH_BUFFER_BASE_GMEM(0));
 		REGS(cs, A6XX_GRAS_SU_DEPTH_BUFFER_INFO(.depth_format = DEPTH6_NONE));
-		REGS(cs, RB_STENCIL_INFO(CHIP, 0));
 	} else {
 		const struct nmn_image *d = p->depth;
+		const struct fdl_layout *l = &d->layout;
 		enum a6xx_depth_format fmt = d->format == PIPE_FORMAT_Z16_UNORM ? DEPTH6_16 : d->format == PIPE_FORMAT_Z24_UNORM_S8_UINT ? DEPTH6_24_8 : DEPTH6_32;
 		pkt4(cs, REG_A6XX_RB_DEPTH_BUFFER_INFO, 6);
 		nw_cs_emit(cs, RB_DEPTH_BUFFER_INFO(CHIP, .depth_format = fmt, .tilemode = TILE6_3).value);
-		nw_cs_emit(cs, A6XX_RB_DEPTH_BUFFER_PITCH(fdl_pitch(&d->layout, 0)).value);
-		nw_cs_emit(cs, A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH(fdl_layer_stride(&d->layout, 0)).value);
-		nw_cs_emit_qw(cs, d->iova);
+		nw_cs_emit(cs, A6XX_RB_DEPTH_BUFFER_PITCH(fdl_pitch(l, p->depth_level)).value);
+		nw_cs_emit(cs, A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH(fdl_layer_stride(l, p->depth_level)).value);
+		nw_cs_emit_qw(cs, d->iova + fdl_surface_offset(l, p->depth_level, p->depth_layer));
 		nw_cs_emit(cs, 0);
 		REGS(cs, A6XX_GRAS_SU_DEPTH_BUFFER_INFO(.depth_format = fmt));
+		pkt4(cs, REG_A6XX_RB_DEPTH_FLAG_BUFFER_BASE, 3);
+		nw_cs_emit(cs, 0);
+		nw_cs_emit(cs, 0);
+		nw_cs_emit(cs, 0);
+	}
+	/* a stencil plane of its own: Depth32Float_Stencil8 or Stencil8 (tu6_emit_zs) */
+	if (p->stencil != NULL) {
+		const struct nmn_image *x = p->stencil;
+		const struct fdl_layout *l = x->stencil_offset ? &x->stencil : &x->layout;
+		pkt4(cs, REG_A6XX_RB_STENCIL_INFO, 6);
+		nw_cs_emit(cs, RB_STENCIL_INFO(CHIP, .separate_stencil = true, .tilemode = TILE6_3).value);
+		nw_cs_emit(cs, A6XX_RB_STENCIL_BUFFER_PITCH(fdl_pitch(l, p->stencil_level)).value);
+		nw_cs_emit(cs, A6XX_RB_STENCIL_BUFFER_ARRAY_PITCH(fdl_layer_stride(l, p->stencil_level)).value);
+		nw_cs_emit_qw(cs, x->iova + x->stencil_offset + fdl_surface_offset(l, p->stencil_level, p->stencil_layer));
+		nw_cs_emit(cs, 0);
+	} else {
 		REGS(cs, RB_STENCIL_INFO(CHIP, 0));
 	}
 
@@ -1380,7 +1437,14 @@ void nmn_cmd_raster(struct nw_cs *cs, const struct nmn_raster *r)
 		REGS(cs, A6XX_GRAS_SU_STENCIL_CNTL(.stencil_enable = false));
 		REGS(cs, A6XX_RB_STENCILMASK(.mask = 0xff, .bfmask = 0xff), A6XX_RB_STENCILWRMASK(.wrmask = 0xff, .bfwrmask = 0xff), A6XX_RB_STENCILREF(.ref = r->stencil_front, .bfref = r->stencil_back));
 	}
-	REGS(cs, A6XX_RB_Z_BOUNDS_MIN(0.0f), A6XX_RB_Z_BOUNDS_MAX(1.0f));
+	/* Metal has no bounds test: not read. The values as Turnip's state leaves them, so that the comparison stays exact */
+	REGS(cs, A6XX_RB_Z_BOUNDS_MIN(0.0f), A6XX_RB_Z_BOUNDS_MAX(r->depth_test ? 0.0f : 1.0f));
+	/* early Z saves the fragment work of what the depth test rejects: a shader's whole cost on this GPU */
+	{
+		const enum a6xx_ztest_mode z = r->early_z ? A6XX_EARLY_Z : A6XX_LATE_Z;
+		REGS(cs, A6XX_GRAS_SU_DEPTH_PLANE_CNTL(.z_mode = z));
+		REGS(cs, A6XX_RB_DEPTH_PLANE_CNTL(.z_mode = z));
+	}
 	REGS(cs, A6XX_RB_LRZ_CNTL());
 	pkt4(cs, REG_A6XX_RB_BLEND_RED_F32, 4);
 	nw_cs_emit(cs, fui(r->blend_color[0]));

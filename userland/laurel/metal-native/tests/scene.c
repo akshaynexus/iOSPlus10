@@ -263,6 +263,10 @@ int main(int argc, char **argv)
 		pd.colors[0].source_alpha = 1;
 		pd.colors[0].destination_alpha = 5;
 	}
+	/* NMN_SCENE_DEPTH: Depth32Float_Stencil8 as RenderBox asks for it, compared against Turnip: a depth test, a stencil test, both cleared */
+	const bool with_depth = getenv("NMN_SCENE_DEPTH") != NULL;
+	if (with_depth)
+		pd.depth_format = pd.stencil_format = 260;
 	pd.samples = 1;
 	pd.rasterization = 1;
 	pd.vertex_inputs = 1;
@@ -323,11 +327,28 @@ int main(int argc, char **argv)
 	rp.height = 1560;
 	rp.array_length = 1;
 	rp.samples = 1;
+	NmbDepthStencil *zs = NULL;
+	if (with_depth) {
+		struct NmbTextureDescriptor zd = {.type = 2, .format = 260, .width = 720, .height = 1560, .depth = 1, .levels = 1, .samples = 1, .array_length = 1, .usage = 4, .options = 2u << 4};
+		NmbTexture *z = nmb_texture_new(dev, &zd);
+		if (z == NULL)
+			FAIL("depth texture");
+		rp.depth.texture = rp.stencil.texture = z;
+		rp.depth.load = rp.stencil.load = 2;
+		rp.depth.clear[0] = 1.0;
+		rp.stencil.clear[0] = 7;
+		struct NmbDepthStencilDescriptor zsd = {.compare = 1 /* less */, .write = 1, .front = {.compare = 7, .failure = 0, .depth_failure = 0, .pass = 2 /* replace */, .read_mask = 0xff, .write_mask = 0xff}, .back = {.compare = 7, .failure = 0, .depth_failure = 0, .pass = 2, .read_mask = 0xff, .write_mask = 0xff}};
+		zs = nmb_depth_stencil_new(dev, &zsd);
+		if (zs == NULL)
+			FAIL("depth state");
+	}
 	NmbEncoder *en = nmb_render_encoder_new(cb, &rp);
 	if (en == NULL)
 		FAIL("render encoder");
 	if (!nmb_render_set_pipeline(en, pipe))
 		FAIL("set pipeline");
+	if (zs != NULL && !nmb_render_set_depth_stencil(en, zs))
+		FAIL("set depth state");
 	const double viewport[6] = {0, 0, 720, 1560, 0, 1};
 	const uint64_t scissor[4] = {0, 0, 720, 1560};
 	nmb_render_set_viewport(en, viewport);

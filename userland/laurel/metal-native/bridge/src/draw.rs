@@ -321,7 +321,7 @@ pub(crate) fn new_texture(gpu: &Arc<Gpu>, d: &NmbTextureDescriptor, over: Option
     let layers = if d.kind == 5 || d.kind == 6 { (d.array_length.max(1) * 6) as u32 } else { d.array_length.max(1) as u32 };
     let image = unsafe { nmn_image_new(gpu.gpu, pipe, kind, d.width as u32, d.height.max(1) as u32, d.depth.max(1) as u32, d.levels.max(1) as u32, layers, d.samples.max(1) as u32, tiled, stride) };
     if image.is_null() {
-        return Err("no layout for this texture".into());
+        return Err(format!("no layout for a texture of format {} {} x {}, {} levels, row bytes {}", d.format, d.width, d.height, d.levels, stride));
     }
     let size = unsafe { nmn_image_size(image) };
     let mut memory = None;
@@ -798,10 +798,12 @@ pub(crate) struct ComputeState {
 
 struct PassRecord {
     colors: Vec<Option<(Arc<TextureObj>, u64, u64, u64, u64, [f64; 4])>>,
-    depth: Option<Arc<TextureObj>>,
+    depth: Option<(Arc<TextureObj>, u32, u32)>,
     depth_load: u64,
-    depth_store: u64,
     clear_z: f64,
+    stencil: Option<(Arc<TextureObj>, u32, u32)>,
+    stencil_load: u64,
+    clear_s: u32,
     w: u32,
     h: u32,
     samples: u32,
@@ -848,7 +850,22 @@ pub extern "C" fn nmb_render_encoder_new(c: *mut NmbCommandBuffer, d: *const Nmb
         while colors.last().is_some_and(|c| c.is_none()) {
             colors.pop();
         }
-        let depth = if d.depth.texture.is_null() { None } else { Some(get(d.depth.texture)?.t.clone()) };
+        // depth and stencil: a level and a slice of their own; one texture for both when it is Depth32Float_Stencil8
+        let plane = |a: &NmbPassAttachment| -> Result<Option<(Arc<TextureObj>, u32, u32)>, String> {
+            if a.texture.is_null() {
+                return Ok(None);
+            }
+            let t = get(a.texture)?.t.clone();
+            let (level, layer) = (t.base_level + a.level as u32, t.base_layer + (a.slice + a.depth_plane) as u32);
+            Ok(Some((t, level, layer)))
+        };
+        let depth = plane(&d.depth)?;
+        let stencil = plane(&d.stencil)?;
+        if let Some((t, ..)) = &depth {
+            if t.pipe_format == unsafe { nmn_format_from_metal(253) } {
+                return Err("a Stencil8 texture as the depth attachment".into());
+            }
+        }
         // Metal's renderTargetWidth and renderTargetHeight stay 0 unless the caller sets them, and CoreAnimation leaves them: 0 is the attachments' size. Taken as it is, w - 1 made a clear of 16384 x 16384 that ran past a small surface: the hang of the first compositor run (FAR 0x1008000, 0x1068000). A size above an attachment's is cut to it: a target must not be written past its end.
         let (w, h) = match smallest {
             Some((sw, sh)) => (if d.width == 0 { sw } else { d.width.min(sw) }, if d.height == 0 { sh } else { d.height.min(sh) }),
@@ -860,7 +877,7 @@ pub extern "C" fn nmb_render_encoder_new(c: *mut NmbCommandBuffer, d: *const Nmb
         unsafe { nw_cs_init(&mut *draws, cb.gpu.dev) };
         cb.open = true;
         let raster = default_raster(w, h);
-        Ok(boxed(NmbEncoder { cb: c, gpu: cb.gpu.clone(), kind: 0, pass: Some(PassRecord { colors, depth, depth_load: d.depth.load, depth_store: d.depth.store, clear_z: d.depth.clear[0], w, h, samples: d.samples.max(1) as u32 }), draws, stages: Default::default(), pipeline: None, raster, plan_cache: HashMap::new(), attachment_written: 0, compute: None }))
+        Ok(boxed(NmbEncoder { cb: c, gpu: cb.gpu.clone(), kind: 0, pass: Some(PassRecord { colors, depth, depth_load: d.depth.load, clear_z: d.depth.clear[0], stencil, stencil_load: d.stencil.load, clear_s: d.stencil.clear[0] as u32, w, h, samples: d.samples.max(1) as u32 }), draws, stages: Default::default(), pipeline: None, raster, plan_cache: HashMap::new(), attachment_written: 0, compute: None }))
     })
 }
 
@@ -871,7 +888,7 @@ impl NmbEncoder {
 }
 
 pub(crate) fn default_raster(w: u32, h: u32) -> NmnRaster {
-    NmnRaster { viewport: [0.0, 0.0, w as f64, h as f64, 0.0, 1.0], scissor: [0, 0, w, h], cull_mode: 0, winding: 0, fill_mode: 0, depth_bias: 0.0, slope_scale: 0.0, bias_clamp: 0.0, line_width: 1.0, blend_color: [0.0; 4], stencil_front: 0, stencil_back: 0, depth_func: 7, depth_write: false, depth_test: false, reads_framebuffer: false, pass_width: w, pass_height: h, stencil_enable: false, st_func: [7, 7], st_fail: [0, 0], st_zpass: [0, 0], st_zfail: [0, 0], st_read: [0xff, 0xff], st_write: [0xff, 0xff] }
+    NmnRaster { early_z: false, viewport: [0.0, 0.0, w as f64, h as f64, 0.0, 1.0], scissor: [0, 0, w, h], cull_mode: 0, winding: 0, fill_mode: 0, depth_bias: 0.0, slope_scale: 0.0, bias_clamp: 0.0, line_width: 1.0, blend_color: [0.0; 4], stencil_front: 0, stencil_back: 0, depth_func: 7, depth_write: false, depth_test: false, reads_framebuffer: false, pass_width: w, pass_height: h, stencil_enable: false, st_func: [7, 7], st_fail: [0, 0], st_zpass: [0, 0], st_zfail: [0, 0], st_read: [0xff, 0xff], st_write: [0xff, 0xff] }
 }
 
 fn stage_index(stage: u32) -> Result<usize, String> {
@@ -1224,6 +1241,18 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
         }
         let mut raster = e.raster;
         raster.reads_framebuffer = entry.baked.reads_fb;
+        // a state's depth or stencil test acts only on a pass that has that attachment (Metal's rule)
+        let (has_depth, has_stencil) = e.pass.as_ref().map_or((false, false), |p| (p.depth.is_some(), p.stencil.is_some()));
+        raster.depth_test &= has_depth;
+        raster.depth_write &= has_depth;
+        raster.stencil_enable &= has_stencil;
+        // tu6_build_depth_plane_z_mode: late when the fragment can be killed after it wrote, when the shader writes depth, and when no depth test runs
+        let fs = entry.baked.program.stage_info(1);
+        let stencil_writes = raster.stencil_enable && (0..2).any(|i| raster.st_write[i] != 0 && (raster.st_fail[i] != 0 || raster.st_zpass[i] != 0 || raster.st_zfail[i] != 0));
+        let writes = (raster.depth_test && raster.depth_write) || stencil_writes;
+        let stencil_only = e.pass.as_ref().and_then(|p| p.stencil.as_ref()).is_some_and(|x| x.0.pipe_format == nmn_format_from_metal(253));
+        let (kill, late, early_tests) = fs.map_or((false, false, false), |i| (i.has_kill, i.no_early_z, i.early_tests));
+        raster.early_z = early_tests || (raster.depth_test && !(kill && writes) && !late && !stencil_only);
         nmn_cmd_raster(cs, &raster);
         // the push range of each stage
         for w in &commands.push_constants {
@@ -1503,12 +1532,27 @@ pub extern "C" fn nmb_encoder_end(e: *mut NmbEncoder) -> bool {
                 }
                 cb.held_textures.push(t.clone());
             }
-            if let Some(d) = &pass.depth {
+            if let Some((d, level, layer)) = &pass.depth {
                 p.depth = d.image as *const NmnImage;
+                p.depth_level = *level;
+                p.depth_layer = *layer;
                 p.clear_depth = pass.depth_load == 2;
                 p.clear_z = pass.clear_z;
-                let _ = pass.depth_store;
+                if d.must_name() {
+                    cb.names.push(d.bo() as usize);
+                }
                 cb.held_textures.push(d.clone());
+            }
+            if let Some((x, level, layer)) = &pass.stencil {
+                p.stencil = x.image as *const NmnImage;
+                p.stencil_level = *level;
+                p.stencil_layer = *layer;
+                p.clear_stencil = pass.stencil_load == 2;
+                p.clear_s = pass.clear_s;
+                if x.must_name() {
+                    cb.names.push(x.bo() as usize);
+                }
+                cb.held_textures.push(x.clone());
             }
             let cs: *mut NwCs = &mut *cb.cs;
             unsafe {

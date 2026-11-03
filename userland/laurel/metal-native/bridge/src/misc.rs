@@ -615,6 +615,10 @@ pub extern "C" fn nmb_blit_copy_texture(e: *mut NmbEncoder, s: *mut NmbTexture, 
     guard(false, || {
         let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
         let (st, dt) = (get(s)?.t.clone(), get(d)?.t.clone());
+        // two planes: this path copies one. A refusal says so
+        if st.pipe_format == unsafe { nmn_format_from_metal(260) } || dt.pipe_format == unsafe { nmn_format_from_metal(260) } {
+            return Err("a copy of a Depth32Float_Stencil8 texture has no native path yet".into());
+        }
         hold_texture(e, &st)?;
         hold_texture(e, &dt)?;
         let (so, size, dorigin) = unsafe { (std::slice::from_raw_parts(so, 3), std::slice::from_raw_parts(size, 3), std::slice::from_raw_parts(dorigin, 3)) };

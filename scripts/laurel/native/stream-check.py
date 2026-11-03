@@ -103,6 +103,8 @@ class Walk:
             self.fits(at, f"target {i}: {rows} rows, pitch {pitch}", self.q(0x8825 + 8 * i), rows * pitch if pitch else 1)
         pitch = self.r.get(0x8873, 0) << 6
         self.fits(at, f"depth: {rows} rows, pitch {pitch}", self.q(0x8875), rows * pitch if pitch else 1)
+        pitch = self.r.get(0x8882, 0) << 6
+        self.fits(at, f"stencil: {rows} rows, pitch {pitch}", self.q(0x8884), rows * pitch if pitch else 1)
 
     def find(self, a, n=1):
         for lo, hi, body in self.bos:
@@ -175,7 +177,7 @@ class Walk:
                     # a new pass: RM6_DIRECT_RENDER
                     for i2 in range(8):
                         self.r[0x8825 + 8 * i2] = self.r[0x8826 + 8 * i2] = 0
-                    self.r[0x8875] = self.r[0x8876] = 0
+                    self.r[0x8875] = self.r[0x8876] = self.r[0x8884] = self.r[0x8885] = 0
                 if op == 0x46:
                     e = p[0] & 0xff if c else -1
                     if e in TS_EVENTS and c == 1:
