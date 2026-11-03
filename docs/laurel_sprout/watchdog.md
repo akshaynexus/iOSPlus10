@@ -30,7 +30,7 @@ One line: `LAUREL WDOG: on: APSS WDT 0xf017000, bark 12 s (any CPU), bite 20 s, 
 | Pet | Only if no CPU in use has a signal open for 8 s, and no panic. A CPU that never came up (`SIGPdisabled`, the case `CPU 4 not alive`) is not in use | [V code, host test] |
 | Bark | IRQ to any CPU (1-of-N; if the GIC refuses, the boot CPU). Two lines per CPU, then `panic("LAUREL WDOG: bark: ...")`. So the panic hold sends the text over USB, and its timed reset follows | [V code] |
 | Bite | No pet for 20 s: the hardware resets with no CPU. This is what a hang of all CPUs gets | [V design], [U] on the phone |
-| Panic | `kPEPanicBegin`: no pets, bark = bite = 30 s, count from 0. If the panic hangs before its hold: a bite. Panic hold, `laurel_panic_final`: hardware off, so **a hold does not reset**. `laurel_restart`, `laurel_power_off`: off just before PSCI: ABL and Mu get no running count | [V code] |
+| Panic | `kPEPanicBegin`: no pets, bark = bite = 30 s, count from 0. If the panic hangs before its hold: a bite. Panic hold, `laurel_panic_final`: hardware off, so **a hold does not reset**, except after a bark (patch 2987): the count runs on and the bite resets the phone 30 s after the panic [V code], [U] on the phone. Reason: at 17:56:16 a bark on stuck CPU 5 printed `holding`, then the hold gave no pong and took no `ctl bootloader` [V]. `laurel_restart`, `laurel_power_off`: off just before PSCI: ABL and Mu get no running count | [V code] |
 | Lines | A CPU silent 2, 5, 10 s: 2 lines with its last interrupt, thread, signals, SGI state. `answers again` when it comes back. Each minute: `longest answer in 60 s, ms per CPU`, with the pc of the worst. The thread itself over 2 s late: one line per new worst. | [V code] |
 | Fallback | Self-check failed: no hardware, the same thread and lines. The USB thread (`ud_thread`) also checks: the pet thread 3 s late gives a line, and it does a round | [V code] |
 
@@ -142,3 +142,7 @@ LAUREL WDOG: bark: cpu N ...  then panic(...LAUREL WDOG: bark...)
 ```
 
 Host test [V]: `scripts/laurel/wdog-test.sh`: PASS: healthy 1 h no bark; a CPU off 5 s, a slow stackshot, the thread 10 s late, a CPU not in use: no bark. One stuck CPU at 60 s: bark 79.1 s, bite 87.1 s. All stop at 60 s: bite 79.1 s.
+
+## First catch, 2026-11-03 17:56:16, kernel 833d75cdc9 [V]
+
+CPU 5 (mpidr 0x1, silver) took its last interrupt in EL0 of `iconservicesagent`, pc 0x19dc52724 lr 0x19dbee774 (the pc of that interrupt, so it can be stale), then stayed silent 19562 ms with an SGI pending. The other 7 CPUs ran. `iconservicesagent` had started 6 s earlier and opened Metal. The hang of 13:46:59 also has `iconservicesagent` in its last lines (a link [I], two events). Cause [U].
