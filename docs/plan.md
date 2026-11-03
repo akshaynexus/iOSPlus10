@@ -1195,3 +1195,6 @@ Results [V phone, 4 runs of 8, no hang]: `scene: wait 0 status 4 error ''`; `cop
 Not proven: a texture read on the GPU (the run did not start: the phone was in another kernel's panic), an IOSurface target, the compositor.
 Next: the owner's step `ios26-native-metal.md` section 11.7; then the `refused` lines of section 11.6.
 
+## 2026-11-03: Mi A3: DDR and RPM scaling, kill loops (branch `t3/laurel-ddr-rpm-cpu-waste`, pushed, not merged, NOT BOOTED)
+Done: read the stock `rpm.mbn`: `clk0` 2 `Enab` gates the bus nodes. 2985 sends the stock order, then DDR follows the GPU level and the stock Gold table, floor 1353 MHz (`docs/laurel_sprout/gpu.md` "RPM scaling"). Host test PASS. Floors: usernotificationsd, aonsensed, localizationswitcherd, extensionkitservice, donotdisturbd, dasd, iconservicesagent, one commit each (`docs/laurel_sprout/cpu-parallel.md` section 6). dasd, PerfPowerServices, BackgroundShortcutRunner: read, no fix: boot-time work.
+Next: owner's decision on a boot with 2985 (new kernel) and the plist. Read `LAUREL RPM SCALE`, `LAUREL DDR`, a flash at a DDR change, `gpu N C`, `ended tasks`. Kill switch `rpmscale=0`.

@@ -54,7 +54,7 @@ So a daemon that maps the store is at 5-11 MB before it does any work. Why the r
 |---|---|---|
 | Why CPU 5 held interrupts over 12.5 ms | Not found. Panic in boot 11: right after `CRASH deviceaccessd`, `crossed memory high watermark`: a kill loop asks for corpses, so floors remove most of the triggers [I]. In our code only SPMI and kprintf mask interrupts by hand; kprintf draws a line in about 100 us at speed, 700 us at Silver's 300 MHz [I]. Not excluded: TrustZone calls, xnu's own paths. `kern.interrupt_masked_debug_mode` is 0, so no number exists. `LAUREL DEBUG ACK` gives the CPU when it happens again | [U] |
 | CPU 4 not alive, boot 6 | Once, 18:49:20 on 2026-11-02: one boot of the 3 in `usblog-20261102-172222` (the logs `ios26-boot6` to `ios26-boot8` are cuts of it). PSCI `CPU_ON rc=0`, no `entered initCPU`, off after 5 s, 7 CPUs for that boot. Boot 11: 8 of 8 alive; the logs of boots 9 and 10 begin after this point [U]. A second CPU_ON would answer ALREADY_ON [I]: no fix made | [U] |
-| DDR | `ddr.boot_mhz=1355 ddr.vote_mhz=0`: fixed. Stock Gold 2016 goes with 1804 MHz. A limit on all compute, 25 % bandwidth [I]. Near the GPU clock work: not touched | [V] value, [I] effect |
+| DDR | Patch 2985: the stock enable of the RPM's scaling. `gpu.md` "RPM scaling". NOT BOOTED | [V] cause, [U] the phone |
 | UFS gear | 144 MB/s at 1 MiB looks like one HS-G1 lane [I]. The line `LAUREL UFS QUEUE: on:` gives gear and lanes on the next boot. A gear change needs PHY work | [U] |
 | Writes | Still one slot, in the caller's thread, by choice: the fence and HFS order stay as they were | [V] |
 | DEVELOPMENT kernel | asserts and `lock_stats` are in. Cost [U]. RELEASE gates boot-args and sysctls we use: not tried | [U] |
@@ -83,3 +83,39 @@ LAUREL COMPOSITOR SYNC: on: the CPU goes on, the presenter waits for the GPU fen
 LAUREL CPU TOP: 60 s, busy B s of 480 ... ended tasks E                             E far below 32 at rest
 ```
 Kill switches: `ufsqueue=0`, `ufswait=0`, the file `sync`. Bench over SSH (read only): the 4 parallel `dd` of section 1.
+
+## 6. Kill loops and boot storms, part 2 (boot 2026-11-03 07:13; read-only SSH, unified log; no flash)
+
+Logs `usblog-20261103-071332.txt` (10 min) and `usblog-20261103-000638.txt` (18 boots, 256 minutes).
+
+### Why a daemon dies with memory free [V stacks, new]
+
+Two kinds, by `scripts/laurel/crash-bt-symbolize.py` on the `CRASH ... bt` lines, against 23F84:
+- **It walks the LaunchServices store.** usernotificationsd, 91 stacks: `BindingEvaluation::addBundles`, `_UTGetActiveTypeForCFStringIdentifier`. The store is 10.5 MB [V file]; each page it touches counts against it; the limit is 8 MB. Each start burns CPU until the kill, 10 s later it starts again: 59 kills in 10 min. So 25-46 s a minute of `ended tasks` at rest.
+- **It dies at the end of an XPC transaction.** extensionkitservice 27 of 28, aonsensed 5 of 11, localizationswitcherd: `_xpc_transaction_end`. The job goes clean, so the inactive limit applies at that moment, and the footprint is above it. It dies at its first idle moment and starts again at the next request. A limit under the footprint at rest cannot work.
+
+### Fixes: one commit each. New root, or the plist by `ios26-live-update.sh` + reboot
+
+| Job | Limits, MB | Evidence |
+|---|---|---|
+| `com.apple.usernotificationsd` | 12/8 -> 32/32 | above |
+| `com.apple.aonsensed` | 6/6 -> 16/16 | 93 kills in the long log; footprint at rest 2.1 MB; KeepAlive + RunAtLoad |
+| `com.apple.localizationswitcherd` | none (6) -> 24/24 | 25 kills, RSS 11 MB |
+| `com.apple.extensionkitservice` (XPCService) | none (6) -> 24/24 | 28 kills, RSS 17 MB, bundle id from its Info.plist |
+| `com.apple.donotdisturbd` | 9/9 -> 24/24 | 16 kills, RSS 20-23 MB |
+| `com.apple.dasd` | 18/18 -> 48/48 | 3 EXC_RESOURCE; RSS 40-47 MB; no kill |
+| `com.apple.iconservices.iconservicesagent` | inactive 96 -> 200 | 3 crossings of 96; a kill leaves its icons half made |
+
+All labels are in the phone's `launchd.plist` [V]. **Expected [I]:** `ended tasks` falls from 24-46 s to under 5 s a minute at rest: 5-9 % of all CPU.
+
+### What the others spin on: no fix made, no job removed
+
+| Job | Finding | Mark |
+|---|---|---|
+| dasd | **A boot storm, not a leak.** 8 SQLite opens per record: 51,938 lines `volume does not support data protection, stripping SQLITE_OPEN_FILEPROTECTION_*` and 6,369 `BackgroundProcessing \| TaskMetadata` in 8 boots. About 7,000 opens per boot, about 1 per ms, all in minutes 1-2 after boot. Each boot: 10-60 s of CPU a minute, 2-5 minutes, then quiet (40 s of CPU, then 0 in the 30 s sample). The worker threads end. So it takes 1 CPU in the first minutes, and not in the steady state | [V] |
+| dasd: can it be shorter? | The log line is the path of a volume with no content protection (our HFS root). The line costs little; the 7,000 opens are the cost. Not changed: it is the task store of the scheduler | [I] |
+| PerfPowerServices | 60 s a minute in **1 boot of 18**, 5 minutes, the boot with no UI (06:21-06:25, with `TU_DEBUG=sysmem`). In the UI boots 1-2 s a minute. No log record says why | [V] rows, [U] cause |
+| BackgroundShortcutRunner | Builds the Shortcuts action catalog: 1,007 `-[WFLinkActionProvider createActionsForRequests:...]`, 371 `GRDB.DatabaseError` (text private). 2-6 boots of 18, 2-5 minutes, up to 60 s a minute. Ends by itself. Its limit is 64 MB already | [V] rows, [U] the database error |
+| iconservicesagent | 10-76 s a minute after boot, when icons are made. Not a loop: floor above | [V] |
+
+Not done, for the record: `spindump`. It asks for a stackshot, and a stackshot with a late CPU caused the panics of 9007. The phone is under test.

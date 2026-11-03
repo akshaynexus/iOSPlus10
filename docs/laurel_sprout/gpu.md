@@ -965,15 +965,57 @@ Sensor 15. **95 C** (`gpu-step`, no hysteresis): a raise is refused, and one lev
 
 Stock vote: `msm_bus` path 26 -> 512, ib of the level, /8 = the DDR clock. Here: RPM `clk2` id 0 `KHz`, at the `bus-freq` of the level. Stock also scales in `bus-min`..`bus-max` by the `bw_vbif` governor; here only `bus-freq`. So at 900 and 950 MHz the vote is **1804 MHz, the stock one** [V].
 
-**What the phone does with it: [U].** All boots read `DDR 1355 MHz` [V], and 2892 sent no vote, because 1355 >= 1017. The RPM has never had a DDR vote from XNU on this phone, and XNU sends no `clk0` `Enab` (`clk_smd_rpm_enable_scaling`), so it may ignore it. `ddr_start` votes 1804 once at start and reads the period register:
+**What the phone did with it before 2985:** all boots read `DDR 1355 MHz` [V], and 2892 sent no vote, because 1355 >= 1017. The RPM has never had a DDR vote from XNU on this phone, and XNU sends no `clk0` `Enab` (`clk_smd_rpm_enable_scaling`), so it may ignore it. `ddr_start` votes 1804 once at start and reads the period register:
 - A rise of 10 % or more: votes per level, never below the boot clock (snapped to the level, 1353).
-- No rise: `LAUREL DDR: off: ...`, the vote goes back to the boot clock, and 820+ MHz run with DDR at 1353. `Enab` stays an owner decision (section "DDR: held low?"); it could also let the RPM lower SNOC and CNOC.
+- No rise: `LAUREL DDR: off: ...`, the vote goes back to the boot clock, and 820+ MHz run with DDR at 1353.
+
+[V boot 2026-11-03] `off: 1355 MHz at boot, 1355 MHz after a vote of 1804 MHz`. Patch 2985 is the fix: section "RPM scaling".
+
+### RPM scaling (2985; built, host test PASS, NOT BOOTED)
+
+Owner's decision 2026-11-03: full speed. `iokit/Kernel/arm/laurel_rpm_scale.h` (order, no hardware access), `ddr_start` in `laurel_gpu_clock_read.h`, a word in `laurel_reboot.c`. Both kernels: `patches/laurel/xnu/2985-laurel-rpm-scale.patch`. Edit in `src/xnu`, then `scripts/laurel/rpm-scale-patch.sh`. Host test: `scripts/laurel/test-rpm-scale.sh`.
+
+**Why the RPM does not follow [V stock `rpm.mbn`, ROM V12.0.26.0; disassembled here, nothing of it in git].** `clk0` id 2 is the NPA node `/clk/dcvs.ena`. Generic clock driver (0xfc6c): a node with flag 0x10 reads the byte that this node sets, and while it is 0 the driver returns the node's old state: the vote gets an ack and does nothing. Flag 0x10: `snoc`, `snoc_gc`, `snoc_monaq`, `snoc_lpass`, `cnoc`, `snoc_periph`, `bimc`, `shub`, `ipa`, `qup`. No flag (they follow at once): `ce1`, `mmnrt`, `mmrt`.
+
+**What `Enab` does [V same, driver 0xf7ec].** It sets the byte, then for each flagged node takes the highest vote of the masters and applies it at once. **No vote = the lowest level.** With 0 it restores each node's boot level (a path stock never sends; not used here). So the old fear was right: `Enab` alone would drop SNOC, CNOC, and others.
+
+**Stock order [V `rpm_smd_clk_probe`, `clk_smd_rpm_prepare`, `clk_vote_bimc`, `clk_smd_rpm_enable_scaling`], and what 2985 sends:**
+
+| # | Message | Value | Set |
+|---:|---|---:|---|
+| 1 | `clk2` id 0 `KHz` (bimc) | 0x7fffffff | active |
+| 2-21 | snoc `clk1` 2, bimc `clk2` 0, ipa 0, qup 0, mmrt `mmxi` 1, mmnrt `mmxi` 0, snoc_periph `clk1` 0, snoc_lpass `clk1` 5, cnoc `clk1` 1, ce1 `ce` 0: `KHz` | 2147484 | active, then sleep |
+| 22 | `clk0` id 2 `Enab` | 1 | sleep |
+| 23 | `clk0` id 2 `Enab` | 1 | active |
+
+The order is the index order of `trinket_clks` (`check-table.py` reads it). Against stock, **not sent:** XO (`clk0` 0; the firmware votes it itself at its start [V 0x20546]), QDSS (`clk0` 1), XO buffers (`clka`, `swen`). The 0xf7ec driver does not read them [V]; stock drops most of them later. Keepalive votes of 19.2 MHz are below the top vote. The other agents' writes (`ipa` 201000 kHz from 2780, LDOs) stay valid.
+
+**After that:** the 10 clocks hold the top vote for the boot, except BIMC: stock lowers them through `msm_bus` clients, which do not exist here. BIMC: 1804 once, read, then the rule. DDR rows of the firmware [V 0x9516c]: 200000 300000 451200 547200 681600 768000 1017600 1353600 1555200 1804800 kHz; a vote takes the first row at or above it.
+
+**Rule (50 ms tick):** the higher of the GPU level's bus level and the stock Gold table, never below the boot clock (1353); down after 500 ms. Gold table, `cpu4_cpu_ddr_latmon` ddr4-map: up to 902 MHz 451, up to 1401 MHz 1017, up to 1804 MHz 1555, above 1804 MHz **1804**. Stock asks the upper rows only for a memory-bound load (`memlat`), and 2016 -> 1804 with no condition (`cpu4_computemon`). Here no PMU reads that load: full speed, by the owner's choice. Silver's stock rows end at 1017: under the floor.
+
+**MC, L3, CCI [V]:** MC is BIMC. Trinket has **no L3 clock**: `clk_cpu_osm_driver_trinket_fixup` removes `L3_CLK` and its votes. **No CCI devfreq** node in `trinket.dtsi`. `shub` has no AP vote; the firmware's own client on BIMC moves it [V table at 0x100d8]. So no second feature.
+
+**Failure modes:**
+| Failure | What happens | Line |
+|---|---|---|
+| RPM error or no ack before Enab | Stops there. No Enab: flagged nodes did not move. `ce1`, `mmnrt`, `mmrt` stay at the top vote | `LAUREL DDR: off: ... refused or did not ack NAME` |
+| Enab acked, no rise of 10 % in 200 ms | No more votes, all stay at the top, so no bus clock can fall | `LAUREL DDR: off: ... the RPM does not follow` |
+| Reset at or after Enab | Code cannot catch it. The word of IMEM 0x0C12565C is `LRPM` from before message 1 to 30 s after Enab. A boot that finds it does not try, and the next boot tries again. [U] whether the word survives such a reset. If not: `rpmscale=0` | `LAUREL DDR: off: the last boot ended within 30 s ...` |
+
+Kill switches: `rpmscale=0`, `gpupll=0`, `gpudcvs=0`.
+
+**Not proved on the host:** that the phone's firmware equals this ROM's file (not read from the phone); the first DDR change under a live panel: stock's display votes and QoS are not all here, so a flash or underrun at a DDR change is possible [U]; heat: the top votes can hold CX and MX above the corner of a low GPU level [I], so "never above the stock corner" (section Table) no longer holds for the rail as a whole; idle power rises [I], not measured.
+
+```
+LAUREL RPM SCALE: on: 10 bus clocks at the stock top vote, Enab acked in both sets; GCC reads snoc 200 -> 400, pnoc 100 -> 200, bimc 677 -> 902 MHz
+LAUREL DDR: on: 1355 MHz at boot, the stock enable gave 1804 MHz, 1353 MHz now; stock bus level of each GPU level and Gold clock, never below 1353 MHz
+```
+(Numbers of the first line are examples: snoc, pnoc and bimc reads are the first ever.)
 
 ### Lines
 
 ```
-LAUREL DDR: on: 1355 MHz at boot, a vote of 1804 gave 1804 MHz, 1353 MHz now; stock bus level of each GPU level, never below 1353 MHz
-LAUREL DDR: off: 1355 MHz at boot, 1355 MHz after a vote of 1804 MHz: the RPM does not follow (no scaling enable); 820+ MHz run on the boot clock
 LAUREL GPU CLOCK: on: MHz=GCC/CP 320=320/320 465=464/465 600=598/600 745=744/745 820=820/820 900=900/900 950=950/950; fence 90 us; iPeak; raise 50 % or touch; hot 95 C
 LAUREL GPU CLOCK: on: MHz=GCC/CP 320=... 820=820/820; fence 90 us; iPeak; out 900 950: 900: RPM refused the CX vote 0/0; raise 50 % or touch; hot 95 C
 LAUREL GPU CLOCK: on: 950 MHz out: the clock read is wrong (read 817/820); now 900 MHz
