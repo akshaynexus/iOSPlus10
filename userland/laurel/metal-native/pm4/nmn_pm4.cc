@@ -1555,6 +1555,15 @@ static enum pc_di_primtype primtype(uint32_t metal)
 	}
 }
 
+/*
+ * After each draw. The hang of this stack (SP, HLSQ, RB busy, no fault, in a large program) came in every start with no recorder and in no run with its per-draw event: 2 of 2 against 0 of 8 [V logs/stability-*.txt]. Cause not known.
+ * The event makes no wait in the stream.
+ */
+void nmn_cmd_draw_end(struct nw_cs *cs)
+{
+	event_ts(cs, RB_DONE_TS);
+}
+
 /* The flight recorder's mark: the value reaches `iova` when the draws before it have left the render backend. It makes no wait, so a stream with marks keeps its timing. */
 void nmn_cmd_progress(struct nw_cs *cs, uint64_t iova, uint32_t value)
 {

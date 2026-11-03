@@ -1465,8 +1465,9 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
                 cb.names.push(a.backing.bo() as usize);
             }
             nmn_cmd_draw_indirect(cs, primitive, a.backing.iova() + at, index_iova, max, wide);
-            if let Some((word, id)) = mark {
-                nmn_cmd_progress(cs, word, id);
+            match mark {
+                Some((word, id)) => nmn_cmd_progress(cs, word, id),
+                None => nmn_cmd_draw_end(cs),
             }
             cb.held_buffers.push(a.clone());
             if let Some((b, ..)) = index {
@@ -1489,8 +1490,9 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
             }
             None => nmn_cmd_draw(cs, primitive, count, instances, first, first_instance),
         }
-        if let Some((word, id)) = mark {
-            nmn_cmd_progress(cs, word, id);
+        match mark {
+            Some((word, id)) => nmn_cmd_progress(cs, word, id),
+            None => nmn_cmd_draw_end(cs),
         }
     }
     e.attachment_written |= entry.outputs;
