@@ -597,6 +597,7 @@ void nmn_cmd_pass_begin(struct nw_cs *cs, struct nmn_gpu *g, const struct nmn_pa
 	const uint32_t w = p->width, h = p->height;
 	REGS(cs, A6XX_GRAS_LRZ_CNTL(.dword = 0));
 	REGS(cs, A6XX_GRAS_LRZ_BUFFER_BASE(0), A6XX_GRAS_LRZ_BUFFER_PITCH(.dword = 0), A6XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE(0));
+	REGS(cs, A6XX_GRAS_LRZ_DEPTH_VIEW(.base_layer = 0x7ff, .layer_count = 0x7ff, .base_mip_level = 0xf)); /* tu_lrz.cc: an invalid view: LRZ's direction tracking has no image. The one register pm4-diff.py marked UNEXPECTED */
 	REGS(cs, A6XX_GRAS_SC_WINDOW_SCISSOR_TL(.x = 0, .y = 0), A6XX_GRAS_SC_WINDOW_SCISSOR_BR(.x = w - 1, .y = h - 1));
 	REGS(cs, A6XX_GRAS_2D_RESOLVE_CNTL_1(.x = 0, .y = 0), A6XX_GRAS_2D_RESOLVE_CNTL_2(.x = w - 1, .y = h - 1));
 	REGS(cs, A6XX_RB_WINDOW_OFFSET(.x = 0, .y = 0));
