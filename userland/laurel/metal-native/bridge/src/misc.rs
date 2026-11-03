@@ -754,7 +754,7 @@ pub extern "C" fn nmb_compute_dispatch(e: *mut NmbEncoder, size: *const u64, per
                         w[..n].copy_from_slice(&region.specialization.data[at..at + n]);
                         NmnSpec { id: m.constant_id, value: u32::from_le_bytes(w) }
                     }).collect();
-                    let program: Program = compute_program_spec(dev.compiler, &pipeline.pipeline, &spec)?;
+                    let program: Program = crate::compile::cached_program(&dev.cache, dev.compiler, &pipeline.key, &spec, || compute_program_spec(dev.compiler, &pipeline.pipeline, &spec))?;
                     let mut why = [0 as c_char; 256];
                     let baked = unsafe { nmn_bake_compute(e.gpu.gpu, nmn_program_variant(program.0, 0), why.as_mut_ptr(), why.len()) };
                     if baked.is_null() {
@@ -833,8 +833,6 @@ const NO_INDIRECT: &str = "indirect draws and dispatches have no native path yet
 refuse!(nmb_compute_dispatch_indirect(e: *mut NmbEncoder, b: *mut NmbBuffer, o: u64, p: *const u64) -> bool = false, NO_INDIRECT);
 refuse!(nmb_render_draw_indirect(e: *mut NmbEncoder, p: u64, b: *mut NmbBuffer, o: u64) -> bool = false, NO_INDIRECT);
 refuse!(nmb_render_draw_indexed_indirect(e: *mut NmbEncoder, p: u64, t: u64, i: *mut NmbBuffer, io: u64, b: *mut NmbBuffer, o: u64) -> bool = false, NO_INDIRECT);
-const NO_DESC: &str = "a compute descriptor with options has no native path yet";
-refuse!(nmb_compute_pipeline_new_with_descriptor(d: *mut NmbDevice, x: *const c_void, o: *const c_void) -> *mut NmbComputePipeline = std::ptr::null_mut(), NO_DESC);
 
 // Binary archives: this stack has no pipeline library to keep. The frontend treats an empty archive as "compile at first use".
 pub struct NmbBinaryArchive;

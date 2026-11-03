@@ -4,6 +4,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod compile;
+mod diskcache;
 mod ffi;
 mod draw;
 mod misc;

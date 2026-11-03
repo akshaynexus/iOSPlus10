@@ -56,6 +56,11 @@ struct nmn_program;     /* one vertex + one fragment, or one compute */
 struct nmn_program *nmn_program_render(struct nmn_compiler *, const struct nmn_layout *, const struct nmn_stage_input *vertex, const struct nmn_stage_input *fragment /* may be NULL */, char *why, size_t why_size);
 struct nmn_program *nmn_program_compute(struct nmn_compiler *, const struct nmn_layout *, const struct nmn_stage_input *kernel, uint32_t local_size_x, uint32_t local_size_y, uint32_t local_size_z, char *why, size_t why_size);
 void nmn_program_free(struct nmn_program *);
+/* A finished program as bytes, and back: Mesa's ir3_store_variant. malloc'ed; the caller frees. NULL: it does not fit, or the bytes are not such a program. Bytes of this build only (nmn_cache_id). */
+void *nmn_program_store(const struct nmn_program *, size_t *size);
+struct nmn_program *nmn_program_load(struct nmn_compiler *, const void *data, size_t size);
+/* This image, for the name of its cache folder: its LC_UUID, on the host the size and time of the program */
+const char *nmn_cache_id(void);
 bool nmn_program_info(const struct nmn_program *, unsigned stage, struct nmn_stage_info *);
 /* The opaque ir3_shader_variant of a stage, for nmn_pm4. NULL: no such stage. */
 const void *nmn_program_variant(const struct nmn_program *, unsigned stage);

@@ -3,7 +3,7 @@
 use crate::ffi::*;
 use metal2vulkan::pipeline::{ComputePipeline, PipelineLayout, RenderPipeline, StageModule};
 use metal2vulkan::vk;
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString, c_char, c_void};
 
 /// Slots of 16 dwords, in the order of the translator's layout, as tu_descriptor_set.cc lays a set out: sampler 1, combined 2, the others 1.
 pub fn lay_out(layout: &PipelineLayout) -> Result<Vec<NmnBinding>, String> {
@@ -80,6 +80,28 @@ fn why_text(why: &[c_char]) -> String {
 
 pub fn render_program(compiler: *mut NmnCompiler, p: &RenderPipeline) -> Result<Program, String> {
     render_program_spec(compiler, p, &[])
+}
+
+/// A program from the disk cache, or compiled and kept. key: what the translator's pipeline is made from; the specialization values come on top of it.
+pub fn cached_program(cache: &crate::diskcache::DiskCache, compiler: *mut NmnCompiler, key: &str, spec: &[NmnSpec], compile: impl FnOnce() -> Result<Program, String>) -> Result<Program, String> {
+    let mut full = format!("program {key}");
+    for s in spec {
+        full.push_str(&format!(" {}={}", s.id, s.value));
+    }
+    if let Some(bytes) = cache.get(&full) {
+        let p = unsafe { nmn_program_load(compiler, bytes.as_ptr() as *const c_void, bytes.len()) };
+        if !p.is_null() {
+            return Ok(Program(p));
+        }
+    }
+    let program = compile()?;
+    let mut size = 0usize;
+    let data = unsafe { nmn_program_store(program.0, &mut size) };
+    if !data.is_null() {
+        cache.put(&full, unsafe { std::slice::from_raw_parts(data as *const u8, size) });
+        unsafe { libc::free(data) };
+    }
+    Ok(program)
 }
 
 /// With the plan's specialization values over each stage's defaults.

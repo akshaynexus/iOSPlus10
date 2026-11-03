@@ -39,6 +39,9 @@ NMN_SCENE_NO_SURFACES=1 run row0 "$OUT/ios26/native/plans/ca-real.txt" 0 || rc=1
 python3 -I "$REPO/scripts/laurel/native/pm4-diff.py" "$R/row0-sysmem-1-summary.txt" "$W/row0-summary.txt" | tee "$W/row0-diff.txt" || rc=1
 # the compositor's first frames: IOSurface targets, a pass size of 0 (the hang of logs/native-compositor-1.txt). No Turnip capture: the walk and the gate are the proof
 run surfaces "$OUT/ios26/native/plans/ca-real.txt" 0 || rc=1
+# the disk cache: a second start of the same image reads its pipelines and ir3 code, and the stream it writes is the same word for word
+NMN_RD=$W/surfaces-again.rd "$W/scene-native" none "$W/cache" "$LIB" "$OUT/ios26/native/plans/ca-real.txt" 0 > "$W/surfaces-again.log" 2>&1 || { echo "cache: the second start failed"; rc=1; }
+if cmp -s "$W/surfaces.rd" "$W/surfaces-again.rd"; then echo "cache: the second start wrote the same stream"; else echo "cache: FAIL: the second start wrote another stream"; rc=1; fi
 # the rules must hold on the driver that is known to draw on this GPU: if Turnip fails a rule, the rule is wrong
 for f in plain-sysmem-1 plain-sysmem-2 plain-sysmem-3 row0-sysmem-1; do
   python3 -I "$REPO/scripts/laurel/native/stream-check.py" "$X" "$R/$f.rd" | cut -c1-200 || rc=1

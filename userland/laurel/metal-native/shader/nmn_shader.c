@@ -19,6 +19,7 @@
 #include "ir3_nir.h"
 #include "ir3_shader.h"
 #include "freedreno_dev_info.h"
+#include "util/blob.h"
 #include "util/ralloc.h"
 #include "util/u_math.h"
 
@@ -492,6 +493,101 @@ void nmn_program_free(struct nmn_program *p)
 	}
 	free(p);
 }
+
+/* ---- the disk cache's form of a program ---- */
+#define NMN_PROGRAM_MAGIC 0x314d4e4eu
+
+void *nmn_program_store(const struct nmn_program *p, size_t *size)
+{
+	struct blob b;
+	void *data = NULL;
+	blob_init(&b);
+	blob_write_uint32(&b, NMN_PROGRAM_MAGIC);
+	blob_write_uint32(&b, p->count);
+	for (unsigned i = 0; i < p->count; i++) {
+		const struct nmn_compiled *s = &p->stage[i];
+		blob_write_bytes(&b, &s->info, sizeof(s->info));
+		blob_write_uint32(&b, s->push_lo_dwords);
+		blob_write_uint32(&b, s->push_dwords);
+		blob_write_uint32(&b, s->push_first_vec4);
+		ir3_store_variant(&b, s->variant);
+	}
+	if (b.out_of_memory) {
+		blob_finish(&b);
+		return NULL;
+	}
+	blob_finish_get_buffer(&b, &data, size);
+	return data;
+}
+
+struct nmn_program *nmn_program_load(struct nmn_compiler *c, const void *data, size_t size)
+{
+	struct blob_reader r;
+	blob_reader_init(&r, data, size);
+	if (blob_read_uint32(&r) != NMN_PROGRAM_MAGIC)
+		return NULL;
+	const uint32_t count = blob_read_uint32(&r);
+	if (r.overrun || count == 0 || count > 2)
+		return NULL;
+	struct nmn_program *p = calloc(1, sizeof(*p));
+	if (p == NULL)
+		return NULL;
+	p->count = count;
+	for (unsigned i = 0; i < count; i++) {
+		struct nmn_compiled *s = &p->stage[i];
+		blob_copy_bytes(&r, &s->info, sizeof(s->info));
+		s->push_lo_dwords = blob_read_uint32(&r);
+		s->push_dwords = blob_read_uint32(&r);
+		s->push_first_vec4 = blob_read_uint32(&r);
+		if (r.overrun) {
+			nmn_program_free(p);
+			return NULL;
+		}
+		s->variant = ir3_retrieve_variant(&r, c->ir3, NULL);
+		if (r.overrun || s->variant == NULL) {
+			nmn_program_free(p);
+			return NULL;
+		}
+	}
+	return p;
+}
+
+#ifdef __APPLE__
+#include <dlfcn.h>
+#include <mach-o/loader.h>
+const char *nmn_cache_id(void)
+{
+	static char id[40];
+	if (id[0] != 0)
+		return id;
+	Dl_info info;
+	snprintf(id, sizeof(id), "no-uuid");
+	if (dladdr((const void *)nmn_cache_id, &info) != 0 && info.dli_fbase != NULL) {
+		const struct mach_header_64 *h = info.dli_fbase;
+		const struct load_command *lc = (const struct load_command *)(h + 1);
+		for (uint32_t i = 0; i < h->ncmds; i++) {
+			if (lc->cmd == LC_UUID) {
+				const uint8_t *u = ((const struct uuid_command *)lc)->uuid;
+				for (int b = 0; b < 16; b++)
+					snprintf(id + b * 2, sizeof(id) - b * 2, "%02x", u[b]);
+				break;
+			}
+			lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+		}
+	}
+	return id;
+}
+#else
+#include <sys/stat.h>
+const char *nmn_cache_id(void)
+{
+	static char id[40];
+	struct stat st;
+	if (id[0] == 0)
+		snprintf(id, sizeof(id), "%llx-%llx", stat("/proc/self/exe", &st) == 0 ? (unsigned long long)st.st_size : 0ull, stat("/proc/self/exe", &st) == 0 ? (unsigned long long)st.st_mtime : 0ull);
+	return id;
+}
+#endif
 
 struct nmn_program *nmn_program_render(struct nmn_compiler *c, const struct nmn_layout *layout, const struct nmn_stage_input *vertex, const struct nmn_stage_input *fragment, char *why, size_t why_size)
 {

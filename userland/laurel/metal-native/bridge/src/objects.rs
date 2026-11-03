@@ -65,6 +65,7 @@ pub struct NmbDevice {
     pub(crate) compiler: *mut NmnCompiler,
     pub(crate) stats: bool,
     pub(crate) gpu: std::sync::Arc<crate::draw::Gpu>,
+    pub(crate) cache: crate::diskcache::DiskCache,
 }
 // SAFETY: ir3_compiler is read only after its creation: Turnip shares one between threads.
 unsafe impl Send for NmbDevice {}
@@ -86,7 +87,7 @@ fn policy() -> DevicePolicy {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nmb_device_open(_loader: *const c_char, _cache: *const c_char) -> *mut NmbDevice {
+pub unsafe extern "C" fn nmb_device_open(_loader: *const c_char, cache: *const c_char) -> *mut NmbDevice {
     guard(std::ptr::null_mut(), || {
         let description = DeviceDescription::from_khronos_json(PROFILE, None).map_err(e("profile"))?;
         let device = Device::new(description, policy()).map_err(e("device"))?;
@@ -96,7 +97,7 @@ pub unsafe extern "C" fn nmb_device_open(_loader: *const c_char, _cache: *const 
             return Err(unsafe { CStr::from_ptr(why.as_ptr()) }.to_string_lossy().into_owned());
         }
         let gpu = crate::draw::Gpu::open()?;
-        Ok(boxed(NmbDevice { device, compiler, stats: std::env::var_os("NMN_STATS").is_some(), gpu }))
+        Ok(boxed(NmbDevice { device, compiler, stats: std::env::var_os("NMN_STATS").is_some(), gpu, cache: crate::diskcache::DiskCache::open(cache) }))
     })
 }
 
@@ -243,14 +244,14 @@ pub extern "C" fn nmb_function_release(f: *mut NmbFunction) {
 // ---- pipelines ----
 
 pub struct NmbComputePipeline {
-    pub(crate) first: Program,
+    pub(crate) key: String,
     pub(crate) pipeline: std::sync::Arc<metal2vulkan::pipeline::ComputePipeline>,
     pub(crate) device: *const NmbDevice,
     pub(crate) baked: std::sync::Mutex<std::collections::HashMap<Vec<u8>, std::sync::Arc<crate::misc::ComputeBaked>>>,
 }
 /// The translator's pipeline; the fixed state of its descriptor; its programs per bind shape (a plan and a specialization: the second use is a lookup).
 pub struct NmbRenderPipeline {
-    pub(crate) first: Program,
+    pub(crate) key: String,
     pub(crate) pipeline: std::sync::Arc<metal2vulkan::pipeline::RenderPipeline>,
     pub(crate) fixed: PipelineFixed,
     pub(crate) device: *const NmbDevice,
@@ -276,25 +277,71 @@ fn print_stage(name: &str, stage: &str, i: &NmnStageInfo) {
     println!("stat\t{name}\t{stage}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", i.instructions, i.nops, i.movs, i.covs, i.sizedwords, i.half_regs, i.full_regs, i.const_vec4, i.tex_ops, i.mem_ops, i.sstall, i.systall, i.loops, i.reads_framebuffer as u32);
 }
 
+/// What a compute pipeline is made from, as the frontend gives it (NativeMetalObjects.h).
+#[repr(C)]
+pub struct NmbComputePipelineDescriptor {
+    pub function: *mut NmbFunction,
+    pub max_threads: u64,
+    pub multiple_of_execution_width: u64,
+    pub indirect: u64,
+    pub max_call_stack_depth: u64,
+    pub adding_binary_functions: u64,
+    pub mutability: [u64; 31],
+}
+
+fn compute_pipeline(d: *mut NmbDevice, descriptor: &ComputePipelineDescriptor) -> Result<*mut NmbComputePipeline, String> {
+    let device = get(d)?;
+    let key = format!("compute {:?}", device.device.compute_pipeline_key(descriptor));
+    let pipeline = load_or_compile(device, &key, || device.device.compile_compute_pipeline(descriptor, &Budget::standard()).map_err(e("compute pipeline")))?;
+    // the ir3 code at the first dispatch: a pipeline that never runs costs no compile. The tool that counts programs asks for it now
+    if device.stats {
+        let program = compute_program(device.compiler, &pipeline)?;
+        if let Some(i) = program.stage_info(0) {
+            print_stage(&std::env::var("NMN_STAT_NAME").unwrap_or_default(), "compute", &i);
+        }
+    }
+    Ok(boxed(NmbComputePipeline { key, pipeline: std::sync::Arc::new(pipeline), device: d, baked: std::sync::Mutex::new(std::collections::HashMap::new()) }))
+}
+
+/// The translator's pipeline from the disk cache, or compiled and kept.
+fn load_or_compile<P: metal2vulkan::cache::PipelineArtifact>(device: &NmbDevice, key: &str, compile: impl FnOnce() -> Result<P, String>) -> Result<P, String> {
+    if let Some(bytes) = device.cache.get(key) {
+        if let Ok(p) = P::from_bytes(&bytes, &device.device) {
+            return Ok(p);
+        }
+    }
+    let p = compile()?;
+    device.cache.put(key, &p.to_bytes());
+    Ok(p)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_compute_pipeline_new(d: *mut NmbDevice, f: *mut NmbFunction) -> *mut NmbComputePipeline {
-    guard(std::ptr::null_mut(), || {
-        let device = get(d)?;
-        let descriptor = ComputePipelineDescriptor::new(StageSource::Function(get(f)?.0.clone()));
-        let pipeline = device.device.compile_compute_pipeline(&descriptor, &Budget::standard()).map_err(e("compute pipeline"))?;
-        let program = compute_program(device.compiler, &pipeline)?;
-        if device.stats {
-            if let Some(i) = program.stage_info(0) {
-                print_stage(&std::env::var("NMN_STAT_NAME").unwrap_or_default(), "compute", &i);
-            }
-        }
-        Ok(boxed(NmbComputePipeline { first: program, pipeline: std::sync::Arc::new(pipeline), device: d, baked: std::sync::Mutex::new(std::collections::HashMap::new()) }))
-    })
+    guard(std::ptr::null_mut(), || compute_pipeline(d, &ComputePipelineDescriptor::new(StageSource::Function(get(f)?.0.clone()))))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nmb_compute_pipeline_new_with_options(d: *mut NmbDevice, f: *mut NmbFunction, _options: *const c_void) -> *mut NmbComputePipeline {
     nmb_compute_pipeline_new(d, f)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_compute_pipeline_new_with_descriptor(d: *mut NmbDevice, descriptor: *const NmbComputePipelineDescriptor, _options: *const c_void) -> *mut NmbComputePipeline {
+    guard(std::ptr::null_mut(), || {
+        let x = get(descriptor)?;
+        let mut out = ComputePipelineDescriptor::new(StageSource::Function(get(x.function)?.0.clone()));
+        out.max_total_threads_per_threadgroup = if x.max_threads == 0 { None } else { Some(u32::try_from(x.max_threads).map_err(e("compute max threads"))?) };
+        out.threadgroup_size_is_multiple_of_execution_width = x.multiple_of_execution_width != 0;
+        out.support_indirect_command_buffers = x.indirect != 0;
+        out.max_call_stack_depth = u32::try_from(x.max_call_stack_depth).map_err(e("compute stack depth"))?;
+        out.support_adding_binary_functions = x.adding_binary_functions != 0;
+        for (index, &m) in x.mutability.iter().enumerate() {
+            if m != 0 {
+                out.buffers.insert(index as u32, raw::<metal2vulkan::metal::Mutability>(m, "buffer mutability")?);
+            }
+        }
+        compute_pipeline(d, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -447,14 +494,17 @@ pub(crate) fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) 
 pub extern "C" fn nmb_render_pipeline_new(d: *mut NmbDevice, descriptor: *const NmbRenderPipelineDescriptor) -> *mut NmbRenderPipeline {
     guard(std::ptr::null_mut(), || {
         let device = get(d)?;
-        let pipeline = device.device.compile_render_pipeline(&render_descriptor(descriptor)?, &Budget::standard()).map_err(e("render pipeline"))?;
-        let program = render_program(device.compiler, &pipeline)?;
+        let description = render_descriptor(descriptor)?;
+        let key = format!("render {:?}", device.device.render_descriptor_key(&description));
+        let pipeline = load_or_compile(device, &key, || device.device.compile_render_pipeline(&description, &Budget::standard()).map_err(e("render pipeline")))?;
         let source = get(descriptor)?;
         let fixed = PipelineFixed {
             colors: source.colors.iter().map(|c| ColorFixed { format: c.format, blending: c.blending, source_rgb: c.source_rgb as u32, destination_rgb: c.destination_rgb as u32, rgb_operation: c.rgb_operation as u32, source_alpha: c.source_alpha as u32, destination_alpha: c.destination_alpha as u32, alpha_operation: c.alpha_operation as u32, write_mask: c.write_mask as u32 }).collect(),
             samples: source.samples.max(1) as u32,
         };
+        // the ir3 code at the first draw, under the plan's constants: a pipeline that never draws costs no compile. The tool that counts programs asks for it now
         if device.stats {
+            let program = render_program(device.compiler, &pipeline)?;
             let name = std::env::var("NMN_STAT_NAME").unwrap_or_default();
             for (i, stage) in ["vertex", "fragment"].iter().enumerate() {
                 if let Some(info) = program.stage_info(i as u32) {
@@ -462,7 +512,7 @@ pub extern "C" fn nmb_render_pipeline_new(d: *mut NmbDevice, descriptor: *const 
                 }
             }
         }
-        Ok(boxed(NmbRenderPipeline { first: program, pipeline: std::sync::Arc::new(pipeline), fixed, device: d, plans: std::sync::Mutex::new(std::collections::HashMap::new()) }))
+        Ok(boxed(NmbRenderPipeline { key, pipeline: std::sync::Arc::new(pipeline), fixed, device: d, plans: std::sync::Mutex::new(std::collections::HashMap::new()) }))
     })
 }
 

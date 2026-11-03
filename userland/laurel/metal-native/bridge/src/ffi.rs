@@ -79,6 +79,9 @@ unsafe extern "C" {
     pub fn nmn_program_render(c: *mut NmnCompiler, layout: *const NmnLayout, vertex: *const NmnStageInput, fragment: *const NmnStageInput, why: *mut c_char, why_size: usize) -> *mut NmnProgram;
     pub fn nmn_program_compute(c: *mut NmnCompiler, layout: *const NmnLayout, kernel: *const NmnStageInput, x: u32, y: u32, z: u32, why: *mut c_char, why_size: usize) -> *mut NmnProgram;
     pub fn nmn_program_free(p: *mut NmnProgram);
+    pub fn nmn_program_store(p: *const NmnProgram, size: *mut usize) -> *mut c_void;
+    pub fn nmn_program_load(c: *mut NmnCompiler, data: *const c_void, size: usize) -> *mut NmnProgram;
+    pub fn nmn_cache_id() -> *const c_char;
     pub fn nmn_program_info(p: *const NmnProgram, stage: u32, out: *mut NmnStageInfo) -> bool;
 }
 

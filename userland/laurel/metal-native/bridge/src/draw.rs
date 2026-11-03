@@ -1062,7 +1062,7 @@ fn plan_entry(e: &mut NmbEncoder, device_pipeline: &NmbRenderPipeline, state: &B
         w[..n].copy_from_slice(&plan.specialization.data[at..at + n]);
         NmnSpec { id: m.constant_id, value: u32::from_le_bytes(w) }
     }).collect();
-    let program = crate::compile::render_program_spec(dev.compiler, pipeline, &spec)?;
+    let program = crate::compile::cached_program(&dev.cache, dev.compiler, &device_pipeline.key, &spec, || crate::compile::render_program_spec(dev.compiler, pipeline, &spec))?;
     let bindings = crate::compile::lay_out(&pipeline.layout)?;
     let mut offsets = HashMap::new();
     let mut set_slots = vec![];
