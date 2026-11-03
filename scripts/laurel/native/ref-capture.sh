@@ -11,7 +11,8 @@ B=$MOUT/bridge/linux/libnative_metal_bridge.a
 FLAME=$MOUT/src/flame/phone/metal2/bridge
 LIB=$OUT/ios26/metallib/Frameworks_QuartzCore.framework_default.metallib/default.metallib
 [ -f "$LIB" ] || LIB=$(find "$OUT/ios26/metallib/Frameworks_QuartzCore.framework_default.metallib" -maxdepth 1 -type f | head -1)
-mkdir -p "$W"; rm -rf "$W"/*
+# REF_ONLY=NAME: one more capture of the list below, and the others stay: pm4-actions.py's table is by index into the old captures
+mkdir -p "$W"; [ -n "${REF_ONLY:-}" ] || rm -rf "$W"/*
 TU=$(find "$H" -name libvulkan_freedreno.so | head -1)
 SHIM=$(find "$H" -name libfreedreno_noop_drm_shim.so | head -1)
 cat > "$W/icd.json" <<JSON
@@ -38,8 +39,14 @@ one() {
   done
   echo "$name: bins $(cat "$W/$name"-*.txt | grep -c 'RM6_BIN_RENDER_START\|mode: RM6_RENDER\|RM6_BIN_VISIBILITY' ) direct $(cat "$W/$name"-*.txt | grep -c RM6_DIRECT_RENDER) CP_DRAW $(cat "$W/$name"-*.txt | grep -c 'opcode: CP_DRAW')"
 }
+if [ "${REF_ONLY:-}" = depth-sysmem ]; then
+  # Depth32Float_Stencil8: Turnip's registers for pm4-compare.sh
+  NMN_SCENE_DEPTH=1 one depth-sysmem ,sysmem
+  exit 0
+fi
 one plain-sysmem ,sysmem
 one plain-auto ""
+NMN_SCENE_DEPTH=1 one depth-sysmem ,sysmem
 for row in ${REF_ROWS:-0}; do
   one "row$row-sysmem" ,sysmem "$OUT/ios26/native/plans/ca-real.txt" "$row"
   one "row$row-auto" "" "$OUT/ios26/native/plans/ca-real.txt" "$row"

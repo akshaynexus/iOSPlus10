@@ -1,7 +1,7 @@
 /*
  * NegroniMetal.bundle's executable on the iOS 26 root: the Metal.framework plug-in class. It picks one stack, loads it, and hands over. The stacks are separate images (options/<name>/NegroniMetal) because
  * their Objective-C classes have the same names, so one process never loads two. Setting: /private/var/db/negronimetal/option, or BUNDLE/option.local for a sandboxed process; first word; read once, at the process's
- * device open. Changing it needs the process to restart: XNUtils offers Restart UI. Rule: option_rule.h. Docs: docs/laurel_sprout/ios26-metal.md section 10.
+ * device open. Changing it needs the process to restart: XNUtils offers Restart UI. Rule: option_rule.h, its files: option_store.h. Docs: docs/laurel_sprout/ios26-metal.md section 10.
  * Lines: LAUREL METAL: on: stack NAME ...  |  LAUREL METAL: off: <reason>: stack default. The native stack's own: LAUREL METAL NATIVE: off: <reason> (docs/laurel_sprout/ios26-native-metal.md).
  */
 #import <Foundation/Foundation.h>
@@ -14,14 +14,11 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "option_rule.h"
+#include "option_store.h"
 
 #define DB       "/private/var/db/negronimetal"
 #define SETTING  DB "/option"
 #define STACK_D  DB "/stack"
-#define STATE    STACK_D "/state"
-#define OK_MARK  STACK_D "/ok"
-#define FAILED   STACK_D "/failed"
 #define ACTIVE   STACK_D "/active"
 #define IMPL     "NegroniMTLDeviceImpl"
 
@@ -89,35 +86,26 @@ static bool read_word(const char *path, char *out, size_t size)
 	dispatch_once(&once, ^{
 		strlcpy(g_bundle, [[NSBundle bundleForClass:[NegroniMTLDevice class]] bundlePath].UTF8String ?: "/nonexistent", sizeof(g_bundle));
 		const bool compositor = !strcmp(getprogname() ?: "", "backboardd");
-		char wanted[32] = "", local[640], text[64] = "", why[160];
+		char wanted[32] = "", local[640], why[320], note[160];
 		snprintf(local, sizeof(local), "%s/option.local", g_bundle);
 		if (!read_word(SETTING, wanted, sizeof(wanted)))
 			(void)read_word(local, wanted, sizeof(wanted));
-		struct nmtl_option_state s;
-		FILE *f = fopen(STATE, "r");
-		if (f != NULL) {
-			if (fgets(text, sizeof(text), f) == NULL)
-				text[0] = 0;
-			fclose(f);
-		}
-		nmtl_option_state_read(text, &s);
+		FILE *f;
 		if (compositor) {
 			/* the mode of helper_ios26.c stack_dir(): a root process can come here first; as mobile both calls only fail: the parent folder and this one are root's */
 			mkdir(STACK_D, 01777);
 			chmod(STACK_D, 01777);
 		}
-		const bool ok = compositor && access(OK_MARK, F_OK) == 0, failed = compositor && access(FAILED, F_OK) == 0;
-		const char *pick = nmtl_option_choose(wanted, known, &s, ok, failed, compositor, why, sizeof(why));
-		if (compositor) {
-			unlink(OK_MARK);
-			unlink(FAILED);
-			if ((f = fopen(STATE, "w")) != NULL) {
-				fprintf(f, "%s %d %d\n", s.option[0] ? s.option : "-", s.fails, s.pending);
-				fclose(f);
-			}
+		char wanted_file[640];
+		snprintf(wanted_file, sizeof(wanted_file), "%s/options/%s/NegroniMetal", g_bundle, wanted);
+		const char *pick = nmtl_option_select(STACK_D, wanted, wanted_file, known, compositor, why, sizeof(why), note, sizeof(note));
+		char say[440];
+		if (note[0] != 0) {
+			snprintf(say, sizeof(say), "%s: %s", tag_of(wanted), note);
+			line(say);
 		}
-		char say[240];
-		if (why[0] != 0) {
+		/* one line a start, from the compositor; a client follows it */
+		if (why[0] != 0 && compositor) {
 			snprintf(say, sizeof(say), "%s: off: %s: stack default", tag_of(wanted), why);
 			line(say);
 		} else if (compositor) {
@@ -142,6 +130,8 @@ static bool read_word(const char *path, char *out, size_t size)
 				fprintf(f, "%s it does not load\n", pick);
 				fclose(f);
 			}
+			if (compositor)
+				(void)nmtl_store_write(STACK_D, "failed", "it does not load\n");
 			snprintf(path, sizeof(path), "%s/options/%s/NegroniMetal", g_bundle, pick);
 			image = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 		}
@@ -155,10 +145,9 @@ static bool read_word(const char *path, char *out, size_t size)
 		device = [fresh initWithAcceleratorPort:port];
 		if (device == nil && compositor && strcmp(pick, NMTL_OPTION_DEFAULT) != 0) {
 			/* the classes are in this process now, so the default cannot come in beside them: the next start takes it. launchd restarts backboardd at once */
-			if ((f = fopen(FAILED, "w")) != NULL) {
-				fprintf(f, "no device\n");
-				fclose(f);
-			}
+			/* on the disk before the exit: the next start, in this boot or after a reset, reads it */
+			if (nmtl_store_write(STACK_D, "failed", "no device\n") != 0)
+				line("LAUREL METAL: stack/failed cannot be written");
 			snprintf(say, sizeof(say), "%s: off: stack %s gave no device: restart on stack default", tag_of(pick), pick);
 			line(say);
 			_exit(0);

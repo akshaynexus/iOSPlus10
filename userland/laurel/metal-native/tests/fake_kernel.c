@@ -20,6 +20,7 @@ struct fake_surface {
 	uint64_t size;
 	void *mem;
 	uint32_t width, height, row_bytes, fourcc;
+	uint32_t handle;        /* one handle per surface, as RedwoodGPU's surfaceBuffer: GEM_CLOSE drops the buffer */
 };
 
 struct fake_kernel {
@@ -70,6 +71,11 @@ uint32_t fake_kernel_add_surface(struct fake_kernel *k, uint64_t size, uint32_t 
 	s->row_bytes = row_bytes;
 	s->fourcc = fourcc;
 	return k->surface_count;        /* ids from 1 */
+}
+
+void *fake_kernel_surface_memory(struct fake_kernel *k, uint32_t id)
+{
+	return id >= 1 && id <= k->surface_count ? k->surfaces[id - 1].mem : NULL;
 }
 
 static struct fake_bo *bo_at(struct fake_kernel *k, uint32_t handle)
@@ -266,10 +272,17 @@ static int fake_call(void *ctx, uint32_t sel, void *data, size_t size)
 	}
 	case 0x7e: {
 		struct { uint32_t surface, handle; uint64_t size; uint32_t offset, row_bytes, width, height, pixel_format, planes; } *r = data;
-		if (r->surface == 0 || r->surface > k->surface_count)
+		const uint32_t id = r->surface & ~0x40000000u; /* kRedwoodAnyLayout */
+		if (id == 0 || id > k->surface_count)
 			return ENOENT;
-		struct fake_surface *s = &k->surfaces[r->surface - 1];
-		r->handle = bo_add(k, s->size, s->mem, 1, 1)->handle;
+		struct fake_surface *s = &k->surfaces[id - 1];
+		struct fake_bo *have = s->handle ? bo_at(k, s->handle) : NULL;
+		if (have != NULL && have->mem == s->mem && have->live) {
+			r->handle = s->handle;
+		} else {
+			r->handle = bo_add(k, s->size, s->mem, 1, 1)->handle;
+			s->handle = r->handle;
+		}
 		r->size = s->size;
 		r->offset = 0;
 		r->row_bytes = s->row_bytes;

@@ -57,7 +57,10 @@ def main():
                     continue
                 fragment = fixed.get(k, "") if fs[1][0] == "T" or " fc_" in fs[2] else fs[1]
                 vertex = vs[1]
-                if not fragment or re.match(r"V[a-z]", vertex):   # CA's name of a specialized vertex: the fragment's own compile says what matters
+                if vertex == "VfxXgh":      # CA's generic vertex stage: no vertex descriptor, its constants join the row
+                    vertex = "fixed_vert_lph_gen"
+                    k = ",".join(x for x in (constants(vs[2]), k) if x and x != "-")
+                elif not fragment or re.match(r"V[a-z]", vertex):   # CA's name of a specialized vertex: the fragment's own compile says what matters
                     vertex = "std_vert_lph" if not re.match(r"V[a-z]", vertex) else "fixed_vert_lph_spc"
                 row = ("R", (fragment or "?") + ":" + fs[1], vertex, fragment, colors, layout(line), k)
                 if not fragment:

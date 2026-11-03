@@ -100,7 +100,7 @@ impl Drop for Slice {
 /// Memory of a buffer: a slice of ours, an imported surface, or the caller's pages.
 pub(crate) enum Backing {
     Slice(Arc<Slice>),
-    Sub(Arc<Slice>, u64),
+    Sub(Arc<Slice>, u64, Option<crate::misc::HeapRange>),
     Bo { gpu: Arc<Gpu>, bo: usize, offset: u64 },
 }
 impl Drop for Backing {
@@ -114,20 +114,20 @@ impl Backing {
     pub(crate) fn iova(&self) -> u64 {
         match self {
             Backing::Slice(s) => s.iova,
-            Backing::Sub(s, o) => s.iova + o,
+            Backing::Sub(s, o, _) => s.iova + o,
             Backing::Bo { bo, offset, .. } => unsafe { (*(*bo as *mut NwBoHead)).iova + offset },
         }
     }
     pub(crate) fn bo(&self) -> *mut NwBoHead {
         match self {
-            Backing::Slice(s) | Backing::Sub(s, _) => s.bo(),
+            Backing::Slice(s) | Backing::Sub(s, _, _) => s.bo(),
             Backing::Bo { bo, .. } => *bo as *mut NwBoHead,
         }
     }
     pub(crate) fn map(&self) -> *mut c_void {
         match self {
             Backing::Slice(s) => s.map as *mut c_void,
-            Backing::Sub(s, o) => (s.map as u64 + o) as *mut c_void,
+            Backing::Sub(s, o, _) => (s.map as u64 + o) as *mut c_void,
             Backing::Bo { bo, offset, .. } => unsafe {
                 let b = *bo as *mut NwBoHead;
                 if (*b).map.is_null() { std::ptr::null_mut() } else { ((*b).map as *mut u8).add(*offset as usize) as *mut c_void }
@@ -136,7 +136,7 @@ impl Backing {
     }
     pub(crate) fn must_name(&self) -> bool {
         match self {
-            Backing::Slice(s) | Backing::Sub(s, _) => unsafe { (*s.bo()).kind == NW_BO_SCATTERED },
+            Backing::Slice(s) | Backing::Sub(s, _, _) => unsafe { (*s.bo()).kind == NW_BO_SCATTERED },
             Backing::Bo { .. } => true,
         }
     }
@@ -190,17 +190,21 @@ pub unsafe extern "C" fn nmb_buffer_new_no_copy(d: *mut NmbDevice, pointer: *mut
             let mut offset = 0u32;
             let mut row = 0u32;
             let bo = unsafe { nw_bo_import_surface(gpu.dev, id, &mut offset, &mut row) };
-            if bo.is_null() {
-                return Err(format!("the kernel refused IOSurface {id}"));
+            if !bo.is_null() {
+                unsafe { (*bo).map = pointer };
+                return Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Bo { gpu: gpu.clone(), bo: bo as usize, offset: offset as u64 }, length, surface_id: id }) }));
             }
-            unsafe { (*bo).map = pointer };
-            return Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Bo { gpu: gpu.clone(), bo: bo as usize, offset: offset as u64 }, length, surface_id: id }) }));
+            // a surface the kernel takes no import by ID of: its mapping in this process is whole pages too, as in Turnip's redwood_drm_host_import
         }
-        let bo = unsafe { nw_bo_import_host(gpu.dev, pointer, length, false) };
+        // the kernel takes whole pages of this process (hostPages: its PAGE_MASK, 16 KiB here); the caller's range can start and end inside one, as Metal allows for newBufferWithBytesNoCopy on this device [V log: 6400 bytes at 0x...9c00]
+        let page = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64).max(4096);
+        let first = pointer as u64 & !(page - 1);
+        let whole = ((pointer as u64 + length + page - 1) & !(page - 1)) - first;
+        let bo = unsafe { nw_bo_import_host(gpu.dev, first as *mut c_void, whole, false) };
         if bo.is_null() {
-            return Err("the kernel refused the host pages".into());
+            return Err(format!("the kernel refused the host pages {first:#x} + {whole}: {}", unsafe { std::ffi::CStr::from_ptr(nw_last_refusal(gpu.dev)) }.to_string_lossy()));
         }
-        Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Bo { gpu: gpu.clone(), bo: bo as usize, offset: 0 }, length, surface_id: 0 }) }))
+        Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Bo { gpu: gpu.clone(), bo: bo as usize, offset: pointer as u64 - first }, length, surface_id: surface.unwrap_or(0) }) }))
     })
 }
 
@@ -245,6 +249,7 @@ pub(crate) struct TextureObj {
     pub(crate) desc: NmbTextureDescriptor,
     pub(crate) backing: Option<Arc<BufferObj>>, // over a buffer or a surface
     pub(crate) memory: Option<Arc<Slice>>,
+    pub(crate) heap: Option<crate::misc::HeapRange>, // in a heap: `memory` is the heap's, and the image starts here in it
     pub(crate) parent: Option<Arc<TextureObj>>,
     pub(crate) view_type: u32,
     pub(crate) base_level: u32,
@@ -252,6 +257,17 @@ pub(crate) struct TextureObj {
     pub(crate) base_layer: u32,
     pub(crate) layers: u32,
     pub(crate) memoryless: bool,
+    pub(crate) shadow: Option<Shadow>,
+}
+/// A texture over a buffer whose rows the GPU cannot read as they lie: an a6xx reads a pitch of 64 bytes at least (fdl6_layout), and a caller may choose 16. The image lies in this copy, with an aligned pitch, and each command buffer that reads the texture copies the rows first.
+/// Limit [I]: the buffer's content as the CPU sees it when the draw is encoded. A GPU write to that buffer in the same command buffer is not seen; a render or blit target with such rows is refused.
+pub(crate) struct Shadow {
+    pub(crate) copy: Arc<Slice>,
+    pub(crate) offset: u64,
+    pub(crate) row: u64,
+    pub(crate) pitch: u64,
+    pub(crate) line: u64,
+    pub(crate) rows: u64,
 }
 impl Drop for TextureObj {
     fn drop(&mut self) {
@@ -278,6 +294,41 @@ impl TextureObj {
             return b.backing.bo();
         }
         self.memory.as_ref().map_or(std::ptr::null_mut(), |m| m.bo())
+    }
+    /// Width and height of a level of this view, counted from its first level.
+    pub(crate) fn level_size(&self, level: u64) -> (u64, u64) {
+        let l = self.base_level as u64 + level;
+        ((self.desc.width >> l).max(1), (self.desc.height >> l).max(1))
+    }
+    /// The shadow of this texture or of the texture this view is of.
+    pub(crate) fn shadow(&self) -> Option<&Shadow> {
+        match &self.parent {
+            Some(p) => p.shadow(),
+            None => self.shadow.as_ref(),
+        }
+    }
+    pub(crate) fn root_id(&self) -> usize {
+        match &self.parent {
+            Some(p) => p.root_id(),
+            None => self as *const TextureObj as usize,
+        }
+    }
+    /// Where the CPU reads and writes this image's first byte: its own memory (a heap's, at its place in the heap) or its buffer. A view's is its parent's: one image.
+    pub(crate) fn cpu_base(&self) -> Option<*mut u8> {
+        if let Some(p) = &self.parent {
+            return p.cpu_base();
+        }
+        if let Some(m) = &self.memory {
+            return Some((m.map as u64 + self.heap.as_ref().map_or(0, |h| h.at)) as *mut u8);
+        }
+        self.backing.as_ref().map(|b| b.backing.map() as *mut u8)
+    }
+    /// The buffer that holds what the CPU wrote (a shadow's source).
+    pub(crate) fn root_backing(&self) -> Option<&Arc<BufferObj>> {
+        match &self.parent {
+            Some(p) => p.root_backing(),
+            None => self.backing.as_ref(),
+        }
     }
     pub(crate) fn view_kind(metal: u64) -> u32 {
         // MTLTextureType: 0 1D, 1 1D array, 2 2D, 3 2D array, 4 2D MS, 5 cube, 6 cube array, 7 3D, 8 2D MS array, 9 buffer
@@ -312,17 +363,31 @@ pub(crate) fn new_texture(gpu: &Arc<Gpu>, d: &NmbTextureDescriptor, over: Option
     let mode = TextureObj::storage_mode(d);
     // private and memoryless render targets take the GPU's own layout; everything the CPU can touch stays linear, so replace and getBytes are plain copies
     let tiled = over.is_none() && mode >= 2;
-    let stride = over.map_or(0, |o| o.2 as u32);
+    // a row this GPU cannot read as it lies: the image gets its own memory, with an aligned pitch
+    // ... or a first byte it cannot name: a base address is in units of 64 bytes, and the low bits are lost (icons moved by 4 pixels, over host pages that start inside a page)
+    let unaligned = over.is_some_and(|o| o.2 & 63 != 0 || (o.0.backing.iova() + o.1) & 63 != 0);
+    let stride = over.map_or(0, |o| if unaligned { ((o.2 + 63) & !63) as u32 } else { o.2 as u32 });
     let layers = if d.kind == 5 || d.kind == 6 { (d.array_length.max(1) * 6) as u32 } else { d.array_length.max(1) as u32 };
     let image = unsafe { nmn_image_new(gpu.gpu, pipe, kind, d.width as u32, d.height.max(1) as u32, d.depth.max(1) as u32, d.levels.max(1) as u32, layers, d.samples.max(1) as u32, tiled, stride) };
     if image.is_null() {
-        return Err("no layout for this texture".into());
+        return Err(format!("no layout for a texture of format {} {} x {}, {} levels, row bytes {}", d.format, d.width, d.height, d.levels, stride));
     }
     let size = unsafe { nmn_image_size(image) };
     let mut memory = None;
     let mut backing = None;
+    let mut shadow = None;
     let memoryless = mode == MEMORYLESS && over.is_none();
-    if let Some((b, offset, _)) = over {
+    if let (Some((b, offset, row)), true) = (over, unaligned) {
+        if d.levels.max(1) != 1 || d.kind == 7 || d.array_length.max(1) != 1 {
+            unsafe { nmn_image_free(image) };
+            return Err(format!("a texture of more than one level or layer over rows of {row} bytes has no native path yet"));
+        }
+        let copy = Slice::new(gpu, size, 4096)?;
+        unsafe { nmn_image_bind(image, copy.iova) };
+        let cpp = unsafe { nmn_format_blocksize(pipe) } as u64;
+        shadow = Some(Shadow { copy, offset, row, pitch: stride as u64, line: (d.width * cpp).min(row), rows: d.height.max(1) });
+        backing = Some(b.clone());
+    } else if let Some((b, offset, _)) = over {
         unsafe { nmn_image_bind(image, b.backing.iova() + offset) };
         backing = Some(b.clone());
     } else if memoryless {
@@ -345,7 +410,7 @@ pub(crate) fn new_texture(gpu: &Arc<Gpu>, d: &NmbTextureDescriptor, over: Option
         memory = Some(m);
     }
     let levels = d.levels.max(1) as u32;
-    Ok(Arc::new(TextureObj { gpu: gpu.clone(), image: image as usize, pipe_format: pipe, desc: *d, backing, memory, parent: None, view_type: kind, base_level: 0, levels, base_layer: 0, layers, memoryless }))
+    Ok(Arc::new(TextureObj { gpu: gpu.clone(), image: image as usize, pipe_format: pipe, desc: *d, backing, memory, heap: None, parent: None, view_type: kind, base_level: 0, levels, base_layer: 0, layers, memoryless, shadow }))
 }
 
 #[unsafe(no_mangle)]
@@ -358,7 +423,7 @@ pub extern "C" fn nmb_texture_new_on_buffer(b: *mut NmbBuffer, descriptor: *cons
     guard(std::ptr::null_mut(), || {
         let buffer = &get(b)?.b;
         let gpu = match &buffer.backing {
-            Backing::Slice(s) | Backing::Sub(s, _) => s.gpu.clone(),
+            Backing::Slice(s) | Backing::Sub(s, _, _) => s.gpu.clone(),
             Backing::Bo { gpu, .. } => gpu.clone(),
         };
         Ok(boxed(NmbTexture { t: new_texture(&gpu, get(descriptor)?, Some((buffer, offset, bytes_per_row)))? }))
@@ -391,11 +456,15 @@ pub unsafe extern "C" fn nmb_texture_replace(t: *mut NmbTexture, region: *const 
         if TextureObj::storage_mode(&t.desc) >= 2 {
             return Err("replaceRegion on a private texture".into());
         }
-        let map = t.memory.as_ref().map(|m| m.map as *mut u8).or(t.backing.as_ref().map(|b| b.backing.map() as *mut u8)).ok_or("no CPU mapping")?;
+        let map = t.cpu_base().ok_or("no CPU mapping")?;
+        let (level, slice) = (level as u32 + t.base_level, slice as u32 + t.base_layer);
         unsafe {
             let cpp = nmn_format_blocksize(t.pipe_format) as u64;
-            let pitch = nmn_image_pitch(t.image as *const NmnImage, level as u32) as u64;
-            let base = nmn_image_layer_offset(t.image as *const NmnImage, level as u32, slice as u32);
+            // with a shadow, the buffer holds the truth, in the caller's rows at the caller's offset
+            let (pitch, base) = match t.shadow() {
+                Some(x) => (x.row, x.offset),
+                None => (nmn_image_pitch(t.image as *const NmnImage, level) as u64, nmn_image_layer_offset(t.image as *const NmnImage, level, slice)),
+            };
             for y in 0..r[4] {
                 let dst = map.add((base + (r[1] + y) * pitch + r[0] * cpp) as usize);
                 let src = (bytes as *const u8).add((y * bytes_per_row) as usize);
@@ -477,6 +546,7 @@ pub struct NmbCommandBuffer {
     pub(crate) held_baked: Vec<Arc<Baked>>,
     pub(crate) held_streams: Vec<Box<NwCs>>,
     pub(crate) names: Vec<usize>,
+    pub(crate) shadows_done: Vec<usize>,
     upload: Option<Upload>,
     pub(crate) state: Arc<(Mutex<CbState>, Condvar)>,
     handlers: Vec<(extern "C" fn(*mut c_void), usize)>,
@@ -521,7 +591,7 @@ pub extern "C" fn nmb_command_buffer_new(q: *mut NmbQueue) -> *mut NmbCommandBuf
             nw_cs_init(&mut *cs, gpu.dev);
             nmn_cmd_init(&mut *cs, gpu.gpu);
         }
-        Ok(boxed(NmbCommandBuffer { gpu, cs, held_textures: vec![], held_buffers: vec![], held_slices: vec![], held_baked: vec![], held_streams: vec![], names: vec![], upload: None, state: Arc::new((Mutex::new(CbState::default()), Condvar::new())), handlers: vec![], scheduled: vec![], open: false, signals: vec![], waits: vec![] }))
+        Ok(boxed(NmbCommandBuffer { gpu, cs, held_textures: vec![], held_buffers: vec![], held_slices: vec![], held_baked: vec![], held_streams: vec![], names: vec![], shadows_done: vec![], upload: None, state: Arc::new((Mutex::new(CbState::default()), Condvar::new())), handlers: vec![], scheduled: vec![], open: false, signals: vec![], waits: vec![] }))
     })
 }
 
@@ -602,6 +672,15 @@ pub extern "C" fn nmb_command_buffer_commit(c: *mut NmbCommandBuffer) -> bool {
                 nw_submit_name(&mut s, b as *mut NwBoHead);
             }
             let e = nw_submit_go(&mut s, &mut fence);
+            crate::flight::line(&format!("submit fence={fence} errno {e}, {} names", s.name_count));
+            if crate::flight::on() {
+                let mut ibs = String::from("  ibs:");
+                for i in 0..(*cb.cs).ib_count as usize {
+                    let ib = &*(*cb.cs).ibs.add(i);
+                    ibs.push_str(&format!(" {:#x}+{}", ib.iova, ib.dwords));
+                }
+                crate::flight::line(&ibs);
+            }
             cb.gpu.names_total.fetch_add(s.name_count as u64, Ordering::Relaxed);
             nw_submit_end(&mut s);
             if e != 0 {
@@ -783,6 +862,7 @@ pub struct NmbEncoder {
     pub(crate) raster: NmnRaster,
     plan_cache: HashMap<(usize, Vec<u8>), Arc<PlanEntry>>,
     attachment_written: u32,
+    target_dirty: bool, // a draw of this pass wrote an attachment since the last flush: a draw that reads the target needs that flush
     pub(crate) compute: Option<ComputeState>,
 }
 
@@ -793,10 +873,12 @@ pub(crate) struct ComputeState {
 
 struct PassRecord {
     colors: Vec<Option<(Arc<TextureObj>, u64, u64, u64, u64, [f64; 4])>>,
-    depth: Option<Arc<TextureObj>>,
+    depth: Option<(Arc<TextureObj>, u32, u32)>,
     depth_load: u64,
-    depth_store: u64,
     clear_z: f64,
+    stencil: Option<(Arc<TextureObj>, u32, u32)>,
+    stencil_load: u64,
+    clear_s: u32,
     w: u32,
     h: u32,
     samples: u32,
@@ -818,36 +900,73 @@ pub extern "C" fn nmb_render_encoder_new(c: *mut NmbCommandBuffer, d: *const Nmb
             return Err("another encoder is open".into());
         }
         let d = get(d)?;
+        // a view's level and slice count from its own first level and slice: the image behind it is the parent's
         let mut colors = vec![];
+        let mut smallest: Option<(u64, u64)> = None;
+        let mut fit = |t: &TextureObj, level: u64| {
+            let (w, h) = t.level_size(level);
+            smallest = Some(smallest.map_or((w, h), |s: (u64, u64)| (s.0.min(w), s.1.min(h))));
+        };
         for a in &d.colors {
             if a.texture.is_null() {
                 colors.push(None);
             } else {
-                colors.push(Some((get(a.texture)?.t.clone(), a.level, a.slice, a.load, a.store, a.clear)));
+                let t = get(a.texture)?.t.clone();
+                if t.shadow().is_some() {
+                    return Err("a render target with rows the GPU cannot write has no native path".into());
+                }
+                fit(&t, a.level);
+                let (level, layer) = (t.base_level as u64 + a.level, t.base_layer as u64 + a.slice + a.depth_plane);
+                colors.push(Some((t, level, layer, a.load, a.store, a.clear)));
+            }
+        }
+        for a in [&d.depth, &d.stencil] {
+            if !a.texture.is_null() {
+                fit(&get(a.texture)?.t, a.level);
             }
         }
         while colors.last().is_some_and(|c| c.is_none()) {
             colors.pop();
         }
-        let depth = if d.depth.texture.is_null() { None } else { Some(get(d.depth.texture)?.t.clone()) };
+        // depth and stencil: a level and a slice of their own; one texture for both when it is Depth32Float_Stencil8
+        let plane = |a: &NmbPassAttachment| -> Result<Option<(Arc<TextureObj>, u32, u32)>, String> {
+            if a.texture.is_null() {
+                return Ok(None);
+            }
+            let t = get(a.texture)?.t.clone();
+            let (level, layer) = (t.base_level + a.level as u32, t.base_layer + (a.slice + a.depth_plane) as u32);
+            Ok(Some((t, level, layer)))
+        };
+        let depth = plane(&d.depth)?;
+        let stencil = plane(&d.stencil)?;
+        if let Some((t, ..)) = &depth {
+            if t.pipe_format == unsafe { nmn_format_from_metal(253) } {
+                return Err("a Stencil8 texture as the depth attachment".into());
+            }
+        }
+        // Metal's renderTargetWidth and renderTargetHeight stay 0 unless the caller sets them, and CoreAnimation leaves them: 0 is the attachments' size. Taken as it is, w - 1 made a clear of 16384 x 16384 that ran past a small surface: the hang of the first compositor run (FAR 0x1008000, 0x1068000). A size above an attachment's is cut to it: a target must not be written past its end.
+        let (w, h) = match smallest {
+            Some((sw, sh)) => (if d.width == 0 { sw } else { d.width.min(sw) }, if d.height == 0 { sh } else { d.height.min(sh) }),
+            None if d.width != 0 && d.height != 0 => (d.width, d.height),
+            None => return Err("a pass with no attachment and no size".into()),
+        };
+        let (w, h) = (w as u32, h as u32);
         let mut draws: Box<NwCs> = Box::new(unsafe { std::mem::zeroed() });
         unsafe { nw_cs_init(&mut *draws, cb.gpu.dev) };
         cb.open = true;
-        let w = d.width as u32;
-        let h = d.height as u32;
         let raster = default_raster(w, h);
-        Ok(boxed(NmbEncoder { cb: c, gpu: cb.gpu.clone(), kind: 0, pass: Some(PassRecord { colors, depth, depth_load: d.depth.load, depth_store: d.depth.store, clear_z: d.depth.clear[0], w, h, samples: d.samples.max(1) as u32 }), draws, stages: Default::default(), pipeline: None, raster, plan_cache: HashMap::new(), attachment_written: 0, compute: None }))
+        Ok(boxed(NmbEncoder { cb: c, gpu: cb.gpu.clone(), kind: 0, pass: Some(PassRecord { colors, depth, depth_load: d.depth.load, clear_z: d.depth.clear[0], stencil, stencil_load: d.stencil.load, clear_s: d.stencil.clear[0] as u32, w, h, samples: d.samples.max(1) as u32 }), draws, stages: Default::default(), pipeline: None, raster, plan_cache: HashMap::new(), attachment_written: 0, target_dirty: true, compute: None }))
     })
 }
 
 impl NmbEncoder {
     pub(crate) fn plain(cb: *mut NmbCommandBuffer, gpu: Arc<Gpu>, kind: u32, draws: Box<NwCs>) -> NmbEncoder {
-        NmbEncoder { cb, gpu, kind, pass: None, draws, stages: Default::default(), pipeline: None, raster: default_raster(1, 1), plan_cache: HashMap::new(), attachment_written: 0, compute: None }
+        NmbEncoder { cb, gpu, kind, pass: None, draws, stages: Default::default(), pipeline: None, raster: default_raster(1, 1), plan_cache: HashMap::new(), attachment_written: 0, target_dirty: false, compute: None }
     }
 }
 
 pub(crate) fn default_raster(w: u32, h: u32) -> NmnRaster {
-    NmnRaster { viewport: [0.0, 0.0, w as f64, h as f64, 0.0, 1.0], scissor: [0, 0, w, h], cull_mode: 0, winding: 0, fill_mode: 0, depth_bias: 0.0, slope_scale: 0.0, bias_clamp: 0.0, line_width: 1.0, blend_color: [0.0; 4], stencil_front: 0, stencil_back: 0, depth_func: 7, depth_write: false, depth_test: false, reads_framebuffer: false, pass_width: w, pass_height: h, stencil_enable: false, st_func: [7, 7], st_fail: [0, 0], st_zpass: [0, 0], st_zfail: [0, 0], st_read: [0xff, 0xff], st_write: [0xff, 0xff] }
+    NmnRaster { lines: false, early_z: false, viewport: [0.0, 0.0, w as f64, h as f64, 0.0, 1.0], scissor: [0, 0, w, h], cull_mode: 0, winding: 0, fill_mode: 0, depth_bias: 0.0, slope_scale: 0.0, bias_clamp: 0.0, line_width: 1.0, blend_color: [0.0; 4], stencil_front: 0, stencil_back: 0, depth_func: 7, depth_write: false, depth_test: false, reads_framebuffer: false, pass_width: w, pass_height: h, stencil_enable: false, st_func: [7, 7], st_fail: [0, 0], st_zpass: [0, 0], st_zfail: [0, 0], st_read: [0xff, 0xff], st_write: [0xff, 0xff] }
 }
 
 fn stage_index(stage: u32) -> Result<usize, String> {
@@ -1038,7 +1157,7 @@ fn plan_entry(e: &mut NmbEncoder, device_pipeline: &NmbRenderPipeline, state: &B
         w[..n].copy_from_slice(&plan.specialization.data[at..at + n]);
         NmnSpec { id: m.constant_id, value: u32::from_le_bytes(w) }
     }).collect();
-    let program = crate::compile::render_program_spec(dev.compiler, pipeline, &spec)?;
+    let program = crate::compile::cached_program(&dev.cache, dev.compiler, &device_pipeline.key, &spec, || crate::compile::render_program_spec(dev.compiler, pipeline, &spec))?;
     let bindings = crate::compile::lay_out(&pipeline.layout)?;
     let mut offsets = HashMap::new();
     let mut set_slots = vec![];
@@ -1059,6 +1178,11 @@ fn plan_entry(e: &mut NmbEncoder, device_pipeline: &NmbRenderPipeline, state: &B
     }
     let reads_fb = program.stage_info(1).is_some_and(|i| i.reads_framebuffer);
     let outputs = program.stage_info(1).map_or(0, |i| i.color_outputs);
+    // the file only: one line a program, at its first use in this process. The last of these before a GPU hang names the suspect; a hang's process is killed, so nothing later can say it
+    {
+        let f = program.stage_info(1).unwrap_or_default();
+        file_line(&format!("native-metal: program {}: {} fragment instructions, {} texture reads, reads the target: {reads_fb}", device_pipeline.names, f.instructions, f.tex_ops));
+    }
     let entry = Arc::new(PlanEntry { plan, baked: Arc::new(Baked { gpu: e.gpu.clone(), b: baked as usize, reads_fb, program }), offsets, set_slots, outputs });
     device_pipeline.plans.lock().unwrap().insert(key.1.clone(), entry.clone());
     e.plan_cache.insert(key, entry.clone());
@@ -1119,7 +1243,10 @@ pub(crate) fn write_descriptors(e: &mut NmbEncoder, cb: &mut NmbCommandBuffer, d
                         }
                         cb.held_buffers.push(b.clone());
                         let r = range.map(|r| r.range);
-                        (b.backing.iova() + r.map_or(*off, |r| r.offset), r.map_or(b.length - off, |r| r.range))
+                        // a range past the buffer's end (the planner's whole size) stops at its end: the shader's bounds come from this descriptor
+                        let at = r.map_or(*off, |r| r.offset);
+                        let left = b.length.saturating_sub(at);
+                        (b.backing.iova() + at, r.map_or(left, |r| r.range.min(left)))
                     }
                     Some(BoundBuf::Bytes(d)) => {
                         let (iova, map) = cb.upload((d.len() as u64).max(16), 64)?;
@@ -1176,19 +1303,78 @@ pub(crate) fn write_descriptors(e: &mut NmbEncoder, cb: &mut NmbCommandBuffer, d
 }
 
 /// One draw: the plan decides, this writes it.
-fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, u64, bool, i32)>, primitive: u32, counts: (u32, u32, u32, u32)) -> Result<(), String> {
+fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, u64, bool, i32)>, arguments: Option<(Arc<BufferObj>, u64)>, primitive: u32, counts: (u32, u32, u32, u32)) -> Result<(), String> {
     let pipeline_ptr = e.pipeline.ok_or("a draw with no pipeline")?;
     let device_pipeline = unsafe { pipeline_ptr.as_ref() }.ok_or("the pipeline")?;
     let state = build_state(e)?;
     let entry = plan_entry(e, device_pipeline, &state)?;
     let commands = entry.plan.instantiate_draw(&state, &draw).map_err(|x| format!("draw: {x:?}"))?;
+    // what a draw needs beside its descriptors and constants. Each of these fills memory or a pointer the shader reads: left out, the shader reads garbage and the GPU can fault. Refused, with the reason in the line
+    if !commands.descriptor_bytes.is_empty() {
+        return Err(format!("this draw uploads {} descriptor tables (argument or handle tables), which have no native path yet", commands.descriptor_bytes.len()));
+    }
+    if !commands.root_tables.is_empty() || !commands.push_holes.is_empty() {
+        return Err(format!("this draw needs {} root tables and {} address holes in its constants, which have no native path yet", commands.root_tables.len(), commands.push_holes.len()));
+    }
+    if commands.indirect_needs_arguments {
+        return Err("this indirect draw needs its arguments in the planner's hands, which has no native path yet".into());
+    }
+    if !commands.amplifications.is_empty() || commands.mesh_dispatch.is_some() || commands.tessellation_dispatch.is_some() || commands.mesh_arguments.is_some() || commands.object_fold.is_some() || commands.index_bounds_pass || commands.index_overrun.is_some() {
+        return Err("this draw needs a pass before it (amplification, mesh, tessellation, an index check), which has no native path yet".into());
+    }
     let cb = unsafe { e.cb.as_mut() }.ok_or("the command buffer")?;
     cb.held_baked.push(entry.baked.clone());
 
     let set_memory = write_descriptors(e, cb, &entry.plan.descriptors, &commands.descriptor_ranges, &entry.offsets, &entry.set_slots, &device_pipeline.pipeline.layout)?;
+    let mark = if crate::flight::on() { crate::flight::next_mark(&cb.gpu) } else { None };
+    if crate::flight::on() {
+        let at = unsafe { e.draws.start_iova + (e.draws.cur as u64).wrapping_sub(e.draws.start as u64) };
+        crate::flight::line(&format!("draw {} prim {primitive} counts {counts:?} at {at:#x} id {}", device_pipeline.names, mark.map_or(0, |m| m.1)));
+        for (i, s) in set_memory.iter().enumerate() {
+            crate::flight::line(&crate::flight::set_words(i, s.0, s.1, entry.set_slots.get(i).copied().unwrap_or(0)));
+        }
+        let mut facts = [0 as std::ffi::c_char; 400];
+        let private = unsafe { nmn_baked_describe(entry.baked.b as *const NmnBaked, facts.as_mut_ptr(), facts.len()) };
+        crate::flight::line(&format!("  program: {}", unsafe { std::ffi::CStr::from_ptr(facts.as_ptr()) }.to_string_lossy()));
+        if private {
+            // what such a large program reads: its uniform buffers, for a comparison of a draw that stops with one that ended
+            for (i, m) in set_memory.iter().enumerate() {
+                let slots = entry.set_slots.get(i).copied().unwrap_or(0) as usize;
+                for slot in 0..slots.min(64) {
+                    let w = unsafe { std::slice::from_raw_parts(m.1.add(slot * 16), 16) };
+                    // a UBO descriptor: address, size in vec4 from bit 17; the rest 0
+                    if w[1] >> 17 == 0 || w[1] & 0x1ffff != 0 || w[2..].iter().any(|x| *x != 0) {
+                        continue;
+                    }
+                    let (iova, bytes) = (w[0] as u64, ((w[1] >> 17) as u64 * 16).min(512));
+                    let bo = unsafe { nw_bo_of_address(cb.gpu.dev, iova, bytes) };
+                    if bo.is_null() || unsafe { (*bo).map.is_null() } {
+                        continue;
+                    }
+                    let data = unsafe { std::slice::from_raw_parts(((*bo).map as *const u8).add((iova - (*bo).iova) as usize), bytes as usize) };
+                    crate::flight::line(&format!("  ubo {slot} {iova:#x}: {}", crate::flight::hex(data)));
+                }
+            }
+        }
+        for (k, b) in [("v", 1usize), ("f", 2)] {
+            for (slot, t) in &e.stages[b].textures {
+                crate::flight::line(&format!("  {k} texture {slot}: format {} {}x{} at {:#x}{}", t.desc.format, t.desc.width, t.desc.height, unsafe { nmn_image_iova(t.image as *const NmnImage) }, if t.memoryless { " memoryless" } else { "" }));
+            }
+        }
+        for w in &commands.push_constants {
+            crate::flight::line(&format!("  push at {} stages {:?}: {}", w.offset, w.stages, crate::flight::hex(&w.bytes)));
+        }
+    }
 
     let cs: *mut NwCs = &mut *e.draws;
     unsafe {
+        // In sysmem the fragment reads the target through the texture path while the pixels of the draws before it are in the CCU: Metal's rule is that it sees them. GRAS_SC_CNTL's per-overlap flush covers the primitives
+        // of one draw. Without this: wrong pixels in blocks of a cache line (RenderBox's paths: stripes, no text). In GMEM Turnip has no such need; a Vulkan self-dependency does the same.
+        if entry.baked.reads_fb && e.target_dirty {
+            nmn_cmd_barrier(cs);
+            e.target_dirty = false;
+        }
+        e.target_dirty |= entry.outputs != 0;
         // program first: its stream invalidates constants and state, and what follows is the draw's own
         nmn_cmd_program(cs, entry.baked.b as *const NmnBaked);
         let sets: Vec<u64> = set_memory.iter().map(|s| s.0).collect();
@@ -1197,6 +1383,20 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
         }
         let mut raster = e.raster;
         raster.reads_framebuffer = entry.baked.reads_fb;
+        // MTLPrimitiveType: 1 line, 2 line strip. Turnip's register for lines at one sample: Bresenham, no polygon offset. The rectangular form is for MSAA; these draws marked each hang of 08:39 and 08:54
+        raster.lines = primitive == 1 || primitive == 2;
+        // a state's depth or stencil test acts only on a pass that has that attachment (Metal's rule)
+        let (has_depth, has_stencil) = e.pass.as_ref().map_or((false, false), |p| (p.depth.is_some(), p.stencil.is_some()));
+        raster.depth_test &= has_depth;
+        raster.depth_write &= has_depth;
+        raster.stencil_enable &= has_stencil;
+        // tu6_build_depth_plane_z_mode: late when the fragment can be killed after it wrote, when the shader writes depth, and when no depth test runs
+        let fs = entry.baked.program.stage_info(1);
+        let stencil_writes = raster.stencil_enable && (0..2).any(|i| raster.st_write[i] != 0 && (raster.st_fail[i] != 0 || raster.st_zpass[i] != 0 || raster.st_zfail[i] != 0));
+        let writes = (raster.depth_test && raster.depth_write) || stencil_writes;
+        let stencil_only = e.pass.as_ref().and_then(|p| p.stencil.as_ref()).is_some_and(|x| x.0.pipe_format == nmn_format_from_metal(253));
+        let (kill, late, early_tests) = fs.map_or((false, false, false), |i| (i.has_kill, i.no_early_z, i.early_tests));
+        raster.early_z = early_tests || (raster.depth_test && !(kill && writes) && !late && !stencil_only);
         nmn_cmd_raster(cs, &raster);
         // the push range of each stage
         for w in &commands.push_constants {
@@ -1256,6 +1456,28 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
         }
         nmn_cmd_vertex_buffers(cs, iova.as_ptr(), size.as_ptr(), stride.as_ptr(), iova.len() as u32);
         let (count, instances, first, first_instance) = counts;
+        if let Some((a, at)) = &arguments {
+            let (index_iova, max, wide) = match &index {
+                Some((b, offset, wide, _)) => (b.backing.iova() + offset, ((b.length - offset) / if *wide { 4 } else { 2 }) as u32, *wide),
+                None => (0, 0, false),
+            };
+            if a.backing.must_name() {
+                cb.names.push(a.backing.bo() as usize);
+            }
+            nmn_cmd_draw_indirect(cs, primitive, a.backing.iova() + at, index_iova, max, wide);
+            if let Some((word, id)) = mark {
+                nmn_cmd_progress(cs, word, id);
+            }
+            cb.held_buffers.push(a.clone());
+            if let Some((b, ..)) = index {
+                if b.backing.must_name() {
+                    cb.names.push(b.backing.bo() as usize);
+                }
+                cb.held_buffers.push(b);
+            }
+            e.attachment_written |= entry.outputs;
+            return Ok(());
+        }
         match index {
             Some((b, offset, wide, base)) => {
                 if b.backing.must_name() {
@@ -1266,6 +1488,9 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
                 cb.held_buffers.push(b);
             }
             None => nmn_cmd_draw(cs, primitive, count, instances, first, first_instance),
+        }
+        if let Some((word, id)) = mark {
+            nmn_cmd_progress(cs, word, id);
         }
     }
     e.attachment_written |= entry.outputs;
@@ -1321,6 +1546,15 @@ fn write_neutral_image(e: &NmbEncoder, view: vk::ImageViewType, slot: *mut u32) 
     Ok(())
 }
 
+/// One line in metal.log only: for what is too many lines for the console.
+pub(crate) fn file_line(text: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open("/private/var/db/negronimetal/metal.log") {
+        let name = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default();
+        let _ = f.write_all(format!("NMTL[{} {}]: {}\n", std::process::id(), name, text).as_bytes());
+    }
+}
+
 /// One line where the selector's lines go: the console (the USB log) and metal.log. Failure of a log is nothing.
 pub(crate) fn console_line(text: &str) {
     use std::io::Write;
@@ -1334,7 +1568,7 @@ pub(crate) fn console_line(text: &str) {
     }
 }
 
-/// ENODEV from a fence: the kernel turned the GPU off (a hang), for every stack, until a reboot. The compositor marks this stack as failed: the next start takes the default and stays on it until the setting is written again (option_rule.h). Without this, a stack that hangs after the screen was lit would hang again at each boot: the lit screen has already cleared its count.
+/// ENODEV from a fence: the kernel turned the GPU off (a hang), for every stack, until a reboot. The compositor reports it; the next start marks this build as failed (option_store.h). The kernel kills backboardd at a hang, often first [V logs 06:47:15, 06:49:22: no line of this function]: then the selector's own count and "no device" do it.
 fn mark_gpu_off() {
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -1342,21 +1576,32 @@ fn mark_gpu_off() {
     }
     let compositor = std::env::current_exe().ok().is_some_and(|p| p.file_name().is_some_and(|n| n == "backboardd"));
     if compositor {
-        let _ = std::fs::write("/private/var/db/negronimetal/stack/failed", "the kernel turned the GPU off\n");
+        // on the disk before the next start: option_store.h turns it into this build's mark
+        let written = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let dir = "/private/var/db/negronimetal/stack";
+            let mut f = std::fs::File::create(format!("{dir}/failed"))?;
+            f.write_all(b"the kernel turned the GPU off\n")?;
+            f.sync_all()?;
+            std::fs::File::open(dir)?.sync_all()
+        })();
+        if let Err(x) = written {
+            console_line(&format!("LAUREL METAL NATIVE: stack/failed cannot be written: {x}"));
+        }
         console_line("LAUREL METAL NATIVE: off: the kernel turned the GPU off: the next start takes stack default");
     }
 }
 
 /// A descriptor's address reaches the GPU with no packet around it, so nw_stream_check cannot read it. It is checked where it is written.
-pub(crate) fn check_descriptor_address(dev: *mut NwDevice, iova: u64) -> Result<(), String> {
-    if iova != 0 && unsafe { nw_bo_of_address(dev, iova, 1) }.is_null() {
-        return Err(format!("stream check: a descriptor at {iova:#x}: no live buffer holds it"));
+pub(crate) fn check_descriptor_address(dev: *mut NwDevice, iova: u64, bytes: u64) -> Result<(), String> {
+    if iova != 0 && unsafe { nw_bo_of_address(dev, iova, bytes.max(1)) }.is_null() {
+        return Err(format!("stream check: a descriptor at {iova:#x} of {bytes} bytes: no live buffer holds it"));
     }
     Ok(())
 }
 
 fn write_buffer_descriptor(dev: *mut NwDevice, ty: vk::DescriptorType, iova: u64, length: u64, slot: *mut u32) -> Result<(), String> {
-    check_descriptor_address(dev, iova)?;
+    check_descriptor_address(dev, iova, length)?;
     match ty {
         vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => unsafe { nmn_descriptor_ubo(iova, length, slot) },
         vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => unsafe { nmn_descriptor_ssbo(iova, length, slot) },
@@ -1388,9 +1633,29 @@ fn swizzle_of(view: Option<&metal2vulkan::bind::ImageViewDesc>) -> [u8; 4] {
 fn write_texture(e: &NmbEncoder, cb: &mut NmbCommandBuffer, stage: Stage, index: u32, view: Option<&metal2vulkan::bind::ImageViewDesc>, storage: bool, slot: *mut u32) -> Result<(), String> {
     let t = e.stages[stage_slot(stage)?].textures.get(&index).ok_or("a texture slot with nothing bound")?.clone();
     let swizzle = swizzle_of(view);
-    check_descriptor_address(e.gpu.dev, unsafe { nmn_image_iova(t.image as *const NmnImage) })?;
+    // the first level the view reaches, up to its last layer: a read past the buffer's end is a fault as a write is
+    check_descriptor_address(e.gpu.dev, unsafe { nmn_image_iova(t.image as *const NmnImage) }, unsafe { nmn_image_extent(t.image as *const NmnImage, t.base_level, t.base_layer + t.layers.max(1) - 1) })?;
     unsafe { nmn_descriptor_image(t.image as *const NmnImage, t.pipe_format, t.view_type, t.base_level, t.levels, t.base_layer, t.layers, swizzle.as_ptr(), storage, slot) };
-    if t.must_name() {
+    if let Some(shadow) = t.shadow() {
+        // the rows as the CPU sees them now, once in a command buffer: the image lies in the copy (Shadow). Without this the GPU read old memory: blank icons, masks of sparse dots
+        if !cb.shadows_done.contains(&t.root_id()) {
+            let source = t.root_backing().ok_or("a shadow with no buffer")?;
+            let from = source.backing.map() as *const u8;
+            if from.is_null() {
+                return Err("a shadow over a buffer with no CPU mapping".into());
+            }
+            let fits = source.length.saturating_sub(shadow.offset);
+            let rows = if shadow.row == 0 { 0 } else { shadow.rows.min((fits + shadow.row - shadow.line.min(fits)) / shadow.row) };
+            for y in 0..rows {
+                let start = y * shadow.row;
+                unsafe { std::ptr::copy_nonoverlapping(from.add((shadow.offset + start) as usize), (shadow.copy.map as *mut u8).add((y * shadow.pitch) as usize), shadow.line.min(fits - start) as usize) };
+            }
+            cb.shadows_done.push(t.root_id());
+        }
+        if unsafe { (*shadow.copy.bo()).kind == NW_BO_SCATTERED } {
+            cb.names.push(shadow.copy.bo() as usize);
+        }
+    } else if t.must_name() {
         cb.names.push(t.bo() as usize);
     }
     cb.held_textures.push(t);
@@ -1403,7 +1668,7 @@ pub extern "C" fn nmb_render_draw(e: *mut NmbEncoder, primitive: u64, start: u32
         let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
         let draw = DrawCall::Primitives { vertex_start: start, vertex_count: count, instance_count: instances, base_instance };
         let _ = PrimitiveType::try_from(primitive as u32).map_err(|_| "primitive type")?;
-        emit_draw(e, draw, None, primitive as u32, (count, instances, start, base_instance))?;
+        emit_draw(e, draw, None, None, primitive as u32, (count, instances, start, base_instance))?;
         Ok(true)
     })
 }
@@ -1416,7 +1681,31 @@ pub extern "C" fn nmb_render_draw_indexed(e: *mut NmbEncoder, primitive: u64, co
         let wide = index_type == 1;
         let it = if wide { vk::IndexType::UINT32 } else { vk::IndexType::UINT16 };
         let draw = DrawCall::Indexed { index_count: count, index_type: it, index_buffer: metal2vulkan::bind::IndexBufferRef::new(0, b.length), index_offset: offset, instance_count: instances, base_vertex, base_instance };
-        emit_draw(e, draw, Some((b, offset, wide, base_vertex)), primitive as u32, (count, instances, 0, base_instance))?;
+        emit_draw(e, draw, Some((b, offset, wide, base_vertex)), None, primitive as u32, (count, instances, 0, base_instance))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_draw_indirect(e: *mut NmbEncoder, primitive: u64, b: *mut NmbBuffer, offset: u64) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        let a = get(b)?.b.clone();
+        let draw = DrawCall::Indirect { indirect: metal2vulkan::bind::IndirectRef::new(0, offset), indexed: None };
+        emit_draw(e, draw, None, Some((a, offset)), primitive as u32, (0, 0, 0, 0))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_draw_indexed_indirect(e: *mut NmbEncoder, primitive: u64, index_type: u64, indices: *mut NmbBuffer, index_offset: u64, b: *mut NmbBuffer, offset: u64) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        let (i, a) = (get(indices)?.b.clone(), get(b)?.b.clone());
+        let wide = index_type == 1;
+        let it = if wide { vk::IndexType::UINT32 } else { vk::IndexType::UINT16 };
+        let draw = DrawCall::Indirect { indirect: metal2vulkan::bind::IndirectRef::new(0, offset), indexed: Some((it, metal2vulkan::bind::IndexBufferRef::new(0, i.length), index_offset)) };
+        emit_draw(e, draw, Some((i, index_offset, wide, 0)), Some((a, offset)), primitive as u32, (0, 0, 0, 0))?;
         Ok(true)
     })
 }
@@ -1464,12 +1753,27 @@ pub extern "C" fn nmb_encoder_end(e: *mut NmbEncoder) -> bool {
                 }
                 cb.held_textures.push(t.clone());
             }
-            if let Some(d) = &pass.depth {
+            if let Some((d, level, layer)) = &pass.depth {
                 p.depth = d.image as *const NmnImage;
+                p.depth_level = *level;
+                p.depth_layer = *layer;
                 p.clear_depth = pass.depth_load == 2;
                 p.clear_z = pass.clear_z;
-                let _ = pass.depth_store;
+                if d.must_name() {
+                    cb.names.push(d.bo() as usize);
+                }
                 cb.held_textures.push(d.clone());
+            }
+            if let Some((x, level, layer)) = &pass.stencil {
+                p.stencil = x.image as *const NmnImage;
+                p.stencil_level = *level;
+                p.stencil_layer = *layer;
+                p.clear_stencil = pass.stencil_load == 2;
+                p.clear_s = pass.clear_s;
+                if x.must_name() {
+                    cb.names.push(x.bo() as usize);
+                }
+                cb.held_textures.push(x.clone());
             }
             let cs: *mut NwCs = &mut *cb.cs;
             unsafe {

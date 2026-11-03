@@ -61,6 +61,8 @@ pub struct NmnStageInfo {
     pub loops: u32,
     pub instrlen: u32,
     pub reads_framebuffer: bool,
+    pub early_tests: bool,
+    pub no_early_z: bool,
     pub has_kill: bool,
     pub writes_z: bool,
     pub needs_full_quad: bool,
@@ -79,6 +81,9 @@ unsafe extern "C" {
     pub fn nmn_program_render(c: *mut NmnCompiler, layout: *const NmnLayout, vertex: *const NmnStageInput, fragment: *const NmnStageInput, why: *mut c_char, why_size: usize) -> *mut NmnProgram;
     pub fn nmn_program_compute(c: *mut NmnCompiler, layout: *const NmnLayout, kernel: *const NmnStageInput, x: u32, y: u32, z: u32, why: *mut c_char, why_size: usize) -> *mut NmnProgram;
     pub fn nmn_program_free(p: *mut NmnProgram);
+    pub fn nmn_program_store(p: *const NmnProgram, size: *mut usize) -> *mut c_void;
+    pub fn nmn_program_load(c: *mut NmnCompiler, data: *const c_void, size: usize) -> *mut NmnProgram;
+    pub fn nmn_cache_id() -> *const c_char;
     pub fn nmn_program_info(p: *const NmnProgram, stage: u32, out: *mut NmnStageInfo) -> bool;
 }
 
@@ -107,6 +112,7 @@ pub struct NwBoHead {
     pub fence: u32,
     pub list_index: u32,
     pub list_stamp: u32,
+    pub extra_refs: u32,
 }
 pub const NW_BO_POOL: u32 = 0;
 pub const NW_BO_SCATTERED: u32 = 1;
@@ -192,6 +198,11 @@ pub struct NmnPass {
     pub colors: [NmnColorTarget; 8],
     pub color_count: u32,
     pub depth: *const NmnImage,
+    pub stencil: *const NmnImage,
+    pub depth_level: u32,
+    pub depth_layer: u32,
+    pub stencil_level: u32,
+    pub stencil_layer: u32,
     pub clear_depth: bool,
     pub clear_stencil: bool,
     pub clear_z: f64,
@@ -252,6 +263,8 @@ pub struct NmnRaster {
     pub depth_write: bool,
     pub depth_test: bool,
     pub reads_framebuffer: bool,
+    pub lines: bool,
+    pub early_z: bool,
     pub pass_width: u32,
     pub pass_height: u32,
     pub stencil_enable: bool,
@@ -331,6 +344,7 @@ unsafe extern "C" {
     pub fn nmn_image_size(i: *const NmnImage) -> u64;
     pub fn nmn_image_pitch(i: *const NmnImage, level: u32) -> u32;
     pub fn nmn_image_layer_offset(i: *const NmnImage, level: u32, layer: u32) -> u64;
+    pub fn nmn_image_extent(i: *const NmnImage, level: u32, layer: u32) -> u64;
     pub fn nmn_image_bind(i: *mut NmnImage, iova: u64);
     pub fn nmn_image_iova(im: *const NmnImage) -> u64;
     pub fn nmn_descriptor_image(i: *const NmnImage, f: u32, view: u32, base_level: u32, levels: u32, base_layer: u32, layers: u32, swizzle: *const u8, storage: bool, out: *mut u32);
@@ -344,11 +358,14 @@ unsafe extern "C" {
     pub fn nmn_bake_render(g: *mut NmnGpu, vs: *const c_void, fs: *const c_void, f: *const NmnFixed, why: *mut c_char, why_size: usize) -> *mut NmnBaked;
     pub fn nmn_bake_compute(g: *mut NmnGpu, cs: *const c_void, why: *mut c_char, why_size: usize) -> *mut NmnBaked;
     pub fn nmn_baked_free(g: *mut NmnGpu, b: *mut NmnBaked);
+    pub fn nmn_baked_describe(b: *const NmnBaked, out: *mut c_char, size: usize) -> bool;
     pub fn nmn_cmd_program(cs: *mut NwCs, b: *const NmnBaked);
     pub fn nmn_cmd_raster(cs: *mut NwCs, r: *const NmnRaster);
     pub fn nmn_cmd_descriptor_sets(cs: *mut NwCs, set: *const u64, count: u32, graphics: bool);
     pub fn nmn_cmd_push(cs: *mut NwCs, stage: u32, first_vec4: u32, data: *const c_void, vec4s: u32);
     pub fn nmn_cmd_vertex_buffers(cs: *mut NwCs, iova: *const u64, size: *const u32, stride: *const u32, count: u32);
+    pub fn nmn_cmd_draw_indirect(cs: *mut NwCs, prim: u32, arguments: u64, index_iova: u64, index_max: u32, wide: bool);
+    pub fn nmn_cmd_progress(cs: *mut NwCs, iova: u64, value: u32);
     pub fn nmn_cmd_draw(cs: *mut NwCs, prim: u32, count: u32, instances: u32, first: u32, first_instance: u32);
     pub fn nmn_cmd_draw_indexed(cs: *mut NwCs, prim: u32, count: u32, instances: u32, index: u64, index_max: u32, wide: bool, base: i32, first_instance: u32);
     pub fn nmn_cmd_dispatch(cs: *mut NwCs, b: *const NmnBaked, groups: *const u32, local: *const u32);

@@ -15,6 +15,9 @@ struct NmbTextureDescriptor;
 
 /* the native stack only: the cost of its stream check, one line. The default stack has no such call. */
 const char *nmn_stream_check_line(NmbDevice *) __attribute__((weak));
+/* the native stack only: an IOSurface as CA gets one. tests/scene_surface_ios.c on the phone, tests/fake_platform.c on the host. 0: no surface */
+void nmn_note_surface(const void *base, uint64_t bytes, uint32_t surface) __attribute__((weak));
+uint32_t scene_make_surface(uint32_t width, uint32_t height, void **base, uint64_t *bytes, uint32_t *row) __attribute__((weak));
 
 /* the bridge imports it (Darwin libSystem) */
 void sys_dcache_flush(void *start, size_t length) { (void)start; (void)length; }
@@ -75,6 +78,109 @@ static uint32_t parse_constants(char *s, struct NmbConstant *c, uint32_t max, un
 
 #define FAIL(what) do { printf("FAIL %s: %s\n", what, nmb_last_error()); return 1; } while (0)
 
+/* A quad over the whole target, with CA's layout and slots. */
+static bool scene_bind(NmbEncoder *en, NmbTexture *image, NmbSampler *sampler)
+{
+	/* CA's layout: position, 2 texture coordinates, colour as half floats (0x3c00 = 1.0) */
+	static const struct { float position[4], uv0[2], uv1[2]; uint16_t color[4]; uint32_t pad[2]; } vb[4] = {
+		{{-1, -1, 0, 1}, {0, 1}, {0, 1}, {0x3c00, 0x3c00, 0x3c00, 0x3c00}, {0, 0}}, {{1, -1, 0, 1}, {1, 1}, {1, 1}, {0x3c00, 0x3c00, 0x3c00, 0x3c00}, {0, 0}},
+		{{-1, 1, 0, 1}, {0, 0}, {0, 0}, {0x3c00, 0x3c00, 0x3c00, 0x3c00}, {0, 0}}, {{1, 1, 0, 1}, {1, 0}, {1, 0}, {0x3c00, 0x3c00, 0x3c00, 0x3c00}, {0, 0}},
+	};
+	/* the vertex stage reads a matrix here: identity, or the quad has no area and the draw writes nothing. The rest: 1.0, as a neutral tint */
+	static const float uniforms[32] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+	/* the slots CA's functions declare (their layout's Buffer and Texture sources): vertex 2 and 3, fragment 1, texture 3. Elsewhere the planner binds a zero buffer and a neutral image, the quad has no area, and nothing shows on the target. */
+	if (!nmb_encoder_set_bytes(en, 1, vb, sizeof(vb), 1) || !nmb_encoder_set_bytes(en, 1, uniforms, sizeof(uniforms), 2) || !nmb_encoder_set_bytes(en, 1, uniforms, sizeof(uniforms), 3) || !nmb_encoder_set_bytes(en, 2, uniforms, sizeof(uniforms), 1))
+		return false;
+	/* a plan's row may read another slot: the same image and sampler in each of them */
+	for (uint32_t slot = 0; slot < 8; slot++)
+		if (!nmb_encoder_set_texture(en, 2, image, slot) || !nmb_encoder_set_sampler(en, 2, sampler, slot))
+			return false;
+	return true;
+}
+
+/*
+ * The compositor's first frames (logs/native-compositor-1.txt): a pass over a small IOSurface, with no draw, a clear, and renderTargetWidth = renderTargetHeight = 0 as CA leaves them. Then the same over a screen-size surface with the row's draw.
+ * What reaches the GPU is what the frontend asks for a surface: nmn_note_surface, nmb_buffer_new_no_copy, nmb_texture_new_on_buffer.
+ */
+static NmbTexture *scene_surface_texture(NmbDevice *dev, uint32_t w, uint32_t h, void **base)
+{
+	uint64_t bytes = 0;
+	uint32_t row = 0;
+	const uint32_t id = scene_make_surface(w, h, base, &bytes, &row);
+	if (id == 0) {
+		printf("scene: surface %u x %u: not made\n", w, h);
+		return NULL;
+	}
+	nmn_note_surface(*base, bytes, id);
+	NmbBuffer *b = nmb_buffer_new_no_copy(dev, *base, bytes, 0);
+	struct NmbTextureDescriptor d = {.type = 2, .format = 80, .width = w, .height = h, .depth = 1, .levels = 1, .samples = 1, .array_length = 1, .usage = 5, .options = 0};
+	NmbTexture *t = b ? nmb_texture_new_on_buffer(b, &d, 0, row, true) : NULL;
+	if (t == NULL)
+		printf("scene: surface %u x %u: %s\n", w, h, nmb_last_error());
+	return t;
+}
+
+static int scene_surfaces(NmbDevice *dev, NmbQueue *queue, NmbRenderPipeline *pipe, NmbTexture *memoryless, NmbTexture *image, NmbSampler *sampler, NmbBuffer *ib)
+{
+	/* a texture over a buffer with rows of 160 bytes, as SpringBoard's icons: the shadow copy: its creation, and a draw's read below */
+	{
+		NmbBuffer *rows = nmb_buffer_new(dev, 160 * 40, 0, NULL);
+		struct NmbTextureDescriptor d = {.type = 2, .format = 80, .width = 40, .height = 40, .depth = 1, .levels = 1, .samples = 1, .array_length = 1, .usage = 1, .options = 0};
+		NmbTexture *t = rows ? nmb_texture_new_on_buffer(rows, &d, 0, 160, false) : NULL;
+		if (t == NULL)
+			FAIL("a texture with rows of 160 bytes");
+		image = t;
+	}
+	void *small_base = NULL, *big_base = NULL;
+	NmbTexture *small = scene_surface_texture(dev, 32, 32, &small_base), *big = scene_surface_texture(dev, 720, 1560, &big_base);
+	if (small == NULL || big == NULL)
+		return 1;
+	NmbCommandBuffer *c1 = nmb_command_buffer_new(queue);
+	struct NmbRenderPassDescriptor rp;
+	memset(&rp, 0, sizeof(rp));
+	rp.colors[0].texture = small;
+	rp.colors[0].load = 2;
+	rp.colors[0].store = 1;
+	rp.colors[0].clear[2] = 1.0;    /* blue, as a word ffff0000... of BGRA: 0xff0000ff */
+	rp.colors[0].clear[3] = 1.0;
+	rp.array_length = 1;
+	rp.samples = 1;
+	NmbEncoder *en = c1 ? nmb_render_encoder_new(c1, &rp) : NULL;
+	if (en == NULL)
+		FAIL("surface pass");
+	if (!nmb_encoder_end(en) || !nmb_command_buffer_commit(c1) || nmb_command_buffer_wait(c1, 20000) != 0)
+		FAIL("surface commit");
+	printf("scene: surface 32 x 32, size 0, clear, no draw: status %llu, pixel %08x (a GPU writes ff0000ff)\n", (unsigned long long)nmb_command_buffer_status(c1), *(const uint32_t *)small_base);
+	if (nmb_command_buffer_status(c1) != 4)
+		return 1;
+	NmbCommandBuffer *c2 = nmb_command_buffer_new(queue);
+	memset(&rp, 0, sizeof(rp));
+	rp.colors[0].texture = big;
+	rp.colors[0].load = 2;
+	rp.colors[0].store = 1;
+	rp.colors[0].clear[3] = 1.0;
+	if (memoryless != NULL)
+		rp.colors[1].texture = memoryless;
+	rp.array_length = 1;
+	rp.samples = 1;
+	en = c2 ? nmb_render_encoder_new(c2, &rp) : NULL;
+	if (en == NULL)
+		FAIL("screen surface pass");
+	if (!nmb_render_set_pipeline(en, pipe) || !scene_bind(en, image, sampler))
+		FAIL("screen surface bind");
+	const double viewport[6] = {0, 0, 720, 1560, 0, 1};
+	const uint64_t scissor[4] = {0, 0, 720, 1560};
+	nmb_render_set_viewport(en, viewport);
+	nmb_render_set_scissor(en, scissor);
+	if (!nmb_render_draw_indexed(en, 3, 6, 0, ib, 0, 1, 0, 0))
+		FAIL("screen surface draw");
+	if (!nmb_encoder_end(en) || !nmb_command_buffer_commit(c2) || nmb_command_buffer_wait(c2, 20000) != 0)
+		FAIL("screen surface commit");
+	const uint32_t *px = big_base;
+	printf("scene: surface 720 x 1560, size 0, the row's draw: status %llu, pixel (360,780) %08x\n", (unsigned long long)nmb_command_buffer_status(c2), px[780 * 720 + 360]);
+	return nmb_command_buffer_status(c2) == 4 ? 0 : 1;
+}
+
 static void *read_file(const char *path, size_t *length)
 {
 	FILE *f = fopen(path, "rb");
@@ -104,7 +210,7 @@ int main(int argc, char **argv)
 	static unsigned char pool[8192];
 	struct NmbConstant cons[128];
 	uint32_t ncons = 0;
-	bool plan = argc == 6;
+	bool plan = argc == 6, no_vertex_descriptor = false;
 	if (plan) {
 		static char line[65536];
 		FILE *f = fopen(argv[4], "r");
@@ -124,6 +230,7 @@ int main(int argc, char **argv)
 			snprintf(vname, sizeof(vname), "%s", field[2]);
 			snprintf(fname, sizeof(fname), "%s", field[3]);
 			snprintf(colors, sizeof(colors), "%s", field[4]);
+			no_vertex_descriptor = strcmp(field[5], "-") == 0;
 			ncons = parse_constants(field[6], cons, 128, pool);
 			break;
 		}
@@ -166,18 +273,24 @@ int main(int argc, char **argv)
 		pd.colors[0].source_alpha = 1;
 		pd.colors[0].destination_alpha = 5;
 	}
+	/* NMN_SCENE_DEPTH: Depth32Float_Stencil8 as RenderBox asks for it, compared against Turnip: a depth test, a stencil test, both cleared */
+	const bool with_depth = getenv("NMN_SCENE_DEPTH") != NULL;
+	if (with_depth)
+		pd.depth_format = pd.stencil_format = 260;
 	pd.samples = 1;
 	pd.rasterization = 1;
-	pd.vertex_inputs = 1;
+	pd.vertex_inputs = no_vertex_descriptor ? 0 : 1;        /* a real key with no vertex descriptor: its vertex stage pulls its data from a buffer */
 	static const struct { uint64_t format, offset; } attr[4] = {{31, 0}, {29, 16}, {29, 24}, {27, 32}};
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < 4 && !no_vertex_descriptor; i++) {
 		pd.attributes[i].format = attr[i].format;
 		pd.attributes[i].offset = attr[i].offset;
 		pd.attributes[i].buffer = 1;
 	}
-	pd.layouts[1].stride = 48;
-	pd.layouts[1].step_function = 1;
-	pd.layouts[1].step_rate = 1;
+	if (!no_vertex_descriptor) {
+		pd.layouts[1].stride = 48;
+		pd.layouts[1].step_function = 1;
+		pd.layouts[1].step_rate = 1;
+	}
 	NmbRenderPipeline *pipe = nmb_render_pipeline_new(dev, &pd);
 	if (pipe == NULL)
 		FAIL("render pipeline");
@@ -226,34 +339,47 @@ int main(int argc, char **argv)
 	rp.height = 1560;
 	rp.array_length = 1;
 	rp.samples = 1;
+	NmbDepthStencil *zs = NULL;
+	if (with_depth) {
+		struct NmbTextureDescriptor zd = {.type = 2, .format = 260, .width = 720, .height = 1560, .depth = 1, .levels = 1, .samples = 1, .array_length = 1, .usage = 4, .options = 2u << 4};
+		NmbTexture *z = nmb_texture_new(dev, &zd);
+		if (z == NULL)
+			FAIL("depth texture");
+		rp.depth.texture = rp.stencil.texture = z;
+		rp.depth.load = rp.stencil.load = 2;
+		rp.depth.clear[0] = 1.0;
+		rp.stencil.clear[0] = 7;
+		struct NmbDepthStencilDescriptor zsd = {.compare = 1 /* less */, .write = 1, .front = {.compare = 7, .failure = 0, .depth_failure = 0, .pass = 2 /* replace */, .read_mask = 0xff, .write_mask = 0xff}, .back = {.compare = 7, .failure = 0, .depth_failure = 0, .pass = 2, .read_mask = 0xff, .write_mask = 0xff}};
+		zs = nmb_depth_stencil_new(dev, &zsd);
+		if (zs == NULL)
+			FAIL("depth state");
+	}
 	NmbEncoder *en = nmb_render_encoder_new(cb, &rp);
 	if (en == NULL)
 		FAIL("render encoder");
 	if (!nmb_render_set_pipeline(en, pipe))
 		FAIL("set pipeline");
+	if (zs != NULL && !nmb_render_set_depth_stencil(en, zs))
+		FAIL("set depth state");
 	const double viewport[6] = {0, 0, 720, 1560, 0, 1};
 	const uint64_t scissor[4] = {0, 0, 720, 1560};
 	nmb_render_set_viewport(en, viewport);
 	nmb_render_set_scissor(en, scissor);
-	/* CA's layout: position, 2 texture coordinates, colour as half floats (0x3c00 = 1.0) */
-	static const struct { float position[4], uv0[2], uv1[2]; uint16_t color[4]; uint32_t pad[2]; } vb[4] = {
-		{{-1, -1, 0, 1}, {0, 1}, {0, 1}, {0x3c00, 0x3c00, 0x3c00, 0x3c00}, {0, 0}}, {{1, -1, 0, 1}, {1, 1}, {1, 1}, {0x3c00, 0x3c00, 0x3c00, 0x3c00}, {0, 0}},
-		{{-1, 1, 0, 1}, {0, 0}, {0, 0}, {0x3c00, 0x3c00, 0x3c00, 0x3c00}, {0, 0}}, {{1, 1, 0, 1}, {1, 0}, {1, 0}, {0x3c00, 0x3c00, 0x3c00, 0x3c00}, {0, 0}},
-	};
-	/* the vertex stage reads a matrix here: identity, or the quad has no area and the draw writes nothing. The rest: 1.0, as a neutral tint */
-	static const float uniforms[32] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
-	/* the slots CA's functions declare (their layout's Buffer and Texture sources): vertex 2 and 3, fragment 1, texture 3. Elsewhere the planner binds a zero buffer and a neutral image, the quad has no area, and nothing shows on the target. */
-	if (!nmb_encoder_set_bytes(en, 1, vb, sizeof(vb), 1) || !nmb_encoder_set_bytes(en, 1, uniforms, sizeof(uniforms), 2) || !nmb_encoder_set_bytes(en, 1, uniforms, sizeof(uniforms), 3) || !nmb_encoder_set_bytes(en, 2, uniforms, sizeof(uniforms), 1))
-		FAIL("set bytes");
-	/* a plan's row may read another slot: the same image and sampler in each of them */
-	for (uint32_t slot = 0; slot < 8; slot++)
-		if (!nmb_encoder_set_texture(en, 2, image, slot) || !nmb_encoder_set_sampler(en, 2, sampler, slot))
-			FAIL("set texture");
+	if (!scene_bind(en, image, sampler))
+		FAIL("bind");
 	static const uint16_t ib_data[6] = {0, 1, 2, 2, 1, 3};
 	NmbBuffer *ib = nmb_buffer_new(dev, sizeof(ib_data), 0, ib_data);
 	if (ib == NULL)
 		FAIL("index buffer");
-	if (!nmb_render_draw_indexed(en, 3 /* triangle */, 6, 0 /* uint16 */, ib, 0, 1, 0, 0))
+	/* NMN_SCENE_PRIM=1: line lists, as CA's generic program draws paths: the mark of the hangs of 08:39 and 08:54. A row of 6 indices is 3 lines */
+	const uint64_t prim = getenv("NMN_SCENE_PRIM") ? strtoull(getenv("NMN_SCENE_PRIM"), NULL, 10) : 3;
+	if (getenv("NMN_SCENE_INDIRECT") != NULL) {
+		/* MTLDrawIndexedPrimitivesIndirectArguments: 6 indices, 1 instance */
+		const uint32_t args[5] = {6, 1, 0, 0, 0};
+		NmbBuffer *ab = nmb_buffer_new(dev, sizeof(args), 0, args);
+		if (ab == NULL || !nmb_render_draw_indexed_indirect(en, prim, 0, ib, 0, ab, 0))
+			FAIL("indirect draw");
+	} else if (!nmb_render_draw_indexed(en, prim, 6, 0 /* uint16 */, ib, 0, 1, 0, 0))
 		FAIL("draw");
 	if (!nmb_encoder_end(en))
 		FAIL("end");
@@ -296,7 +422,36 @@ int main(int argc, char **argv)
 	printf("scene: pixel (0,0) %08x, (360,780) %08x, (719,1559) %08x; copied byte %02x (a GPU writes 5a)\n", px[0], px[780 * 720 + 360], px[1559 * 720 + 719], cp[128]);
 	/* The clear gives ff000000. A pixel that differs proves that the draw reached the target: a texture on a quad over the whole target. */
 	printf("scene: the draw wrote: %s\n", px[780 * 720 + 360] != 0xff000000u && px[780 * 720 + 360] != 0 ? "yes" : "no");
+	/* 2D copies with rows the hardware cannot express: 40-byte rows from an unaligned offset, then 44-byte rows back. On a phone the bytes must match (a row of 40 read as 0 gave icons as stripes) */
+	{
+		enum { W = 30, H = 8, ROW_IN = 40, AT_IN = 8, ROW_OUT = 44, AT_OUT = 12 };
+		struct NmbTextureDescriptor rd = {.type = 2, .format = 10, .width = W, .height = H, .depth = 1, .levels = 1, .samples = 1, .array_length = 1, .usage = 5, .options = 0};
+		NmbTexture *small_texture = nmb_texture_new(dev, &rd);
+		NmbBuffer *row_in = nmb_buffer_new(dev, 4096, 0, NULL), *row_out = nmb_buffer_new(dev, 4096, 0, NULL);
+		NmbCommandBuffer *b3 = nmb_command_buffer_new(queue);
+		NmbEncoder *e3 = b3 ? nmb_blit_encoder_new(b3) : NULL;
+		if (small_texture == NULL || row_in == NULL || row_out == NULL || e3 == NULL)
+			FAIL("row copy objects");
+		unsigned char *in = nmb_buffer_contents(row_in);
+		for (int y = 0; y < H; y++)
+			for (int x = 0; x < W; x++)
+				in[AT_IN + y * ROW_IN + x] = (unsigned char)(y * 16 + x + 1);
+		const uint64_t size_rows[3] = {W, H, 1};
+		if (!nmb_blit_buffer_to_texture(e3, row_in, AT_IN, ROW_IN, 0, size_rows, small_texture, 0, 0, origin) || !nmb_blit_texture_to_buffer(e3, small_texture, 0, 0, origin, size_rows, row_out, AT_OUT, ROW_OUT, 0))
+			FAIL("row copy blit");
+		if (!nmb_encoder_end(e3) || !nmb_command_buffer_commit(b3) || nmb_command_buffer_wait(b3, 20000) != 0)
+			FAIL("row copy commit");
+		const unsigned char *out = nmb_buffer_contents(row_out);
+		int wrong = 0;
+		for (int y = 0; y < H; y++)
+			for (int x = 0; x < W; x++)
+				wrong += out[AT_OUT + y * ROW_OUT + x] != (unsigned char)(y * 16 + x + 1);
+		printf("scene: row copy: %d of %d bytes differ (rows of %d and %d, offsets %d and %d)\n", wrong, W * H, ROW_IN, ROW_OUT, AT_IN, AT_OUT);
+	}
 	/* compute: the first kernel of the library that compiles with no arguments bound */
+	/* NMN_SCENE_NO_SURFACES: pm4-compare.sh's runs against Turnip: its register comparison reads the last draw */
+	if (nmn_note_surface != NULL && scene_make_surface != NULL && getenv("NMN_SCENE_NO_SURFACES") == NULL && scene_surfaces(dev, queue, pipe, memoryless, image, sampler, ib) != 0)
+		return 1;
 	NmbFunction *kf = nmb_function_new(lib, "compute_apl");
 	if (kf == NULL) {
 		char name[128];

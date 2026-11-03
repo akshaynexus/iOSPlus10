@@ -19,6 +19,7 @@
 #include "ir3_nir.h"
 #include "ir3_shader.h"
 #include "freedreno_dev_info.h"
+#include "util/blob.h"
 #include "util/ralloc.h"
 #include "util/u_math.h"
 
@@ -441,15 +442,12 @@ static bool finish_stage(struct nmn_compiler *c, const struct nmn_layout *layout
 		snprintf(why, why_size, "ir3 refused stage %d", nir->info.stage);
 		return false;
 	}
-	if (ir3_exceeds_safe_constlen(out->variant)) {
-		struct ir3_shader_key safe = *key;
-		safe.safe_constlen = true;
-		struct ir3_shader_variant *v = ir3_shader_create_variant(out->shader, &safe, false);
-		if (v != NULL) {
-			ralloc_free(out->variant);
-			out->variant = v;
-		}
-	}
+	return true;
+}
+
+/* what the bridge reads of a stage, from the variant that runs */
+static void stage_info_fill(struct nmn_compiled *out, gl_shader_stage stage)
+{
 	const struct ir3_shader_variant *v = out->variant;
 	struct nmn_stage_info *i = &out->info;
 	i->instructions = v->info.instrs_count;
@@ -467,16 +465,47 @@ static bool finish_stage(struct nmn_compiler *c, const struct nmn_layout *layout
 	i->loops = v->loops;
 	i->instrlen = v->instrlen;
 	i->has_kill = v->has_kill;
+	i->early_tests = v->fs.early_fragment_tests;
+	i->no_early_z = v->writes_pos || v->no_earlyz || v->writes_stencilref || v->writes_smask;  /* tu_shader.cc force_late_z */
 	i->writes_z = v->writes_pos;
 	i->needs_full_quad = v->need_full_quad;
 	i->color_outputs = 0;
-	if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+	if (stage == MESA_SHADER_FRAGMENT) {
 		for (unsigned r = 0; r < 8; r++) {
 			int idx = ir3_find_output(v, (gl_varying_slot)(FRAG_RESULT_DATA0 + r));
 			if (idx >= 0 && VALIDREG(ir3_get_output_regid(&v->outputs[idx])))
 				i->color_outputs |= 1u << r;
 		}
 	}
+	}
+
+/*
+ * Which stages run their safe-constlen variant: tu_pipeline.cc tu_pipeline_builder's rule: Mesa's ir3_trim_constlen, only when the pipeline's constants pass the hardware's limit. The full variant otherwise, as on Turnip: a program of the size of CA's generic one is compiled and tested there in that form. Native took the safe variant whenever a stage alone passed the safe size [V 10:22:32: every hang of the generic program on this stack].
+ */
+static bool choose_variants(struct nmn_compiler *c, struct nmn_program *p, const struct ir3_shader_key *key, char *why, size_t why_size)
+{
+	const struct ir3_shader_variant *variants[MESA_SHADER_STAGES] = {0};
+	gl_shader_stage stages[2];
+	for (unsigned i = 0; i < p->count; i++) {
+		stages[i] = p->stage[i].variant->type;
+		variants[stages[i]] = p->stage[i].variant;
+	}
+	const uint32_t safe = ir3_trim_constlen(variants, c->ir3);
+	for (unsigned i = 0; i < p->count; i++) {
+		if (!(safe & (1u << stages[i])))
+			continue;
+		struct ir3_shader_key k = *key;
+		k.safe_constlen = true;
+		struct ir3_shader_variant *v = ir3_shader_create_variant(p->stage[i].shader, &k, false);
+		if (v == NULL) {
+			snprintf(why, why_size, "ir3 refused the safe variant of stage %d", stages[i]);
+			return false;
+		}
+		ralloc_free(p->stage[i].variant);
+		p->stage[i].variant = v;
+	}
+	for (unsigned i = 0; i < p->count; i++)
+		stage_info_fill(&p->stage[i], stages[i]);
 	return true;
 }
 
@@ -491,6 +520,73 @@ void nmn_program_free(struct nmn_program *p)
 			ir3_shader_destroy(p->stage[i].shader);
 	}
 	free(p);
+}
+
+/* ---- the disk cache's form of a program ---- */
+#define NMN_PROGRAM_MAGIC 0x314d4e4eu
+
+void *nmn_program_store(const struct nmn_program *p, size_t *size)
+{
+	struct blob b;
+	void *data = NULL;
+	blob_init(&b);
+	blob_write_uint32(&b, NMN_PROGRAM_MAGIC);
+	blob_write_uint32(&b, p->count);
+	for (unsigned i = 0; i < p->count; i++) {
+		const struct nmn_compiled *s = &p->stage[i];
+		blob_write_bytes(&b, &s->info, sizeof(s->info));
+		blob_write_uint32(&b, s->push_lo_dwords);
+		blob_write_uint32(&b, s->push_dwords);
+		blob_write_uint32(&b, s->push_first_vec4);
+		ir3_store_variant(&b, s->variant);
+	}
+	if (b.out_of_memory) {
+		blob_finish(&b);
+		return NULL;
+	}
+	blob_finish_get_buffer(&b, &data, size);
+	return data;
+}
+
+struct nmn_program *nmn_program_load(struct nmn_compiler *c, const void *data, size_t size)
+{
+	struct blob_reader r;
+	blob_reader_init(&r, data, size);
+	if (blob_read_uint32(&r) != NMN_PROGRAM_MAGIC)
+		return NULL;
+	const uint32_t count = blob_read_uint32(&r);
+	if (r.overrun || count == 0 || count > 2)
+		return NULL;
+	struct nmn_program *p = calloc(1, sizeof(*p));
+	if (p == NULL)
+		return NULL;
+	p->count = count;
+	for (unsigned i = 0; i < count; i++) {
+		struct nmn_compiled *s = &p->stage[i];
+		blob_copy_bytes(&r, &s->info, sizeof(s->info));
+		s->push_lo_dwords = blob_read_uint32(&r);
+		s->push_dwords = blob_read_uint32(&r);
+		s->push_first_vec4 = blob_read_uint32(&r);
+		if (r.overrun) {
+			nmn_program_free(p);
+			return NULL;
+		}
+		s->variant = ir3_retrieve_variant(&r, c->ir3, NULL);
+		if (r.overrun || s->variant == NULL) {
+			nmn_program_free(p);
+			return NULL;
+		}
+	}
+	return p;
+}
+
+/* A hash of what the compile path is made from (the build scripts: this file, compile.rs, the translator's and Mesa's versions). A change in the stream code keeps the cache; a change here starts a new one. */
+#ifndef NMN_CACHE_ID
+#error NMN_CACHE_ID: scripts/laurel/native/cache-id.sh
+#endif
+const char *nmn_cache_id(void)
+{
+	return NMN_CACHE_ID;
 }
 
 struct nmn_program *nmn_program_render(struct nmn_compiler *c, const struct nmn_layout *layout, const struct nmn_stage_input *vertex, const struct nmn_stage_input *fragment, char *why, size_t why_size)
@@ -515,6 +611,8 @@ struct nmn_program *nmn_program_render(struct nmn_compiler *c, const struct nmn_
 		if (!finish_stage(c, layout, fs, &p->stage[1], &key, why, why_size))
 			goto bad;
 	}
+	if (!choose_variants(c, p, &key, why, why_size))
+		goto bad;
 	ralloc_free(mem_ctx);
 	return p;
 bad:
@@ -538,6 +636,8 @@ struct nmn_program *nmn_program_compute(struct nmn_compiler *c, const struct nmn
 	struct ir3_shader_key key = {0};
 	p->count = 1;
 	if (!finish_stage(c, layout, cs, &p->stage[0], &key, why, why_size))
+		goto bad;
+	if (!choose_variants(c, p, &key, why, why_size))
 		goto bad;
 	ralloc_free(mem_ctx);
 	return p;
