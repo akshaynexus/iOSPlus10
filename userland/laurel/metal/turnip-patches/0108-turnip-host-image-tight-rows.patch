@@ -1,0 +1,26 @@
+laurel (Mi A3, iOS 26): a linear image for a host allocation has the tightest rows a 16x4 store allows, not rows of 64 pixels: an IOSurface of 720 x 4 bytes a pixel has rows of 2880 bytes [V phone: m2v's notice: "lays rows 3072 bytes apart"], so no image lay on it. Docs: docs/laurel_sprout/ios26-default-speed.md.
+
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -824,6 +824,21 @@
+       modifier = eci.drmFormatModifier;
+    }
+ 
++   /* laurel (Mi A3, iOS 26): a linear image for a host allocation lies on rows it does not own: an IOSurface of 720 pixels has rows of 2880 bytes,
++    * and the layout's own 64 pixels gave 3072, so metal2vulkan kept a shadow of every surface. Rows as tight as a store of 16x4 blocks allows, as
++    * fdl6_layout takes an explicit layout. A row pitch that does not meet that stays what it was, and metal2vulkan keeps its shadow.
++    */
++   VkSubresourceLayout host_plane = {};
++   if (!plane_layouts && pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&
++       (image->vk.external_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) &&
++       image->vk.mip_levels == 1 && image->vk.array_layers == 1 && image->vk.extent.depth == 1 &&
++       vk_format_get_plane_count(image->vk.format) == 1) {
++      const uint32_t cpp = vk_format_get_blocksize(image->vk.format);
++      const uint32_t align_bytes = MAX2(64, 16 * cpp);
++      host_plane.rowPitch = align(DIV_ROUND_UP(image->vk.extent.width, vk_format_get_blockwidth(image->vk.format)) * cpp, align_bytes);
++      plane_layouts = &host_plane;
++   }
++
+    result = tu_image_init(device, image, pCreateInfo);
+    if (result != VK_SUCCESS)
+       goto fail;

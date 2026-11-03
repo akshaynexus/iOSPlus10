@@ -187,7 +187,7 @@ index 0000000..98faacc
 +{
 +   if (!g.window_start)
 +      g.window_start = ns;
-+   else if (ns - g.window_start >= WINDOW_NS && !g.in_pass)
++   else if (ns - g.window_start >= WINDOW_NS)
 +      window_end(ns);
 +   g.last_ns = ns;
 +
