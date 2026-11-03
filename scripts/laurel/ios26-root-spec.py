@@ -65,6 +65,7 @@ JETSAM_FLOORS = {'Daemon': {'com.apple.iconservices.iconservicesagent': {'Inacti
                             'com.apple.aonsensed': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
                             'com.apple.localizationswitcherd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
                             'com.apple.donotdisturbd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
+                            'com.apple.dasd': {'ActiveSoftMemoryLimit': 48, 'InactiveHardMemoryLimit': 48},
                             'com.apple.driverkitd': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
                             'com.apple.usernotificationsd': {'ActiveSoftMemoryLimit': 32, 'InactiveHardMemoryLimit': 32}},
                  'XPCService': {'com.apple.intents.intents-helper': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
