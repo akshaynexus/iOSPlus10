@@ -1213,3 +1213,7 @@ Open: the Control Center close swipe: 1 of 3 closed clean, 1 left a dark Now Pla
 [V] 2986 (both kernels), post/9015, 9016. Host test `wdog-test.sh` PASS. iOS 26 and iOS 16 kernels build; series 0 errors. Audit of 2970, 2972, 2973, 2975-2978, 2981, 2982, 2985, 9013: no unbounded spin with interrupts off, no leaked lock.
 [I] Best hang candidate: live bus scaling (2985). [U] why CPU 5 is late.
 Next: the owner flashes a new image. Read `LAUREL WDOG: on`, the minute line, `this thread ran`. A hang now ends in a reset in 20 to 28 s. Way back: `watchdog.md` section 7.
+
+## 2026-11-03: Mi A3 iOS 26: frame gaps, stuck CPU 5 (branch `t3/ios26-frame-gap-root-cause`, pushed, not merged; 2988 + post/9017 NOT BOOTED)
+Done [V samples, code]: in the Home animation the render thread is 49 % busy, 33 % in the vsync wait, 8 % waiting for metal2vulkan's scheduler, 8 % in Turnip's kernel calls; the kernel tick holds; the GPU wait is a 200 us poll under a dropped lock; u_trace's worker makes the 963 fence waits per 5 s. Hang 17:56: emulator, EOI, MAIR, FIQ ruled out in code; the strongest candidate is an exclusive on Non-cacheable memory in EL0 [I]. 2988 + 9017: the stuck-CPU report tells EL1 from EL0, prints the redistributor words and the task's dyld slide.
+Next: flash a kernel with 2987 + 2988; at the next catch read the third line. Run `scripts/laurel/ios26-speed.sh` on a booted phone (the constant-factor question), then a 500 Hz sample of thread 6 through one animation.

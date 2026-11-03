@@ -1,0 +1,180 @@
+laurel 2988: the stuck-CPU report says whether the CPU is inside the kernel on an EL0 trap, and which; both kernels. docs/laurel_sprout/watchdog.md.
+
+[V 2026-11-03 17:56:16, logs/hang-175616.txt] The first catch of 2986: CPU 5 silent 19.5 s with its SGI pending, no interrupt handler open, the last
+interrupt from EL0 of iconservicesagent. The two lines could not tell a CPU stalled on one user instruction (no interrupt can come in) from a kernel path
+entered from EL0 that holds interrupts off. Each exception from EL0 now stamps its CPU (time, ESR, FAR, user pc, thread) in sleh_synchronous, and the
+stamp closes when the thread goes back to EL0 (thread_exception_return, the end of sleh_synchronous): post/9017 holds the sleh.c calls for iOS 26.
+A third report line: "is in the kernel since an EL0 trap N ms ago: class (name) esr far user pc" or "has no EL0 trap open (in EL0, or the trap ended)",
+the redistributor's whole pending and active words (a PPI or SGI taken and never ended shows as active), and the dyld shared cache slide of the task on
+that CPU (the slide is random per boot, so a user pc had no image before). iOS 16: the functions exist, nothing calls them yet (its sleh.c hunk is in 2986).
+Cost: five stores per EL0 exception. No new line at boot; nothing to turn off.
+
+diff --git a/osfmk/arm64/laurel_wdog.c b/osfmk/arm64/laurel_wdog.c
+index fa1a28f..7704105 100644
+--- a/osfmk/arm64/laurel_wdog.c
++++ b/osfmk/arm64/laurel_wdog.c
+@@ -29,6 +29,7 @@
+ #include <kern/misc_protos.h>
+ #include <kern/processor.h>
+ #include <kern/sched_prim.h>
++#include <kern/task.h>
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <machine/atomic.h>
+@@ -71,7 +72,14 @@ struct lwd_cpu {
+ 	uint64_t online;                /* first round that saw this CPU in use */
+ 	unsigned level;                 /* lwd_line */
+ 	unsigned silent_ms;
+-	char pad[48];
++	/* laurel 2988: the open EL0 trap of this CPU (post/9017: sleh_synchronous in, thread_exception_return and the handler's end out) */
++	volatile uint64_t trap_t;       /* when the trap entered the kernel; 0: none open */
++	volatile uint64_t trap_pc;      /* the user pc that trapped */
++	volatile uint64_t trap_far;
++	volatile uint64_t trap_esr;
++	volatile void *trap_thread;     /* the thread that trapped: the stamp is stale when another thread runs on this CPU */
++	volatile uint32_t trap_count;
++	uint32_t pad[3];
+ } __attribute__((aligned(64)));
+ 
+ static struct lwd_cpu lwd_cpu[LWD_CPUS];
+@@ -144,9 +152,45 @@ lwd_gicd_settle(void)
+ 	}
+ }
+ 
+-/* read only: the SGI bits of a CPU's redistributor. Pending: the signal got there and the CPU has interrupts off. Neither: nothing is on its way. false: no frame */
++/*
++ * laurel 2988: an exception from EL0 enters the kernel on this CPU (sleh_synchronous, post/9017; interrupts as EL0 had them). The report of a
++ * silent CPU reads it: an open trap of the thread that runs there = the CPU is inside the kernel on that path (its class, user pc and address say
++ * which); none open = the CPU is in EL0, on an instruction that does not complete, or its interrupts are held off below the kernel.
++ */
++void laurel_wdog_trap_in(uint64_t esr, uint64_t far, uint64_t pc);
++void
++laurel_wdog_trap_in(uint64_t esr, uint64_t far, uint64_t pc)
++{
++	unsigned int cpu = cpu_number();
++
++	if (cpu >= LWD_CPUS) {
++		return;
++	}
++	struct lwd_cpu *c = &lwd_cpu[cpu];
++
++	c->trap_esr = esr;
++	c->trap_far = far;
++	c->trap_pc = pc;
++	c->trap_thread = current_thread();
++	c->trap_count++;
++	c->trap_t = mach_absolute_time();
++}
++
++/* the thread goes back to EL0 (thread_exception_return, the end of sleh_synchronous): the trap is over */
++void laurel_wdog_trap_out(void);
++void
++laurel_wdog_trap_out(void)
++{
++	unsigned int cpu = cpu_number();
++
++	if (cpu < LWD_CPUS && lwd_cpu[cpu].trap_thread == (volatile void *)current_thread()) {
++		lwd_cpu[cpu].trap_t = 0;
++	}
++}
++
++/* read only: the pending and active words of a CPU's redistributor: its SGIs and PPIs (bit = INTID). laurel 2988: whole words */
+ static bool
+-lwd_sgi_state(uint32_t mpidr, bool *pending, bool *active)
++lwd_gicr_words(uint32_t mpidr, uint32_t *pending, uint32_t *active)
+ {
+ 	if (lwd_gicr == 0) {
+ 		return false;
+@@ -156,8 +200,8 @@ lwd_sgi_state(uint32_t mpidr, bool *pending, bool *active)
+ 		uint32_t aff = (uint32_t)(typer >> 32) & 0xffffu;
+ 
+ 		if (typer != 0 && aff == (mpidr & 0xffffu)) {
+-			*pending = (*(volatile uint32_t *)(lwd_gicr + off + LWD_SGI_OFF + 0x200u) & LWD_SGI_BIT) != 0;
+-			*active = (*(volatile uint32_t *)(lwd_gicr + off + LWD_SGI_OFF + 0x300u) & LWD_SGI_BIT) != 0;
++			*pending = *(volatile uint32_t *)(lwd_gicr + off + LWD_SGI_OFF + 0x200u);
++			*active = *(volatile uint32_t *)(lwd_gicr + off + LWD_SGI_OFF + 0x300u);
+ 			return true;
+ 		}
+ 		if (typer & (1ull << 4)) {      /* GICR_TYPER.Last */
+@@ -167,6 +211,20 @@ lwd_sgi_state(uint32_t mpidr, bool *pending, bool *active)
+ 	return false;
+ }
+ 
++/* the SGI bits of those words. Pending: the signal got there and the CPU has not taken it. Active: taken, in its handler */
++static bool
++lwd_sgi_state(uint32_t mpidr, bool *pending, bool *active)
++{
++	uint32_t p = 0, a = 0;
++
++	if (!lwd_gicr_words(mpidr, &p, &a)) {
++		return false;
++	}
++	*pending = (p & LWD_SGI_BIT) != 0;
++	*active = (a & LWD_SGI_BIT) != 0;
++	return true;
++}
++
+ /* "task/thread name" of a thread that can end while we read: each step by a copy that cannot fault */
+ static void
+ lwd_thread_text(cpu_data_t *cd, char *out, size_t n)
+@@ -195,7 +253,29 @@ lwd_thread_text(cpu_data_t *cd, char *out, size_t n)
+ 	snprintf(out, n, "%s%s%s", comm, name[0] ? "/" : "", name);
+ }
+ 
+-/* Two lines through kprintf, also from a path with interrupts off (a stackshot, a bark). Only reads; a CPU that runs on sees no change. */
++/* laurel 2988: ESR exception class of an EL0 trap, by name */
++static const char *
++lwd_class_name(uint32_t cls)
++{
++	switch (cls) {
++	case 0x00: return "undefined word";
++	case 0x07: return "FP or SIMD access";
++	case 0x15: return "SVC: a system call";
++	case 0x18: return "MSR or MRS trap";
++	case 0x20: return "instruction abort";
++	case 0x22: return "pc alignment";
++	case 0x24: return "data abort";
++	case 0x26: return "sp alignment";
++	case 0x2c: return "FP exception";
++	case 0x30: return "breakpoint";
++	case 0x32: return "software step";
++	case 0x34: return "watchpoint";
++	case 0x3c: return "brk";
++	default: return "other";
++	}
++}
++
++/* Three lines through kprintf, also from a path with interrupts off (a stackshot, a bark). Only reads; a CPU that runs on sees no change. */
+ void laurel_wdog_report_cpu(int cpu, const char *prefix);
+ void
+ laurel_wdog_report_cpu(int cpu, const char *prefix)
+@@ -221,6 +301,29 @@ laurel_wdog_report_cpu(int cpu, const char *prefix)
+ 	kprintf("%s cpu %d runs %s; signals 0x%x, SGI %s%s; longest answer this minute %llu ms at pc 0x%llx; slide 0x%lx\n",
+ 	    prefix, cpu, who, (unsigned)cd->cpu_signal, have_sgi ? (pending ? "pending" : "not pending") : "unread", active ? " active" : "",
+ 	    c->worst / ticks, c->worst_pc, vm_kernel_slide);
++	/* laurel 2988: inside the kernel on an EL0 trap, or not; the redistributor's words; the dyld cache slide of the task that runs there */
++	uint64_t trap_t = c->trap_t, esr = c->trap_esr;
++	bool open = trap_t != 0 && c->trap_thread == (volatile void *)cd->cpu_active_thread;
++	uint32_t pend = 0, act = 0;
++	bool have_words = lwd_gicr_words((uint32_t)cd->cpu_phys_id, &pend, &act);
++	uint32_t dyld_slide = 0;
++	thread_t th = (thread_t)cd->cpu_active_thread;
++	struct thread_ro *ro = NULL;
++	struct task *task = NULL;
++
++	if (th != NULL && ml_nofault_copy((vm_offset_t)&th->t_tro, (vm_offset_t)&ro, sizeof(ro)) == sizeof(ro) && ro != NULL &&
++	    ml_nofault_copy((vm_offset_t)&ro->tro_task, (vm_offset_t)&task, sizeof(task)) == sizeof(task) && task != NULL) {
++		(void)ml_nofault_copy((vm_offset_t)&task->task_shared_region_slide, (vm_offset_t)&dyld_slide, sizeof(dyld_slide));
++	}
++	if (open) {
++		kprintf("%s cpu %d is in the kernel since an EL0 trap %llu ms ago: class 0x%02llx (%s) esr 0x%llx far 0x%llx user pc 0x%llx, %u traps in all; GICR pending 0x%08x active 0x%08x%s; dyld slide 0x%x\n",
++		    prefix, cpu, now > trap_t ? (now - trap_t) / ticks : 0, esr >> 26, lwd_class_name((uint32_t)(esr >> 26)), esr, c->trap_far, c->trap_pc,
++		    c->trap_count, pend, act, have_words ? "" : " (unread)", dyld_slide);
++	} else {
++		kprintf("%s cpu %d has no EL0 trap open (in EL0, or the trap ended): %u traps in all, the last %llu ms ago at user pc 0x%llx class 0x%02llx; GICR pending 0x%08x active 0x%08x%s; dyld slide 0x%x\n",
++		    prefix, cpu, c->trap_count, trap_t != 0 && now > trap_t ? (now - trap_t) / ticks : 0, c->trap_pc, esr >> 26, pend, act,
++		    have_words ? "" : " (unread)", dyld_slide);
++	}
+ }
+ 
+ /* post/9015: a stackshot gave this CPU up */

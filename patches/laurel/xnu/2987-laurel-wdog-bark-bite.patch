@@ -1,0 +1,86 @@
+laurel 2987: after a watchdog bark the bite stays armed through the panic hold, so a stuck CPU ends in a reset, with no key press.
+
+[V 2026-11-03 17:56:16, kernel 833d75cdc9] A bark on a stuck CPU 5 sent its report and printed `LAUREL PANIC: holding`, then the hold gave no pong and took no `ctl bootloader`; 2986 had stopped the hardware for the hold, so only the Power key could end it. Now: a bark panic keeps the 30 s count of laurel_wdog_panic_begin. Any other panic holds as before. Kill switch: laurelwdog=0 (2986).
+
+diff --git a/bsd/dev/laurel_reboot.c b/bsd/dev/laurel_reboot.c
+--- a/bsd/dev/laurel_reboot.c
++++ b/bsd/dev/laurel_reboot.c
+@@ -29,6 +29,7 @@
+ extern int kdb_printf(const char *format, ...) __printflike(1, 2);
+ extern void laurel_wdog_panic_begin(void);      /* laurel 2986: osfmk/arm64/laurel_wdog.c */
+ extern void laurel_wdog_stop(void);
++extern void laurel_wdog_hold(void);        /* laurel 2987 */
+ 
+ #define LAUREL_IMEM_PA            0x0c125000ull
+ #define LAUREL_IMEM_RESTART_OFF   0x65c
+@@ -332,7 +333,7 @@
+ 	int secs = 0;
+ 
+ 	laurel_panic_mark();
+-	laurel_wdog_stop();                     /* laurel 2986: a panic hold or spin does not reset, unless laurelpanic=N asks */
++	laurel_wdog_hold();                     /* laurel 2987: a hold does not reset, unless laurelpanic=N asks or a bark caused the panic */
+ 	if (entries++ != 0) {
+ 		if (cpu == cpu_number()) {
+ 			(void)lr_psci(PSCI_SYSTEM_RESET);
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -106,6 +106,7 @@
+ extern uint64_t sweet_log_position(void);
+ extern int laurel_reboot_set_mode(const char *name);
+ extern void laurel_wdog_stop(void);     /* laurel 2986 */
++extern void laurel_wdog_hold(void);     /* laurel 2987 */
+ extern void laurel_wdog_poll(void);
+ extern void laurel_restart(void);
+ extern void laurel_power_off(void);
+@@ -1740,7 +1741,7 @@
+ 	uint64_t sec, half, now, reset_at = UINT64_MAX, act_at = 0;
+ 	int pending = -1, secs = 0;
+ 
+-	laurel_wdog_stop();                     /* laurel 2986: the hold has its own timed reset; the watchdog must not end it */
++	laurel_wdog_hold();                     /* laurel 2987: the hold has its own timed reset; only after a bark the bite stays */
+ 	if (entries++ != 0) {
+ 		return;                         /* nested panic: no USB */
+ 	}
+diff --git a/osfmk/arm64/laurel_wdog.c b/osfmk/arm64/laurel_wdog.c
+--- a/osfmk/arm64/laurel_wdog.c
++++ b/osfmk/arm64/laurel_wdog.c
+@@ -77,6 +77,7 @@
+ static struct lwd_cpu lwd_cpu[LWD_CPUS];
+ static vm_offset_t lwd_regs, lwd_gicd, lwd_gicr;
+ static uint32_t lwd_on;                 /* the hardware runs, with a pet */
++static volatile uint32_t lwd_barked;    /* laurel 2987: this panic is the bark: the bite stays armed through the hold */
+ static volatile uint32_t lwd_hold;      /* a panic has it: no more pets */
+ static uint32_t lwd_bark_on;
+ static bool lwd_bark_any;               /* 1-of-N worked: any CPU takes the bark */
+@@ -272,6 +273,22 @@
+ 	}
+ }
+ 
++/*
++ * laurel 2987: the panic hold. A panic of any other kind stops the hardware, as before: the text stays for the owner.
++ * A bark means a CPU is stuck, and that CPU can also stop the hold from answering on USB (17:56:16: no pong, only the Power key).
++ * So the count of laurel_wdog_panic_begin runs on: a bite 30 s after the panic. The USB log has the text by then.
++ */
++void laurel_wdog_hold(void);
++void
++laurel_wdog_hold(void)
++{
++	if (lwd_barked != 0 && lwd_on != 0) {
++		kprintf("LAUREL WDOG: on: bark: the phone resets in 30 s by the bite\n");
++		return;
++	}
++	laurel_wdog_stop();
++}
++
+ /* SPI 3, from sleh_irq, already acknowledged. No pet for 12 s and this CPU has interrupts on: the text, then the panic, with the hold and its timed reset. */
+ void laurel_wdog_bark(void);
+ void
+@@ -283,6 +300,7 @@
+ 	if (lwd_on == 0 || lwd_hold != 0) {
+ 		return;
+ 	}
++	lwd_barked = 1;
+ 	for (unsigned i = 0; i < LWD_CPUS; i++) {
+ 		if (CpuDataEntries[i].cpu_data_vaddr != NULL && lwd_cpu[i].silent_ms >= 1000u) {
+ 			silent |= 1u << i;
