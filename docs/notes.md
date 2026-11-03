@@ -5351,3 +5351,6 @@ Full text: `docs/laurel_sprout/ios26-control-center.md`.
 
 ## 2026-11-03: panic `Console I/O from interrupt-disabled context @serial_console.c:175`
 [V 06:15:41] First line `DebuggerXCallEnter>Debugger synch pending on cpu 5`, then the panic. post/9007's printf ran with interrupts off in the stackshot path. Now kprintf, as the function around it. So a stackshot with a late CPU panicked on every kernel from 9007 on, under load. Agent's error and mine: no host test runs that path. [U] why CPU 5 is late.
+
+## 2026-11-03: boot with `TU_DEBUG=sysmem` + `CA_ENABLE_MEMORYLESS=0`: no UI at 3.5 min
+[V 06:21-06:25] Stuck on the Apple logo: SpringBoard 60.6 s, usernotificationsd 60.2 s, PerfPowerServices 60.7 s a minute; usernotificationsd, aonsensed, localizationswitcher, extensionkitservice killed in a loop (sig 9); SSH: `Connection timed out during banner exchange`. Same kernel as the UI boots but with 9007's kprintf. Test: settings off, next boot. [U] whether the settings or the loop are the cause.
