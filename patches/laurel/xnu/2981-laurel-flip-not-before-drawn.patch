@@ -1,0 +1,398 @@
+laurel 2981: a surface goes to the panel when the GPU is done: 900 ms on the presenter, not 100 ms, then the panel keeps its frame. Older swaps are refused; LAUREL FLIP names late, lost, refused and repeated frames. Kill switch sweetfb_flipwait=0. docs/laurel_sprout/gpu.md "Previous state on each update".
+
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -311,7 +311,8 @@
+ 
+ 	if (fence != 0 && gGPULock != NULL) {
+ 		IOLockLock(gGPULock);
+-		done = !redwood_gpu_ready() || gpuWait(fence, milliseconds);
++		/* laurel 2981: false only for a GPU that is alive and late: with a dead GPU no fence comes, and the panel must go on showing what there is */
++		done = !redwood_gpu_ready() || gpuWait(fence, milliseconds) || gGPUReported;
+ 		IOLockUnlock(gGPULock);
+ 	}
+ 	return done;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -65,6 +65,7 @@
+ extern "C" void topaz_adreno_init(void);
+ extern "C" bool topaz_gpu_gl_active(void);          /* laurel 2150: backboardd's GL has the GPU (SWEET FPS, 2152) */           /* iokit/Kernel/arm/TopazAdreno.cpp (boot-arg gpu=1) */
+ bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);   /* RedwoodGPU.cpp */
++#include "laurel_flip_core.h"                                             /* laurel 2981 */
+ 
+ /*
+  * topaz: a surface the MDP may still be fetching counts as in use, so
+@@ -86,6 +87,8 @@
+ 	uint32_t moving_frames, gaps[4];        /* under 20, 36, 52 ms, longer: 0, 1, 2, 3 or more panel frames missed */
+ 	uint64_t touch;                 /* from a touch event to the next flip */
+ 	uint32_t touches;
++	uint32_t not_drawn, lost, older, again, over_100ms;     /* laurel 2981: LAUREL FLIP */
++	uint64_t fence_longest;
+ } lf;
+ extern "C" kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority, thread_t *new_thread);
+ extern "C" uint64_t laurel_touch_event_at;      /* bsd/dev/sweet_touch.c: mach time of the last finger event not yet followed by a flip */
+@@ -240,7 +243,12 @@
+ 	uint64_t      fScanPhys;      /* what VIG0 currently fetches */
+ 	uint32_t      fScanStride;
+ 	uint32_t      fBootSrc, fBootStride;
+-	bool          directPresent(const uint8_t *rec);
++	bool          directPresent(const uint8_t *rec, bool *refused);
++	bool          flipOlder(const uint8_t *rec);
++	void          flipNote(const uint8_t *rec, SweetSurface *s);
++	thread_t      fPresenter;
++	uint32_t      fShownSwap;             /* laurel 2981: the newest swap that went to the panel */
++	bool          fFlipRule;              /* laurel 2981: kill switch sweetfb_flipwait=0 */
+ 	/*
+ 	 * Direct frames go to a thread of ours (presenter): SwapEnd returns at once and backboardd is
+ 	 * at its next frame while this one waits for the GPU and the MDP's latch (8-10 ms a frame,
+@@ -373,7 +381,7 @@
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+-	void present(const uint8_t *rec);
++	bool present(const uint8_t *rec);
+ };
+ 
+ /*
+@@ -935,6 +943,14 @@
+ 			fQLock = NULL;
+ 		}
+ 	}
++	{
++		uint32_t v = 1;
++
++		(void)PE_parse_boot_argn("sweetfb_flipwait", &v, sizeof(v));
++		fFlipRule = v != 0;
++		IOLog("LAUREL FLIP: %s: a surface goes to the panel when the GPU is done, the presenter waits up to %u ms (kill switch sweetfb_flipwait=0: 100 ms, then shown as it is)\n",
++		    fFlipRule ? "on" : "off", LFL_WAIT_PRESENTER_MS);
++	}
+ 
+ 	publishModes();
+ 	sweet_hid_set_geometry((int)fWidth, (int)fHeight, (int)fLogicalW, (int)fLogicalH, fOffX, fOffY, 1, 1);     /* laurel 2200 */
+@@ -1110,12 +1126,17 @@
+ 		}
+ 	}
+ 	if (rec != NULL) {
+-		fb->present(rec);
++		bool shown = fb->present(rec);
++
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+-		IOLockLock(fb->fLock);
+-		memcpy(fb->fRetireHold, fb->fShowHold, sizeof(taken));
+-		memcpy(fb->fShowHold, taken, sizeof(taken));
+-		IOLockUnlock(fb->fLock);
++		if (shown) {
++			IOLockLock(fb->fLock);
++			memcpy(fb->fRetireHold, fb->fShowHold, sizeof(taken));
++			memcpy(fb->fShowHold, taken, sizeof(taken));
++			IOLockUnlock(fb->fLock);
++		} else {
++			sweet_hold_set(taken, false);   /* laurel 2981: a newer frame is on the panel */
++		}
+ 	}
+ 	sender->setTimeoutUS(fb->fVLock ? fb->vsyncNext() : SWEET_FB_VSYNC_US);
+ }
+@@ -1331,11 +1352,27 @@
+ 	    lf.gaps[0], lf.gaps[1], lf.gaps[2], lf.gaps[3]);
+ 	IOLog("LAUREL FRAME: after SwapEnd, %u flips: %llu us to the presenter, %llu us GPU fence, %llu us flush to latch, %u past one panel frame; touch to next flip %llu us (%u)\n",
+ 	    lf.shown, us[2] / 1000, us[3] / 1000, us[4] / 1000, lf.missed, us[5] / 1000, lf.touches);
++	if (lf.not_drawn != 0 || lf.lost != 0 || lf.older != 0 || lf.again != 0 || lf.over_100ms != 0) {
++		uint64_t longest = 0;
++
++		absolutetime_to_nanoseconds(lf.fence_longest, &longest);
++		IOLog("LAUREL FLIP: %u waits over 100 ms, longest %llu ms; %u not drawn in time, %u lost at a full queue, %u older swaps refused, %u surfaces shown again with no new draw\n",
++		    lf.over_100ms, longest / 1000000, lf.not_drawn, lf.lost, lf.older, lf.again);
++	}
+ 	bzero(&lf.queue, sizeof(lf) - __builtin_offsetof(struct laurel_frame_stats, queue));
+ 	lf.tick_sum = lf.tick_worst = 0;
+ 	lf.ticks = 0;
+ }
+ 
++/* laurel 2981: the first cases by name; the numbers per window are in the LAUREL FLIP line */
++static bool
++laurel_flip_tell(void)
++{
++	static uint32_t told;
++
++	return told < LFL_EVENT_LINES && OSIncrementAtomic((volatile SInt32 *)&told) < (SInt32)LFL_EVENT_LINES;
++}
++
+ static void
+ sweet_fps_count(void)
+ {
+@@ -1438,11 +1475,15 @@
+ 	 */
+ 	if (directEligible(rec, held) && fQLock != NULL) {
+ 		AbsoluteTime deadline;
+-		clock_interval_to_deadline(200, kMillisecondScale, &deadline);
++		clock_interval_to_deadline(fFlipRule ? LFL_QUEUE_MS : LFL_QUEUE_OLD_MS, kMillisecondScale, &deadline);
+ 		IOLockLock(fQLock);
+ 		while (fQWaiting >= 2) {
+ 			if (IOLockSleepDeadline(fQLock, &fQWaiting, deadline, THREAD_UNINT) == THREAD_TIMED_OUT && fQWaiting >= 2) {
+ 				IOLockUnlock(fQLock);
++				lf.lost++;
++				if (laurel_flip_tell()) {
++					IOLog("LAUREL FLIP: swap %u lost: the presenter's queue stayed full\n", get32(rec, 0x50));
++				}
+ 				sweet_hold_set(held, false);    /* (the presenter is stuck: this frame is lost) */
+ 				return;
+ 			}
+@@ -1490,6 +1531,7 @@
+ 	static uint8_t rec[SWEET_FB_SWAP_REC_SIZE];     /* (one thread) */
+ 	SweetSurface *held[4];
+ 
++	fPresenter = current_thread();          /* laurel 2981 */
+ 	for (;;) {
+ 		IOLockLock(fQLock);
+ 		while (fQWaiting == 0) {
+@@ -1526,7 +1568,11 @@
+ 		IOLockUnlock(fLock);
+ 		sweet_hold_set(dropped, false);
+ 		uint64_t waited = mach_absolute_time(), wns = 0;  /* (present waits for the GPU too) */
+-		present(rec);
++		if (!present(rec)) {
++			/* laurel 2981: refused, the panel keeps its frame: fShowHold stays what is on the panel, so nobody draws into that surface */
++			sweet_hold_set(held, false);
++			return;
++		}
+ 		/*
+ 		 * laurel 2913: until the MDP has latched it. Sleep to the panel frame's start, then look: before, 100 us at a time for up to a whole
+ 		 * panel frame (up to 160 wake-ups per frame at this thread's priority; kernel_task 17.2 s of the minute 22:14:55, 8.0 in a quiet one).
+@@ -2502,7 +2548,7 @@
+  * fall back to the copy path.
+  */
+ bool
+-AppleCLCD::directPresent(const uint8_t *rec)
++AppleCLCD::directPresent(const uint8_t *rec, bool *refused)
+ {
+ 	if (fVig0 == NULL) {
+ 		return false;
+@@ -2522,9 +2568,41 @@
+ 		return false;
+ 	}
+ 	bool ok = false;
+-	uint64_t fence_began = mach_absolute_time();
+-	(void)topaz_surface_drawn(s, 100);
+-	lf.fence += mach_absolute_time() - fence_began;         /* laurel 2913 */
++	uint64_t fence_began = mach_absolute_time(), fence_ns = 0;
++	bool on_presenter = current_thread() == fPresenter;
++	/*
++	 * laurel 2981: the limit was 100 ms, and after it the surface went to the panel as it was: what it held from its last frame, then the GPU's
++	 * work appearing on it. [V log] the GPU worked 98 ms on average in 05:25:46, 189 ms in 05:22:09, 429 ms in 02:54:49: frames over the limit are common.
++	 */
++	bool drawn = topaz_surface_drawn(s, fFlipRule && on_presenter ? LFL_WAIT_PRESENTER_MS : LFL_WAIT_TICK_MS);
++	uint64_t fence_spent = mach_absolute_time() - fence_began;
++
++	lf.fence += fence_spent;         /* laurel 2913 */
++	lf.fence_longest = fence_spent > lf.fence_longest ? fence_spent : lf.fence_longest;
++	absolutetime_to_nanoseconds(fence_spent, &fence_ns);
++	lf.over_100ms += fence_ns > 100000000ull;
++	lf.not_drawn += !drawn;
++	if (lfl_refuse_not_drawn(drawn, fFlipRule, on_presenter)) {
++		if (laurel_flip_tell()) {
++			IOLog("LAUREL FLIP: surface %u of swap %u not drawn after %u ms (fence %u): the panel keeps its frame\n",
++			    s->id, get32(rec, 0x50), LFL_WAIT_PRESENTER_MS, s->drawn);
++		}
++		s->release();
++		*refused = true;
++		return true;
++	}
++	if (flipOlder(rec)) {
++		s->release();
++		*refused = true;
++		return true;
++	}
++	if (lfl_shown_again(s->drawn, s->shownFence, s == fLastSurf)) {
++		lf.again++;
++		if (laurel_flip_tell()) {
++			IOLog("LAUREL FLIP: surface %u again in swap %u, no submission named it since it was shown at fence %u: an older picture\n",
++			    s->id, get32(rec, 0x50), s->shownFence);
++		}
++	}
+ 	if (s == fSurface) {
+ 		/*
+ 		 * laurel 2104: surface 1 is the boot framebuffer (backboardd's GL draws frames into it). The
+@@ -2535,6 +2613,7 @@
+ 		if (fHandoff > 0 && (fPhys & 0xf) == 0 && fPhys + (uint64_t)fHeight * fRowBytes < (1ull << 32) &&
+ 		    scanFrom(fPhys, fRowBytes, LAUREL_SCAN_IOS, "surface 1 frame (direct)")) {
+ 			ok = true;
++			flipNote(rec, s);
+ 			IOLockLock(fLock);
+ 			if (fLastSurf != s) {
+ 				s->retain();
+@@ -2583,6 +2662,7 @@
+ 					scanFrom(pa, s->bytesPerRow, LAUREL_SCAN_IOS, "scanout-slot frame (direct)");
+ 				}
+ 				ok = true;
++				flipNote(rec, s);
+ 				IOLockLock(fLock);
+ 				if (fLastSurf != s) {
+ 					s->retain();
+@@ -2601,6 +2681,35 @@
+ 	return ok;
+ }
+ 
++/* laurel 2981: an older swap never replaces a newer one on the panel (the timer's copy path waits on its own thread, the presenter can pass it) */
++bool
++AppleCLCD::flipOlder(const uint8_t *rec)
++{
++	uint32_t id = get32(rec, 0x50);
++
++	if (!fFlipRule || !lfl_swap_older(id, fShownSwap)) {
++		return false;
++	}
++	lf.older++;
++	if (laurel_flip_tell()) {
++		IOLog("LAUREL FLIP: swap %u came after swap %u: not shown\n", id, fShownSwap);
++	}
++	return true;
++}
++
++void
++AppleCLCD::flipNote(const uint8_t *rec, SweetSurface *s)
++{
++	uint32_t id = get32(rec, 0x50);
++
++	if (id != 0) {
++		fShownSwap = id;
++	}
++	if (s != NULL) {
++		s->shownFence = s->drawn;
++	}
++}
++
+ /*
+  * laurel 2104: console handoff at the first iOS frame. From now on the kernel console never draws
+  * onto the panel; a panic still does (sweet_cons_show / _cnputs with panic_active). Self-check: the
+@@ -2718,7 +2827,7 @@
+ 	OSSafeReleaseNULL(s);
+ }
+ 
+-void
++bool
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+@@ -2731,7 +2840,7 @@
+ 	}
+ 	if (console_only > 0 && fConsShown) {
+ 		(void)mask;
+-		return;
++		return true;
+ 	}
+ 	/* laurel 2870: from the second iOS frame on (the first one is latched by then): clear the kernel buffers */
+ 	handoffClear();
+@@ -2742,7 +2851,12 @@
+ 		consoleHandoff();               /* laurel 2104: the first iOS frame owns the panel */
+ 	}
+ 	fConsShown = false;
+-	if (directPresent(rec)) {
++	bool refused = false;
++
++	if (directPresent(rec, &refused)) {
++		if (refused) {
++			return false;
++		}
+ 		laurel_fb_first_frame(rec, "direct", fLogicalW, fLogicalH);     /* laurel 2103 */
+ 		if (!fConsolePaused) {
+ 			int quiet = 0;
+@@ -2751,7 +2865,7 @@
+ 				sweet_console_muted = 1;
+ 			}
+ 		}
+-		return;
++		return true;
+ 	}
+ 	IOLockLock(fLock);
+ 	fLastVA = NULL;
+@@ -2811,7 +2925,7 @@
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+-		(void)topaz_surface_drawn(s, 100);
++		lf.not_drawn += !topaz_surface_drawn(s, LFL_WAIT_TICK_MS);
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+@@ -2865,9 +2979,14 @@
+ 		s->release();
+ 	}
+ 	if (fFlip[0] != NULL) {
++		if (flipOlder(rec)) {
++			return false;
++		}
+ 		flipBack(LAUREL_SCAN_IOS, "iOS frame (copy path)");
++		flipNote(rec, NULL);
+ 	}
+ 	laurel_fb_first_frame(rec, "copy", fLogicalW, fLogicalH);               /* laurel 2103 */
++	return true;
+ }
+ 
+ bool
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -48,6 +48,7 @@
+ 	bool                      gpuPool;      /* topaz GPU: memory from the GPU pool below 4 GiB (scanoutPhys = its address) */
+ 	uint64_t                  poolSize;     /* bytes taken from the GPU pool (allocSize and a guard) */
+ 	uint32_t                  drawn;        /* topaz GPU: last submission naming this surface (RedwoodGPU.cpp) */
++	uint32_t                  shownFence;   /* laurel 2981: `drawn` when it last went to the panel */
+ 	bool                      pagesWired;   /* laurel 2101: pageable buffer wired by prepare() (complete() in free) */
+ 	bool                      noCache;      /* laurel 2158: every map of it is write-combined (physical framebuffer): no cache upkeep */
+ 	char                      who[20];      /* laurel 2916: the process that created it */
+@@ -55,7 +56,7 @@
+ 	uint64_t                  whoBytes;
+ 	uint32_t                  gpuMoves;     /* laurel 2916: seed moves that are other clients' GPU writes: no CPU write, no cache push for them */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { who[0] = 0; whoSlot = -1; whoBytes = 0; gpuMoves = 0; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; drawn = 0; gpuPool = false; poolSize = 0; pagesWired = false; noCache = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { who[0] = 0; whoSlot = -1; whoBytes = 0; gpuMoves = 0; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; drawn = 0; shownFence = 0; gpuPool = false; poolSize = 0; pagesWired = false; noCache = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+diff --git a/iokit/Kernel/arm/laurel_flip_core.h b/iokit/Kernel/arm/laurel_flip_core.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/laurel_flip_core.h
+@@ -0,0 +1,39 @@
++/*
++ * laurel 2981: what may go to the panel. Pure rules, built as they are by the host test (scripts/laurel/flip-test.sh).
++ * Swap ids grow from SwapBegin; 0 is "no id". A surface's `drawn` is the last submission of the window server that names it.
++ */
++#ifndef LAUREL_FLIP_CORE_H
++#define LAUREL_FLIP_CORE_H
++
++#define LFL_WAIT_PRESENTER_MS   900u    /* under the 1000 ms of gpuWait that report a dead GPU, under the watchdog's 1500 ms. [V log] windows average 430 ms a submission */
++#define LFL_WAIT_TICK_MS        100u    /* the timer's thread: the old limit, this thread also sends vsync */
++#define LFL_QUEUE_MS            2000u   /* SwapEnd with a full queue: two frames at the presenter's limit, and some */
++#define LFL_QUEUE_OLD_MS        200u
++#define LFL_EVENT_LINES         8u
++
++/* A swap older than the one on the panel: only the timer's copy path can come late (its wait is on another thread). */
++static inline bool
++lfl_swap_older(uint32_t id, uint32_t shown)
++{
++	return id != 0 && shown != 0 && (int32_t)(id - shown) < 0;
++}
++
++/*
++ * The surface was on the panel before and no submission named it since, so it holds what it held then: an older picture comes back.
++ * A surface on the panel now is no change. Limit: every submission of the window server names all its surfaces, so an unrelated
++ * submission in between hides a case; a hit is always real.
++ */
++static inline bool
++lfl_shown_again(uint32_t drawn, uint32_t shown_fence, bool on_panel)
++{
++	return !on_panel && shown_fence != 0 && drawn == shown_fence;
++}
++
++/* Does this flip go ahead after the wait for the GPU? Only the presenter may refuse: the timer's flip has no later try. A kill switch restores the old rule. */
++static inline bool
++lfl_refuse_not_drawn(bool drawn, bool rule, bool on_presenter)
++{
++	return !drawn && rule && on_presenter;
++}
++
++#endif /* LAUREL_FLIP_CORE_H */

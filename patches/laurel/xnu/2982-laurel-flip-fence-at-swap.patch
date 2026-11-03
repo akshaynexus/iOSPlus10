@@ -1,0 +1,127 @@
+laurel 2982: a queued frame waits for its own submission, taken at SwapEnd, not for later ones: Turnip names every buffer in each submission. Kill switch sweetfb_swapfence=0. docs/laurel_sprout/gpu.md "Previous state on each update".
+
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -53,6 +53,7 @@
+ extern "C" unsigned int pmap_cache_attributes(ppnum_t pn);     /* laurel 2977 */
+ extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
+ bool topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds);
++bool topaz_fence_drawn(uint32_t fence, uint64_t milliseconds);
+ 
+ extern "C" {
+ /* bsd/dev/redwood_adreno.c ("the GPU kept on"; declared in bsd/sys/redwood_input.h, which is not seen from here) */
+@@ -304,9 +305,8 @@
+ 
+ /* the display waits for the GPU to be done drawing a surface before it shows it */
+ bool
+-topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds)
++topaz_fence_drawn(uint32_t fence, uint64_t milliseconds)
+ {
+-	uint32_t fence = surface->drawn;
+ 	bool done = true;
+ 
+ 	if (fence != 0 && gGPULock != NULL) {
+@@ -318,6 +318,12 @@
+ 	return done;
+ }
+ 
++bool
++topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds)
++{
++	return topaz_fence_drawn(surface->drawn, milliseconds);
++}
++
+ /*
+  * Boot-arg touch_lat=1: a line for every wait of a program's for the GPU that took a millisecond or
+  * more ("tl: f KIND US at US"), for telling apart what holds a frame up (tools/frames.py).
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -65,6 +65,7 @@
+ extern "C" void topaz_adreno_init(void);
+ extern "C" bool topaz_gpu_gl_active(void);          /* laurel 2150: backboardd's GL has the GPU (SWEET FPS, 2152) */           /* iokit/Kernel/arm/TopazAdreno.cpp (boot-arg gpu=1) */
+ bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);   /* RedwoodGPU.cpp */
++bool topaz_fence_drawn(uint32_t fence, uint64_t milliseconds);             /* laurel 2982 */
+ #include "laurel_flip_core.h"                                             /* laurel 2981 */
+ 
+ /*
+@@ -258,6 +259,9 @@
+ 	uint8_t       fQRec[2][SWEET_FB_SWAP_REC_SIZE];
+ 	SweetSurface *fQHeld[2][4];
+ 	uint64_t      fQAt[2];        /* laurel 2913: when SwapEnd gave the frame */
++	uint32_t      fQFence[2];     /* laurel 2982: the surface's last submission when SwapEnd gave the frame */
++	uint32_t      fFlipFence;     /* laurel 2982: of the frame at the presenter; only that thread */
++	bool          fSwapFence;     /* laurel 2982: kill switch sweetfb_swapfence=0 */
+ 	unsigned      fQFirst, fQWaiting;
+ 	bool          fQStarted;
+ 	void          presenter(void);
+@@ -948,6 +952,10 @@
+ 
+ 		(void)PE_parse_boot_argn("sweetfb_flipwait", &v, sizeof(v));
+ 		fFlipRule = v != 0;
++		v = 1;
++		(void)PE_parse_boot_argn("sweetfb_swapfence", &v, sizeof(v));
++		fSwapFence = v != 0;
++		IOLog("LAUREL FLIP: %s: a frame waits for the submission it had at SwapEnd, not for later ones (kill switch sweetfb_swapfence=0)\n", fSwapFence ? "on" : "off");
+ 		IOLog("LAUREL FLIP: %s: a surface goes to the panel when the GPU is done, the presenter waits up to %u ms (kill switch sweetfb_flipwait=0: 100 ms, then shown as it is)\n",
+ 		    fFlipRule ? "on" : "off", LFL_WAIT_PRESENTER_MS);
+ 	}
+@@ -1492,6 +1500,14 @@
+ 		memcpy(fQRec[slot], rec, SWEET_FB_SWAP_REC_SIZE);
+ 		memcpy(fQHeld[slot], held, sizeof(fQHeld[slot]));
+ 		fQAt[slot] = mach_absolute_time();
++		fQFence[slot] = 0;
++		if (fSwapFence) {
++			for (uint32_t i = 0; i < 4 && i < SWEET_FB_LAYERS; i++) {
++				if (held[i] != NULL && (mask & (1u << i))) {
++					fQFence[slot] = lfl_fence_for_flip(held[i]->drawn, held[i]->shownFence);
++				}
++			}
++		}
+ 		fQWaiting++;
+ 		IOLockWakeup(fQLock, fQRec, true);
+ 		IOLockUnlock(fQLock);
+@@ -1540,6 +1556,7 @@
+ 		memcpy(rec, fQRec[fQFirst], sizeof(rec));
+ 		memcpy(held, fQHeld[fQFirst], sizeof(held));
+ 		lf.queue += mach_absolute_time() - fQAt[fQFirst];
++		fFlipFence = fQFence[fQFirst];
+ 		IOLockUnlock(fQLock);
+ 		if (directEligible(rec, held)) {
+ 			showDirect(rec, held);
+@@ -2574,7 +2591,13 @@
+ 	 * laurel 2981: the limit was 100 ms, and after it the surface went to the panel as it was: what it held from its last frame, then the GPU's
+ 	 * work appearing on it. [V log] the GPU worked 98 ms on average in 05:25:46, 189 ms in 05:22:09, 429 ms in 02:54:49: frames over the limit are common.
+ 	 */
+-	bool drawn = topaz_surface_drawn(s, fFlipRule && on_presenter ? LFL_WAIT_PRESENTER_MS : LFL_WAIT_TICK_MS);
++	uint64_t fence_limit = fFlipRule && on_presenter ? LFL_WAIT_PRESENTER_MS : LFL_WAIT_TICK_MS;
++	/*
++	 * laurel 2982: the frame's own submission, taken at SwapEnd. Read here, it was the last submission that names the surface when the presenter comes to this
++	 * frame, and Turnip names every buffer in each submission: with the next frame already on the GPU, this frame waited for that one too, its surfaces stayed marked in use.
++	 */
++	uint32_t fence_want = on_presenter ? fFlipFence : 0;
++	bool drawn = fence_want != 0 ? topaz_fence_drawn(fence_want, fence_limit) : topaz_surface_drawn(s, fence_limit);
+ 	uint64_t fence_spent = mach_absolute_time() - fence_began;
+ 
+ 	lf.fence += fence_spent;         /* laurel 2913 */
+diff --git a/iokit/Kernel/arm/laurel_flip_core.h b/iokit/Kernel/arm/laurel_flip_core.h
+--- a/iokit/Kernel/arm/laurel_flip_core.h
++++ b/iokit/Kernel/arm/laurel_flip_core.h
+@@ -36,4 +36,15 @@
+ 	return !drawn && rule && on_presenter;
+ }
+ 
++/*
++ * laurel 2982: the fence a queued frame waits for: the surface's last submission at SwapEnd. No submission since the surface was last shown: the frame's
++ * own work has not come by now, or there is none: 0, so that the flip reads the surface's newest, as before. [V log] SwapEnd comes after the submission: a presenter
++ * that takes the frame 200 us after SwapEnd waits 17 of the GPU's 18 ms (05:26:20).
++ */
++static inline uint32_t
++lfl_fence_for_flip(uint32_t drawn_at_swap, uint32_t shown_fence)
++{
++	return drawn_at_swap == shown_fence ? 0 : drawn_at_swap;
++}
++
+ #endif /* LAUREL_FLIP_CORE_H */

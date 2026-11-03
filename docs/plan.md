@@ -1178,3 +1178,9 @@ Next: boot. Read `LAUREL GPU PUSH`, `LAUREL GPU WC`, `LAUREL GPU TIME`, `push us
 ## 2026-11-03: Mi A3: native Metal stack, third option (branch `t3/native-adreno-metal-driver`, not merged)
 Done on the host, no phone: winsys, PM4, AIR -> ir3 with no Vulkan (141 of 154, 218 of 218 real keys), 148 frontend calls, third option, phone image passes abi, ARMv8.0 and import checks. Register state at a draw agrees with Turnip's on 2 scenes, 0 unexpected. **Never drew a pixel. The Objective-C frontend and the IOKit transport never ran.** GL ES: not built; route found.
 Next: owner's yes for `nmn-scene` on the phone (`docs/laurel_sprout/ios26-native-metal.md` section 8). Found on the way, for the default stack: a real CA pass runs in 108 tiles (section 3.3).
+
+## 2026-11-03: Mi A3 iOS 26: previous-state flash, frame rate (branch `t3/ios26-turnip-fps-flash-fix`, not merged, NOT BOOTED)
+Done: 2981 (a surface waits for the GPU, up to 900 ms on the presenter; a late frame is refused; `LAUREL FLIP` lines), 2982 (a frame waits for its own fence, taken at SwapEnd). Host test `scripts/laurel/flip-test.sh` passes.
+Results [V log]: the steady 10.0 frames/s windows have no touch, one command buffer a submission, the same in boot 16: not a limit. In use the compositor's GPU work is 70 to 430 ms a submission, and that is the frame rate. Details: `docs/laurel_sprout/gpu.md` "Previous state on each update".
+Next: kernel flash, then the owner's test in that section. GPU cost of a glass frame stays the limit: tiles (`ios26-native-metal.md`), DDR at 1355 MHz.
+

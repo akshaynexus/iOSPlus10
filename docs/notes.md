@@ -5324,3 +5324,14 @@ Full text: `docs/laurel_sprout/ios26-native-metal.md`. Not merged. Never drew a 
 ## 2026-11-03: first run of `native` on the real GPU (nmn-scene)
 [V] `scene: wait 0 status 5 error 'the GPU did not finish: errno 19'`; `LAUREL GPU SMMU: fault FSR 00000402 FAR 0000001970460000 FSYNR0 00040010`; `TopazGPU: watchdog: GPU hang: fence 4135 done 4123 ... IB1 972f0000`; `LAUREL GPU: off: GPU hang`, needs a reboot; then `FAIL blit encoder: no GPU memory for 4492800 bytes`. Log logs/nmn-scene-1.txt.
 [V] At the same boot, Turnip stack, texture pool off: motion 7 to 24 fps; GPU busy 18 % at about 10 fps, 24 ms a frame in present + latch, so the GPU is not the limit in those windows.
+
+## 2026-11-03: Mi A3 iOS 26: flash of the previous state, frame rate (branch t3/ios26-turnip-fps-flash-fix; host and read-only SSH; 2981, 2982 NOT BOOTED)
+Full text: `docs/laurel_sprout/gpu.md` "Previous state on each update".
+- Exactly 100 frames in 10 s with `touch ... (0)` and one command buffer per submission is a fixed-rate client, not a limit. It was in boot 16 too. Do not use these windows for a budget. In use: 70 to 430 ms GPU a submission.
+- `topaz_surface_drawn(s, 100)` result was ignored: after 100 ms the panel showed the surface as it was. Frames are often longer. [I] that is the flash; no line proved it. 2981 refuses, 2982 waits for the frame's own fence.
+- Turnip names every buffer in each submission, so `surface->drawn` read later can be the next frame's fence. Read it at SwapEnd.
+- zsh does not split `$FILES`: `git diff C -- $FILES` wrote an empty patch and the script went on. Check `grep -c '^diff --git'` on a made patch.
+- `git diff COMMIT` on a file with `add -N` gives nothing useful there either: use `diff -u --label` for a new file.
+- `LAUREL GPU WC` is printed once per boot: its absence in boot 18 means no scattered buffer, so 2977's WC path did not run there.
+- [U] the owner of the 10 Hz drawing; SpringBoard's commit rate during a touch; the flash with `sync` on (pool was on in that run).
+

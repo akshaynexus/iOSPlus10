@@ -1123,6 +1123,75 @@ Reading: `moving` near 60 and few `<36` gaps = smooth. `M past one panel frame` 
 
 Tools: `scripts/ios26/objc-methods.py BINARY [CLASS]`, `scripts/ios26/objc-stub-sel.py BINARY VADDR...`, `scripts/laurel/dsc-image.py CACHE fn QuartzCore __ZN2CA12WindowServer11IOMFBServer14vsync_callbackEP21__IOMobileFramebufferyyyPv`.
 
+## Previous state on each update, and the frame rate (boots 2026-11-03 05:12 and 05:24; patches 2981, 2982; built, NOT BOOTED)
+
+Owner: whole screen 5 fps at most; each update flashes the previous state, then the current state. Log: `logs/usblog-20261103-000638.txt`.
+
+### What stops frames
+
+| Label | Fact | Evidence |
+|---|---|---|
+| [V] | The 05:26:20 to 05:27:10 windows are not a measure of use. Exactly 100 frames in 10 s, gaps all over 52 ms, `touch to next flip 0 us (0)`, one command buffer per submission, 18 ms GPU at 600 MHz | Same 10.0 a second in boot 16 (02:27 to 02:51: 1000 swaps per 101 s) and at 22:16 of the older boot (section "The steady 10.0 frames") |
+| [I] | So a fixed-rate client draws there; it is no cap: the same boot has 24 to 30 frames/s and 37 to 42 frames/s bursts. Its owner: [U] | |
+| [V] | In use, the GPU is the cost. 05:25:35: 69.6 ms a submission, 52 % busy; 05:25:46: 98.4 ms, 62 %; 05:22:09: 189 ms; 05:25:52: 274 ms; boot 16 02:54:49: 430 ms. Clock over the window 500 to 950 MHz | `the GPU worked` |
+| [V] | Those frames spend their time at the presenter: 05:25:41: 9.6 ms to the presenter + 39.0 ms fence + 7.7 ms latch = 56 ms of 75 ms between moving frames. 05:25:44: 8.1 + 69.2 + 11.3 = 89 ms of 71 | `after SwapEnd`, `moving` |
+| [V] | The window server gave 33 of 35 and 35 of 39 submissions in those windows: the compositor's own work, not a client ahead of it in the ring | `LAUREL GPU TIME: submit` |
+| [V] | The DDR is 1355 MHz at all GPU levels: `LAUREL DDR: off ... the RPM does not follow`. 820+ MHz run on it | Boot line |
+| [V] | Not new: boot 16 has the same numbers (63 to 76 ms fence, 10 to 17 frames/s in a touch). So 2974 to 2980 did not make this | 02:52 to 02:57 |
+| [I] | Governor: no real loss. A raise comes at the next 50 ms tick (busy 90 % goes to the top); 50 ms at 320 MHz does the work of 17 ms at 950: at most 33 ms on the first frame after a pause. 320 MHz 38 s of the minute is the idle time | `laurel_gpu_opp.h` `opp_decide`, `LAUREL GPU CLOCK` |
+| [I] | post/9008: no cap. a2 + a3 is the right next refresh, the tick line is correct at 16666 us, boot 16 had it already, and 37 to 42 frames/s came with it. With the old counter a due time inside a tick renders one tick later (`frame-pace.py`): at most 16.7 ms a frame | Code, log. `sweetfb_period=0` is not needed for this question |
+| [V] | Defect in the flip: `topaz_surface_drawn` read `surface->drawn` when the presenter reached the frame, and Turnip names every buffer in each submission (`named/sub` 342 to 1826). So with the next frame on the GPU, this frame also waited for that one | Code; 2982 |
+| [U] | SpringBoard's commit rate. SpringBoard 35 s a minute of 480 s; the phone rebooted at 05:28, so its main thread was not sampled in these windows. At idle now: state `S`, 0 % | `ps -M` |
+
+Pool on and off: no gain in GPU time: 05:13:47 (on) 81 ms, 05:25:35 to 05:25:46 (off) 33 to 98 ms a submission; off makes 253 to 390 buffers per 5 s in a change. One sample each [I].
+
+### The flash: ranked
+
+| Rank | Cause | Label | For | Against |
+|---|---|---|---|---|
+| 1 | **A surface goes to the panel before the GPU drew it.** After 100 ms `topaz_surface_drawn` returned false and the result was thrown away. The surface still holds its last frame: the previous state; the new frame then appears on it. A fresh surface holds zeros: the black flash of boot 17 | [I] strong: the limit and the frame times are [V], no log line counted a late flip | Frames of 98 to 430 ms; each update starts with the heavy frames | Boot 16 has the same limit and frames, and no flash was reported. Owner: the flash stays with `sync` on, where the fence is 2 us: see rank 2 |
+| 2 | Texture pool (52a227f): a pooled render target holds the last frame's picture; a new one was zeroed. A target that is sampled outside what the frame drew shows the old picture | [I] | New since boot 16. Was ON in the `sync` run 05:15 to 05:24, so it fits a flash with no late flip | The pool-off run (05:24 on) has no owner statement yet |
+| 3 | Frame lost: full queue for 200 ms (`swap`), so CoreAnimation thinks it shown | [I] | Two frames over 100 ms fill the queue | Holds the panel on the old frame, no flash by itself |
+| 4 | Timer copy path passes the presenter | [I] | Possible by code | [V] `N swaps (direct)` in 3 of 4 lines; rare |
+| 5 | Turnip 0104 | [I] weak | New since boot 16 | [V code] a reset comes after the GPU is done; old words past the end of a stream are not in an IB |
+| out | 2977 WC and the dirty rule | [V] | | Boot 18 has no `LAUREL GPU WC` line, and `own 0` in all windows: no scattered buffer ran |
+| out | 2978 table ranges | [I] | | Pool buffers are VA = PA; boot 18 has no fault before the other test's at 05:27:12 |
+| out | 8a25c38 | [V] | | Owner: the flash stays with `sync` |
+| out | Scanout address | [V code] | | `scanFrom` is the only writer; order is FIFO on the direct path |
+
+The presenter's queue of 2 keeps order [V code]. No line could tell an older surface from an undrawn one until now.
+
+### Patches
+
+**2981** (both kernels), kill switch `sweetfb_flipwait=0`. On the presenter the wait is 900 ms; if the GPU is alive and late, the frame is refused and the panel keeps its frame. `fShowHold` stays what is on the panel, so nothing draws into that surface. With a dead GPU the flip goes on as before. A full queue waits 2000 ms, not 200. An older swap never replaces a newer one. On the timer's thread the wait stays 100 ms, because it also sends vsync; it shows the frame and counts it.
+
+**2982** (both kernels), kill switch `sweetfb_swapfence=0`. A queued frame waits for the surface's last submission at SwapEnd. Safe by [V]: 05:26:20 a presenter 180 us after SwapEnd waits 17.3 of 18.5 ms, so the submission comes first. With no submission since the surface was shown, the flip reads the newest, as before.
+
+Rules: `laurel_flip_core.h`. Host test: `scripts/laurel/flip-test.sh`.
+
+### Lines
+
+```
+LAUREL FLIP: on: a surface goes to the panel when the GPU is done, the presenter waits up to 900 ms (kill switch sweetfb_flipwait=0: 100 ms, then shown as it is)
+LAUREL FLIP: on: a frame waits for the submission it had at SwapEnd, not for later ones (kill switch sweetfb_swapfence=0)
+LAUREL FLIP: N waits over 100 ms, longest M ms; A not drawn in time, B lost at a full queue, C older swaps refused, D surfaces shown again with no new draw
+LAUREL FLIP: surface S again in swap W, no submission named it since it was shown at fence F: an older picture
+```
+
+The window line comes only with a number above 0. `D` is exact when it counts; a submission in between hides a case, because the window server names all its surfaces.
+
+Reading: flash gone and `waits over 100 ms` above 0: rank 1 was right. Flash stays with `D` above 0: CoreAnimation or the submission order sends an old surface. Flash stays with `D` 0 and `A` 0: it is inside the surface: rank 2 (`NEGRONIMETAL_TEXTURE_POOL=0`).
+
+### Test for the owner
+
+Needs a kernel flash only; no root or plug-in file changes. `/var/db/negronimetal/sync` must not exist.
+
+1. Keep `NEGRONIMETAL_TEXTURE_POOL=0` in `/var/db/negronimetal/env`. Boot. Open Control Center, close it, go between Home pages, open and close an app: 2 minutes. Say: flash yes or no.
+2. Remove that line, restart backboardd (or reboot). The same 2 minutes. Say: flash yes or no.
+3. Log: `grep 'LAUREL FLIP' logs/usblog-*.txt` and the `LAUREL FRAME` lines. Reading: section "Lines". Pool on and flash only in step 2: rank 2.
+
+Kill switches if a frame stays stuck: `sweetfb_flipwait=0`, `sweetfb_swapfence=0`.
+
 ## Black layers (boot 2026-11-01 23:28; patches 2916, eagl 0006, Mesa 0003; built + host test, NOT BOOTED)
 
 Owner: "Maps shows a map, but all in black. Widgets are failing to render again." Kernel 4ec4584, root 21:57 (3fba60e). Logs: `logs/laurel-boot-maps.txt` (ends 23:31:36), `logs/phone/metal.log` (pulled 23:31), good boot `logs/laurel-boot-2208.txt`. **No line below proves a map on the screen: a host build cannot.** [V] log, source or binary. [I] inference. [U] unknown.
