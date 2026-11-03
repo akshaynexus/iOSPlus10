@@ -11,6 +11,7 @@ PROGRAM = re.compile(r"(SP_[VF]S_CTRL_REG0|SP_[VF]S_INSTRLEN|HLSQ_[VF]S_CNTL|SP_
 
 # the native stack's decisions, not accidents
 DESIGN = {
+    "RB_DEPTH_FLAG_BUFFER_PITCH": "no UBWC yet: Turnip's flag layout of a depth buffer",
     "HLSQ_SHARED_CONSTS": "push constants per stage, not shared",
     "SP_MODE_CONTROL": "push constants per stage, not shared",
     "GRAS_SC_CNTL": "flush mode only when the program reads the framebuffer",

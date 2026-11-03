@@ -1084,7 +1084,8 @@ static const char *bbd_gl_reason(char *why, size_t size)
  */
 #ifdef NMTL_IOS26
 #include "../../laurel/metal/option/present_stats.h"
-/* The selector's marks (userland/laurel/metal/option/option_rule.h). A stack other than the default ends this start on a failure: the next start takes the default. The default has nothing to go to, so it only logs. */
+#include "../../laurel/metal/option/option_store.h"
+/* The selector's marks (userland/laurel/metal/option/option_rule.h, option_store.h). On the disk before this returns: a CTL reboot is a reset with no sync. A stack other than the default ends this start on a failure: the next start takes the default. The default has nothing to go to, so it only logs. */
 static bool option_is_default(void)
 {
 	const char *o = getenv("NEGRONIMETAL_OPTION");
@@ -1092,12 +1093,11 @@ static bool option_is_default(void)
 }
 static void option_mark(const char *name, const char *text)
 {
-	char p[300];
-	snprintf(p, sizeof(p), NMTL_DIR "/stack/%s", name);
-	if (FILE *f = fopen(p, "w")) {
-		fprintf(f, "%s\n", text);
-		fclose(f);
-	}
+	char line[256];
+	snprintf(line, sizeof(line), "%s\n", text);
+	const int e = nmtl_store_write(NMTL_DIR "/stack", name, line);
+	if (e != 0)
+		nlog("LAUREL METAL: stack/%s cannot be written: errno %d", name, e);
 }
 static void option_failed(const char *why)
 {
@@ -1167,7 +1167,13 @@ static void *bbd_screen_check(void *arg)
 		native_bridge_metal_progress(p);
 		IOSurfaceRef screen = native_bridge_metal_copy_screen_surface();
 		if (!screen) {
-			if (now - t0 >= 240) {
+#ifdef NMTL_NATIVE
+			/* a cold start of the native stack compiles each pipeline on the render thread: 3 min [V log 07:22:04 to 07:25:20]; its disk cache makes the later starts short */
+			const double no_frame_limit = 480;
+#else
+			const double no_frame_limit = 240;
+#endif
+			if (now - t0 >= no_frame_limit) {
 				nlog(BBD_TAG ": %s: no frame on a screen surface %.0f s after the device opened (%llu command buffers completed, %llu pending)",
 #ifdef NMTL_IOS26
 				     "problem",
@@ -1179,7 +1185,7 @@ static void *bbd_screen_check(void *arg)
 				bbd_mark_off("no frame in 240 s");
 				_exit(0);
 #else
-				option_failed("no frame in 240 s");
+				option_failed("no frame on a screen surface in time");
 				return NULL;
 #endif
 			}
@@ -1209,19 +1215,19 @@ static void *bbd_screen_check(void *arg)
 			nlog(BBD_TAG ": screen: %u of 64 samples lit, %.0f s after the device opened; %llu command buffers completed", lit, now - t0, (unsigned long long)p[1]);
 		}
 		last_lit = lit;
+#ifdef NMTL_IOS26
+		/* 60 s after the first lit sample this start did not fail, whatever the screen shows then: a display that sleeps gives a black surface [V 10:32:18: 10 s after it first lit: "the screen surface stayed black"]. A start that dies before that counts in the selector's rule, so a crash loop after the first frame ends too. */
+		static double lit_at;
+		if (lit && lit_at == 0)
+			lit_at = now;
+		if (lit_at != 0 && now - lit_at >= 60) {
+			option_mark("ok", "lit");
+			nlog(BBD_TAG ": on: stack %s: the screen is lit 60 s after the first frame", getenv("NEGRONIMETAL_OPTION") ?: "default");
+			return NULL;
+		}
+#endif
 		if (lit) {
 			first_lit_wait = now;
-#ifdef NMTL_IOS26
-			/* Lit for 60 s: this start did not fail. A start that dies before that counts in the selector's rule, so a crash loop after the first frame ends too. Later black is the display's sleep, not a failure. */
-			static double lit_at;
-			if (lit_at == 0)
-				lit_at = now;
-			if (now - lit_at >= 60) {
-				option_mark("ok", "lit");
-				nlog(BBD_TAG ": on: stack %s: the screen is lit 60 s after the first frame", getenv("NEGRONIMETAL_OPTION") ?: "default");
-				return NULL;
-			}
-#endif
 		}
 #ifdef LAUREL_BBD_METAL
 		else if (now - first_lit_wait >= 30) {
@@ -1233,8 +1239,14 @@ static void *bbd_screen_check(void *arg)
 			return NULL;
 		}
 #else
-		else if (now - first_lit_wait >= 30)
+#ifdef NMTL_NATIVE
+		/* a cold start: the boot screen is black with a spinner the samples miss, while the render thread compiles [V log 07:38:18]. Only before the first lit sample: later a sleeping display is black too */
+		else if (lit_at == 0 && now - first_lit_wait >= 240)
+			option_failed("the screen surface stayed black for 240 s after a frame");
+#else
+		else if (lit_at == 0 && now - first_lit_wait >= 30)
 			option_failed("the screen surface stayed black for 30 s after a frame");
+#endif
 		if (now - t0 >= 300)
 			return NULL;
 #endif

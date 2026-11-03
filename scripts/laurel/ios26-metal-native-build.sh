@@ -36,7 +36,8 @@ PY
 TARGET="-target arm64-apple-ios16.0 -isysroot $SDK $LAUREL_CPU_FLAGS -fno-strict-aliasing -O2 -g"
 INC="@$W/flags.rsp -I$S/src/freedreno -I$S/include -I$B/src/compiler -I$S/src/compiler -I$S/src/freedreno/fdl -I$N/winsys -I$N/pm4 -I$B/src/freedreno/registers/adreno -I$B/src/freedreno/registers"
 pids=()
-clang -std=gnu11 $TARGET $INC -c "$N/shader/nmn_shader.c" -o "$W/nmn_shader.o" & pids+=($!)
+CACHE_ID=$("$REPO/scripts/laurel/native/cache-id.sh" "$REPO" "$M2V" "$S")
+clang -std=gnu11 $TARGET -DNMN_CACHE_ID="\"$CACHE_ID\"" $INC -c "$N/shader/nmn_shader.c" -o "$W/nmn_shader.o" & pids+=($!)
 clang -std=gnu11 $TARGET $INC -c "$N/winsys/nw.c" -o "$W/nw.o" & pids+=($!)
 clang -std=gnu11 $TARGET $INC -c "$N/winsys/nw_check.c" -o "$W/nw_check.o" & pids+=($!)
 clang -std=gnu11 $TARGET $INC -c "$N/winsys/winsys_iokit.c" -o "$W/winsys_iokit.o" & pids+=($!)
@@ -77,7 +78,8 @@ ldid -S "$OBJ"
 ls -la "$OBJ"
 # the first phone test: the fixed scene as a tool, no Metal.framework, no compositor. It draws into its own memory and prints pixels. Docs: section 8.
 clang -target arm64-apple-ios16.0 -isysroot "$SDK" $LAUREL_CPU_FLAGS -O2 -c -I"$FRONT/bridge" "$N/tests/scene.c" -o "$W/scene.o"
-clang++ -target arm64-apple-ios16.0 -isysroot "$SDK" -fuse-ld=lld -Wl,-dead_strip "$W/scene.o" "$W/nmn_shader.o" "$W/nw.o" "$W/nw_check.o" "$W/winsys_iokit.o" "$W/nmn_pm4.o" "$RLIB" $LIBS -lz -lc++ -framework Foundation -framework IOKit -framework CoreFoundation -framework Security -o "$W/nmn-scene"
+clang -target arm64-apple-ios16.0 -isysroot "$SDK" $LAUREL_CPU_FLAGS -O2 -c "$N/tests/scene_surface_ios.c" -o "$W/scene_surface.o"
+clang++ -target arm64-apple-ios16.0 -isysroot "$SDK" -fuse-ld=lld -Wl,-dead_strip "$W/scene.o" "$W/scene_surface.o" "$W/nmn_shader.o" "$W/nw.o" "$W/nw_check.o" "$W/winsys_iokit.o" "$W/nmn_pm4.o" "$RLIB" $LIBS -lz -lc++ -framework Foundation -framework IOKit -framework IOSurface -framework CoreFoundation -framework Security -o "$W/nmn-scene"
 llvm-strip -x "$W/nmn-scene"
 ldid -S "$W/nmn-scene"
 # the selector of the bundle, with the option's lines: it must build against the same SDK

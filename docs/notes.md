@@ -5370,6 +5370,21 @@ Full text: `docs/laurel_sprout/ios26-control-center.md`.
 ## 2026-11-03: first compositor run on `native`
 [V logs/native-compositor-1.txt, 06:47] `LAUREL METAL: on: stack native`, then `TopazGPU: watchdog: GPU hang: fence 2708 done 2705 ... IB1 83db042c`, SMMU FSR 80000402 FAR 0000000001068000. The selector fell back as designed: `LAUREL METAL NATIVE: off: option native failed in 2 starts`. The GPU is off until a reboot.
 [V 06:49] The fallback does not hold across a reboot: at the next boot the setting `native` was tried again, and it hung the GPU again. So the setting is back to `default` on the phone until `native` runs the compositor. Fix for the selector: a GPU hang must keep a mark that survives a reboot (native agent's task).
+
+## 2026-11-03: `native` came back at each boot; the compositor's first hang (branch t3/native-metal-ca-features). Details: `ios26-native-metal.md` section 12
+- [V phone] `stack/state`: root, 0 bytes. backboardd is `mobile`, the folder is sticky. **As root, never create a file in `stack/`: remove it.** `: > state` in the install script made the selector's write fail with no line, so the count never reached the disk, and SpringBoard took `native` too.
+- [V log] `LAUREL CTL: reboot` is a reset after 500 ms: no sync. A mark that must survive needs fsync + rename + a sync of the folder.
+- [V log] A hang: the kernel kills backboardd before the fence thread reports. Do not rely on a line or a mark from the dying process. Count before the stack loads.
+- A selector's write that fails must change the decision: no count on the disk = no risky stack. A failure to write is a failure of the feature.
+- [V code] `renderTargetWidth` and `renderTargetHeight`: 0 unless the caller sets them; 0 = the attachments' size. A scene with explicit sizes hides this. Test a pass the way CA builds it.
+- [V] A FAR of the allocator's range (`0x01000000` on, below `0x80000000`) at a 64 KiB start + a round number: a buffer's end, not a wild address. `FSYNR0` ending in 3: a missing leaf entry; ending in 0 (the first hang): out of the tables.
+- `RedwoodGPU: submission N: 2 command buffers` with a first IB of about 270 words: a pass with no draw: `IB1` at the first's end means the clear stalled.
+- [V kernel] One handle per surface and client; GEM_CLOSE drops the buffer. Count imports in user space.
+- `GRAS_2D_SRC_*` hold a position with 8 fraction bits; `GRAS_2D_DST_*` do not. The second decoder on Turnip's capture found this in my rule (3841 x 5889 on a 720 x 1560 read).
+- pm4-diff reads the **last** draw of a file: a new part of the scene goes in a run of its own.
+- A worktree's build: reflink `out/ios26/*`, `out/laurel-metal`, `out/metal`, symlink `out/laurel-kernel`; `rm -rf out/ios26/metal-hot/build`. `compile_commands` of `mesa-host` keeps the path of the worktree that built it.
+- `xnutils-test.sh` fails on the base too: `XT_METAL_WIDE differs from root-add-metal-ios26.sh` (`-PosterBoard`). Not this branch's; not fixed here.
+
 ## 2026-11-03: agents test the iOS 26 UI by themselves (branch t3/ios26-ui-autotest). Full text: `docs/laurel_sprout/ios26-autotest.md`
 - **`scripts/laurel/ios26-autotest.sh shot NAME` gives a PNG of the real frame; `tap`, `swipe`, `edge`, `key`, `open`, `home` need no finger; `run` is the whole test with a table.** No kernel change, no flash: install to `/usr/local/bin` over SSH.
 - [V] A binary in `/var/tmp` runs with csflags 0 and no blobs: no entitlement. In `/usr/local/bin`: 0x26000001. backboardd's log said the reason at once: `missing the 'com.apple.private.hid.client.event-dispatch' entitlement`. `oslogstream` first when a system service refuses.
@@ -5404,6 +5419,18 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - Worktree: `INCR=1 kernel-ios26-linux.sh` builds in 60 s after a tree. A `grep -c '^diff --git'` guard in `rpm-scale-patch.sh`.
 - `scripts/laurel/gpu-opp-patch.sh` diffs from 2961's parent to the work tree: after 2985 it also takes 2985's hunks in the same files. Use it only on a tree of 2961 alone, or move the hunks by hand.
 
+## 2026-11-03: native Metal, rounds on the phone (branch t3/native-metal-ca-features). Details: `ios26-native-metal.md` section 13
+- Keep a flight recorder for a GPU hang: a process is killed at the hang, so only memory-mapped text survives (`bridge/src/flight.rs`, `stack/flight-on`). It answered in one round what 3 rounds of reading code did not: **each failed submission holds all the `prim 1` draws of the ring.**
+- **Wrong, corrected 2026-11-03 [V]:** the "wild FAR" of the native hangs (`0x1244_04820902`, `0x1264_04820902`, ...) is no address. All of these lines have `FSR 00000400`: FSR.FORMAT, no fault bit (`gfsr 0`, `CP_HW_FAULT 0`). FAR, FSYNR0/1 and UCHE_CLIENT_PF are then stale values: FAR differs by single bits between boots. **Read the FSR first: a FAR means something only with a fault bit (bit 1 TF, 2 AF, 3 PF ...).** post/9014 logs these registers and is harmless; it cannot name a client of a hang with no fault.
+- `MTLPrimitiveType` 1 = line list. CA's generic program draws paths as lines. Turnip at 1 sample: `GRAS_SU_CNTL` Bresenham, no polygon offset. Every earlier scene drew triangles, so no register comparison could show this.
+- `pm4-rows.sh`: compare many real keys against Turnip. It found nothing for the prefetch by itself: a missing register in both captures of a key that does not need it. Read Turnip's emit function for each register group when a new shape arrives.
+- `SP_FS_BINDLESS_PREFETCH_CMD` holds the slot of a bindless prefetch. No such write: the hardware reads a stale slot.
+- ir3 safe_constlen: native takes the safe variant alone, so its registers differ from Turnip's for a large program (FS length `0x623` against `0x8d1`, private memory 0 against 0x800). Not an error.
+- Do not export `NMN_SCENE_*` in a shell that also runs `ref-capture.sh`: the depth capture took the line draw.
+- `ref-capture.sh` empties `out/ios26/native/ref`, and `pm4-actions.py`'s table is by index into that older capture: use `REF_ONLY=depth-sysmem` to add one.
+- `/tmp` is another file system: `cp --reflink=always` to it fails, and the following `rm` loses the source. Keep scratch copies under `out/`.
+- `minimumLinearTextureAlignmentForPixelFormat`: the default stack's 16 is its own (it can copy behind the caller). An a6xx reads a pitch of 64 at least: the native stack answers 64.
+- A first native start now takes 5 s to its first frame (3 min with no disk cache): 17.9 s for one generic pipeline, cold.
 ## 2026-11-03: Mi A3 default stack: 73 % of backboardd's GPU time is metal2vulkan's own merge kernel, not drawing (branch t3/default-stack-glass-60fps). Full text: `docs/laurel_sprout/ios26-default-speed.md`
 - **Measure first:** `LAUREL GPU PASS` (Turnip 0105) names the shape of each compute dispatch. `64x1, 3x1560` = `shadow_merge_image` over a full screen, 16 ms a frame.
 - Every texture over an IOSurface is a shadow: 3 locks: `in_place()`, a check that answers `Unchecked` here for ever, Turnip's dedicated import.
@@ -5417,3 +5444,27 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - [V] Render thread in busy bins (s7, a mix): `draw_elements` 12 ms of 33, flat, no hot line.
 - Not run on the phone yet: `laurel-autotest kstack PID`, `sample ... only=N`. The phone has had no SSH since 13:46:59.
 - Bench: uptime gate 420 s; option copy on the phone. Do not edit a running shell script: `mv` a new file over it.
+
+## 2026-11-03: native stack, wrong pictures and their causes [V code; phone pictures in logs/round-*]
+
+- `SP_PS_2D_SRC_PITCH` and `RB_2D_DST_PITCH` hold 64-byte units, and a 2D base is 64-byte aligned: a row of 40 reads as 0. Such a copy goes line by line, as `tu_copy_buffer_to_image`.
+- A texture's base address has the same rule: low bits are lost, and the picture moves by some pixels with wraparound.
+- **`Shadow` in bridge/src/draw.rs was never filled until 12:45.** The earlier report "shadow done" was wrong: the fields were there and no code copied. A feature with no test on real data is not done.
+- In sysmem a draw that reads the target needs a CCU flush and a cache invalidate after the draws before it: `FLUSH_PER_OVERLAP_AND_OVERWRITE` is not enough between draws. Without it: wrong pixels in cache-line blocks.
+- Metal's A8 follows metal2vulkan's `AlphaInRed`: `R8_UNORM` with swizzle (0,0,0,R). `FMT6_A8_UNORM` with that swizzle reads 0 in alpha: no text.
+- `fdl6_layout` asks 16 pixels a row above 4 bytes a pixel, for tile memory only. A native row of 64-byte units is valid on the hardware.
+- Host pages: the kernel wants pages of 16 KiB here; errno 5 (kIOReturnVMError) means read-only pages: try again read-only, as `host_import_pages`.
+- Host compare: `pm4-rows.sh` does `cd` into the ref folder: PLAN must be an absolute path. With a relative path Turnip's row falls back to the default pipeline with no error line, and the compare means nothing.
+
+## 2026-11-03: Mi A3: APSS watchdog (2986), stuck-CPU report (post/9016), hang audit. NOT BOOTED (branch t3/mi-a3-watchdog-stuck-cpu-audit). Full text: `docs/laurel_sprout/watchdog.md`
+- [V] Hang at 13:46:59, 67 s after `LAUREL RPM SCALE: on`. A first `LAUREL CPU TOP` of `busy 376 s of 480` is 8 CPUs x 47 s, not a lost CPU: the first window is short. Do not read 376 as a limit.
+- [V] 12 of 12 stackshots given up name CPU 5 (logical 5 = Silver core 1: boot CPU Gold 0x100 is logical 0).
+- Times: pet 1 s, CPU silent 8 s stops the pet, bark 12 s, bite 20 s; one stuck CPU: bark 20 s, bite 28 s. Panic: 30 s until its hold, then off. Kill switch `laurelwdog=0`.
+- `SIGPast` for a heartbeat: no slot, no spin. `cpu_xcall` waits on a slot of the target with interrupts off. The answer is the stamp in `sleh_irq`.
+- Count silence from an open signal, not from the last interrupt: a late pet thread would otherwise blame all CPUs.
+- `sleh.c` is owned by 12377 base 0003: a series patch needs its name in `owned.txt`, and the 12377 hunk goes to `post/`.
+- `IGROUPR` reads 0 from NS whatever the group here (2016): test a Secure SPI by an enable that does not hold.
+- `ml_dbgwrap_*`: UNSUPPORTED on this SoC. EDPCSR needs QDSS clock and debug power: an access with these off can stop the bus [I]: not used. The pc of a late CPU comes when it takes the signal: `LAUREL DEBUG ACK: on: cpu N came`.
+- `delay()` with interrupts off is WFE: safe here only because `wfe_timeout_init` runs on every CPU [V].
+- IMEM restart word: `was 0x00000000` in 3 of 3 boots: [U] it survives a hard reset. Not a base for a boot-loop guard; 2985 also uses it.
+- Worktree build of iOS 16: `kernel-linux.sh` needs `external/ios-topaz` and `ios-sweet-linux` in the worktree (symlink to the main checkout, delete after), and `out/laurel-kernel/{theos,cache,dl,deps}` from the main checkout. Under 10 min with ccache.

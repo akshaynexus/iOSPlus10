@@ -374,7 +374,7 @@ NMTL[.. backboardd]: LAUREL METAL: off: option junk is not in this bundle: stack
 | Crash, a hang that the watchdog kills, or Restart UI before 60 s of lit screen | The next start counts one failure. **Two** failures: the default | Two starts |
 | Lit for 60 s | `ok` mark: the count goes to 0. The screen check of this start ends, so a later display sleep is no failure | - |
 
-The state stays until the setting is written again, so a loop cannot come back to the option by itself. To retry: choose the option again. XNUtils clears the counts.
+The result holds across reboots for that build (`option_store.h`, `ios26-native-metal.md` section 12): `stack/failed-OPTION`. It goes with a new build, or the owner's reset: choose the option again in XNUtils (`metaloption` clears the counts and the marks), or `RESET_FAILED=1 scripts/laurel/ios26-metal-install-options.sh OPTION`.
 
 **If the default itself fails, there is no other path:** 23F84 has no GL (section 9). The selector cannot help there. This is not "never black" for the whole route. It is "an option never makes it worse than the default".
 

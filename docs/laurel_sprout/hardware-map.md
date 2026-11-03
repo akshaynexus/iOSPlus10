@@ -17,7 +17,7 @@ DDR banks: not in the DT (ABL fills `memory`). Read them from the live FDT (root
 | cpufreq | OSM pwrcl 0xf521000, perfcl 0xf523000 | Q trinket.dtsi:861 | check | verify 0094 |
 | PS_HOLD | 0x440b000 | Q trinket.dtsi:1069 | same | none |
 | IMEM restart reason | 0xc12565c | Q trinket.dtsi:1026-1061 | same | none |
-| APSS WDT | 0xf017000, SPI 3/4 | Q trinket.dtsi:1188 | check | verify 0088 |
+| APSS WDT | 0xf017000, SPI 3/4 | Q trinket.dtsi:1188 | laurel 2986, not booted | `watchdog.md` |
 | TLMM | 0x400000; tiles WEST 0x100000, SOUTH 0x500000, EAST 0x900000; 133 GPIOs | pinctrl-trinket.c:28-33 | WEST 0x500000, SOUTH 0x900000, EAST 0xd00000 | **change tile table** |
 | Touch bus | QUP0 SE2 I2C 0x04a88000, SPI 329, GPIO 6/7 | Q trinket-qupv3.dtsi:125 | QUP0 SE2 | check clocks (0087) |
 | Touch IC | Goodix GT9883 @0x5d **or** FocalTech FT3518 @0x38; IRQ GPIO 88, reset 87, ts_vdd enable GPIO 83 | X touchscreen.dtsi | FT5452 | **FT3518 near FT5452; Goodix path from sweet (0063)**; detect at boot |

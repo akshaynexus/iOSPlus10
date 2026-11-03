@@ -1,0 +1,753 @@
+laurel 2986: the APSS watchdog (0xf017000) and a report of a stuck CPU. Both kernels. docs/laurel_sprout/watchdog.md.
+
+[V 2026-11-03 13:46:59, logs/usblog-20261103-071332.txt] A kernel hang: no panic, no pong, only the Power button: it stops the agents' test loop. No driver existed (build-honest.md).
+A kernel thread signals each CPU once a second and pets only if each answered in 8 s: bark 12 s (SPI 3: lines, then a panic), bite 20 s (a reset with no CPU); a stuck CPU: bark 20 s, bite 28 s after it stopped. A panic: no pets, one bite in 30 s if it stops before its hold; the hold and our own resets stop the hardware. Each interrupt stamps its CPU with the time and pc: a stuck CPU shows where it last took one.
+Self-check: the times and enable must hold, the counter must move; else LAUREL WDOG: off, and the heartbeat alone names a stuck CPU. Kill switch laurelwdog=0. Host test: scripts/laurel/wdog-test.sh. iOS 26: the sleh.c hunk is also in post/9015 (the base owns that file). The stackshot report: post/9016.
+
+diff --git a/bsd/dev/laurel_reboot.c b/bsd/dev/laurel_reboot.c
+index 9bc12e3..64e30de 100644
+--- a/bsd/dev/laurel_reboot.c
++++ b/bsd/dev/laurel_reboot.c
+@@ -27,6 +27,8 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int kdb_printf(const char *format, ...) __printflike(1, 2);
++extern void laurel_wdog_panic_begin(void);      /* laurel 2986: osfmk/arm64/laurel_wdog.c */
++extern void laurel_wdog_stop(void);
+ 
+ #define LAUREL_IMEM_PA            0x0c125000ull
+ #define LAUREL_IMEM_RESTART_OFF   0x65c
+@@ -274,6 +276,7 @@ laurel_power_off(void)
+ 		kdb_printf("LAUREL REBOOT: power off without the shutdown type: the PS_HOLD drop may reset\n");
+ 	}
+ 	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_OFF\n");
++	laurel_wdog_stop();                     /* laurel 2986 */
+ 	int64_t rc = lr_psci(PSCI_SYSTEM_OFF);
+ 	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_OFF returned %lld\n", (long long)rc);
+ 	if (old >= 0) {
+@@ -296,6 +299,7 @@ laurel_restart(void)
+ 	}
+ 	/* kdb_printf: also safe in the panic hold (console only, no os_log, no locks) */
+ 	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_RESET (%s)\n", lr_modes[lr_mode].name);
++	laurel_wdog_stop();                     /* laurel 2986: ABL and Mu must not inherit a running count */
+ 	int64_t rc = lr_psci(PSCI_SYSTEM_RESET);
+ 	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_RESET returned %lld\n", (long long)rc);
+ }
+@@ -306,6 +310,7 @@ void
+ laurel_panic_mark(void)
+ {
+ 	lr_in_panic = 1;
++	laurel_wdog_panic_begin();              /* laurel 2986: no more pets, one bite in 30 s if the panic stops before its hold */
+ 	if (lr_reason != NULL) {
+ 		*lr_reason = LR_PANIC_WORD;
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+@@ -327,6 +332,7 @@ laurel_panic_final(void)
+ 	int secs = 0;
+ 
+ 	laurel_panic_mark();
++	laurel_wdog_stop();                     /* laurel 2986: a panic hold or spin does not reset, unless laurelpanic=N asks */
+ 	if (entries++ != 0) {
+ 		if (cpu == cpu_number()) {
+ 			(void)lr_psci(PSCI_SYSTEM_RESET);
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index d3b1d7e..3f8b1ca 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -105,6 +105,8 @@ extern void sweet_log_append(const char *c, int size);
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+ extern uint64_t sweet_log_position(void);
+ extern int laurel_reboot_set_mode(const char *name);
++extern void laurel_wdog_stop(void);     /* laurel 2986 */
++extern void laurel_wdog_poll(void);
+ extern void laurel_restart(void);
+ extern void laurel_power_off(void);
+ /* laurel 2720: settime / time (bsd/dev/laurel_rtc.c) */
+@@ -1738,6 +1740,7 @@ laurel_usb_panic_hold(void)
+ 	uint64_t sec, half, now, reset_at = UINT64_MAX, act_at = 0;
+ 	int pending = -1, secs = 0;
+ 
++	laurel_wdog_stop();                     /* laurel 2986: the hold has its own timed reset; the watchdog must not end it */
+ 	if (entries++ != 0) {
+ 		return;                         /* nested panic: no USB */
+ 	}
+@@ -2142,6 +2145,7 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			ud_ctl_poll();
+ 		}
+ 		laurel_calendar_poll();         /* laurel 2720: a queued settime, in thread context */
++		laurel_wdog_poll();             /* laurel 2986: says so if the pet thread stopped */
+ 		++ticks;
+ 		uint64_t now = mach_absolute_time();
+ 		if (!ud.configured && now >= next_nohost) {
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 03a534c..0064d46 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -17,6 +17,7 @@ void laurel_power_off(void);
+ void laurel_restart(void);
+ void laurel_panic_mark(void);        /* laurel 2956: bsd/dev/laurel_reboot.c */
+ void laurel_panic_final(void);
++void laurel_wdog_start(void);         /* laurel 2986 */
+ void laurel_usb_panic_hold(void);     /* laurel 2005: bsd/dev/sweet_usb.c; returns only without USB */
+ /* laurel 2720: calendar from the PM6125 RTC + saved offset (bsd/dev/laurel_rtc.c) */
+ void laurel_rtc_get(clock_sec_t *secs, clock_nsec_t *nsecs);
+@@ -99,6 +100,7 @@ SweetPlatformExpert::start(IOService *provider)
+ 	if (laurel_reboot_prepare()) {
+ 		PE_halt_restart = &laurel_halt_restart;
+ 	}
++	laurel_wdog_start();                    /* laurel 2986: osfmk/arm64/laurel_wdog.c */
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+ }
+diff --git a/osfmk/arm64/laurel_wdog.c b/osfmk/arm64/laurel_wdog.c
+new file mode 100644
+index 0000000..e7b5dd3
+--- /dev/null
++++ b/osfmk/arm64/laurel_wdog.c
+@@ -0,0 +1,541 @@
++/*
++ * laurel 2986: the APSS watchdog of the SM6125 (msm watchdog_v2.c, trinket.dtsi wdog@f017000) and a report of a stuck CPU.
++ *
++ * Before: "a kernel hang is forever" [V 2026-11-03 13:46:59: no panic, no pong, only the Power button]. Now:
++ *   a kernel thread sends a signal to each CPU in use, once a second. It pets the hardware only if every CPU took an interrupt in the last 8 s, as stock's ping of each CPU.
++ *   pet stops -> 12 s: bark (SPI 3), if some CPU can take it: a line per CPU, then a panic, so the panic hold has the text.
++ *             -> 20 s: bite: the hardware resets the phone, with no CPU: this also covers all CPUs with interrupts off.
++ * Times and their check against the long stalls of this port: docs/laurel_sprout/watchdog.md.
++ *
++ * Who owns it: stock Linux on this firmware writes these registers from EL1 NS, so TrustZone leaves them to us [V watchdog_v2.c]. The bite interrupt (SPI 4) and Group 0 are TrustZone's:
++ * no FIQ is ours. If the registers do not hold our values or the counter stands still: "off", and the heartbeat alone stays: it names a stuck CPU, and nothing resets.
++ *
++ * What it can say about a stuck CPU: no register of this SoC gives the pc of another CPU safely:
++ *   ml_dbgwrap_* answers UNSUPPORTED here (coresight_base is Apple's, 0 here) [V dbgwrap.c, grep of the series].
++ *   EDPCSR (CoreSight) needs the QDSS clock and the debug power domain: an access with these off can stop the bus [I], and no self-check can see that first. Not used.
++ * So: each interrupt stamps its CPU with the time and the interrupted pc and lr. A stuck CPU shows where it last took one and how long ago. The answer time of a signal shows
++ * where a CPU next let interrupts in: the end of the long section. Lock-free; the stamp costs a read of the counter.
++ *
++ * laurelwdog=0 turns off the hardware and the heartbeat; the stamps cost nothing else.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <arm/cpu_data_internal.h>
++#include <arm/cpu_internal.h>
++#include <arm/machine_routines.h>
++#include <arm64/proc_reg.h>
++#include <kern/kalloc.h>
++#include <kern/misc_protos.h>
++#include <kern/processor.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <mach/mach_time.h>
++#include <machine/atomic.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <arm64/laurel_wdog_core.h>
++
++extern char *proc_name_address(void *p);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define LWD_PA          0x0f017000ull   /* trinket.dtsi wdog */
++#define LWD_RST         0x04u
++#define LWD_EN          0x08u
++#define LWD_STS         0x0cu
++#define LWD_BARK        0x10u
++#define LWD_BITE        0x14u
++#define LWD_EN_ON       0x03u           /* EN | UNMASKED_INT_EN, as qcom,wakeup-enable */
++#define LWD_BARK_INTID  35u             /* interrupts = <0 3 0>: SPI 3 */
++
++/* [V trinket.dtsi] GIC-600 of this SoC; mapped again here: pexpert/arm/pe_fiq.c keeps its bases to itself */
++#define LWD_GICD_PA     0x0f200000ull
++#define LWD_GICR_PA     0x0f300000ull
++#define LWD_GICR_SIZE   0x100000u
++#define LWD_GICR_FRAME  0x20000u
++#define LWD_GICD_CTLR   0x0000u
++#define LWD_GICD_RWP    (1u << 31)
++#define LWD_SGI_OFF     0x10000u
++#define LWD_SGI_BIT     (1u << SWEET_IPI_SGI)
++
++#define LWD_CPUS        8u
++
++struct lwd_cpu {
++	volatile uint64_t t;            /* time of the last interrupt on this CPU */
++	volatile uint64_t pc, lr;       /* what it interrupted */
++	volatile uint32_t el0;          /* from user space */
++	volatile uint32_t count;
++	volatile uint64_t sent;         /* time of a signal with no interrupt since */
++	volatile uint64_t worst;        /* the longest answer in this minute */
++	volatile uint64_t worst_pc;     /* where that answer came in */
++	uint64_t online;                /* first round that saw this CPU in use */
++	unsigned level;                 /* lwd_line */
++	unsigned silent_ms;
++	char pad[48];
++} __attribute__((aligned(64)));
++
++static struct lwd_cpu lwd_cpu[LWD_CPUS];
++static vm_offset_t lwd_regs, lwd_gicd, lwd_gicr;
++static uint32_t lwd_on;                 /* the hardware runs, with a pet */
++static volatile uint32_t lwd_hold;      /* a panic has it: no more pets */
++static uint32_t lwd_bark_on;
++static bool lwd_bark_any;               /* 1-of-N worked: any CPU takes the bark */
++static uint64_t lwd_ms;                 /* ticks per ms */
++static volatile uint64_t lwd_thread_ran;/* the pet thread's last round */
++static uint32_t lwd_thread_late_said;
++static uint64_t lwd_late_said[LWD_CPUS];/* the time a stackshot gave this CPU up; 0 none */
++
++static inline uint32_t
++lwd_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(lwd_regs + off);
++}
++
++static inline void
++lwd_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(lwd_regs + off) = v;
++	__builtin_arm_dsb(DSB_SY);
++}
++
++/* sleh_irq, each interrupt, interrupts off */
++void laurel_wdog_irq(unsigned int cpu, uint64_t pc, uint64_t lr, bool el0);
++void
++laurel_wdog_irq(unsigned int cpu, uint64_t pc, uint64_t lr, bool el0)
++{
++	if (cpu >= LWD_CPUS) {
++		return;
++	}
++	struct lwd_cpu *c = &lwd_cpu[cpu];
++	uint64_t now = mach_absolute_time(), sent = c->sent;
++
++	if (sent != 0) {
++		c->sent = 0;
++		if (now > sent && now - sent > c->worst) {
++			c->worst = now - sent;
++			c->worst_pc = pc;
++		}
++	}
++	c->pc = pc;
++	c->lr = lr;
++	c->el0 = el0;
++	c->count++;
++	c->t = now;
++}
++
++static inline uint32_t
++lwd_gicd_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(lwd_gicd + off);
++}
++
++static inline void
++lwd_gicd_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(lwd_gicd + off) = v;
++}
++
++static void
++lwd_gicd_settle(void)
++{
++	for (unsigned i = 0; i < 100000u && (lwd_gicd_rd(LWD_GICD_CTLR) & LWD_GICD_RWP); i++) {
++		;
++	}
++}
++
++/* read only: the SGI bits of a CPU's redistributor. Pending: the signal got there and the CPU has interrupts off. Neither: nothing is on its way. false: no frame */
++static bool
++lwd_sgi_state(uint32_t mpidr, bool *pending, bool *active)
++{
++	if (lwd_gicr == 0) {
++		return false;
++	}
++	for (uint32_t off = 0; off + LWD_GICR_FRAME <= LWD_GICR_SIZE; off += LWD_GICR_FRAME) {
++		uint64_t typer = *(volatile uint64_t *)(lwd_gicr + off + 0x8u);
++		uint32_t aff = (uint32_t)(typer >> 32) & 0xffffu;
++
++		if (typer != 0 && aff == (mpidr & 0xffffu)) {
++			*pending = (*(volatile uint32_t *)(lwd_gicr + off + LWD_SGI_OFF + 0x200u) & LWD_SGI_BIT) != 0;
++			*active = (*(volatile uint32_t *)(lwd_gicr + off + LWD_SGI_OFF + 0x300u) & LWD_SGI_BIT) != 0;
++			return true;
++		}
++		if (typer & (1ull << 4)) {      /* GICR_TYPER.Last */
++			break;
++		}
++	}
++	return false;
++}
++
++/* "task/thread name" of a thread that can end while we read: each step by a copy that cannot fault */
++static void
++lwd_thread_text(cpu_data_t *cd, char *out, size_t n)
++{
++	thread_t th = (thread_t)cd->cpu_active_thread;
++	struct thread_ro *ro = NULL;
++	struct proc *p = NULL;
++	char comm[17] = "?", name[32] = "";
++
++	if (th != NULL && ml_nofault_copy((vm_offset_t)&th->t_tro, (vm_offset_t)&ro, sizeof(ro)) == sizeof(ro) && ro != NULL &&
++	    ml_nofault_copy((vm_offset_t)&ro->tro_proc, (vm_offset_t)&p, sizeof(p)) == sizeof(p) && p != NULL) {
++		if (ml_nofault_copy((vm_offset_t)proc_name_address(p), (vm_offset_t)comm, sizeof(comm) - 1) != sizeof(comm) - 1) {
++			comm[0] = '?';
++			comm[1] = '\0';
++		}
++		comm[sizeof(comm) - 1] = '\0';
++	}
++#if CONFIG_THREAD_NAME
++	char *tn = NULL;
++
++	if (th != NULL && ml_nofault_copy((vm_offset_t)&th->thread_name, (vm_offset_t)&tn, sizeof(tn)) == sizeof(tn) && tn != NULL) {
++		(void)ml_nofault_copy((vm_offset_t)tn, (vm_offset_t)name, sizeof(name) - 1);
++		name[sizeof(name) - 1] = '\0';
++	}
++#endif
++	snprintf(out, n, "%s%s%s", comm, name[0] ? "/" : "", name);
++}
++
++/* Two lines through kprintf, also from a path with interrupts off (a stackshot, a bark). Only reads; a CPU that runs on sees no change. */
++void laurel_wdog_report_cpu(int cpu, const char *prefix);
++void
++laurel_wdog_report_cpu(int cpu, const char *prefix)
++{
++	if (cpu < 0 || (unsigned)cpu >= LWD_CPUS || CpuDataEntries[cpu].cpu_data_vaddr == NULL) {
++		return;
++	}
++	cpu_data_t *cd = (cpu_data_t *)CpuDataEntries[cpu].cpu_data_vaddr;
++	struct lwd_cpu *c = &lwd_cpu[cpu];
++	uint64_t now = mach_absolute_time(), t = c->t, ticks = lwd_ms ? lwd_ms : 19200;
++	bool pending = false, active = false, have_sgi = lwd_sgi_state((uint32_t)cd->cpu_phys_id, &pending, &active);
++	char who[56];
++	arm_saved_state_t *in = (arm_saved_state_t *)cd->cpu_int_state;
++	arm_saved_state_t saved;
++	uint64_t in_pc = 0;
++
++	if (in != NULL && ml_nofault_copy((vm_offset_t)in, (vm_offset_t)&saved, sizeof(saved)) == sizeof(saved)) {
++		in_pc = get_saved_state_pc(&saved);
++	}
++	lwd_thread_text(cd, who, sizeof(who));
++	kprintf("%s cpu %d mpidr 0x%llx: last interrupt %llu ms ago, %u in all, pc 0x%llx lr 0x%llx%s; in a handler now: pc 0x%llx\n",
++	    prefix, cpu, (unsigned long long)cd->cpu_phys_id, t ? (now - t) / ticks : 0, c->count, c->pc, c->lr, c->el0 ? " (user)" : "", in_pc);
++	kprintf("%s cpu %d runs %s; signals 0x%x, SGI %s%s; longest answer this minute %llu ms at pc 0x%llx; slide 0x%lx\n",
++	    prefix, cpu, who, (unsigned)cd->cpu_signal, have_sgi ? (pending ? "pending" : "not pending") : "unread", active ? " active" : "",
++	    c->worst / ticks, c->worst_pc, vm_kernel_slide);
++}
++
++/* post/9015: a stackshot gave this CPU up */
++void laurel_wdog_late_mark(int cpu);
++void
++laurel_wdog_late_mark(int cpu)
++{
++	if (cpu >= 0 && (unsigned)cpu < LWD_CPUS) {
++		lwd_late_said[cpu] = mach_absolute_time();
++	}
++}
++
++/* post/9015: DebuggerXCall: this CPU has the signal at last: what it interrupted is the first place with interrupts on */
++void laurel_wdog_late_came(uint64_t pc, uint64_t lr, uint64_t fp, bool el0);
++void
++laurel_wdog_late_came(uint64_t pc, uint64_t lr, uint64_t fp, bool el0)
++{
++	int cpu = cpu_number();
++
++	if ((unsigned)cpu >= LWD_CPUS || lwd_late_said[cpu] == 0) {
++		return;
++	}
++	uint64_t ms = (mach_absolute_time() - lwd_late_said[cpu]) / (lwd_ms ? lwd_ms : 19200);
++
++	lwd_late_said[cpu] = 0;
++	kprintf("LAUREL DEBUG ACK: on: cpu %d came %llu ms after the stackshot gave it up: pc 0x%llx lr 0x%llx fp 0x%llx%s\n", cpu, ms, pc, lr, fp, el0 ? " (user)" : "");
++}
++
++/* a panic has begun: no more pets; one bite in 30 s if the panic stops before its hold. Interrupts off, no locks. */
++void laurel_wdog_panic_begin(void);
++void
++laurel_wdog_panic_begin(void)
++{
++	if (lwd_on == 0 || os_atomic_xchg(&lwd_hold, 1u, relaxed) != 0) {
++		return;
++	}
++	lwd_wr(LWD_BARK, lwd_ticks(LWD_PANIC_S));
++	lwd_wr(LWD_BITE, lwd_ticks(LWD_PANIC_S));
++	lwd_wr(LWD_RST, 1u);
++}
++
++/* the panic hold, a reset of our own, a power off: the hardware stops. Interrupts off, no locks. */
++void laurel_wdog_stop(void);
++void
++laurel_wdog_stop(void)
++{
++	os_atomic_store(&lwd_hold, 1u, relaxed);
++	if (lwd_on != 0) {
++		lwd_wr(LWD_EN, 0u);
++	}
++}
++
++/* SPI 3, from sleh_irq, already acknowledged. No pet for 12 s and this CPU has interrupts on: the text, then the panic, with the hold and its timed reset. */
++void laurel_wdog_bark(void);
++void
++laurel_wdog_bark(void)
++{
++	uint64_t ticks = lwd_ms ? lwd_ms : 19200, now = mach_absolute_time();
++	uint32_t silent = 0;
++
++	if (lwd_on == 0 || lwd_hold != 0) {
++		return;
++	}
++	for (unsigned i = 0; i < LWD_CPUS; i++) {
++		if (CpuDataEntries[i].cpu_data_vaddr != NULL && lwd_cpu[i].silent_ms >= 1000u) {
++			silent |= 1u << i;
++		}
++		laurel_wdog_report_cpu((int)i, "LAUREL WDOG: bark:");
++	}
++	panic("LAUREL WDOG: bark: no pet for %u s; pet thread last ran %llu ms ago; silent CPUs 0x%x", LWD_BARK_S, (now - lwd_thread_ran) / ticks, silent);
++}
++
++/* one signal to each CPU in use: the stamp in sleh_irq is the answer. SIGPast waits for nothing: no slot, no spin (cpu_signal_internal): a stuck CPU cannot stop the sender. */
++static void
++lwd_round(uint64_t now)
++{
++	for (unsigned i = 0; i < LWD_CPUS && i <= (unsigned)ml_get_max_cpu_number(); i++) {
++		cpu_data_t *cd = (cpu_data_t *)CpuDataEntries[i].cpu_data_vaddr;
++		struct lwd_cpu *c = &lwd_cpu[i];
++
++		if (cd == NULL || (cd->cpu_signal & SIGPdisabled)) {
++			c->online = 0;          /* not in use yet, or a CPU that never came up */
++			c->silent_ms = 0;
++			continue;
++		}
++		if (c->online == 0) {
++			c->online = now;        /* its time starts here */
++		}
++		if (c->sent == 0) {
++			c->sent = now;
++		}
++		(void)cpu_signal(cd, SIGPast, NULL, NULL);
++	}
++}
++
++/* true: every CPU in use answered, so a pet is right. Lines for a CPU over each limit. */
++static bool
++lwd_check(uint64_t now)
++{
++	unsigned silent[LWD_CPUS];
++	unsigned char used[LWD_CPUS];
++
++	for (unsigned i = 0; i < LWD_CPUS; i++) {
++		struct lwd_cpu *c = &lwd_cpu[i];
++		uint64_t sent = c->sent;
++
++		/* an open signal, not the age of the last interrupt: if this thread itself ran late, no CPU is to blame */
++		used[i] = c->online != 0;
++		silent[i] = used[i] && sent != 0 && now > sent ? (unsigned)((now - sent) / lwd_ms) : 0;
++		unsigned before = c->silent_ms;
++
++		c->silent_ms = silent[i];
++		int say = lwd_line(silent[i], &c->level);
++		if (say > 0) {
++			char prefix[48];
++
++			snprintf(prefix, sizeof(prefix), "LAUREL WDOG: on: silent %u ms:", silent[i]);
++			laurel_wdog_report_cpu((int)i, prefix);
++		} else if (say < 0) {
++			kprintf("LAUREL WDOG: on: cpu %u answers again after over %u ms; it came in at pc 0x%llx\n", i, before, c->pc);
++		}
++	}
++	return lwd_pet_ok(silent, used, LWD_CPUS);
++}
++
++/* the USB thread, each poll: a second pair of eyes if the pet thread does not run. The hardware keeps its own time: this only says why. */
++void laurel_wdog_poll(void);
++void
++laurel_wdog_poll(void)
++{
++	uint64_t ran = lwd_thread_ran;
++
++	if (ran == 0 || lwd_ms == 0) {
++		return;
++	}
++	uint64_t now = mach_absolute_time();
++
++	if (now - ran < LWD_LATE_THREAD_MS * lwd_ms) {
++		lwd_thread_late_said = 0;
++		return;
++	}
++	if (now - ran >= ((uint64_t)lwd_thread_late_said + 1) * LWD_LATE_THREAD_MS * lwd_ms && lwd_thread_late_said < 4) {
++		lwd_thread_late_said++;
++		kprintf("LAUREL WDOG: on: the pet thread has not run for %llu ms, the USB thread still runs\n", (now - ran) / lwd_ms);
++		lwd_round(now);
++		(void)lwd_check(now);
++	}
++}
++
++static void
++lwd_minute(void)
++{
++	char text[200];
++	size_t at = 0;
++	unsigned worst = 0;
++	uint64_t worst_t = 0, worst_pc = 0;
++
++	text[0] = '\0';
++	for (unsigned i = 0; i < LWD_CPUS; i++) {
++		struct lwd_cpu *c = &lwd_cpu[i];
++		uint64_t t = c->worst;
++
++		c->worst = 0;
++		if (c->online == 0) {
++			continue;
++		}
++		if (t >= worst_t) {
++			worst = i;
++			worst_t = t;
++			worst_pc = c->worst_pc;
++		}
++		at += (size_t)snprintf(text + at, sizeof(text) - at, "%s%llu", at ? " " : "", t / lwd_ms);
++	}
++	kprintf("LAUREL WDOG: on: longest answer in 60 s, ms per CPU: %s; cpu %u at pc 0x%llx\n", text, worst, worst_pc);
++}
++
++static void
++lwd_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint64_t worst_gap = 0, last = mach_absolute_time(), period = (uint64_t)LWD_PET_MS * lwd_ms, next_minute = last + 60000ull * lwd_ms;
++
++	thread_set_thread_name(current_thread(), "laurel_wdog");
++	for (;;) {
++		uint64_t now = mach_absolute_time(), gap = now - last;
++
++		last = now;
++		lwd_thread_ran = now;
++		if (gap > worst_gap && gap >= 2 * period) {
++			worst_gap = gap;
++			kprintf("LAUREL WDOG: on: this thread ran %llu ms after its last run (limit: bark %u s, bite %u s)\n", gap / lwd_ms, LWD_BARK_S, LWD_BITE_S);
++		}
++		if (lwd_check(now) && lwd_on != 0 && lwd_hold == 0) {
++			lwd_wr(LWD_RST, 1u);
++		}
++		lwd_round(now);
++		if (now >= next_minute) {
++			next_minute = now + 60000ull * lwd_ms;
++			lwd_minute();
++		}
++		assert_wait_deadline((event_t)&lwd_thread_ran, THREAD_UNINT, now + period);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++/*
++ * SPI 3 to any CPU that has interrupts on, or to this CPU if the GIC has no 1-of-N routing. IGROUPR reads 0 from NS whatever the group [V pe_fiq.c, 2016]: a Secure SPI shows as an enable that does
++ * not hold.
++ */
++static const char *
++lwd_bark_setup(void)
++{
++	const uint32_t n = LWD_BARK_INTID / 32, bit = 1u << (LWD_BARK_INTID % 32);
++
++	if (lwd_gicd == 0) {
++		return "GICD not mapped";
++	}
++	lwd_gicd_wr(0x180u + 4 * n, bit);
++	lwd_gicd_settle();
++	uint32_t po = 0x400u + (LWD_BARK_INTID & ~3u), ps = (LWD_BARK_INTID & 3u) * 8, co = 0xc00u + 4 * (LWD_BARK_INTID / 16), cs = (LWD_BARK_INTID % 16) * 2;
++
++	lwd_gicd_wr(po, (lwd_gicd_rd(po) & ~(0xffu << ps)) | (0xa0u << ps));    /* below PMR, as the SGIs */
++	lwd_gicd_wr(co, lwd_gicd_rd(co) | (2u << cs));                          /* rising edge, as IRQF_TRIGGER_RISING */
++	uint32_t ro = 0x6000u + 8 * LWD_BARK_INTID;
++
++	lwd_gicd_wr(ro + 4, 0u);
++	lwd_gicd_wr(ro, 0x80000000u);                                           /* IRM */
++	lwd_bark_any = (lwd_gicd_rd(ro) & 0x80000000u) != 0;
++	if (!lwd_bark_any) {
++		uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
++
++		lwd_gicd_wr(ro, (uint32_t)(mpidr & 0xffffu));
++	}
++	lwd_gicd_wr(0x280u + 4 * n, bit);
++	lwd_gicd_wr(0x100u + 4 * n, bit);
++	lwd_gicd_settle();
++	if ((lwd_gicd_rd(0x100u + 4 * n) & bit) == 0) {
++		return "SPI 3 does not enable: it is TrustZone's";
++	}
++	lwd_bark_on = 1;
++	return NULL;
++}
++
++/* Thread context, SweetPlatformExpert::start: threads and the timebase run. One line, on or off. */
++void laurel_wdog_start(void);
++void
++laurel_wdog_start(void)
++{
++	uint32_t on = 1;
++	const char *why = NULL, *bark_why = NULL;
++	thread_t th;
++
++	PE_parse_boot_argn("laurelwdog", &on, sizeof(on));
++	if (on == 0) {
++		printf("LAUREL WDOG: off: laurelwdog=0\n");
++		return;
++	}
++	nanoseconds_to_absolutetime(NSEC_PER_MSEC, &lwd_ms);
++	lwd_gicd = ml_io_map(LWD_GICD_PA, 0x10000);
++	lwd_gicr = ml_io_map(LWD_GICR_PA, LWD_GICR_SIZE);
++	lwd_regs = ml_io_map(LWD_PA, 0x1000);
++
++	uint32_t en0 = 0, bark0 = 0, bite0 = 0;
++
++	if (lwd_regs == 0) {
++		why = "registers not mapped";
++	} else {
++		en0 = lwd_rd(LWD_EN);
++		bark0 = lwd_rd(LWD_BARK);
++		bite0 = lwd_rd(LWD_BITE);
++		if (en0 & 1u) {
++			lwd_wr(LWD_RST, 1u);    /* the firmware left it on: no count of its own may reach us during this setup */
++		}
++		lwd_wr(LWD_BARK, lwd_ticks(LWD_BARK_S));
++		lwd_wr(LWD_BITE, lwd_ticks(LWD_BITE_S));
++		if (lwd_rd(LWD_BARK) != lwd_ticks(LWD_BARK_S) || lwd_rd(LWD_BITE) != lwd_ticks(LWD_BITE_S)) {
++			why = "the hardware does not hold our times: TrustZone or the bootloader locks it";
++		} else {
++			lwd_wr(LWD_RST, 1u);
++			lwd_wr(LWD_EN, LWD_EN_ON);
++			if ((lwd_rd(LWD_EN) & 1u) == 0) {
++				why = "the enable bit does not hold";
++			} else {
++				uint32_t c0 = (lwd_rd(LWD_STS) >> 1) & LWD_COUNT_MAX, c1 = c0;
++				uint64_t until = mach_absolute_time() + 20 * lwd_ms;
++
++				/* 20 ms: 655 counts at 32765 Hz */
++				while (c1 == c0 && mach_absolute_time() < until) {
++					c1 = (lwd_rd(LWD_STS) >> 1) & LWD_COUNT_MAX;
++				}
++				if (c1 == c0) {
++					lwd_wr(LWD_EN, 0u);
++					why = "the counter stands still";
++				} else {
++					lwd_wr(LWD_RST, 1u);
++					lwd_on = 1;
++				}
++			}
++		}
++	}
++	if (lwd_on) {
++		bark_why = lwd_bark_setup();
++	}
++	if (kernel_thread_start_priority(lwd_thread, NULL, MAXPRI_KERNEL, &th) != KERN_SUCCESS) {
++		if (lwd_on) {
++			lwd_wr(LWD_EN, 0u);
++			lwd_on = 0;
++		}
++		printf("LAUREL WDOG: off: no thread (found EN 0x%x)\n", en0);
++		return;
++	}
++	thread_deallocate(th);
++	if (lwd_on) {
++		printf("LAUREL WDOG: on: APSS WDT 0x%llx, bark %u s (%s%s), bite %u s, pet %u ms, a CPU silent %u ms stops the pet; found EN 0x%x bark 0x%x bite 0x%x; laurelwdog=0\n",
++		    LWD_PA, LWD_BARK_S, bark_why ? "no interrupt: " : (lwd_bark_any ? "any CPU" : "one CPU"), bark_why ? bark_why : "", LWD_BITE_S, LWD_PET_MS, LWD_SILENT_MS, en0, bark0, bite0);
++	} else {
++		printf("LAUREL WDOG: off: %s (found EN 0x%x bark 0x%x bite 0x%x); no reset: a heartbeat names a stuck CPU\n", why, en0, bark0, bite0);
++	}
++}
++#endif /* SWEET */
+diff --git a/osfmk/arm64/laurel_wdog_core.h b/osfmk/arm64/laurel_wdog_core.h
+new file mode 100644
+index 0000000..e164ae5
+--- /dev/null
++++ b/osfmk/arm64/laurel_wdog_core.h
+@@ -0,0 +1,61 @@
++/*
++ * laurel 2986: the rules of the APSS watchdog, with no kernel types, so that a host test runs exactly this code (scripts/laurel/wdog-test.sh).
++ * Times: docs/laurel_sprout/watchdog.md. The hardware counts at 32765 Hz in 20 bits: at most 32 s (msm watchdog_v2.c: WDT_HZ, WDT0_STS bits 1-20).
++ */
++#ifndef LAUREL_WDOG_CORE_H
++#define LAUREL_WDOG_CORE_H
++
++#define LWD_HZ          32765u
++#define LWD_COUNT_MAX   0xFFFFFu
++#define LWD_BARK_S      12u     /* no pet for 12 s: interrupt, if a CPU can take it. Stock trinket: 11 s */
++#define LWD_BITE_S      20u     /* no pet for 20 s: reset, with no CPU. Stock: bark + 3 s. Here 8 s, so that the panic of the bark can run */
++#define LWD_PET_MS      1000u   /* a round: a signal to each CPU, one pet if all answered. Stock: 9360 ms */
++#define LWD_SILENT_MS   8000u   /* a CPU silent this long stops the pet: bark 20 s, bite 28 s after that CPU stopped */
++#define LWD_PANIC_S     30u     /* a panic in progress: one last bite, if the panic itself hangs before its hold */
++#define LWD_LATE_THREAD_MS 3000u /* the pet thread this late: the USB thread names it */
++
++static const unsigned lwd_line_ms[3] = { 2000u, 5000u, 10000u };        /* a line at each of these silences */
++
++static inline unsigned
++lwd_ticks(unsigned seconds)
++{
++	unsigned long long t = (unsigned long long)seconds * LWD_HZ;
++
++	return t > LWD_COUNT_MAX ? LWD_COUNT_MAX : (unsigned)t;
++}
++
++/* a pet is right only if every CPU in use answered: silent[i] in ms, used[i] != 0 for a CPU in use */
++static inline int
++lwd_pet_ok(const unsigned *silent_ms, const unsigned char *used, unsigned n)
++{
++	for (unsigned i = 0; i < n; i++) {
++		if (used[i] && silent_ms[i] >= LWD_SILENT_MS) {
++			return 0;
++		}
++	}
++	return 1;
++}
++
++/*
++ * The next line for one CPU. level: lines already given for this silence, kept by the caller. 1: give a line now. -1: the CPU answers again after a silence with a line:
++ * give one line with the time. 0: nothing.
++ */
++static inline int
++lwd_line(unsigned silent_ms, unsigned *level)
++{
++	if (silent_ms < lwd_line_ms[0]) {
++		int back = *level != 0;
++
++		*level = 0;
++		return back ? -1 : 0;
++	}
++	if (*level < 3 && silent_ms >= lwd_line_ms[*level]) {
++		while (*level < 3 && silent_ms >= lwd_line_ms[*level]) {
++			(*level)++;
++		}
++		return 1;
++	}
++	return 0;
++}
++
++#endif /* LAUREL_WDOG_CORE_H */
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 9e6f9cf..0250e4c 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3111,6 +3111,10 @@ sleh_irq(arm_saved_state_t *state)
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
++	/* laurel 2986: this CPU lives; what it interrupted (osfmk/arm64/laurel_wdog.c) */
++	extern void laurel_wdog_irq(unsigned int cpu, uint64_t pc, uint64_t lr, bool el0);
++	extern void laurel_wdog_bark(void);
++	laurel_wdog_irq(cdp->cpu_number, get_saved_state_pc(state), get_saved_state_lr(state), PSR64_IS_USER(get_saved_state_cpsr(state)));
+ 	if (intid == sweet_vtimer_intid) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+@@ -3124,6 +3128,11 @@ sleh_irq(arm_saved_state_t *state)
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
++	} else if (intid == 35) {       /* laurel 2986: the bark of the APSS watchdog, SPI 3 */
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		__builtin_arm_isb(ISB_SY);
++		laurel_wdog_bark();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 		if (cdp->interrupt_handler) {
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index dd2c337..c5fa02b 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -54,6 +54,7 @@ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
+ osfmk/arm64/laurel_ram.c	standard
++osfmk/arm64/laurel_wdog.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard

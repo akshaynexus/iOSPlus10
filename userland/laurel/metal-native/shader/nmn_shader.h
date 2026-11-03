@@ -47,7 +47,8 @@ struct nmn_stage_input {
 struct nmn_stage_info {
 	uint32_t instructions, nops, movs, covs, sizedwords, half_regs, full_regs, const_vec4, tex_ops, mem_ops, sstall, systall, loops;
 	uint32_t instrlen;      /* units of 16 instructions */
-	bool reads_framebuffer; /* an input attachment survives into this stage's code */
+	bool reads_framebuffer;
+	bool early_tests, no_early_z;     /* the shader asks for early tests; it writes depth or its own rule forbids early Z */ /* an input attachment survives into this stage's code */
 	bool has_kill, writes_z, needs_full_quad;
 	uint32_t color_outputs; /* bit per render target this stage writes */
 };
@@ -56,6 +57,11 @@ struct nmn_program;     /* one vertex + one fragment, or one compute */
 struct nmn_program *nmn_program_render(struct nmn_compiler *, const struct nmn_layout *, const struct nmn_stage_input *vertex, const struct nmn_stage_input *fragment /* may be NULL */, char *why, size_t why_size);
 struct nmn_program *nmn_program_compute(struct nmn_compiler *, const struct nmn_layout *, const struct nmn_stage_input *kernel, uint32_t local_size_x, uint32_t local_size_y, uint32_t local_size_z, char *why, size_t why_size);
 void nmn_program_free(struct nmn_program *);
+/* A finished program as bytes, and back: Mesa's ir3_store_variant. malloc'ed; the caller frees. NULL: it does not fit, or the bytes are not such a program. Bytes of this compile path only (nmn_cache_id). */
+void *nmn_program_store(const struct nmn_program *, size_t *size);
+struct nmn_program *nmn_program_load(struct nmn_compiler *, const void *data, size_t size);
+/* The name of the cache folder: a hash of what the compile path is made from */
+const char *nmn_cache_id(void);
 bool nmn_program_info(const struct nmn_program *, unsigned stage, struct nmn_stage_info *);
 /* The opaque ir3_shader_variant of a stage, for nmn_pm4. NULL: no such stage. */
 const void *nmn_program_variant(const struct nmn_program *, unsigned stage);

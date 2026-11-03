@@ -13,6 +13,7 @@
 #define NW_SEL_GEM_CLOSE 0x09u
 #define NW_SEL_USERPTR 0x49u
 #define NW_SEL_SURFACE 0x7eu
+#define NW_SURFACE_ANY_LAYOUT 0x40000000u   /* kernel kRedwoodAnyLayout, laurel 2913 */
 #define NW_SAME_PLACE_BASE 0x80000000ull     /* kernel kSamePlaceBase: at or above it a kernel buffer is the pool's, at VA = PA */
 #define NW_CHUNK_SIZE (256u * 1024u)
 #define NW_FREE_LISTS 16
@@ -33,6 +34,7 @@ struct nw_device {
 	void *ctx;
 	struct nw_info info;
 	pthread_mutex_t lock;
+	pthread_mutex_t surface_lock;   /* a surface's kernel call and its entry in the table: an import must not take a handle that a free is closing */
 	uint32_t stamp;
 	struct nw_slab *slabs;
 	struct nw_bo **free_chunks;
@@ -214,6 +216,7 @@ struct nw_device *nw_device_open(const struct nw_ops *ops, void *ctx, char *why,
 	d->ops = ops;
 	d->ctx = ctx;
 	pthread_mutex_init(&d->lock, NULL);
+	pthread_mutex_init(&d->surface_lock, NULL);
 	pthread_rwlock_init(&d->table_lock, NULL);
 	const char *check = getenv("NMN_STREAM_CHECK");
 	d->check_on = check == NULL || strcmp(check, "0") != 0;
@@ -227,6 +230,7 @@ struct nw_device *nw_device_open(const struct nw_ops *ops, void *ctx, char *why,
 		if (e != 0) {
 			snprintf(why, why_size, "GET_PARAM %s: errno %d", need[i].name, e);
 			pthread_mutex_destroy(&d->lock);
+			pthread_mutex_destroy(&d->surface_lock);
 			pthread_rwlock_destroy(&d->table_lock);
 			free(d);
 			return NULL;
@@ -312,28 +316,51 @@ struct nw_surface_request {
 
 struct nw_bo *nw_bo_import_surface(struct nw_device *d, uint32_t surface_id, uint32_t *offset, uint32_t *row_bytes)
 {
-	struct nw_surface_request r = {.surface = surface_id, .handle = 0};
-	struct nw_bo *b;
-	if (d->ops->call(d->ctx, NW_SEL_SURFACE, &r, sizeof(r)) != 0)
+	/* laurel 2913: any layout (a plane, 2 bytes an element, an odd row): the kernel's check of the old GL path does not apply; the frontend knows each plane's layout */
+	struct nw_surface_request r = {.surface = surface_id | NW_SURFACE_ANY_LAYOUT, .handle = 0};
+	struct nw_bo *b = NULL;
+	pthread_mutex_lock(&d->surface_lock);
+	if (d->ops->call(d->ctx, NW_SEL_SURFACE, &r, sizeof(r)) != 0) {
+		pthread_mutex_unlock(&d->surface_lock);
 		return NULL;
+	}
+	if (offset != NULL)
+		*offset = r.offset;
+	if (row_bytes != NULL)
+		*row_bytes = r.row_bytes;
+	/*
+	 * The kernel answers with the handle this client already has for this surface, and GEM_CLOSE drops the buffer: a second object of its own would unmap the surface under the first. So one object, counted.
+	 */
+	pthread_rwlock_rdlock(&d->table_lock);
+	for (uint32_t i = 0; i < d->range_count; i++) {
+		if (d->ranges[i].bo->handle == r.handle && d->ranges[i].bo->kind == NW_BO_SURFACE) {
+			b = d->ranges[i].bo;
+			break;
+		}
+	}
+	pthread_rwlock_unlock(&d->table_lock);
+	if (b != NULL) {
+		b->extra_refs++;
+		pthread_mutex_unlock(&d->surface_lock);
+		return b;
+	}
 	b = calloc(1, sizeof(*b));
 	if (b == NULL || bo_iova(d, r.handle, &b->iova) != 0) {
 		bo_close_handle(d, r.handle);
 		free(b);
+		pthread_mutex_unlock(&d->surface_lock);
 		return NULL;
 	}
 	b->handle = r.handle;
 	b->size = r.size;
 	b->kind = NW_BO_SURFACE;
-	if (offset != NULL)
-		*offset = r.offset;
-	if (row_bytes != NULL)
-		*row_bytes = r.row_bytes;
 	if (!table_add(d, b)) {
 		bo_close_handle(d, r.handle);
 		free(b);
+		pthread_mutex_unlock(&d->surface_lock);
 		return NULL;
 	}
+	pthread_mutex_unlock(&d->surface_lock);
 	pthread_mutex_lock(&d->lock);
 	d->bo_count++;
 	pthread_mutex_unlock(&d->lock);
@@ -349,8 +376,17 @@ struct nw_bo *nw_bo_import_host(struct nw_device *d, void *pointer, uint64_t siz
 {
 	struct nw_userptr_request r = {.pointer = (uint64_t)(uintptr_t)pointer, .size = size, .flags = read_only ? 1u : 0u};
 	struct nw_bo *b;
-	if (d->ops->call(d->ctx, NW_SEL_USERPTR, &r, sizeof(r)) != 0)
+	int e = d->ops->call(d->ctx, NW_SEL_USERPTR, &r, sizeof(r));
+	if (e == EIO && !read_only) {
+		/* kIOReturnVMError: the pages are not writable (a compositor maps a client's memory read-only): the GPU only reads them (negroni_drm.c host_import_pages) */
+		struct nw_userptr_request ro = {.pointer = r.pointer, .size = r.size, .flags = 1u};
+		e = d->ops->call(d->ctx, NW_SEL_USERPTR, &ro, sizeof(ro));
+		r = ro;
+	}
+	if (e != 0) {
+		snprintf(d->refusal, sizeof(d->refusal), "errno %d", e);
 		return NULL;
+	}
 	b = calloc(1, sizeof(*b));
 	if (b == NULL || bo_iova(d, r.handle, &b->iova) != 0) {
 		bo_close_handle(d, r.handle);
@@ -376,11 +412,22 @@ void nw_bo_free(struct nw_device *d, struct nw_bo *b)
 {
 	if (b == NULL)
 		return;
+	const bool surface = b->kind == NW_BO_SURFACE;
+	if (surface) {
+		pthread_mutex_lock(&d->surface_lock);
+		if (b->extra_refs > 0) {
+			b->extra_refs--;
+			pthread_mutex_unlock(&d->surface_lock);
+			return;
+		}
+	}
 	table_remove(d, b);
 	/* only what this file mapped: a surface's or host range's address is the caller's */
 	if (b->map != NULL && (b->kind == NW_BO_POOL || b->kind == NW_BO_SCATTERED))
 		d->ops->unmap(d->ctx, b->handle, b->map, b->size);
 	bo_close_handle(d, b->handle);
+	if (surface)
+		pthread_mutex_unlock(&d->surface_lock);
 	pthread_mutex_lock(&d->lock);
 	d->bo_count--;
 	if (b->kind == NW_BO_POOL || b->kind == NW_BO_SCATTERED)
@@ -408,6 +455,7 @@ void nw_device_close(struct nw_device *d)
 		free(d->free_big[c]);
 	}
 	pthread_mutex_destroy(&d->lock);
+	pthread_mutex_destroy(&d->surface_lock);
 	pthread_rwlock_destroy(&d->table_lock);
 	free(d->ranges);
 	free(d->known);
@@ -839,10 +887,12 @@ int nw_submit_go(struct nw_submit *s, uint32_t *fence)
 	}
 	if (s->dev->check_on) {
 		uint64_t began = nw_now_ns();
+		struct nw_check_state state;
+		memset(&state, 0, sizeof(state));
 		for (uint32_t i = 0; i < s->stream_count; i++) {
 			for (uint32_t j = 0; j < s->streams[i]->ib_count; j++) {
 				const struct nw_ib *ib = &s->streams[i]->ibs[j];
-				if (!nw_stream_check(s->dev, (const uint32_t *)((const char *)ib->bo->map + ib->offset), ib->dwords, ib->iova, 1, s->dev->refusal, sizeof(s->dev->refusal)))
+				if (!nw_stream_check_with(s->dev, &state, (const uint32_t *)((const char *)ib->bo->map + ib->offset), ib->dwords, ib->iova, 1, s->dev->refusal, sizeof(s->dev->refusal)))
 					return EFAULT;
 			}
 		}

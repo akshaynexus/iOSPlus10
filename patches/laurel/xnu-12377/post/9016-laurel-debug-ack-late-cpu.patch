@@ -1,0 +1,58 @@
+laurel 9016 (iOS 26): a late CPU: what it last did, and where it comes in
+
+[V logs/usblog-20261103-071332.txt] 12 of 12 stackshots given up, in 4 boots, name CPU 5, and the line says nothing more. ml_dbgwrap_* is UNSUPPORTED on this SoC and EDPCSR is not safe to read (laurel_wdog.c, docs/laurel_sprout/watchdog.md).
+After LAUREL DEBUG ACK: on: stackshot given up: two lines per late CPU (last interrupt, its thread, SGI pending or not). When that CPU takes the signal: LAUREL DEBUG ACK: on: cpu N came M ms after ...: pc lr fp: the first point where it let interrupts in.
+
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+index c341d4e..5a29394 100644
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -187,6 +187,10 @@ MACHINE_TIMEOUT_ALWAYS_ENABLED(debug_ack_timeout, "debug-ack", 1920000, MACHINE_
+ 
+ /* Forward functions definitions */
+ void panic_display_times(void);
++/* laurel 9015: osfmk/arm64/laurel_wdog.c */
++extern void laurel_wdog_report_cpu(int cpu, const char *prefix);
++extern void laurel_wdog_late_mark(int cpu);
++extern void laurel_wdog_late_came(uint64_t pc, uint64_t lr, uint64_t fp, bool el0);
+ void panic_print_symbol_name(vm_address_t search);
+ 
+ 
+@@ -1110,6 +1114,7 @@ DebuggerXCallEnter(
+ 	uint64_t max_mabs_time, current_mabs_time;
+ 	int cpu;
+ 	int timeout_cpu = -1;
++	uint32_t laurel_late = 0;       /* laurel 9015: the CPUs that did not answer */
+ 	int max_cpu;
+ 	unsigned int sync_pending;
+ 	cpu_data_t      *target_cpu_datap;
+@@ -1222,6 +1227,7 @@ DebuggerXCallEnter(
+ 			}
+ 			kprintf("%s>Debugger synch pending on cpu %d\n", __FUNCTION__, cpu);
+ 			timeout_cpu = cpu;
++			laurel_late |= 1u << cpu;
+ #if CONFIG_SPTM
+ 			if (proceed_on_sync_failure) {
+ 				/*
+@@ -1271,6 +1277,13 @@ DebuggerXCallEnter(
+ 				if (laurel_late_count++ < 8) {
+ 					kprintf("LAUREL DEBUG ACK: on: stackshot given up: cpu %d is late by over %llu ticks (time %u)\n",
+ 					    timeout_cpu, (unsigned long long)os_atomic_load(&debug_ack_timeout, relaxed), laurel_late_count);
++					/* laurel 9015: what a late CPU last did, and where it comes in: LAUREL DEBUG ACK: on: cpu N came ... (osfmk/arm64/laurel_wdog.c) */
++					for (cpu = 0; cpu <= max_cpu; cpu++) {
++						if (laurel_late & (1u << cpu)) {
++							laurel_wdog_report_cpu(cpu, "LAUREL DEBUG ACK: on: late");
++							laurel_wdog_late_mark(cpu);
++						}
++					}
+ 				}
+ 				return KERN_OPERATION_TIMED_OUT;
+ 			}
+@@ -1421,6 +1434,7 @@ DebuggerXCall(
+ 		current_cpu_datap()->ipi_lr = (uint64_t)get_saved_state_lr(regs);
+ 		current_cpu_datap()->ipi_fp = (uint64_t)get_saved_state_fp(regs);
+ 		save_context = PSR64_IS_KERNEL(get_saved_state_cpsr(regs));
++		laurel_wdog_late_came(current_cpu_datap()->ipi_pc, current_cpu_datap()->ipi_lr, current_cpu_datap()->ipi_fp, !save_context); /* laurel 9015 */
+ #endif
+ 	}
+ 

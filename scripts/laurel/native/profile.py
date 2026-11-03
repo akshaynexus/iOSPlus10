@@ -12,4 +12,8 @@ LIMITS = {
 d = json.load(open(sys.argv[1]))
 limits = d["capabilities"]["vulkan10requirements"]["properties"]["VkPhysicalDeviceProperties"]["limits"]
 limits.update(LIMITS)
+# Turnip's real format table on this GPU (scripts/laurel/native/profile-capture.sh, committed beside this file): the estimate's floor left Depth32Float_Stencil8 out, which RenderBox asks for
+import os
+formats = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "a610-formats.json")))
+d["capabilities"]["m2v_vulkan12_required_formats"]["formats"].update(formats)
 json.dump(d, open(sys.argv[2], "w"), indent=1)

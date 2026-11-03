@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: MIT */
 /* See nmn_pm4.h. Register values and their order: Mesa Turnip tu_cmd_buffer.cc, tu_pipeline.cc, tu_shader.cc, tu_clear_blit.cc (Copyright Google, Valve, Red Hat, Igalia and others; MIT). */
+#include <inttypes.h>
 #include "nmn_pm4.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "util/format/u_format.h"
 #include "util/format_srgb.h"
@@ -22,6 +24,12 @@
 #include "adreno_common.xml.h"
 #include "adreno_pm4.xml.h"
 #include "a6xx.xml.h"
+#include "nw_check_regs.h"
+static_assert(NW_RB_2D_BLIT_CNTL == REG_A6XX_RB_2D_BLIT_CNTL && NW_RB_2D_BLIT_CNTL_SOLID == A6XX_RB_2D_BLIT_CNTL_SOLID_COLOR && NW_RB_2D_DST == REG_A6XX_RB_2D_DST && NW_RB_2D_DST_PITCH == REG_A6XX_RB_2D_DST_PITCH, "nw_check_regs.h");
+static_assert(NW_GRAS_2D_DST_BR == REG_A6XX_GRAS_2D_DST_BR && NW_GRAS_2D_SRC_BR_X == REG_A6XX_GRAS_2D_SRC_BR_X && NW_GRAS_2D_SRC_BR_Y == REG_A6XX_GRAS_2D_SRC_BR_Y && NW_SP_PS_2D_SRC == REG_A6XX_SP_PS_2D_SRC && NW_SP_PS_2D_SRC_PITCH == REG_A6XX_SP_PS_2D_SRC_PITCH, "nw_check_regs.h");
+static_assert(NW_GRAS_SC_WINDOW_SCISSOR_BR == REG_A6XX_GRAS_SC_WINDOW_SCISSOR_BR && NW_RB_DEPTH_BUFFER_PITCH == REG_A6XX_RB_DEPTH_BUFFER_PITCH && NW_RB_DEPTH_BUFFER_BASE == REG_A6XX_RB_DEPTH_BUFFER_BASE && NW_RB_MRT == REG_A6XX_RB_MRT(0) && NW_MARKER_DIRECT_RENDER == RM6_DIRECT_RENDER, "nw_check_regs.h");
+static_assert(NW_RB_STENCIL_BUFFER_PITCH == REG_A6XX_RB_STENCIL_BUFFER_PITCH && NW_RB_STENCIL_BUFFER_BASE == REG_A6XX_RB_STENCIL_BUFFER_BASE, "nw_check_regs.h");
+static_assert(A6XX_SP_PS_2D_SRC_PITCH_PITCH__SHIFT == 9 && A6XX_GRAS_SC_WINDOW_SCISSOR_BR_Y__SHIFT == 16, "nw_check_regs.h");
 
 struct fd_reg_pair {
    uint32_t reg;
@@ -50,14 +58,17 @@ struct nmn_gpu {
 	struct fd_dev_id id;
 	struct fd_dev_info info;
 	struct nw_slice border;         /* builtin border colors */
-	struct nw_slice pvt;            /* one private memory area for all programs, grown once */
-	uint32_t pvt_fiber, pvt_sp;
+	/* tu_device's fiber_pvtmem_bo and wave_pvtmem_bo: programs share an area only with one layout: another layout in flight overwrites their spills. [0] per fiber, [1] per wave */
+	struct nw_slice pvt[2];
+	uint32_t pvt_fiber[2], pvt_sp[2];
 	uint32_t ccu_color_bypass, ccu_depth_bypass;
 };
 
 struct nmn_image {
 	struct nmn_gpu *gpu;
 	struct fdl_layout layout;
+	struct fdl_layout stencil;      /* Z32_FLOAT_S8X24: the stencil plane, after the depth plane (tu_image.cc): layout is then the depth plane's */
+	uint64_t stencil_offset;        /* 0: one plane */
 	uint32_t format;
 	enum nmn_image_type type;
 	uint32_t layers;
@@ -171,7 +182,8 @@ void nmn_gpu_free(struct nmn_gpu *g)
 	if (g == NULL)
 		return;
 	nw_slice_free(g->dev, &g->border);
-	nw_slice_free(g->dev, &g->pvt);
+	nw_slice_free(g->dev, &g->pvt[0]);
+	nw_slice_free(g->dev, &g->pvt[1]);
 	free(g);
 }
 
@@ -180,7 +192,7 @@ struct nw_device *nmn_gpu_device(struct nmn_gpu *g) { return g->dev; }
 uint32_t nmn_format_from_metal(uint64_t f)
 {
 	switch (f) {
-	case 1: return PIPE_FORMAT_A8_UNORM;
+	case 1: return PIPE_FORMAT_R8_UNORM; /* metal2vulkan FormatEmulation::AlphaInRed: the plan's swizzle is (0, 0, 0, R), for R8. With FMT6_A8_UNORM, whose value is in alpha, R read 0: no text at all */
 	case 10: return PIPE_FORMAT_R8_UNORM;
 	case 11: return PIPE_FORMAT_R8_SRGB;
 	case 12: return PIPE_FORMAT_R8_SNORM;
@@ -236,6 +248,7 @@ uint32_t nmn_format_from_metal(uint64_t f)
 	case 253: return PIPE_FORMAT_S8_UINT;
 	case 255: return PIPE_FORMAT_Z24_UNORM_S8_UINT;
 	case 260: return PIPE_FORMAT_Z32_FLOAT_S8X24_UINT;
+	case 261: return PIPE_FORMAT_X32_S8X24_UINT;
 	default: return PIPE_FORMAT_NONE;
 	}
 }
@@ -255,23 +268,51 @@ struct nmn_image *nmn_image_new(struct nmn_gpu *g, uint32_t format, enum nmn_ima
 	struct fdl_explicit_layout plane = {};
 	struct fdl_explicit_layout *pl = NULL;
 	im->layout.tile_mode = tiled ? TILE6_3 : TILE6_LINEAR;
+	/*
+	 * fdl6_layout wants 16 pixels a row above 4 bytes a pixel, for a store from tile memory: 1344-byte rows of RGBA16F were refused (78 lines in backboardd: 168 x 168). This stack has no tile memory, and a row of 64-byte units is what
+	 * the hardware reads: a layout at the next row, then the caller's row in it. One level: a smaller level's row comes from pitchalign.
+	 */
+	const uint32_t cpp = util_format_get_blocksize((enum pipe_format)format);
+	const uint32_t store_row = cpp > 4 ? 16 * cpp : 64;
+	const bool caller_row = stride != 0 && levels == 1 && (stride & 63) == 0 && (stride & (store_row - 1)) != 0;
 	if (stride != 0) {
 		plane.offset = 0;
-		plane.pitch = stride;
+		plane.pitch = caller_row ? ALIGN(stride, store_row) : stride;
 		pl = &plane;
 	}
 	im->layout.ubwc = false;        /* the first version has no UBWC: fewer flushes to get right, and an erratum to read first (doc section 5) */
-	if (!fdl6_layout(&im->layout, &g->info, (enum pipe_format)format, samples, width, height, depth, levels, layers, type == NMN_IMAGE_3D, false, false, pl)) {
+	/* a depth or stencil target is tiled: RB_DEPTH_BUFFER_INFO and RB_STENCIL_INFO say TILE6_3 (tu6_emit_zs) */
+	if (util_format_is_depth_or_stencil((enum pipe_format)format) && stride == 0)
+		im->layout.tile_mode = TILE6_3;
+	const bool separate = format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT;
+	if (!fdl6_layout(&im->layout, &g->info, separate ? PIPE_FORMAT_Z32_FLOAT : (enum pipe_format)format, samples, width, height, depth, levels, layers, type == NMN_IMAGE_3D, false, false, pl)) {
 		free(im);
 		return NULL;
+	}
+	if (caller_row) {
+		fdl_set_pitchalign(&im->layout, 6);
+		im->layout.pitch0 = stride;
+		im->layout.slices[0].size0 = (uint64_t)stride * height;
+	}
+	if (separate) {
+		im->stencil.tile_mode = TILE6_3;
+		if (!fdl6_layout(&im->stencil, &g->info, PIPE_FORMAT_S8_UINT, samples, width, height, depth, levels, layers, type == NMN_IMAGE_3D, false, false, NULL)) {
+			free(im);
+			return NULL;
+		}
+		im->stencil_offset = ALIGN(im->layout.size, 4096);
 	}
 	return im;
 }
 void nmn_image_free(struct nmn_image *im) { free(im); }
-uint64_t nmn_image_size(const struct nmn_image *im) { return im->layout.size; }
+uint64_t nmn_image_size(const struct nmn_image *im) { return im->stencil_offset ? im->stencil_offset + im->stencil.size : im->layout.size; }
 uint32_t nmn_image_pitch(const struct nmn_image *im, uint32_t level) { return fdl_pitch(&im->layout, level); }
 uint64_t nmn_image_layer_offset(const struct nmn_image *im, uint32_t level, uint32_t layer) { return fdl_surface_offset(&im->layout, level, layer); }
 uint32_t nmn_image_format(const struct nmn_image *im) { return im->format; }
+uint64_t nmn_image_extent(const struct nmn_image *im, uint32_t level, uint32_t layer)
+{
+	return fdl_surface_offset(&im->layout, level, layer) + (uint64_t)fdl_pitch(&im->layout, level) * u_minify(im->layout.height0, level);
+}
 void nmn_image_bind(struct nmn_image *im, uint64_t iova) { im->iova = iova; }
 uint64_t nmn_image_iova(const struct nmn_image *im) { return im->iova; }
 
@@ -282,6 +323,16 @@ void nmn_descriptor_image(const struct nmn_image *im, uint32_t format, enum nmn_
 	struct fdl_view_args args = {};
 	args.chip = 6;
 	args.iova = im->iova;
+	/* the plane this view reads: Depth32Float_Stencil8 as depth, X32_Stencil8 as stencil (tu_image_view_init) */
+	if (im->stencil_offset != 0) {
+		if (format == PIPE_FORMAT_X32_S8X24_UINT) {
+			l = &im->stencil;
+			args.iova = im->iova + im->stencil_offset;
+			format = PIPE_FORMAT_S8_UINT;
+		} else {
+			format = PIPE_FORMAT_Z32_FLOAT;
+		}
+	}
 	args.base_miplevel = base_level;
 	args.level_count = levels;
 	args.base_array_layer = base_layer;
@@ -401,6 +452,7 @@ void nmn_cmd_init(struct nw_cs *cs, struct nmn_gpu *g)
 	emit_reg(cs, REG_A6XX_SP_UNKNOWN_B182, 0);
 	REGS(cs, A6XX_HLSQ_SHARED_CONSTS(.enable = false));
 	emit_reg(cs, REG_A6XX_UCHE_UNKNOWN_0E12, i->a6xx.magic.UCHE_UNKNOWN_0E12);
+	/* with the flight recorder on: the value that makes this register latch the client of a fault (kgsl 1, msm BIT(7) | 1), so that the kernel's line names the block; Mesa's magic value does not [V log 10:11:31: it read back 4] */
 	emit_reg(cs, REG_A6XX_UCHE_CLIENT_PF, i->a6xx.magic.UCHE_CLIENT_PF);
 	emit_reg(cs, REG_A6XX_RB_UNKNOWN_8E01, i->a6xx.magic.RB_UNKNOWN_8E01);
 	emit_reg(cs, REG_A6XX_SP_UNKNOWN_A9A8, 0);
@@ -506,15 +558,20 @@ static void clear_values(enum pipe_format f, enum a6xx_2d_ifmt ifmt, const doubl
 	}
 }
 
-static void r2d_dst_image(struct nw_cs *cs, const struct nmn_image *im, uint32_t level, uint32_t layer, enum pipe_format f, enum a6xx_format fmt)
+static void r2d_dst_plane(struct nw_cs *cs, const struct fdl_layout *l, uint64_t iova, uint32_t level, uint32_t layer, enum pipe_format f, enum a6xx_format fmt)
 {
-	REGS(cs, A6XX_RB_2D_DST_INFO(.color_format = fmt, .tile_mode = tile_of(&im->layout, level), .color_swap = fd6_color_swap(f, tile_of(&im->layout, level), false), .srgb = util_format_is_srgb(f), .samples = (enum a3xx_msaa_samples)util_logbase2(im->layout.nr_samples)),
-	     A6XX_RB_2D_DST(.qword = im->iova + fdl_surface_offset(&im->layout, level, layer)),
-	     A6XX_RB_2D_DST_PITCH(fdl_pitch(&im->layout, level)));
+	REGS(cs, A6XX_RB_2D_DST_INFO(.color_format = fmt, .tile_mode = tile_of(l, level), .color_swap = fd6_color_swap(f, tile_of(l, level), false), .srgb = util_format_is_srgb(f), .samples = (enum a3xx_msaa_samples)util_logbase2(l->nr_samples)),
+	     A6XX_RB_2D_DST(.qword = iova + fdl_surface_offset(l, level, layer)),
+	     A6XX_RB_2D_DST_PITCH(fdl_pitch(l, level)));
 	pkt4(cs, REG_A6XX_RB_2D_DST_FLAGS, 3);
 	nw_cs_emit(cs, 0);
 	nw_cs_emit(cs, 0);
 	nw_cs_emit(cs, 0);
+}
+
+static void r2d_dst_image(struct nw_cs *cs, const struct nmn_image *im, uint32_t level, uint32_t layer, enum pipe_format f, enum a6xx_format fmt)
+{
+	r2d_dst_plane(cs, &im->layout, im->iova, level, layer, f, fmt);
 }
 
 /* A 2D write reaches memory and the next read through the texture cache sees it (Turnip: FD_CCU_CLEAN_COLOR, FD_CCU_INVALIDATE_COLOR, FD_CACHE_INVALIDATE, WFI). */
@@ -527,9 +584,9 @@ static void flush_color(struct nw_cs *cs)
 }
 
 /* tu_clear_sysmem_attachment over r2d */
-static void clear_image(struct nw_cs *cs, const struct nmn_image *im, enum pipe_format f, uint32_t level, uint32_t layer, uint32_t w, uint32_t h, const uint32_t solid[4], enum a6xx_2d_ifmt ifmt)
+static void clear_plane(struct nw_cs *cs, const struct fdl_layout *l, uint64_t iova, enum pipe_format f, uint32_t level, uint32_t layer, uint32_t w, uint32_t h, const uint32_t solid[4], enum a6xx_2d_ifmt ifmt)
 {
-	enum a6xx_tile_mode tile = tile_of(&im->layout, level);
+	enum a6xx_tile_mode tile = tile_of(l, level);
 	enum a6xx_format fmt = fd6_color_format(f, tile);
 	r2d_common(cs, f, fmt, ifmt, true);
 	REGS(cs, A6XX_GRAS_2D_DST_TL(.x = 0, .y = 0), A6XX_GRAS_2D_DST_BR(.x = w - 1, .y = h - 1));
@@ -537,9 +594,14 @@ static void clear_image(struct nw_cs *cs, const struct nmn_image *im, enum pipe_
 	pkt4(cs, REG_A6XX_RB_2D_SRC_SOLID_C0, 4);
 	for (int i = 0; i < 4; i++)
 		nw_cs_emit(cs, solid[i]);
-	r2d_dst_image(cs, im, level, layer, f, fmt);
+	r2d_dst_plane(cs, l, iova, level, layer, f, fmt);
 	pkt7(cs, CP_BLIT, 1);
 	nw_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
+}
+
+static void clear_image(struct nw_cs *cs, const struct nmn_image *im, enum pipe_format f, uint32_t level, uint32_t layer, uint32_t w, uint32_t h, const uint32_t solid[4], enum a6xx_2d_ifmt ifmt)
+{
+	clear_plane(cs, &im->layout, im->iova, f, level, layer, w, h, solid, ifmt);
 }
 
 void nmn_cmd_pass_begin(struct nw_cs *cs, struct nmn_gpu *g, const struct nmn_pass *p)
@@ -547,6 +609,7 @@ void nmn_cmd_pass_begin(struct nw_cs *cs, struct nmn_gpu *g, const struct nmn_pa
 	const uint32_t w = p->width, h = p->height;
 	REGS(cs, A6XX_GRAS_LRZ_CNTL(.dword = 0));
 	REGS(cs, A6XX_GRAS_LRZ_BUFFER_BASE(0), A6XX_GRAS_LRZ_BUFFER_PITCH(.dword = 0), A6XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE(0));
+	REGS(cs, A6XX_GRAS_LRZ_DEPTH_VIEW(.base_layer = 0x7ff, .layer_count = 0x7ff, .base_mip_level = 0xf)); /* tu_lrz.cc: an invalid view: LRZ's direction tracking has no image. The one register pm4-diff.py marked UNEXPECTED */
 	REGS(cs, A6XX_GRAS_SC_WINDOW_SCISSOR_TL(.x = 0, .y = 0), A6XX_GRAS_SC_WINDOW_SCISSOR_BR(.x = w - 1, .y = h - 1));
 	REGS(cs, A6XX_GRAS_2D_RESOLVE_CNTL_1(.x = 0, .y = 0), A6XX_GRAS_2D_RESOLVE_CNTL_2(.x = w - 1, .y = h - 1));
 	REGS(cs, A6XX_RB_WINDOW_OFFSET(.x = 0, .y = 0));
@@ -579,12 +642,17 @@ void nmn_cmd_pass_begin(struct nw_cs *cs, struct nmn_gpu *g, const struct nmn_pa
 		clear_image(cs, c->image, f, c->level, c->layer, w, h, solid, ifmt);
 		any_clear = true;
 	}
-	if (p->depth != NULL && (p->clear_depth || p->clear_stencil)) {
-		enum pipe_format f = (enum pipe_format)p->depth->format;
-		uint32_t solid[4] = {fui((float)p->clear_z), p->clear_s, 0, 0};
-		if (p->clear_depth)
-			clear_image(cs, p->depth, PIPE_FORMAT_Z32_FLOAT, 0, 0, w, h, solid, R2D_FLOAT32);
-		(void)f;
+	/* depth and stencil clears go through the 2D engine, one plane each (tu_clear_sysmem_attachment); Depth24Unorm_Stencil8 is not on this path: Metal has no such target on iOS */
+	if (p->depth != NULL && p->clear_depth) {
+		const struct nmn_image *d = p->depth;
+		const uint32_t solid[4] = {d->format == PIPE_FORMAT_Z16_UNORM ? (uint32_t)(CLAMP(p->clear_z, 0.0, 1.0) * 65535.0 + 0.5) : fui((float)p->clear_z), 0, 0, 0};
+		clear_plane(cs, &d->layout, d->iova, d->format == PIPE_FORMAT_Z16_UNORM ? PIPE_FORMAT_Z16_UNORM : PIPE_FORMAT_Z32_FLOAT, p->depth_level, p->depth_layer, w, h, solid, d->format == PIPE_FORMAT_Z16_UNORM ? R2D_UNORM8 : R2D_FLOAT32);
+		any_clear = true;
+	}
+	if (p->stencil != NULL && p->clear_stencil) {
+		const struct nmn_image *x = p->stencil;
+		const uint32_t solid[4] = {p->clear_s & 0xff, 0, 0, 0};
+		clear_plane(cs, x->stencil_offset ? &x->stencil : &x->layout, x->iova + x->stencil_offset, PIPE_FORMAT_S8_UINT, p->stencil_level, p->stencil_layer, w, h, solid, R2D_INT8);
 		any_clear = true;
 	}
 	if (any_clear)
@@ -594,17 +662,33 @@ void nmn_cmd_pass_begin(struct nw_cs *cs, struct nmn_gpu *g, const struct nmn_pa
 	if (p->depth == NULL) {
 		REGS(cs, RB_DEPTH_BUFFER_INFO(CHIP, .depth_format = DEPTH6_NONE), A6XX_RB_DEPTH_BUFFER_PITCH(0), A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH(0), A6XX_RB_DEPTH_BUFFER_BASE(0), A6XX_RB_DEPTH_BUFFER_BASE_GMEM(0));
 		REGS(cs, A6XX_GRAS_SU_DEPTH_BUFFER_INFO(.depth_format = DEPTH6_NONE));
-		REGS(cs, RB_STENCIL_INFO(CHIP, 0));
 	} else {
 		const struct nmn_image *d = p->depth;
+		const struct fdl_layout *l = &d->layout;
 		enum a6xx_depth_format fmt = d->format == PIPE_FORMAT_Z16_UNORM ? DEPTH6_16 : d->format == PIPE_FORMAT_Z24_UNORM_S8_UINT ? DEPTH6_24_8 : DEPTH6_32;
 		pkt4(cs, REG_A6XX_RB_DEPTH_BUFFER_INFO, 6);
 		nw_cs_emit(cs, RB_DEPTH_BUFFER_INFO(CHIP, .depth_format = fmt, .tilemode = TILE6_3).value);
-		nw_cs_emit(cs, A6XX_RB_DEPTH_BUFFER_PITCH(fdl_pitch(&d->layout, 0)).value);
-		nw_cs_emit(cs, A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH(fdl_layer_stride(&d->layout, 0)).value);
-		nw_cs_emit_qw(cs, d->iova);
+		nw_cs_emit(cs, A6XX_RB_DEPTH_BUFFER_PITCH(fdl_pitch(l, p->depth_level)).value);
+		nw_cs_emit(cs, A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH(fdl_layer_stride(l, p->depth_level)).value);
+		nw_cs_emit_qw(cs, d->iova + fdl_surface_offset(l, p->depth_level, p->depth_layer));
 		nw_cs_emit(cs, 0);
 		REGS(cs, A6XX_GRAS_SU_DEPTH_BUFFER_INFO(.depth_format = fmt));
+		pkt4(cs, REG_A6XX_RB_DEPTH_FLAG_BUFFER_BASE, 3);
+		nw_cs_emit(cs, 0);
+		nw_cs_emit(cs, 0);
+		nw_cs_emit(cs, 0);
+	}
+	/* a stencil plane of its own: Depth32Float_Stencil8 or Stencil8 (tu6_emit_zs) */
+	if (p->stencil != NULL) {
+		const struct nmn_image *x = p->stencil;
+		const struct fdl_layout *l = x->stencil_offset ? &x->stencil : &x->layout;
+		pkt4(cs, REG_A6XX_RB_STENCIL_INFO, 6);
+		nw_cs_emit(cs, RB_STENCIL_INFO(CHIP, .separate_stencil = true, .tilemode = TILE6_3).value);
+		nw_cs_emit(cs, A6XX_RB_STENCIL_BUFFER_PITCH(fdl_pitch(l, p->stencil_level)).value);
+		nw_cs_emit(cs, A6XX_RB_STENCIL_BUFFER_ARRAY_PITCH(fdl_layer_stride(l, p->stencil_level)).value);
+		nw_cs_emit_qw(cs, x->iova + x->stencil_offset + fdl_surface_offset(l, p->stencil_level, p->stencil_layer));
+		nw_cs_emit(cs, 0);
+	} else {
 		REGS(cs, RB_STENCIL_INFO(CHIP, 0));
 	}
 
@@ -730,26 +814,27 @@ static void emit_xs_config(struct nw_cs *cs, gl_shader_stage stage, const struct
 	emit_reg(cs, r->hlsq_ctrl, A6XX_HLSQ_VS_CNTL_CONSTLEN(xs->constlen) | A6XX_HLSQ_VS_CNTL_ENABLED);
 }
 
-/* tu_setup_pvtmem: one area, grown when a program needs more. Programs baked before keep their own area in the slice they got (the old slice stays). */
-static bool setup_pvtmem(struct nmn_gpu *g, uint32_t bytes, uint32_t *fiber, uint32_t *sp, uint64_t *iova)
+/* tu_setup_pvtmem: one area for each layout, grown when a program needs more. Programs baked before keep their own area in the slice they got (the old slice stays). */
+static bool setup_pvtmem(struct nmn_gpu *g, uint32_t bytes, bool per_wave, uint32_t *fiber, uint32_t *sp, uint64_t *iova)
 {
 	*fiber = *sp = 0;
 	*iova = 0;
 	if (bytes == 0)
 		return true;
-	if (g->pvt_fiber < bytes) {
+	const unsigned l = per_wave ? 1 : 0;
+	if (g->pvt_fiber[l] < bytes) {
 		uint32_t f = util_next_power_of_two(ALIGN(bytes, 512));
 		uint32_t s = ALIGN(f * g->info.fibers_per_sp, 1 << 12);
 		struct nw_slice n;
 		if (!nw_slice_new(g->dev, (uint64_t)g->info.num_sp_cores * s, 4096, &n))
 			return false;
-		g->pvt = n;     /* the old slice stays allocated: baked programs still name its address */
-		g->pvt_fiber = f;
-		g->pvt_sp = s;
+		g->pvt[l] = n;  /* the old slice stays allocated: baked programs still name its address */
+		g->pvt_fiber[l] = f;
+		g->pvt_sp[l] = s;
 	}
-	*fiber = g->pvt_fiber;
-	*sp = g->pvt_sp;
-	*iova = g->pvt.iova;
+	*fiber = g->pvt_fiber[l];
+	*sp = g->pvt_sp[l];
+	*iova = g->pvt[l].iova;
 	return true;
 }
 
@@ -772,7 +857,7 @@ static void emit_xs(struct nw_cs *cs, struct nmn_gpu *g, gl_shader_stage stage, 
 	emit_reg(cs, r->instrlen, xs->instrlen);
 	uint32_t fiber, sp;
 	uint64_t pvt;
-	setup_pvtmem(g, xs->pvtmem_size, &fiber, &sp, &pvt);
+	setup_pvtmem(g, xs->pvtmem_size, xs->pvtmem_per_wave, &fiber, &sp, &pvt);
 	pkt4(cs, r->first_exec, 7);
 	nw_cs_emit(cs, 0);
 	nw_cs_emit_qw(cs, binary_iova);
@@ -885,6 +970,14 @@ static void emit_fs_inputs(struct nw_cs *cs, const struct nmn_gpu *g, const stru
 		const struct ir3_sampler_prefetch *p = &fs->sampler_prefetch[i];
 		enum a6xx_tex_prefetch_cmd c = p->tex_opc == OPC_SAM ? TEX_PREFETCH_SAM : p->tex_opc == OPC_SAMB ? TEX_PREFETCH_SAM : TEX_PREFETCH_SAM;
 		nw_cs_emit(cs, SP_FS_PREFETCH_CMD(CHIP, i, .src = p->src, .samp_id = p->samp_id, .tex_id = p->tex_id, .dst = p->dst, .wrmask = p->wrmask, .half = p->half_precision, .bindless = p->bindless, .cmd = c).value);
+	}
+	/* the slot of a bindless prefetch comes from here, not from the command above (tu6_emit_fs_inputs). Left out, the first texture read of a program read a stale slot, which other processes on the ring had left: FAR 0x124404820902, a read at a wild address, in the first programs of that shape [V logs 08:03:15, 08:24:18, 08:39:34] */
+	if (fs->num_sampler_prefetch > 0) {
+		pkt4(cs, REG_A6XX_SP_FS_BINDLESS_PREFETCH_CMD(0), fs->num_sampler_prefetch);
+		for (unsigned i = 0; i < fs->num_sampler_prefetch; i++) {
+			const struct ir3_sampler_prefetch *p = &fs->sampler_prefetch[i];
+			nw_cs_emit(cs, A6XX_SP_FS_BINDLESS_PREFETCH_CMD_SAMP_ID(p->samp_bindless_id) | A6XX_SP_FS_BINDLESS_PREFETCH_CMD_TEX_ID(p->tex_bindless_id));
+		}
 	}
 	REGS(cs, HLSQ_CONTROL_1_REG(CHIP, .primallocthreshold = g->info.a6xx.prim_alloc_threshold),
 	     HLSQ_CONTROL_2_REG(CHIP, .faceregid = face, .sampleid = samp_id, .samplemask = smask_in, .centerrhw = ij[IJ_PERSP_CENTER_RHW]),
@@ -1302,6 +1395,24 @@ void nmn_baked_info(const struct nmn_baked *b, uint32_t *dwords, bool *reads)
 	*reads = b->reads_framebuffer;
 }
 
+/* For the flight recorder: what the hardware gets of a program. Returns whether a stage uses private memory. */
+bool nmn_baked_describe(const struct nmn_baked *b, char *out, size_t size)
+{
+	size_t n = 0;
+	bool pvt = false;
+	const struct { const char *name; const struct ir3_shader_variant *v; } stages[] = {{"vs", b->vs}, {"fs", b->fs}, {"cs", b->cs}};
+	for (size_t i = 0; i < ARRAY_SIZE(stages); i++) {
+		const struct ir3_shader_variant *v = stages[i].v;
+		if (v == NULL || n >= size)
+			continue;
+		pvt |= v->pvtmem_size != 0;
+		n += snprintf(out + n, size - n, "%s %u instrs%s, %d full %d half, %u const, private %u%s, stack %u, %s, %s; ", stages[i].name, v->info.instrs_count, v->key.safe_constlen ? " safe" : "", v->info.max_reg + 1, v->info.max_half_reg + 1, v->constlen, v->pvtmem_size, v->pvtmem_per_wave ? " per wave" : "", v->branchstack, v->info.double_threadsize ? "thread128" : "thread64", v->mergedregs ? "merged" : "split");
+	}
+	if (n < size)
+		snprintf(out + n, size - n, "code at %#" PRIx64, b->code.iova);
+	return pvt;
+}
+
 /* The program's stream is called, so a pipeline costs 4 dwords per bind and no copy. */
 void nmn_cmd_program(struct nw_cs *cs, const struct nmn_baked *b)
 {
@@ -1348,7 +1459,7 @@ void nmn_cmd_raster(struct nw_cs *cs, const struct nmn_raster *r)
 		nw_cs_emit(cs, A6XX_GRAS_SC_SCREEN_SCISSOR_BR_X(x + w - 1) | A6XX_GRAS_SC_SCREEN_SCISSOR_BR_Y(y + h - 1));
 	}
 	/* raster. MTLCullMode: 0 none, 1 front, 2 back. MTLWinding: 0 clockwise, 1 counter-clockwise. */
-	REGS(cs, A6XX_GRAS_SU_CNTL(.cull_front = r->cull_mode == 1, .cull_back = r->cull_mode == 2, .front_cw = r->winding == 0, .linehalfwidth = r->line_width / 2.0f, .poly_offset = true, .line_mode = RECTANGULAR));
+	REGS(cs, A6XX_GRAS_SU_CNTL(.cull_front = r->cull_mode == 1, .cull_back = r->cull_mode == 2, .front_cw = r->winding == 0, .linehalfwidth = r->line_width / 2.0f, .poly_offset = !r->lines, .line_mode = r->lines ? BRESENHAM : RECTANGULAR));
 	REGS(cs, A6XX_GRAS_CL_CNTL(.znear_clip_disable = false, .zfar_clip_disable = false, .z_clamp_enable = false, .zero_gb_scale_z = 1, .vp_clip_code_ignore = 1));
 	enum a6xx_polygon_mode pm = r->fill_mode == 1 ? POLYMODE6_LINES : POLYMODE6_TRIANGLES;
 	REGS(cs, A6XX_VPC_POLYGON_MODE(pm));
@@ -1371,7 +1482,14 @@ void nmn_cmd_raster(struct nw_cs *cs, const struct nmn_raster *r)
 		REGS(cs, A6XX_GRAS_SU_STENCIL_CNTL(.stencil_enable = false));
 		REGS(cs, A6XX_RB_STENCILMASK(.mask = 0xff, .bfmask = 0xff), A6XX_RB_STENCILWRMASK(.wrmask = 0xff, .bfwrmask = 0xff), A6XX_RB_STENCILREF(.ref = r->stencil_front, .bfref = r->stencil_back));
 	}
-	REGS(cs, A6XX_RB_Z_BOUNDS_MIN(0.0f), A6XX_RB_Z_BOUNDS_MAX(1.0f));
+	/* Metal has no bounds test: not read. The values as Turnip's state leaves them, so that the comparison stays exact */
+	REGS(cs, A6XX_RB_Z_BOUNDS_MIN(0.0f), A6XX_RB_Z_BOUNDS_MAX(r->depth_test ? 0.0f : 1.0f));
+	/* early Z saves the fragment work of what the depth test rejects: a shader's whole cost on this GPU */
+	{
+		const enum a6xx_ztest_mode z = r->early_z ? A6XX_EARLY_Z : A6XX_LATE_Z;
+		REGS(cs, A6XX_GRAS_SU_DEPTH_PLANE_CNTL(.z_mode = z));
+		REGS(cs, A6XX_RB_DEPTH_PLANE_CNTL(.z_mode = z));
+	}
 	REGS(cs, A6XX_RB_LRZ_CNTL());
 	pkt4(cs, REG_A6XX_RB_BLEND_RED_F32, 4);
 	nw_cs_emit(cs, fui(r->blend_color[0]));
@@ -1434,6 +1552,23 @@ static enum pc_di_primtype primtype(uint32_t metal)
 	}
 }
 
+/*
+ * After each draw: the recorder's event, with no recorder too, for one stream in both. By itself it did not stop the hang (SP, HLSQ, RB busy, no fault): 13:42:54 [V]. The event makes no wait in the stream.
+ */
+void nmn_cmd_draw_end(struct nw_cs *cs)
+{
+	event_ts(cs, RB_DONE_TS);
+}
+
+/* The flight recorder's mark: the value reaches `iova` when the draws before it have left the render backend. It makes no wait, so a stream with marks keeps its timing. */
+void nmn_cmd_progress(struct nw_cs *cs, uint64_t iova, uint32_t value)
+{
+	pkt7(cs, CP_EVENT_WRITE, 4);
+	nw_cs_emit(cs, CP_EVENT_WRITE_0_EVENT(RB_DONE_TS));
+	nw_cs_emit_qw(cs, iova);
+	nw_cs_emit(cs, value);
+}
+
 void nmn_cmd_draw(struct nw_cs *cs, uint32_t primitive, uint32_t vertex_count, uint32_t instances, uint32_t first_vertex, uint32_t first_instance)
 {
 	REGS(cs, A6XX_VFD_INDEX_OFFSET(first_vertex), A6XX_VFD_INSTANCE_START_OFFSET(first_instance));
@@ -1458,6 +1593,34 @@ void nmn_cmd_draw_indexed(struct nw_cs *cs, uint32_t primitive, uint32_t index_c
 	nw_cs_emit(cs, 0);
 	nw_cs_emit_qw(cs, index_iova);
 	nw_cs_emit(cs, index_max);
+}
+
+void nmn_cmd_draw_indirect(struct nw_cs *cs, uint32_t primitive, uint64_t arguments, uint64_t index_iova, uint32_t index_max, bool wide)
+{
+	const bool strip = primitive == 2 || primitive == 4;
+	/* draw_wfm: CP_DRAW_INDIRECT_MULTI does not wait for the writes before it on some of this family (indirect_draw_wfm_quirk). The arguments may come from a GPU write */
+	pkt7(cs, CP_WAIT_FOR_ME, 0);
+	REGS(cs, A6XX_VFD_INDEX_OFFSET(0), A6XX_VFD_INSTANCE_START_OFFSET(0));
+	if (index_iova != 0) {
+		REGS(cs, A6XX_PC_PRIMITIVE_CNTL_0(.primitive_restart = strip));
+		emit_reg(cs, REG_A6XX_PC_RESTART_INDEX, wide ? 0xffffffffu : 0xffffu);
+		pkt7(cs, CP_DRAW_INDIRECT_MULTI, 9);
+		nw_cs_emit(cs, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(primtype(primitive)) | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_DMA) | CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(wide ? INDEX4_SIZE_32_BIT : INDEX4_SIZE_16_BIT) | CP_DRAW_INDX_OFFSET_0_VIS_CULL(USE_VISIBILITY));
+		nw_cs_emit(cs, A6XX_CP_DRAW_INDIRECT_MULTI_1_OPCODE(INDIRECT_OP_INDEXED) | A6XX_CP_DRAW_INDIRECT_MULTI_1_DST_OFF(0));
+		nw_cs_emit(cs, 1);
+		nw_cs_emit_qw(cs, index_iova);
+		nw_cs_emit(cs, index_max);
+		nw_cs_emit_qw(cs, arguments);
+		nw_cs_emit(cs, 20);     /* MTLDrawIndexedPrimitivesIndirectArguments */
+	} else {
+		REGS(cs, A6XX_PC_PRIMITIVE_CNTL_0(.primitive_restart = false));
+		pkt7(cs, CP_DRAW_INDIRECT_MULTI, 6);
+		nw_cs_emit(cs, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(primtype(primitive)) | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) | CP_DRAW_INDX_OFFSET_0_VIS_CULL(USE_VISIBILITY) | CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(INDEX4_SIZE_32_BIT));
+		nw_cs_emit(cs, A6XX_CP_DRAW_INDIRECT_MULTI_1_OPCODE(INDIRECT_OP_NORMAL) | A6XX_CP_DRAW_INDIRECT_MULTI_1_DST_OFF(0));
+		nw_cs_emit(cs, 1);
+		nw_cs_emit_qw(cs, arguments);
+		nw_cs_emit(cs, 16);     /* MTLDrawPrimitivesIndirectArguments */
+	}
 }
 
 /* tu_dispatch. The caller has called the program and written its sets and constants: calling it here again would invalidate them. */
@@ -1552,21 +1715,31 @@ void nmn_cmd_copy_image(struct nw_cs *cs, const struct nmn_image *src, uint32_t 
 	flush_color(cs);
 }
 
+/*
+ * SP_PS_2D_SRC_PITCH and RB_2D_DST_PITCH hold the row in units of 64 bytes, and a base address is 64-byte aligned: a row of 40 bytes reads as 0, a row of 96 as 64 (small icons as stripes on the phone).
+ * Such a copy goes line by line, each from an aligned base at a first texel (tu_copy_buffer_to_image, tu_copy_image_to_buffer).
+ */
 void nmn_cmd_buffer_to_image(struct nw_cs *cs, uint64_t src, uint32_t pitch, const struct nmn_image *dst, uint32_t level, uint32_t layer, const uint32_t o[2], const uint32_t size[2])
 {
 	enum pipe_format f = (enum pipe_format)dst->format;
 	enum a6xx_tile_mode tile = tile_of(&dst->layout, level);
 	enum a6xx_format fmt = fd6_color_format(f, tile);
 	uint32_t cpp = util_format_get_blocksize(f);
-	uint64_t base = src & ~0x3full;
-	uint32_t sx = (uint32_t)(src - base) / cpp;
+	if (pitch == 0)
+		pitch = size[0] * cpp;  /* Metal: 0 is tight rows, for one row or one column */
+	const bool lines = (src & 0x3f) != 0 || (pitch & 0x3f) != 0;
+	const uint32_t count = lines ? size[1] : 1, each = lines ? 1 : size[1];
 	r2d_common(cs, f, fmt, format_ifmt(f), false);
-	REGS(cs, SP_PS_2D_SRC_INFO(CHIP, .color_format = fd6_color_format(f, TILE6_LINEAR), .color_swap = fd6_color_swap(f, TILE6_LINEAR, false), .srgb = util_format_is_srgb(f), .unk20 = 1, .unk22 = 1), SP_PS_2D_SRC_SIZE(CHIP, .width = sx + size[0], .height = size[1]), SP_PS_2D_SRC(CHIP, .qword = base), SP_PS_2D_SRC_PITCH(CHIP, .pitch = pitch));
 	r2d_dst_image(cs, dst, level, layer, f, fmt);
-	REGS(cs, A6XX_GRAS_2D_DST_TL(.x = o[0], .y = o[1]), A6XX_GRAS_2D_DST_BR(.x = o[0] + size[0] - 1, .y = o[1] + size[1] - 1));
-	REGS(cs, A6XX_GRAS_2D_SRC_TL_X(sx), A6XX_GRAS_2D_SRC_BR_X(sx + size[0] - 1), A6XX_GRAS_2D_SRC_TL_Y(0), A6XX_GRAS_2D_SRC_BR_Y(size[1] - 1));
-	pkt7(cs, CP_BLIT, 1);
-	nw_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
+	for (uint32_t y = 0; y < count; y++, src += pitch) {
+		uint64_t base = src & ~0x3full;
+		uint32_t sx = (uint32_t)(src - base) / cpp;
+		REGS(cs, SP_PS_2D_SRC_INFO(CHIP, .color_format = fd6_color_format(f, TILE6_LINEAR), .color_swap = fd6_color_swap(f, TILE6_LINEAR, false), .srgb = util_format_is_srgb(f), .unk20 = 1, .unk22 = 1), SP_PS_2D_SRC_SIZE(CHIP, .width = sx + size[0], .height = each), SP_PS_2D_SRC(CHIP, .qword = base), SP_PS_2D_SRC_PITCH(CHIP, .pitch = lines ? 0 : pitch));
+		REGS(cs, A6XX_GRAS_2D_DST_TL(.x = o[0], .y = o[1] + y), A6XX_GRAS_2D_DST_BR(.x = o[0] + size[0] - 1, .y = o[1] + y + each - 1));
+		REGS(cs, A6XX_GRAS_2D_SRC_TL_X(sx), A6XX_GRAS_2D_SRC_BR_X(sx + size[0] - 1), A6XX_GRAS_2D_SRC_TL_Y(0), A6XX_GRAS_2D_SRC_BR_Y(each - 1));
+		pkt7(cs, CP_BLIT, 1);
+		nw_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
+	}
 	flush_color(cs);
 }
 
@@ -1575,15 +1748,21 @@ void nmn_cmd_image_to_buffer(struct nw_cs *cs, const struct nmn_image *src, uint
 	enum pipe_format f = (enum pipe_format)src->format;
 	enum a6xx_format fmt = fd6_color_format(f, TILE6_LINEAR);
 	uint32_t cpp = util_format_get_blocksize(f);
-	uint64_t base = dst & ~0x3full;
-	uint32_t dx = (uint32_t)(dst - base) / cpp;
+	if (pitch == 0)
+		pitch = size[0] * cpp;
+	const bool lines = (dst & 0x3f) != 0 || (pitch & 0x3f) != 0;
+	const uint32_t count = lines ? size[1] : 1, each = lines ? 1 : size[1];
 	r2d_common(cs, f, fmt, format_ifmt(f), false);
 	r2d_src_image(cs, src, level, layer);
-	REGS(cs, A6XX_RB_2D_DST_INFO(.color_format = fmt, .color_swap = fd6_color_swap(f, TILE6_LINEAR, false), .srgb = util_format_is_srgb(f)), A6XX_RB_2D_DST(.qword = base), A6XX_RB_2D_DST_PITCH(pitch));
-	REGS(cs, A6XX_GRAS_2D_DST_TL(.x = dx, .y = 0), A6XX_GRAS_2D_DST_BR(.x = dx + size[0] - 1, .y = size[1] - 1));
-	REGS(cs, A6XX_GRAS_2D_SRC_TL_X(o[0]), A6XX_GRAS_2D_SRC_BR_X(o[0] + size[0] - 1), A6XX_GRAS_2D_SRC_TL_Y(o[1]), A6XX_GRAS_2D_SRC_BR_Y(o[1] + size[1] - 1));
-	pkt7(cs, CP_BLIT, 1);
-	nw_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
+	for (uint32_t y = 0; y < count; y++, dst += pitch) {
+		uint64_t base = dst & ~0x3full;
+		uint32_t dx = (uint32_t)(dst - base) / cpp;
+		REGS(cs, A6XX_RB_2D_DST_INFO(.color_format = fmt, .color_swap = fd6_color_swap(f, TILE6_LINEAR, false), .srgb = util_format_is_srgb(f)), A6XX_RB_2D_DST(.qword = base), A6XX_RB_2D_DST_PITCH(lines ? 0 : pitch));
+		REGS(cs, A6XX_GRAS_2D_DST_TL(.x = dx, .y = 0), A6XX_GRAS_2D_DST_BR(.x = dx + size[0] - 1, .y = each - 1));
+		REGS(cs, A6XX_GRAS_2D_SRC_TL_X(o[0]), A6XX_GRAS_2D_SRC_BR_X(o[0] + size[0] - 1), A6XX_GRAS_2D_SRC_TL_Y(o[1] + y), A6XX_GRAS_2D_SRC_BR_Y(o[1] + y + each - 1));
+		pkt7(cs, CP_BLIT, 1);
+		nw_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
+	}
 	flush_color(cs);
 }
 

@@ -53,7 +53,8 @@ class Image:
             return
         self.table = []
         if self.leaf == "NegroniMetal":
-            d = glob.glob(os.path.join(REPO, "out/ios26/metal-impl/NegroniMetal.dSYM/Contents/Resources/DWARF/*"))
+            # NEGRONI_SYMBOLS: the native stack's out/ios26/metal-native/NegroniMetal.unstripped
+            d = [os.environ["NEGRONI_SYMBOLS"]] if os.environ.get("NEGRONI_SYMBOLS") else glob.glob(os.path.join(REPO, "out/ios26/metal-impl/NegroniMetal.dSYM/Contents/Resources/DWARF/*"))
             self.table = nm(d[0]) if d else []
             self.unslid = 0
         elif "libvulkan_freedreno" in self.leaf:

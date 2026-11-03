@@ -32,6 +32,8 @@ uint64_t nmn_image_size(const struct nmn_image *);
 uint32_t nmn_image_pitch(const struct nmn_image *, uint32_t level);
 uint64_t nmn_image_layer_offset(const struct nmn_image *, uint32_t level, uint32_t layer);
 uint32_t nmn_image_format(const struct nmn_image *);
+/* the bytes from the image's base to the end of this level's last row of this layer: what the GPU reaches at this level */
+uint64_t nmn_image_extent(const struct nmn_image *, uint32_t level, uint32_t layer);
 void nmn_image_bind(struct nmn_image *, uint64_t iova);
 uint64_t nmn_image_iova(const struct nmn_image *);
 
@@ -59,7 +61,8 @@ struct nmn_color_target {
 struct nmn_pass {
 	struct nmn_color_target colors[8];
 	uint32_t color_count;
-	const struct nmn_image *depth;
+	const struct nmn_image *depth, *stencil;      /* the same image for Depth32Float_Stencil8, in its two planes */
+	uint32_t depth_level, depth_layer, stencil_level, stencil_layer;
 	bool clear_depth, clear_stencil;
 	double clear_z;
 	uint32_t clear_s;
@@ -91,6 +94,7 @@ struct nmn_baked *nmn_bake_render(struct nmn_gpu *, const void *vs_variant, cons
 struct nmn_baked *nmn_bake_compute(struct nmn_gpu *, const void *cs_variant, char *why, size_t why_size);
 void nmn_baked_free(struct nmn_gpu *, struct nmn_baked *);
 void nmn_baked_info(const struct nmn_baked *, uint32_t *state_dwords, bool *reads_framebuffer);
+bool nmn_baked_describe(const struct nmn_baked *, char *out, size_t size);
 void nmn_cmd_program(struct nw_cs *, const struct nmn_baked *);
 
 struct nmn_raster {
@@ -101,6 +105,8 @@ struct nmn_raster {
 	uint32_t stencil_front, stencil_back;
 	uint32_t depth_func;    /* 7: always */
 	bool depth_write, depth_test, reads_framebuffer;
+	bool lines;             /* this draw's primitives are lines or a strip of them: GRAS_SU_CNTL as Turnip's */
+	bool early_z;           /* tu6_build_depth_plane_z_mode: the bridge decides it per draw, from the program and this state */
 	uint32_t pass_width, pass_height;
 	bool stencil_enable;
 	uint32_t st_func[2], st_fail[2], st_zpass[2], st_zfail[2], st_read[2], st_write[2]; /* front, back; Metal's raw values */
@@ -111,8 +117,12 @@ void nmn_cmd_descriptor_sets(struct nw_cs *, const uint64_t *set_iova, uint32_t 
 /* A stage's push range, as this stage's const file wants it (nmn_program_push_range). stage: 0 vertex, 1 fragment, 2 compute. */
 void nmn_cmd_push(struct nw_cs *, unsigned stage, uint32_t first_vec4, const void *data, uint32_t vec4s);
 void nmn_cmd_vertex_buffers(struct nw_cs *, const uint64_t *iova, const uint32_t *size, const uint32_t *stride, uint32_t count);
+void nmn_cmd_progress(struct nw_cs *, uint64_t iova, uint32_t value);
+void nmn_cmd_draw_end(struct nw_cs *);
 void nmn_cmd_draw(struct nw_cs *, uint32_t primitive /* Metal's raw value */, uint32_t vertex_count, uint32_t instances, uint32_t first_vertex, uint32_t first_instance);
 void nmn_cmd_draw_indexed(struct nw_cs *, uint32_t primitive, uint32_t index_count, uint32_t instances, uint64_t index_iova, uint32_t index_bytes_max, bool wide, int32_t base_vertex, uint32_t first_instance);
+/* A draw whose arguments the GPU reads from a buffer: tu_CmdDrawIndirect, tu_CmdDrawIndexedIndirect, one draw. index_iova 0: not indexed. */
+void nmn_cmd_draw_indirect(struct nw_cs *, uint32_t primitive, uint64_t arguments_iova, uint64_t index_iova, uint32_t index_bytes_max, bool wide);
 void nmn_cmd_dispatch(struct nw_cs *, const struct nmn_baked *, const uint32_t groups[3], const uint32_t local[3]);
 
 /* A barrier between passes in sysmem: what was written reaches memory, what was cached is dropped. */

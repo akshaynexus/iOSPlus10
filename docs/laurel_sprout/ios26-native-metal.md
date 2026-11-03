@@ -498,10 +498,98 @@ Then Restart UI (XNUtils), or a reboot. XNUtils `metaloption native` writes the 
 | `LAUREL METAL: on: stack native (setting native)` | The selector took it |
 | `LAUREL METAL26: on: stack native: the screen is lit 60 s after the first frame` | It holds |
 | `LAUREL METAL NATIVE: off: <reason>: restart on stack default` | No frame in 240 s, a black surface for 30 s, or no device: the next start is the default stack |
-| `LAUREL METAL NATIVE: off: option native failed in 2 starts of the compositor: stack default` | 2 starts with no lit screen |
+| `LAUREL METAL NATIVE: off: option native failed in 2 starts of the compositor: build UUID stays off until a new build or an owner's reset: stack default` | The start that writes the mark: 2 starts with no lit screen, or a reported failure |
+| `LAUREL METAL NATIVE: off: build UUID failed (reason): a new build or an owner's reset tries it again: stack default` | Each later start, also after a reboot |
+| `LAUREL METAL NATIVE: new build UUID: the failed mark of build UUID is gone` | A new build: it gets a new try |
+| `LAUREL METAL NATIVE: off: the selector cannot write stack/state (errno N): remove that file as root: stack default` | No count on the disk: the stack is not taken |
 | `LAUREL METAL NATIVE: off: the kernel turned the GPU off: the next start takes stack default` | A hang. Reboot: the GPU stays off until then |
 
-The way back: `echo default` into both files, or XNUtils. To try `native` again after a failure, write the setting again: the failure count stays until then.
+The way back: `echo default` into both files, or XNUtils.
 
-Known limit [V code]: when backboardd fell back, a sandboxed app that cannot read `stack/state` still takes `native` from `option.local`. With a GPU that is on this is two stacks on one kernel, which the kernel allows. [U] on the phone.
+**The failed mark holds across reboots (section 12).** Setting `default` and then `native` does not clear it. To try the same build again: XNUtils `metaloption`, or `RESET_FAILED=1 scripts/laurel/ios26-metal-install-options.sh native`. A new build needs no reset.
 
+A sandboxed client that cannot read the stack folder takes `default`, not `native`: it cannot see a failed mark, and its stream could turn the GPU off for all. [U] on the phone: which clients these are. So on a healthy `native` such apps run on the default stack. That is the owner's to change when `native` has proved itself.
+
+## 12. The compositor's first hang, and the fallback that did not hold (2026-11-03, branch `t3/native-metal-ca-features`)
+
+### 12.1 The fallback: why `native` came back at each boot
+
+| Fact | Mark |
+|---|---|
+| 06:49:17 after a CTL reboot: `LAUREL METAL: on: stack native`, hang, then the same 3 starts as at 06:47 | [V] log |
+| `stack/state` on the phone: `root wheel`, 0 bytes, the time of the last change of the setting; `active` and `ok`: `mobile` | [V] `ls -la` over SSH |
+| `ios26-metal-install-options.sh` ran `: > stack/state` as root. backboardd runs as `mobile`. The folder is sticky. `fopen(STATE, "w")` failed, and the selector ignored that | [V] script, code, `ps` |
+| So the count never reached the disk. Each start read 0. The start of pid 868 fell back only because of `stack/failed`, and that file is gone after it is read | [V] code |
+| SpringBoard at 06:47:36 took `native` after the fallback: the same empty state | [V] log |
+| `mark_gpu_off` wrote no line at either hang: the kernel kills backboardd first | [V] log |
+| `LAUREL CTL: reboot` is a reset after 500 ms, with no sync | [V] log, code |
+
+Fix, `userland/laurel/metal/option/option_store.h` (plain C: the phone and the host test run the same code):
+
+- Each write of the selector and of the stacks' marks: a temporary file, `F_FULLFSYNC`, rename, sync of the folder.
+- The count goes to the disk **before** the stack loads.
+- `failed-OPTION` holds `build reason`. Build = LC_UUID of `options/OPTION/NegroniMetal`: a hash of the linked image, so a new signature is the same build.
+- A state that cannot be written: the compositor takes the default, one line. This fails closed.
+- A report of failure wins over a lit screen. The default stack's lit screen clears nothing.
+- Root scripts remove the files in `stack/`, never create them. `option-rule-test.sh` greps for that.
+
+Bound: **at most 2 hangs for a build** (a hang, a reset before the next start, a second hang). In the usual order 1: the next start gets no device, and that marks the build.
+
+Host proof `scripts/laurel/option-rule-test.sh` [V host]: the log's order, 5 reboots, a power loss that brings back only what was synced; the owner's `default`, then `native`; a new build; the owner's reset; a state that cannot be written; a sandboxed client. Mutants: no sync 27 failures, no mark 13, no fail-closed 2. **Not run on the phone.**
+
+### 12.2 The hang: `FAR 0x1008000` and `0x1068000`
+
+| Fact | Mark |
+|---|---|
+| Both FARs are a 64 KiB start of the kernel's allocator (`0x01000000` on, `redwood_gpu_address`) + `0x8000`: not a pool address. A surface or host pages | [V] code, log |
+| `FSYNR0 00040013`: a write, a missing leaf entry (level 3): the tables go that far, the page is not mapped | [V] bits; [I] reading of `ARM SMMU` FSYNR0 |
+| `IB1 83db042c rem 0`, the first IB of 2 had 267 words: 2 IBs = a pass with no draw. The first IB holds init + pass begin, so the only memory write in it (but the scratch word) is the clear | [V] code, log |
+| `pass.width = d.renderTargetWidth` in the frontend. Metal's default is 0: the attachments' size. `metal2vulkan` handles that. The native bridge took it as it was: `w - 1` & 0x3fff = 16383 | [V] code |
+| So a clear of 16384 x 16384 over a small surface: it runs past the surface's pages | [I] the size 0: no log has the pass's numbers. It fits each fact above |
+| `nw_check` let it pass: it read the base address only | [V] code |
+| A shader did not cause it: no draw in that submission | [I] from the IB count |
+
+Fix: the pass's size comes from its attachments when the descriptor says 0, and never exceeds them. A view's level and slice count from the view's first ones.
+
+New rule of the gate, `nw_check.c`: what a `CP_BLIT` or a draw writes must fit its buffer, rows x pitch, from the registers of this submission. Same rule in `stream-check.py`, with no code in common. Descriptors: a texture's reach and a buffer's range, not only the base.
+
+A second defect found on this way [V code]: the kernel gives one handle per surface and client, and GEM_CLOSE drops the buffer. Two imports of one surface were two objects; the first free unmapped the surface under the other. Now one counted object. The frontend's `NSMapTable` hid this for the same key only.
+
+Also: `nw_bo_import_surface` asks with `kRedwoodAnyLayout` (laurel 2913): without it the kernel refuses any surface that is not 4 bytes an element.
+
+New scene part, `tests/scene.c` `scene_surfaces`: a real IOSurface (`scene_surface_ios.c`), 32 x 32, size 0, clear, no draw: the compositor's first frame; then 720 x 1560, size 0, the row's draw.
+
+## 13. Rounds of the compositor on the phone (2026-11-03)
+
+Tool: `scripts/laurel/native/compositor-round.sh`, under `phone-lock.sh`: reboot if the GPU is off, install this tree's stage, wait, screenshot, read the lines, write `default` again. Measure: `scripts/laurel/ios26-autotest.sh` (branch merged on laurel-sprout).
+
+| Time | Build's change | Result [V logs] |
+|---|---|---|
+| 07:22 | Pass size from the attachments; surface handle counted | No hang at the first frame. 3 min of compile, first submission, then 110 to 130 submissions per 5 s with **about 4 names each** (Turnip at that time: 7,300). Screenshot: the boot spinner on black, drawn by the native stack |
+| 07:25 | | A kernel panic in the stackshot path: not this stack: fixed in the kernel (post/9013) |
+| 07:38 | Disk cache | Check: `the screen surface stayed black for 30 s`: the samples miss the spinner in a cold start. Limit for native now 240 s |
+| 08:03 | Depth32Float_Stencil8; Turnip's format table | Hang after 73 s: `FAR 0x124404820902`, a read |
+| 08:24 | Tables and holes refused | First frame 5 s after the device opened. The same hang |
+| 08:39 | Flight recorder; host pages inside a page; rows of 64 | The same hang. The recorder: first failed submission has all 5 line draws of the ring |
+| 08:54 | `SP_FS_BINDLESS_PREFETCH_CMD` | The same hang: `FAR 0x126404820902`. That fix was real, and not the cause |
+| 09:05 | Lines as Turnip's | **Not read yet: the phone did not return to iOS after the reboot** |
+
+| 10:32 | Full ir3 variant unless the pipeline's constants pass the limit; lit rule | Lock Screen correct on the screen (`logs/round-104142/*-awake.png`). No hang only because the display slept 10 s after the first lit frame |
+| 10:44 | The same, with unlock + Home swipe | Hang 75 s after start, at the first submission after the unlock. The CP is 1840 dwords into a 2222-dword IB; with the safe variant it stopped at 860 to 1004 dwords, at the generic draws. So the variant moved the hang [V]; it did not cure it |
+
+**Correction [V]: the rows above that name a FAR read too much.** All these hangs have `FSR 00000400`: FSR.FORMAT, no fault bit, `gfsr 0`, `CP_HW_FAULT 0`. There was no bad read: FAR is a stale value. The GPU stays busy: `RBBM_STATUS 00e714e5` = SP, HLSQ, UCHE, VPC, PC_DCALL, LRZ, RB, RAS, TSE, CP busy; TPL1, VBIF, CCU, VFD idle. (`00e594e5` at 10:44: VFD busy, UCHE idle.) The line register and the prefetch register were real fixes and not the cause.
+
+| 12:55 | The picture causes below fixed, recorder off | **All four steps `ok`: unlock 56.0 fps, Home swipe 21.0, Control Center 19.2, Settings 33.2. Control Center 0.03 % off against the default stack (battery percent), Home 0.34 %** |
+| 13:01, 13:29 | The same, recorder off | Hang: fence 34266, 15533 |
+| 13:04 to 13:24 | The same, recorder on, 4 rounds | No hang |
+| 13:42 | `RB_DONE_TS` after each draw, recorder off | Hang: fence 8007, 30 s after the start. The event alone is not what the recorder gives |
+
+**Picture causes, all [V]:** see docs/notes.md "native stack, wrong pictures and their causes".
+
+**The hang, state at 14:20.** Not solved. [V] Recorder on after the private-memory split and the target flush: 0 hangs in 9 rounds. Recorder off: 3 hangs in 4 starts (one of them with the per-draw event). [V] With the recorder on, the one named stuck draw (11:47) was `gen+cpf`, id 1635, with bindings like draws that ended. The generic program has 30 loops and private memory. [I] What the recorder changes: CPU time per draw (fewer submissions in flight), a thread, reads of uniform buffers, and until 14:11 the value of UCHE_CLIENT_PF. Next: the lite recorder (name and id only).
+
+The recorder now names the draw: each draw has an id, the stream writes it at `RB_DONE_TS` (no wait), a thread keeps the last id in the ring's head, `flight-read.py FILE --stuck` prints the first unfinished draw.
+
+Cold pipeline compile [V `pipelines.log`]: 100 to 560 ms per CA pipeline, 17.9 s for the generic one. With the disk cache: no compile.
+
+What the stack refuses now, each with a line: argument buffers, indirect draws, visibility results, a draw's descriptor tables, root tables and address holes, a pass before a draw, planar YUV taken whole, formats outside the table, a copy of a Depth32Float_Stencil8 texture.
