@@ -15,7 +15,7 @@ if not os.path.exists(kernel):
 syms = []
 for row in subprocess.run(["llvm-nm", "--defined-only", "-n", kernel], capture_output=True, text=True).stdout.splitlines():
     f = row.split()
-    if len(f) == 3 and f[1] in "tT":
+    if len(f) == 3 and f[1] in "tTsS":  # Mach-O: code in __TEXT_EXEC reads as a section symbol
         syms.append((int(f[0], 16), f[2]))
 keys = [a for a, _ in syms]
 slide = next((int(x.split()[1], 16) for x in lines if x.startswith("L ")), 0)

@@ -36,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
@@ -626,7 +627,7 @@ cmd_sample(int pid, int seconds, int hz, const char *mode)
 		mach_msg_type_number_t count;
 		if (task_threads(task, &threads, &count) != KERN_SUCCESS)
 			break;
-		printf("T %llu\n", mach_absolute_time() / 24000);
+		printf("T %llu %ld\n", mach_absolute_time() / 24000, (long)time(NULL));
 		for (mach_msg_type_number_t t = 0; t < count; t++) {
 			struct thread_basic_info basic;
 			mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
@@ -674,11 +675,11 @@ extern int stackshot_config_dealloc(void *);
 extern int kas_info(int, void *, size_t *);
 
 static int
-cmd_kstack(int pid)
+cmd_kstack(int pid, bool raw)
 {
-	enum { KCDATA_FORMAT = 0x10000, TRYLOCK = 0x100000, NO_IO_STATS = 0x800000, WAITINFO = 0x1000000 };
+	enum { KCDATA_FORMAT = 0x10000, NO_IO_STATS = 0x800000, WAITINFO = 0x1000000 }; /* no TRYLOCK: EPERM from user space */
 	void *config = stackshot_config_create();
-	if (!config || stackshot_config_set_pid(config, pid) != 0 || stackshot_config_set_flags(config, KCDATA_FORMAT | TRYLOCK | NO_IO_STATS | WAITINFO) != 0) {
+	if (!config || stackshot_config_set_pid(config, pid) != 0 || stackshot_config_set_flags(config, KCDATA_FORMAT | NO_IO_STATS | WAITINFO) != 0) {
 		fprintf(stderr, "kstack: no config\n");
 		return 1;
 	}
@@ -689,10 +690,15 @@ cmd_kstack(int pid)
 	}
 	uint64_t slide = 0;
 	size_t slide_size = sizeof(slide);
-	if (kas_info(0, &slide, &slide_size) == 0)
+	if (!raw && kas_info(0, &slide, &slide_size) == 0)
 		printf("L %llx\n", slide);
 	const uint8_t *at = stackshot_config_get_stackshot_buffer(config);
 	const uint8_t *end = at + stackshot_config_get_stackshot_size(config);
+	if (raw) {
+		fwrite(at, 1, (size_t)(end - at), stdout);
+		fflush(stdout);
+		return 0;
+	}
 	uint64_t thread = 0, sys = 0, user = 0;
 	while (at + 16 <= end) {
 		uint32_t type = *(const uint32_t *)at, size = *(const uint32_t *)(at + 4);
@@ -834,7 +840,7 @@ main(int argc, char **argv)
 	if (strcmp(argv[1], "cores") == 0 && argc >= 4)
 		return cmd_cores(num(argv[2], "SECONDS"), argc - 3, argv + 3);
 	if (strcmp(argv[1], "kstack") == 0 && argc >= 3)
-		return cmd_kstack(num(argv[2], "PID"));
+		return cmd_kstack(num(argv[2], "PID"), argc > 3 && strcmp(argv[3], "raw") == 0);
 	if (strcmp(argv[1], "sample") == 0 && argc >= 5)
 		return cmd_sample(num(argv[2], "PID"), num(argv[3], "SECONDS"), num(argv[4], "HZ"), argc > 5 ? argv[5] : NULL);
 	if (strcmp(c, "settle") == 0 && argc >= 4)
