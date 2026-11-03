@@ -118,6 +118,8 @@ void nmn_cmd_push(struct nw_cs *, unsigned stage, uint32_t first_vec4, const voi
 void nmn_cmd_vertex_buffers(struct nw_cs *, const uint64_t *iova, const uint32_t *size, const uint32_t *stride, uint32_t count);
 void nmn_cmd_draw(struct nw_cs *, uint32_t primitive /* Metal's raw value */, uint32_t vertex_count, uint32_t instances, uint32_t first_vertex, uint32_t first_instance);
 void nmn_cmd_draw_indexed(struct nw_cs *, uint32_t primitive, uint32_t index_count, uint32_t instances, uint64_t index_iova, uint32_t index_bytes_max, bool wide, int32_t base_vertex, uint32_t first_instance);
+/* A draw whose arguments the GPU reads from a buffer: tu_CmdDrawIndirect, tu_CmdDrawIndexedIndirect, one draw. index_iova 0: not indexed. */
+void nmn_cmd_draw_indirect(struct nw_cs *, uint32_t primitive, uint64_t arguments_iova, uint64_t index_iova, uint32_t index_bytes_max, bool wide);
 void nmn_cmd_dispatch(struct nw_cs *, const struct nmn_baked *, const uint32_t groups[3], const uint32_t local[3]);
 
 /* A barrier between passes in sysmem: what was written reaches memory, what was cached is dropped. */

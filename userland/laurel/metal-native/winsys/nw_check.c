@@ -285,6 +285,22 @@ bool nw_stream_check_with(struct nw_device *d, struct nw_check_state *st, const 
 					return refuse(why, why_size, at, "CP_DRAW_INDX_OFFSET with %u dwords", n);
 				}
 				break;
+			case CP_DRAW_INDIRECT_MULTI: {
+				if (!check_targets(d, st, at, why, why_size))
+					return false;
+				if (n != 6 && n != 9)
+					return refuse(why, why_size, at, "CP_DRAW_INDIRECT_MULTI with %u dwords has no rule", n);
+				const uint64_t args = n == 6 ? (p[3] | ((uint64_t)p[4] << 32)) : (p[6] | ((uint64_t)p[7] << 32));
+				const uint32_t stride = n == 6 ? p[5] : p[8];
+				if (args == 0 || !range_fits(d, args, stride))
+					return refuse(why, why_size, at, "draw arguments at %#" PRIx64 ": no live buffer holds %u bytes", args, stride);
+				if (n == 9) {
+					const uint64_t index = p[3] | ((uint64_t)p[4] << 32);
+					if (index == 0 || !address_ok(d, index, 2))
+						return refuse(why, why_size, at, "index buffer at %#" PRIx64 ": no live buffer holds it", index);
+				}
+				break;
+			}
 			case CP_EXEC_CS:
 				if (n != 4)
 					return refuse(why, why_size, at, "CP_EXEC_CS with %u dwords", n);

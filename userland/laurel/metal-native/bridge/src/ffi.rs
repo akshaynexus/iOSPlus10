@@ -363,6 +363,7 @@ unsafe extern "C" {
     pub fn nmn_cmd_descriptor_sets(cs: *mut NwCs, set: *const u64, count: u32, graphics: bool);
     pub fn nmn_cmd_push(cs: *mut NwCs, stage: u32, first_vec4: u32, data: *const c_void, vec4s: u32);
     pub fn nmn_cmd_vertex_buffers(cs: *mut NwCs, iova: *const u64, size: *const u32, stride: *const u32, count: u32);
+    pub fn nmn_cmd_draw_indirect(cs: *mut NwCs, prim: u32, arguments: u64, index_iova: u64, index_max: u32, wide: bool);
     pub fn nmn_cmd_draw(cs: *mut NwCs, prim: u32, count: u32, instances: u32, first: u32, first_instance: u32);
     pub fn nmn_cmd_draw_indexed(cs: *mut NwCs, prim: u32, count: u32, instances: u32, index: u64, index_max: u32, wide: bool, base: i32, first_instance: u32);
     pub fn nmn_cmd_dispatch(cs: *mut NwCs, b: *const NmnBaked, groups: *const u32, local: *const u32);

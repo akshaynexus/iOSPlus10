@@ -10,7 +10,7 @@ import sys
 
 RD_CMD, RD_GPUADDR, RD_CMDSTREAM_ADDR, RD_BUFFER_CONTENTS = 2, 3, 6, 12  # freedreno/common/redump.h
 TS_EVENTS = {4: "CACHE_FLUSH_TS", 8: "WT_DONE_TS", 22: "RB_DONE_TS", 26: "PC_CCU_RESOLVE_TS", 28: "PC_CCU_FLUSH_DEPTH_TS", 29: "PC_CCU_FLUSH_COLOR_TS"}
-OPS = {16: "NOP", 18: "WAIT_MEM_WRITES", 19: "WAIT_FOR_ME", 29: "SKIP_IB2_ENABLE_GLOBAL", 38: "WAIT_FOR_IDLE", 44: "BLIT", 50: "LOAD_STATE6_GEOM", 51: "EXEC_CS", 52: "LOAD_STATE6_FRAG", 56: "DRAW_INDX_OFFSET", 63: "INDIRECT_BUFFER", 67: "SET_DRAW_STATE", 70: "EVENT_WRITE", 99: "SET_MODE", 100: "SET_VISIBILITY_OVERRIDE", 101: "SET_MARKER", 109: "REG_WRITE"}
+OPS = {42: "DRAW_INDIRECT_MULTI", 16: "NOP", 18: "WAIT_MEM_WRITES", 19: "WAIT_FOR_ME", 29: "SKIP_IB2_ENABLE_GLOBAL", 38: "WAIT_FOR_IDLE", 44: "BLIT", 50: "LOAD_STATE6_GEOM", 51: "EXEC_CS", 52: "LOAD_STATE6_FRAG", 56: "DRAW_INDX_OFFSET", 63: "INDIRECT_BUFFER", 67: "SET_DRAW_STATE", 70: "EVENT_WRITE", 99: "SET_MODE", 100: "SET_VISIBILITY_OVERRIDE", 101: "SET_MARKER", 109: "REG_WRITE"}
 
 
 def odd(v):
@@ -173,6 +173,11 @@ class Walk:
                     self.check_blit(at)
                 elif op == 0x38:
                     self.check_targets(at)
+                elif op == 0x2a and c in (6, 9):
+                    self.check_targets(at)
+                    args, stride = ((p[3] | (p[4] << 32)), p[5]) if c == 6 else ((p[6] | (p[7] << 32)), p[8])
+                    if self.find(args, stride) is None:
+                        self.err(at, f"draw arguments at {args:#x}: no buffer holds {stride} bytes")
                 elif op == 0x65 and c == 1 and (p[0] & 0xf) == 1:
                     # a new pass: RM6_DIRECT_RENDER
                     for i2 in range(8):

@@ -1280,7 +1280,7 @@ pub(crate) fn write_descriptors(e: &mut NmbEncoder, cb: &mut NmbCommandBuffer, d
 }
 
 /// One draw: the plan decides, this writes it.
-fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, u64, bool, i32)>, primitive: u32, counts: (u32, u32, u32, u32)) -> Result<(), String> {
+fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, u64, bool, i32)>, arguments: Option<(Arc<BufferObj>, u64)>, primitive: u32, counts: (u32, u32, u32, u32)) -> Result<(), String> {
     let pipeline_ptr = e.pipeline.ok_or("a draw with no pipeline")?;
     let device_pipeline = unsafe { pipeline_ptr.as_ref() }.ok_or("the pipeline")?;
     let state = build_state(e)?;
@@ -1292,6 +1292,9 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
     }
     if !commands.root_tables.is_empty() || !commands.push_holes.is_empty() {
         return Err(format!("this draw needs {} root tables and {} address holes in its constants, which have no native path yet", commands.root_tables.len(), commands.push_holes.len()));
+    }
+    if commands.indirect_needs_arguments {
+        return Err("this indirect draw needs its arguments in the planner's hands, which has no native path yet".into());
     }
     if !commands.amplifications.is_empty() || commands.mesh_dispatch.is_some() || commands.tessellation_dispatch.is_some() || commands.mesh_arguments.is_some() || commands.object_fold.is_some() || commands.index_bounds_pass || commands.index_overrun.is_some() {
         return Err("this draw needs a pass before it (amplification, mesh, tessellation, an index check), which has no native path yet".into());
@@ -1393,6 +1396,25 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
         }
         nmn_cmd_vertex_buffers(cs, iova.as_ptr(), size.as_ptr(), stride.as_ptr(), iova.len() as u32);
         let (count, instances, first, first_instance) = counts;
+        if let Some((a, at)) = &arguments {
+            let (index_iova, max, wide) = match &index {
+                Some((b, offset, wide, _)) => (b.backing.iova() + offset, ((b.length - offset) / if *wide { 4 } else { 2 }) as u32, *wide),
+                None => (0, 0, false),
+            };
+            if a.backing.must_name() {
+                cb.names.push(a.backing.bo() as usize);
+            }
+            nmn_cmd_draw_indirect(cs, primitive, a.backing.iova() + at, index_iova, max, wide);
+            cb.held_buffers.push(a.clone());
+            if let Some((b, ..)) = index {
+                if b.backing.must_name() {
+                    cb.names.push(b.backing.bo() as usize);
+                }
+                cb.held_buffers.push(b);
+            }
+            e.attachment_written |= entry.outputs;
+            return Ok(());
+        }
         match index {
             Some((b, offset, wide, base)) => {
                 if b.backing.must_name() {
@@ -1561,7 +1583,7 @@ pub extern "C" fn nmb_render_draw(e: *mut NmbEncoder, primitive: u64, start: u32
         let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
         let draw = DrawCall::Primitives { vertex_start: start, vertex_count: count, instance_count: instances, base_instance };
         let _ = PrimitiveType::try_from(primitive as u32).map_err(|_| "primitive type")?;
-        emit_draw(e, draw, None, primitive as u32, (count, instances, start, base_instance))?;
+        emit_draw(e, draw, None, None, primitive as u32, (count, instances, start, base_instance))?;
         Ok(true)
     })
 }
@@ -1574,7 +1596,31 @@ pub extern "C" fn nmb_render_draw_indexed(e: *mut NmbEncoder, primitive: u64, co
         let wide = index_type == 1;
         let it = if wide { vk::IndexType::UINT32 } else { vk::IndexType::UINT16 };
         let draw = DrawCall::Indexed { index_count: count, index_type: it, index_buffer: metal2vulkan::bind::IndexBufferRef::new(0, b.length), index_offset: offset, instance_count: instances, base_vertex, base_instance };
-        emit_draw(e, draw, Some((b, offset, wide, base_vertex)), primitive as u32, (count, instances, 0, base_instance))?;
+        emit_draw(e, draw, Some((b, offset, wide, base_vertex)), None, primitive as u32, (count, instances, 0, base_instance))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_draw_indirect(e: *mut NmbEncoder, primitive: u64, b: *mut NmbBuffer, offset: u64) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        let a = get(b)?.b.clone();
+        let draw = DrawCall::Indirect { indirect: metal2vulkan::bind::IndirectRef::new(0, offset), indexed: None };
+        emit_draw(e, draw, None, Some((a, offset)), primitive as u32, (0, 0, 0, 0))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_draw_indexed_indirect(e: *mut NmbEncoder, primitive: u64, index_type: u64, indices: *mut NmbBuffer, index_offset: u64, b: *mut NmbBuffer, offset: u64) -> bool {
+    guard(false, || {
+        let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
+        let (i, a) = (get(indices)?.b.clone(), get(b)?.b.clone());
+        let wide = index_type == 1;
+        let it = if wide { vk::IndexType::UINT32 } else { vk::IndexType::UINT16 };
+        let draw = DrawCall::Indirect { indirect: metal2vulkan::bind::IndirectRef::new(0, offset), indexed: Some((it, metal2vulkan::bind::IndexBufferRef::new(0, i.length), index_offset)) };
+        emit_draw(e, draw, Some((i, index_offset, wide, 0)), Some((a, offset)), primitive as u32, (0, 0, 0, 0))?;
         Ok(true)
     })
 }

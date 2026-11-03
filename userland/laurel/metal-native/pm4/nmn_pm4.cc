@@ -1541,6 +1541,34 @@ void nmn_cmd_draw_indexed(struct nw_cs *cs, uint32_t primitive, uint32_t index_c
 	nw_cs_emit(cs, index_max);
 }
 
+void nmn_cmd_draw_indirect(struct nw_cs *cs, uint32_t primitive, uint64_t arguments, uint64_t index_iova, uint32_t index_max, bool wide)
+{
+	const bool strip = primitive == 2 || primitive == 4;
+	/* draw_wfm: CP_DRAW_INDIRECT_MULTI does not wait for the writes before it on some of this family (indirect_draw_wfm_quirk). The arguments may come from a GPU write */
+	pkt7(cs, CP_WAIT_FOR_ME, 0);
+	REGS(cs, A6XX_VFD_INDEX_OFFSET(0), A6XX_VFD_INSTANCE_START_OFFSET(0));
+	if (index_iova != 0) {
+		REGS(cs, A6XX_PC_PRIMITIVE_CNTL_0(.primitive_restart = strip));
+		emit_reg(cs, REG_A6XX_PC_RESTART_INDEX, wide ? 0xffffffffu : 0xffffu);
+		pkt7(cs, CP_DRAW_INDIRECT_MULTI, 9);
+		nw_cs_emit(cs, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(primtype(primitive)) | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_DMA) | CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(wide ? INDEX4_SIZE_32_BIT : INDEX4_SIZE_16_BIT) | CP_DRAW_INDX_OFFSET_0_VIS_CULL(USE_VISIBILITY));
+		nw_cs_emit(cs, A6XX_CP_DRAW_INDIRECT_MULTI_1_OPCODE(INDIRECT_OP_INDEXED) | A6XX_CP_DRAW_INDIRECT_MULTI_1_DST_OFF(0));
+		nw_cs_emit(cs, 1);
+		nw_cs_emit_qw(cs, index_iova);
+		nw_cs_emit(cs, index_max);
+		nw_cs_emit_qw(cs, arguments);
+		nw_cs_emit(cs, 20);     /* MTLDrawIndexedPrimitivesIndirectArguments */
+	} else {
+		REGS(cs, A6XX_PC_PRIMITIVE_CNTL_0(.primitive_restart = false));
+		pkt7(cs, CP_DRAW_INDIRECT_MULTI, 6);
+		nw_cs_emit(cs, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(primtype(primitive)) | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) | CP_DRAW_INDX_OFFSET_0_VIS_CULL(USE_VISIBILITY) | CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(INDEX4_SIZE_32_BIT));
+		nw_cs_emit(cs, A6XX_CP_DRAW_INDIRECT_MULTI_1_OPCODE(INDIRECT_OP_NORMAL) | A6XX_CP_DRAW_INDIRECT_MULTI_1_DST_OFF(0));
+		nw_cs_emit(cs, 1);
+		nw_cs_emit_qw(cs, arguments);
+		nw_cs_emit(cs, 16);     /* MTLDrawPrimitivesIndirectArguments */
+	}
+}
+
 /* tu_dispatch. The caller has called the program and written its sets and constants: calling it here again would invalidate them. */
 void nmn_cmd_dispatch(struct nw_cs *cs, const struct nmn_baked *b, const uint32_t groups[3], const uint32_t local[3])
 {

@@ -853,10 +853,8 @@ refuse!(nmb_argument_encoder_set_sampler(e: *mut NmbArgumentEncoder, s: *mut Nmb
 refuse!(nmb_argument_encoder_set_compute_pipeline(e: *mut NmbArgumentEncoder, p: *mut NmbComputePipeline, i: u32) -> bool = false, NO_ARG);
 refuse!(nmb_argument_encoder_set_render_pipeline(e: *mut NmbArgumentEncoder, p: *mut NmbRenderPipeline, i: u32) -> bool = false, NO_ARG);
 refuse!(nmb_argument_encoder_constant_data(e: *mut NmbArgumentEncoder, i: u32) -> *mut c_void = std::ptr::null_mut(), NO_ARG);
-const NO_INDIRECT: &str = "indirect draws and dispatches have no native path yet";
+const NO_INDIRECT: &str = "indirect dispatches have no native path yet: the translator asks for a clamp pass over the group counts";
 refuse!(nmb_compute_dispatch_indirect(e: *mut NmbEncoder, b: *mut NmbBuffer, o: u64, p: *const u64) -> bool = false, NO_INDIRECT);
-refuse!(nmb_render_draw_indirect(e: *mut NmbEncoder, p: u64, b: *mut NmbBuffer, o: u64) -> bool = false, NO_INDIRECT);
-refuse!(nmb_render_draw_indexed_indirect(e: *mut NmbEncoder, p: u64, t: u64, i: *mut NmbBuffer, io: u64, b: *mut NmbBuffer, o: u64) -> bool = false, NO_INDIRECT);
 
 // Binary archives: this stack has no pipeline library to keep. The frontend treats an empty archive as "compile at first use".
 pub struct NmbBinaryArchive;
