@@ -43,24 +43,24 @@ say "on native; waiting $WAIT s"
 for _ in $(seq 1 $((WAIT / 5))); do
   sleep 5
   L=$(usblog)
-  if tail -n +"$FROM" "$L" | grep -qE 'watchdog: GPU hang|LAUREL METAL NATIVE: off|LAUREL PANIC: holding'; then say "stopped early: a hang, a fallback or a panic"; sleep 5; break; fi
+  if tail -n +"$FROM" "$L" | grep -aqE 'watchdog: GPU hang|LAUREL METAL NATIVE: off|LAUREL PANIC: holding'; then say "stopped early: a hang, a fallback or a panic"; sleep 5; break; fi
 done
 A=${AUTOTEST_DIR:-$REPO}
-if [ -n "$TEST" ] && ! tail -n +"$FROM" "$(usblog)" | grep -qE 'watchdog: GPU hang|LAUREL METAL NATIVE: off|LAUREL PANIC: holding'; then
+if [ -n "$TEST" ] && ! tail -n +"$FROM" "$(usblog)" | grep -aqE 'watchdog: GPU hang|LAUREL METAL NATIVE: off|LAUREL PANIC: holding'; then
   (cd "$A" && timeout 40 scripts/laurel/ios26-autotest.sh key power 2>&1 | tail -1; timeout 50 scripts/laurel/ios26-autotest.sh shot "round-$(basename "$D")-awake" 2>&1 | tail -1 | cut -c1-160; timeout 400 scripts/laurel/ios26-autotest.sh run --only "$TEST" 2>&1 | tail -14 | cut -c1-220)
   (cd "$A" && timeout 50 scripts/laurel/ios26-autotest.sh shot "round-$(basename "$D")-after" 2>&1 | tail -1 | cut -c1-160)
   cp "$A/logs/autotest-shots/round-$(basename "$D")-"*.png "$D/" 2>/dev/null
 fi
 L=$(usblog)
 tail -n +"$FROM" "$L" > "$D/usblog.txt"
-grep -E 'LAUREL METAL:|METAL NATIVE|METAL26: |stream check|GPU hang|SMMU gfsr|LAUREL GPU: off|CRASH (backboardd|SpringBoard)\[|LAUREL PANIC|Assertion failed|LAUREL FRAME: motion|native-metal: refused' "$D/usblog.txt" | cut -c1-260 | tail -40
-grep -E 'RedwoodGPU: [0-9]+ submissions' "$D/usblog.txt" | tail -3 | cut -c1-200
+grep -aE 'LAUREL METAL:|METAL NATIVE|METAL26: |stream check|GPU hang|SMMU gfsr|LAUREL GPU: off|CRASH (backboardd|SpringBoard)\[|LAUREL PANIC|Assertion failed|LAUREL FRAME: motion|native-metal: refused' "$D/usblog.txt" | cut -c1-260 | tail -40
+grep -aE 'RedwoodGPU: [0-9]+ submissions' "$D/usblog.txt" | tail -3 | cut -c1-200
 (cd "${AUTOTEST_DIR:-$REPO}" && timeout 50 scripts/laurel/ios26-autotest.sh shot "round-$(basename "$D")" 2>&1 | tail -1 | cut -c1-200)
 cp "${AUTOTEST_DIR:-$REPO}/logs/autotest-shots/round-$(basename "$D").png" "$D/screen.png" 2>/dev/null
 sh_phone 'grep -E "native-metal: (program|compute program)" /private/var/db/negronimetal/metal.log | tail -6; grep -E "this (draw|dispatch)|refused" /private/var/db/negronimetal/metal.log | tail -20; cat /private/var/db/negronimetal/stack/state' 2>/dev/null > "$D/metal-log.txt"
 tail -n 30 "$D/metal-log.txt" | cut -c1-230
 # the hang: each process's last finished draw and the draw after it. (FSR 00000400 in the SMMU line is FSR.FORMAT, no fault bit: FAR means nothing then.)
-H=$(grep -m1 'watchdog: GPU hang' "$D/usblog.txt" || true)
+H=$(grep -a -m1 'watchdog: GPU hang' "$D/usblog.txt" || true)
 if [ -n "$H" ]; then
   for p in backboardd SpringBoard; do sh_phone "cat /private/var/db/negronimetal/stack/flight-$p" > "$D/flight-$p" 2>/dev/null || true; done
   for p in backboardd SpringBoard; do
