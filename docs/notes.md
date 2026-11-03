@@ -5383,3 +5383,4 @@ Full text: `docs/laurel_sprout/ios26-control-center.md`.
 
 ## 2026-11-03: panic `kern_stackshot.c:933 Assertion failed: stackshot_active()`
 [V 07:25:51] Follows `LAUREL DEBUG ACK: on: stackshot given up: cpu 5`. xnu-12377 stackshots use helper CPUs, so the iOS 16 way of giving up is not safe on its own. post/9013: single-threaded by default; a late CPU does no stackshot work. [U] why CPU 5 is late over 100 ms; the panics follow memory kills.
+- [V] Kernel f24b7056ba has 2983: `op10tool input check` says `synth on`, `SWEET HID: touch 9 ... edge`. `kern.laurel_scan_surface` is 0 on the CPU renderer. A UI that works with no `LAUREL FRAME` line is the CPU renderer: read `LAUREL METAL26: off: Metal device refused`. A table from there measures nothing, so `run` stops first (exit 4).
