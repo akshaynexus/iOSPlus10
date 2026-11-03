@@ -39,8 +39,8 @@ export TU_MESON_ARGS="-Db_lto=true -Db_lto_mode=thin -Ddebug=true"
 export TU_WEAK_SELF=1
 export NMTL_CPU_FLAGS="$LAUREL_CPU_FLAGS"
 export CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="-C target-cpu=cortex-a53 -C target-feature=+fix-cortex-a53-835769"
-export CARGO_PROFILE_RELEASE_LTO=thin
-export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4
+export CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO:-thin}
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-4}
 # metal2vulkan shader cache (translated functions, pipelines, Turnip's VkPipelineCache data = ir3 binaries) caps, read at
 # cargo time by flame/0018: 32 MiB memo per process (default 256 MiB: every Metal process has its own device), 1 GiB on
 # disk per cache directory (default 25 GiB).

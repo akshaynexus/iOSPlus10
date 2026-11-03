@@ -611,6 +611,7 @@ cmd_sample(int pid, int seconds, int hz)
 		mach_msg_type_number_t count;
 		if (task_threads(task, &threads, &count) != KERN_SUCCESS)
 			break;
+		printf("T %llu\n", mach_absolute_time() / 24000);
 		for (mach_msg_type_number_t t = 0; t < count; t++) {
 			struct thread_basic_info basic;
 			mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;

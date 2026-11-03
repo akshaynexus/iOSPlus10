@@ -28,6 +28,8 @@ put() {
   say "this run: $2 = $1"
 }
 back() { phone "[ -f '$1.bench-saved' ] && mv -f '$1.bench-saved' '$1'; true"; }
+# A run that a reboot ended left its settings: they go first (we hold the lock, so no run is under way).
+phone "[ -f $DB/env.bench-saved ] && mv -f $DB/env.bench-saved $DB/env; for f in $B/libvulkan_freedreno.dylib $B/options/default/NegroniMetal; do [ -f \$f.bench-saved ] && mv -f \$f.bench-saved \$f; done; true" || { say "no SSH"; exit 2; }
 old_option=$(phone "cat $DB/option 2>/dev/null")
 phone "cp $DB/env $DB/env.bench-saved" || { say "no SSH"; exit 2; }
 restore() {
