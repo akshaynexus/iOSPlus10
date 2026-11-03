@@ -38,7 +38,7 @@ pub(crate) fn on() -> bool {
     ring().is_some()
 }
 
-/// `lite` in the file flight-on: for each draw only its name and id: the marks with almost no CPU time.
+/// `lite` in the file flight-on: only a name and an id for a draw whose program has no private memory: the marks with almost no CPU time.
 pub(crate) fn lite() -> bool {
     static LITE: OnceLock<bool> = OnceLock::new();
     *LITE.get_or_init(|| std::fs::read_to_string("/private/var/db/negronimetal/stack/flight-on").is_ok_and(|t| t.starts_with("lite")))
