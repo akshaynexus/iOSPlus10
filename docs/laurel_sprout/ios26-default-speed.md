@@ -68,6 +68,7 @@ Baseline `b2-base`, same test, same kernel. "Pass" is the mean of `gmem 720x1560
 - A bench with Metal off gives an empty table: read `gpu/sub`.
 - Do not edit a shell script that runs: bash reads it as it goes (`unexpected EOF` at the end of run s9). Write a new file and `mv` it over.
 - A first run after a boot measures the boot: s9 had 377 s busy of 480 (`chronod`, `dasd`, `iconservicesagent`), Gold 79 % mean. The bench now waits for 420 s of uptime (`SETTLE_UP_S`).
+- The lock is not for waiting: a bench looped on `uptime none` under the lock while the phone was in a panic hold, and the owner's flash waited behind it (18:50-18:59). Now `scripts/laurel/ios26-bench-round.sh` waits for SSH and uptime with no lock; under the lock the bench never waits for a phone; `uptime none` for over 60 s ends the round (exit 7), in the settle time and in the test too; a reboot by the bench ends the round (exit 8). A restore with no SSH costs one timeout.
 - A restore with no SSH left `option default` on the shared phone, and the old log said `restored`. The bench now keeps `option.bench-saved` on the phone, and says `NOT restored`.
 
 ## 6. Where the time is in a slow frame, and the CPU map

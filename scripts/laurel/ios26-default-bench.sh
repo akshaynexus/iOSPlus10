@@ -1,7 +1,7 @@
 #!/bin/bash
 # Mi A3 iOS 26: one measure of the default stack (metal2vulkan + Turnip) with the fixed UI test, under given settings. Docs: docs/laurel_sprout/ios26-default-speed.md.
 #   scripts/bg.sh bench-NAME scripts/laurel/ios26-default-bench.sh NAME [KEY=VALUE ...] [-- autotest run args]
-# Always under the lock: scripts/bg.sh bench-NAME scripts/laurel/phone-lock.sh m2v scripts/laurel/ios26-default-bench.sh NAME ...  (the native agent shares the phone).
+# Use scripts/laurel/ios26-bench-round.sh NAME ...: it waits for the phone with no lock, takes the lock for the run, and starts a new round when this script ends with 7 (the phone went away, or is too young) or 8 (this run rebooted it). This script itself never waits for a phone under the lock: `uptime none` for over 60 s ends the round (NONE_S).
 # TURNIP=FILE, PLUGIN=FILE (env): this run uses these files for Turnip and options/default; the phone's own go back at the end. KEY=VALUE lines go into /var/db/negronimetal/env for this run only. The steps: save option and env; set option default; new env; restart the UI; wait for it; run the test;
 # put back option and env (at any exit), and restart the UI so that the phone goes on with its own settings. NO_RESTORE=1: stays as it is, for a next run.
 # Table: logs/bench-NAME.txt. A run that did not run on stack default says so and fails: the native agent can take the phone in between.
@@ -19,6 +19,31 @@ phone() { "$SSHP" "$@"; }
 restart_ui() { phone 'sync; for w in $(ps -ax -o pid=,comm= | grep "/backboardd$"); do kill -9 "$w"; break; done'; }
 
 B=/System/Library/Extensions/NegroniMetal.bundle
+OP=$REPO/out/bin/op10tool; [ -x "$OP" ] || OP=$(git -C "$REPO" worktree list --porcelain | sed -n '1s/^worktree //p')/out/bin/op10tool
+uptime_s() { timeout 6 "$OP" ctl state 2>/dev/null | sed -n '1s/.*up=\([0-9]*\).*/\1/p'; }
+# watch_sleep N: sleeps N s; a phone with no uptime for over NONE_S s ends the round: a panic hold must not keep the lock.
+# kill_tree PID: the job and all under it.
+kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill -KILL "$1" 2>/dev/null; }
+# watched COMMAND...: runs it in the background and ends the round when the phone has no uptime for over NONE_S s: the test's own runner waits 120 s for each lost step, under the lock.
+watched() {
+  local job none=0 rc
+  "$@" & job=$!
+  while kill -0 "$job" 2>/dev/null; do
+    sleep 10
+    if [ -n "$(uptime_s)" ]; then none=0; else none=$((none + 10)); fi
+    if [ "$none" -gt "${NONE_S:-60}" ]; then kill_tree "$job"; say "uptime none for over ${NONE_S:-60} s in the test: the round ends"; exit 7; fi
+  done
+  wait "$job"; rc=$?
+  return "$rc"
+}
+watch_sleep() {
+  local left=$1 none=0
+  while [ "$left" -gt 0 ]; do
+    sleep 10; left=$((left - 10))
+    if [ -n "$(uptime_s)" ]; then none=0; else none=$((none + 10)); fi
+    if [ "$none" -gt "${NONE_S:-60}" ]; then say "uptime none for over ${NONE_S:-60} s: the round ends"; exit 7; fi
+  done
+}
 # FILE PATH: a new file, read back by hash, moved over PATH; the old one stays in PATH.bench-saved until restore()
 put() {
   local want; want=$(sha256sum "$1" | cut -d' ' -f1)
@@ -28,12 +53,17 @@ put() {
   say "this run: $2 = $1"
 }
 back() { phone "[ -f '$1.bench-saved' ] && mv -f '$1.bench-saved' '$1'; true"; }
+# Too young, or gone: no wait under the lock, the round script waits with no lock.
+up=$(uptime_s)
+[ "${up:-0}" -ge "${SETTLE_UP_S:-120}" ] || { say "uptime ${up:-none} s, under ${SETTLE_UP_S:-120}: the round ends"; trap - EXIT; exit 7; }
 # A run that a reboot ended left its settings: they go first (we hold the lock, so no run is under way).
 phone "[ -f $DB/option.bench-saved ] && mv -f $DB/option.bench-saved $DB/option; [ -f $DB/env.bench-saved ] && mv -f $DB/env.bench-saved $DB/env; for f in $B/libvulkan_freedreno.dylib $B/options/default/NegroniMetal; do [ -f \$f.bench-saved ] && mv -f \$f.bench-saved \$f; done; true" || { say "no SSH"; exit 2; }
 old_option=$(phone "cat $DB/option 2>/dev/null")
 phone "cp $DB/env $DB/env.bench-saved; cp $DB/option $DB/option.bench-saved" || { say "no SSH"; exit 2; }
 restore() {
   [ "${NO_RESTORE:-0}" = 1 ] && { say "stays: option default, env and files of this run"; return; }
+  # A phone that is gone costs one SSH timeout here, not one for each step: others wait for the lock. The copies stay on the phone; the next run puts them back first.
+  phone true >/dev/null 2>&1 || { say "NOT restored: no SSH: option, env and files stay until the next run"; return; }
   back "$B/libvulkan_freedreno.dylib"; back "$B/options/default/NegroniMetal"
   phone "tail -c +${meta_at:-1} $DB/metal.log; rm -f $DB/telemetry" > "$REPO/logs/bench-$name.metal.log" 2>/dev/null
   # With no SSH here, the copies stay on the phone, and the next run puts them back first.
@@ -49,36 +79,23 @@ main_log() { local m; m=$(git -C "$REPO" worktree list --porcelain | sed -n '1s/
 LOG=$(main_log)
 log_at() { wc -c < "$LOG"; }
 gpu_lost_since() { tail -c +"$1" "$LOG" | grep -aqE 'open refused: device: NoDevice|LAUREL GPU: off|Metal device refused'; }
-reboots=0
-say "env: $(phone "cat $DB/env.bench-saved | grep -v '^#' | tr '\n' ' '") + ${extra[*]:-nothing}"
-while :; do
-  at=$(log_at)
-  restart_ui
-  "$SSHP" wait 120 >/dev/null
-  say "UI restarted; waiting $SETTLE_S s"
-  sleep "$SETTLE_S"
-  gpu_lost_since "$at" || break
-  [ "$reboots" = 0 ] || { say "the GPU is off after a reboot too"; exit 5; }
-  reboots=1
-  say "the GPU is off (an earlier test): reboot"
+at=$(log_at)
+restart_ui
+"$SSHP" wait 60 >/dev/null || { say "no SSH 60 s after the UI restart: the round ends"; exit 7; }
+say "UI restarted; waiting $SETTLE_S s"
+watch_sleep "$SETTLE_S"
+if gpu_lost_since "$at"; then
+  # The round script comes back after the boot, with no lock held in between. The restore of this run goes first, then the reboot.
+  say "the GPU is off (an earlier test): reboot; the round ends"
+  restore; trap - EXIT
   "$SSHP" reboot -f || true
-  sleep 40
-  "$SSHP" wait 300 >/dev/null || { say "no SSH after the reboot"; exit 5; }
-  sleep 30
-done
-# The first minutes of a boot hold the start's load (chronod, dasd, iconservicesagent: 377 s busy of 480 at 2 min, run s9): a run there measures that load. SETTLE_UP_S=0: no wait.
-OP=$REPO/out/bin/op10tool; [ -x "$OP" ] || OP=$(git -C "$REPO" worktree list --porcelain | sed -n '1s/^worktree //p')/out/bin/op10tool
-while up=$("$OP" ctl state 2>/dev/null | sed -n '1s/.*up=\([0-9]*\).*/\1/p'); [ "${up:-0}" -lt "${SETTLE_UP_S:-420}" ]; do
-  say "uptime ${up:-none} s: waiting until ${SETTLE_UP_S:-420} s"
-  sleep 20
-  settle_tries=$((${settle_tries:-0} + 1))
-  [ "$settle_tries" -le 45 ] || { say "no settled phone in 900 s: last uptime ${up:-none}"; exit 6; }
-done
+  exit 8
+fi
 active=$(phone "head -c 100 $DB/stack/active 2>/dev/null")
 case "$active" in default*) ;; *) say "NOT stack default: $active"; exit 3 ;; esac
 # WARMUP=1: the test once before the measure: a new Turnip file means no pipeline cache, and pipelines compiled in the middle of a motion measure the compiler.
 if [ "${WARMUP:-1}" = 1 ]; then
-  "$REPO/scripts/laurel/ios26-autotest.sh" run "$@" > /dev/null 2>&1 || true
+  watched "$REPO/scripts/laurel/ios26-autotest.sh" run "$@" > /dev/null 2>&1 || true
   say "warm-up done"
 fi
 rc=0
@@ -96,7 +113,8 @@ if [ -n "${SAMPLE_S:-}" ]; then
   phone 'for w in $(ps -ax -o pid=,comm= | grep "/backboardd$"); do /usr/local/bin/laurel-autotest sample $w '"$SAMPLE_S"' '"${SAMPLE_HZ:-100}"' '"${SAMPLE_ALL:-}"'; break; done' > "$REPO/logs/bench-$name.samples" 2>/dev/null &
   phone 'for w in $(ps -ax -o pid=,comm= | grep "/SpringBoard$"); do /usr/local/bin/laurel-autotest sample $w '"$SAMPLE_S"' '"${SAMPLE_HZ:-100}"' '"${SAMPLE_SB:-${SAMPLE_ALL:-}}"'; break; done' > "$REPO/logs/bench-$name.sb.samples" 2>/dev/null &
 fi
-"$REPO/scripts/laurel/ios26-autotest.sh" run "$@" 2>&1 | tee "$t" || rc=$?
+watched "$REPO/scripts/laurel/ios26-autotest.sh" run "$@" > "$t" 2>&1 || rc=$?
+cat "$t"
 { echo "bench $name: env + ${extra[*]:-nothing}"; sed -n '/^Mi A3 iOS 26 UI test/,$p' "$t"; } > "$REPO/logs/bench-$name.txt"
 rm -f "$t"
 cpu1=$(cpu)
