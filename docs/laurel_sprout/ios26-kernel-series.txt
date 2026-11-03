@@ -354,4 +354,6 @@
 9008-laurel-vsync-refresh-period.patch                         post
 9009-laurel-backlight-retry.patch                              post
 9010-laurel-blastdoor-sandbox-check.patch                      post
+9011-laurel-arch-arm64e.patch                                  post
+9012-laurel-bt-legacy-le-scan.patch                            post
 == series: 228 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
