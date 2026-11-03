@@ -5410,3 +5410,10 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - `CA_ENABLE_MEMORYLESS=0` alone: 108 -> 36 tiles, pass 12 -> 3 ms [V].
 - `CASetDebugOption` is exported: the way to set the `CA_DISABLE_*` table after `init_debug` has read the environment.
 - m2v's notices have the exact reason for a shadow: `observe_message` in the bridge. Read them before you guess.
+
+## 2026-11-03: Mi A3 default stack: slow frames, CPU map (branch t3/default-stack-glass-60fps). Full: docs/laurel_sprout/ios26-default-speed.md section 6
+- [V] Logical CPU 0-3 are Gold, 4-7 Silver. `cl_busy` is the busiest single core: `silver busy 100 %` matches contextstored's 60.5 s a minute in time ([I] link). After that reboot: Gold 50-53 %, Silver 9-17 %.
+- [V] Home loop with no sampler (s10a): 15.6 fps; gaps 69 <20 ms, 65 <36, 40 <52, 247 longer. So the long gaps, not the 2-tick gaps, are the larger part. The all-threads sampler at 100 Hz is not the main effect. Thread that holds them: [U].
+- [V] Render thread in busy bins (s7, a mix): `draw_elements` 12 ms of 33, flat, no hot line.
+- Not run on the phone yet: `laurel-autotest kstack PID`, `sample ... only=N`. The phone has had no SSH since 13:46:59.
+- Bench: uptime gate 420 s; option copy on the phone. Do not edit a running shell script: `mv` a new file over it.
