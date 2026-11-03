@@ -1,0 +1,340 @@
+laurel (Mi A3, iOS 26): LAUREL GPU PASS: GPU time per kind of render pass and compute dispatch, from Turnip's own timestamps (u_trace, RB_DONE_TS), printed once per 5 s of work per process with at least 2 % GPU. u_trace gets one hook: a sink in place of a file (tu_gpu_pass.cc). Kill switch NEGRONIMETAL_GPU_PASS=0. [V phone] 2026-11-03: it showed that compute takes most of the GPU time. Docs: docs/laurel_sprout/ios26-default-speed.md.
+
+diff --git a/src/freedreno/vulkan/meson.build b/src/freedreno/vulkan/meson.build
+index e1620de..886e301 100644
+--- a/src/freedreno/vulkan/meson.build
++++ b/src/freedreno/vulkan/meson.build
+@@ -35,6 +35,7 @@ libtu_files = files(
+   'tu_dynamic_rendering.cc',
+   'tu_event.cc',
+   'tu_formats.cc',
++  'tu_gpu_pass.cc',
+   'tu_image.cc',
+   'tu_knl.cc',
+   'tu_lrz.cc',
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 3320230..2c22453 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -46,6 +46,7 @@
+ #include "tu_query_pool.h"
+ #include "tu_rmv.h"
+ #include "tu_tracepoints.h"
++#include "tu_gpu_pass.h"
+ #include "tu_wsi.h"
+ 
+ #if DETECT_OS_ANDROID
+@@ -2810,6 +2811,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+        physical_device->instance->disable_d24s8_border_color_workaround);
+    device->use_lrz = !TU_DEBUG_ENV(NOLRZ);
+ 
++   tu_gpu_pass_init(); /* laurel: before the first look at MESA_GPU_TRACES */
+    tu_gpu_tracepoint_config_variable();
+ 
+    device->submit_count = 0;
+diff --git a/src/freedreno/vulkan/tu_gpu_pass.cc b/src/freedreno/vulkan/tu_gpu_pass.cc
+new file mode 100644
+index 0000000..98faacc
+--- /dev/null
++++ b/src/freedreno/vulkan/tu_gpu_pass.cc
+@@ -0,0 +1,253 @@
++/* laurel (Mi A3, iOS 26): LAUREL GPU PASS: what the GPU did, per kind of render pass, once every 5 s of work, from Turnip's own timestamps (u_trace, RB_DONE_TS, 19.2 MHz).
++ * Kill switch NEGRONIMETAL_GPU_PASS=0 in /var/db/negronimetal/env. The sink runs on Turnip's trace thread, one per device: no lock. Docs: docs/laurel_sprout/ios26-default-speed.md. */
++#include "tu_gpu_pass.h"
++
++#if defined(__APPLE__)
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "tu_tracepoints.h"
++#include "util/macros.h"
++#include "util/perf/u_trace.h"
++
++extern "C" void ngl_log(const char *fmt, ...);
++
++enum part { P_BIN, P_DRAW, P_LOAD, P_STORE, P_CLEAR, P_RESOLVE, P_COUNT };
++static const char *const part_names[P_COUNT] = { "bin", "draw", "load", "store", "clear", "resolve" };
++
++#define SLOTS 48
++#define SHOWN 8
++#define WINDOW_NS 5000000000ull
++
++struct slot {
++   bool used;
++   bool tiled;
++   uint16_t width, height, bins;
++   uint8_t attachments;
++   uint32_t passes;
++   uint64_t draws;
++   uint64_t ns;
++   uint64_t part_ns[P_COUNT];
++};
++
++#define COMPUTES 16
++struct compute_slot {
++   uint16_t lx, ly, gx, gy;
++   uint8_t indirect;
++   uint32_t count;
++   uint64_t ns;
++};
++
++static struct {
++   struct slot slots[SLOTS];
++   struct compute_slot compute[COMPUTES];
++   struct trace_start_compute cur_compute;
++   uint64_t window_start;
++   uint64_t last_ns;
++   uint64_t blit_ns, compute_ns, other_clear_ns, busy_ns;
++   uint32_t blits, computes, other_clears, passes;
++
++   /* the pass in progress */
++   bool in_pass;
++   uint64_t pass_start;
++   struct trace_start_render_pass pass;
++   uint64_t part_ns[P_COUNT];
++   uint64_t part_start[P_COUNT];
++   uint64_t out_start;
++   char process[32];
++} g;
++
++static int
++by_time(const void *a, const void *b)
++{
++   const struct slot *x = (const struct slot *)a, *y = (const struct slot *)b;
++   return x->ns < y->ns ? 1 : x->ns > y->ns ? -1 : 0;
++}
++
++static void
++window_end(uint64_t ns)
++{
++   /* a quiet process says nothing: under 2 % of the window */
++   if (g.busy_ns * 50 >= ns - g.window_start) {
++      ngl_log("LAUREL GPU PASS: on: %s: %" PRIu64 " ms: GPU %" PRIu64 " ms: %u passes, %u blits %" PRIu64 " ms, %u compute %" PRIu64 " ms, %u clears %" PRIu64 " ms",
++              g.process, (ns - g.window_start) / 1000000, g.busy_ns / 1000000, g.passes, g.blits, g.blit_ns / 1000000, g.computes, g.compute_ns / 1000000,
++              g.other_clears, g.other_clear_ns / 1000000);
++      for (int i = 0; i < COMPUTES && g.compute[i].count; i++) {
++         const struct compute_slot *c = &g.compute[i];
++         if (c->ns * 50 >= g.busy_ns)
++            ngl_log("LAUREL GPU PASS:   compute %ux%u, %ux%u groups%s x%u: %" PRIu64 " ms, %" PRIu64 " us each", c->lx, c->ly, c->gx, c->gy, c->indirect ? " indirect" : "", c->count,
++                    c->ns / 1000000, c->ns / 1000 / c->count);
++      }
++      qsort(g.slots, SLOTS, sizeof(g.slots[0]), by_time);
++      for (int i = 0; i < SHOWN && g.slots[i].used; i++) {
++         const struct slot *s = &g.slots[i];
++         char parts[128];
++         int n = 0;
++         parts[0] = 0;
++         for (int p = 0; p < P_COUNT; p++) {
++            if (s->part_ns[p] * 100 >= s->ns)
++               n += snprintf(parts + n, sizeof(parts) - n, " %s %" PRIu64, part_names[p], s->part_ns[p] / 1000 / s->passes);
++         }
++         ngl_log("LAUREL GPU PASS:   %s %ux%u %u att %u tiles x%u: %" PRIu64 " ms, %" PRIu64 " us each, %" PRIu64 " draws each;%s",
++                 s->tiled ? "gmem" : "sysmem", s->width, s->height, s->attachments, s->tiled ? s->bins : 0, s->passes, s->ns / 1000000,
++                 s->ns / 1000 / s->passes, s->draws / s->passes, parts);
++      }
++   }
++   memset(g.slots, 0, sizeof(g.slots));
++   memset(g.compute, 0, sizeof(g.compute));
++   g.blit_ns = g.compute_ns = g.other_clear_ns = g.busy_ns = 0;
++   g.blits = g.computes = g.other_clears = g.passes = 0;
++   g.window_start = ns;
++}
++
++static void
++pass_end(const struct trace_end_render_pass *end, uint64_t ns)
++{
++   uint64_t took = ns - g.pass_start;
++   struct slot *s = NULL;
++   for (int i = 0; i < SLOTS; i++) {
++      struct slot *t = &g.slots[i];
++      if (!t->used) {
++         s = t;
++         s->used = true;
++         s->tiled = end->tiledRender;
++         s->width = g.pass.width;
++         s->height = g.pass.height;
++         s->bins = g.pass.numberOfBins;
++         s->attachments = g.pass.attachment_count;
++         break;
++      }
++      if (t->tiled == end->tiledRender && t->width == g.pass.width && t->height == g.pass.height && t->bins == g.pass.numberOfBins &&
++          t->attachments == g.pass.attachment_count) {
++         s = t;
++         break;
++      }
++   }
++   /* all kinds taken: the last slot takes the rest */
++   if (!s)
++      s = &g.slots[SLOTS - 1];
++   s->passes++;
++   s->draws += end->drawCount;
++   s->ns += took;
++   /* draw_ib holds the load, clear and store of its tile */
++   uint64_t inside = g.part_ns[P_LOAD] + g.part_ns[P_STORE] + g.part_ns[P_CLEAR];
++   if (end->tiledRender)
++      g.part_ns[P_DRAW] -= MIN2(inside, g.part_ns[P_DRAW]);
++   for (int p = 0; p < P_COUNT; p++)
++      s->part_ns[p] += g.part_ns[p];
++   g.passes++;
++   g.busy_ns += took;
++}
++
++static void
++sink(const char *name, uint64_t ns, const void *payload)
++{
++   if (!g.window_start)
++      g.window_start = ns;
++   else if (ns - g.window_start >= WINDOW_NS)
++      window_end(ns);
++   g.last_ns = ns;
++
++   bool start = name[0] == 's';
++   const char *what = name + (start ? 6 : 4); /* start_ end_ */
++   int part = -1;
++   if (!strcmp(what, "render_pass")) {
++      if (start) {
++         g.in_pass = true;
++         g.pass_start = ns;
++         g.pass = *(const struct trace_start_render_pass *)payload;
++         memset(g.part_ns, 0, sizeof(g.part_ns));
++         memset(g.part_start, 0, sizeof(g.part_start));
++      } else if (g.in_pass) {
++         g.in_pass = false;
++         pass_end((const struct trace_end_render_pass *)payload, ns);
++      }
++      return;
++   }
++   if (!strcmp(what, "binning_ib"))
++      part = P_BIN;
++   else if (!strcmp(what, "draw_ib_sysmem") || !strcmp(what, "draw_ib_gmem"))
++      part = P_DRAW;
++   else if (!strcmp(what, "gmem_load"))
++      part = P_LOAD;
++   else if (!strcmp(what, "gmem_store"))
++      part = P_STORE;
++   else if (!strcmp(what, "gmem_clear") || !strcmp(what, "sysmem_clear") || !strcmp(what, "sysmem_clear_all"))
++      part = P_CLEAR;
++   else if (!strcmp(what, "sysmem_resolve"))
++      part = P_RESOLVE;
++
++   if (g.in_pass && part >= 0) {
++      if (start)
++         g.part_start[part] = ns;
++      else if (g.part_start[part]) {
++         g.part_ns[part] += ns - g.part_start[part];
++         g.part_start[part] = 0;
++      }
++      return;
++   }
++   if (start) {
++      g.out_start = ns;
++      if (!strcmp(what, "compute"))
++         g.cur_compute = *(const struct trace_start_compute *)payload;
++      return;
++   }
++   if (!g.out_start)
++      return;
++   uint64_t took = ns - g.out_start;
++   g.out_start = 0;
++   if (!strcmp(what, "blit")) {
++      g.blits++;
++      g.blit_ns += took;
++   } else if (!strcmp(what, "compute") || !strcmp(what, "compute_indirect")) {
++      g.computes++;
++      g.compute_ns += took;
++      if (!strcmp(what, "compute")) {
++         const struct trace_start_compute *c = &g.cur_compute;
++         for (int i = 0; i < COMPUTES; i++) {
++            struct compute_slot *t = &g.compute[i];
++            if (!t->count) {
++               t->lx = c->local_size_x;
++               t->ly = c->local_size_y;
++               t->gx = c->num_groups_x;
++               t->gy = c->num_groups_y;
++               t->indirect = c->indirect;
++            } else if (t->lx != c->local_size_x || t->ly != c->local_size_y || t->gx != c->num_groups_x || t->gy != c->num_groups_y || t->indirect != c->indirect) {
++               continue;
++            }
++            t->count++;
++            t->ns += took;
++            break;
++         }
++      }
++   } else if (!strcmp(what, "generic_clear")) {
++      g.other_clears++;
++      g.other_clear_ns += took;
++   } else {
++      return;
++   }
++   g.busy_ns += took;
++}
++
++extern "C" void (*u_trace_event_sink)(const char *name, uint64_t ns, const void *payload);
++
++void
++tu_gpu_pass_init(void)
++{
++   const char *off = getenv("NEGRONIMETAL_GPU_PASS");
++   if (off && off[0] == '0')
++      return;
++   snprintf(g.process, sizeof(g.process), "%s", getprogname());
++   setenv("MESA_GPU_TRACES", "print", 0);
++   u_trace_event_sink = sink;
++   ngl_log("LAUREL GPU PASS: on: %s: GPU time per kind of render pass from Turnip's timestamps, one block in each 5 s of work (kill switch NEGRONIMETAL_GPU_PASS=0)", g.process);
++}
++#else
++void
++tu_gpu_pass_init(void)
++{
++}
++#endif
+diff --git a/src/freedreno/vulkan/tu_gpu_pass.h b/src/freedreno/vulkan/tu_gpu_pass.h
+new file mode 100644
+index 0000000..8974f28
+--- /dev/null
++++ b/src/freedreno/vulkan/tu_gpu_pass.h
+@@ -0,0 +1,5 @@
++/* laurel: LAUREL GPU PASS, tu_gpu_pass.cc */
++#ifndef TU_GPU_PASS_H
++#define TU_GPU_PASS_H
++void tu_gpu_pass_init(void);
++#endif
+diff --git a/src/util/perf/u_trace.c b/src/util/perf/u_trace.c
+index de1e0c3..55aacc3 100644
+--- a/src/util/perf/u_trace.c
++++ b/src/util/perf/u_trace.c
+@@ -69,6 +69,9 @@ struct u_trace_event {
+    const void *payload;
+ };
+ 
++/* laurel: a consumer of the events in place of a file (tu_gpu_pass.cc) */
++void (*u_trace_event_sink)(const char *name, uint64_t ns, const void *payload);
++
+ /**
+  * A "chunk" of trace-events and corresponding timestamp buffer.  As
+  * trace events are emitted, additional trace chucks will be allocated
+@@ -542,7 +545,10 @@ u_trace_context_init(struct u_trace_context *utctx,
+ 
+    list_inithead(&utctx->flushed_trace_chunks);
+ 
+-   if (utctx->enabled_traces & U_TRACE_TYPE_PRINT) {
++   if (u_trace_event_sink) {
++      utctx->out = NULL;
++      utctx->out_printer = NULL;
++   } else if (utctx->enabled_traces & U_TRACE_TYPE_PRINT) {
+       utctx->out = u_trace_state.trace_file;
+ 
+       if (utctx->enabled_traces & U_TRACE_TYPE_JSON) {
+@@ -709,6 +715,9 @@ process_chunk(void *job, void *gdata, int thread_index)
+          }
+       }
+ 
++      if (u_trace_event_sink && ns != U_TRACE_NO_TIMESTAMP)
++         u_trace_event_sink(evt->tp->name, ns, evt->payload);
++
+       if (utctx->out) {
+          utctx->out_printer->event(utctx, chunk, evt, ns, delta, indirect_data);
+       }

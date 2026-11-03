@@ -1,0 +1,18 @@
+# Settings at rest: a text check. scripts/laurel/ios26-default-bench.sh NAME -- --scenario scripts/laurel/ios26-settings-row.scenario. Verbs: ios26-autotest.scenario.
+step settings
+lock
+wake
+settle 700 8000
+edge bottom 800 300
+settle 2000 10000
+home
+settle 2000 10000
+open com.apple.Preferences
+settle 3000 30000 change
+swipe 360 300 360 1400 150
+settle 2000 10000
+swipe 360 300 360 1400 150
+settle 3000 10000
+shot top
+home
+settle 2000 15000

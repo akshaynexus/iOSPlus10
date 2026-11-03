@@ -1,0 +1,122 @@
+laurel (Mi A3, iOS 26): rasterization order only for a shader that really reads an attachment. metal2vulkan asks it of every pipeline of a device with rasterization-order access, because a pass cannot foresee which of its draws fetch: GMEM drew with FLUSH_PER_OVERLAP on every draw, and sysmem was never chosen. Now a writer needs no flush; a reader after a writer gets a barrier at its draw. Kill switch NEGRONIMETAL_READERS=0. Docs: docs/laurel_sprout/ios26-default-speed.md.
+
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 2474ad8..c34cac9 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -5841,6 +5841,15 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+    if (cmd->state.dirty & TU_CMD_DIRTY_FS)
+       tu_flush_dynamic_input_attachments(cmd);
+ 
++   /* laurel: a writer of this pass flushed no overlap (tu_orders_reads): a reader that follows it sees its writes through a barrier */
++   {
++      const struct tu_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
++      if (fs && fs->fs.reads_input_attachments && cmd->state.rp.drawcall_count > 1 && !cmd->state.rp_reader_is_current) {
++         cmd->state.renderpass_cache.flush_bits |= TU_CMD_FLAG_CCU_CLEAN_COLOR | TU_CMD_FLAG_CACHE_INVALIDATE | TU_CMD_FLAG_WAIT_FOR_IDLE;
++      }
++      cmd->state.rp_reader_is_current = fs && fs->fs.reads_input_attachments;
++   }
++
+    tu_emit_cache_flush_renderpass<CHIP>(cmd);
+ 
+   if (BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+index f8e606c..834120f 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -514,6 +514,7 @@ struct tu_cmd_state
+    bool stencil_front_write;
+    bool stencil_back_write;
+    bool pipeline_sysmem_single_prim_mode;
++   bool rp_reader_is_current; /* laurel: the last draw of this pass read an input attachment */
+    bool pipeline_has_tess;
+    bool pipeline_disable_gmem;
+    bool raster_order_attachment_access;
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index a9dc691..8f220b4 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -3346,6 +3346,21 @@ tu6_prim_mode_sysmem_size(struct tu_device *dev,
+    return 2;
+ }
+ 
++/* laurel: ordering is for a shader that reads the attachment. metal2vulkan asks it of every pipeline of a device with
++ * rasterization-order access, because a pass cannot foresee which of its draws fetch (framebuffer_fetch.rs), so every overlap
++ * flushed and every pass stayed in GMEM. A reader after a writer gets a barrier at its draw (tu_cmd_buffer.cc), so the writer
++ * needs no flush of its own. Kill switch: NEGRONIMETAL_READERS=0 in /var/db/negronimetal/env. */
++static bool
++tu_orders_reads(const struct tu_shader *fs)
++{
++   static int all = -1;
++   if (all < 0) {
++      const char *e = getenv("NEGRONIMETAL_READERS");
++      all = e && e[0] == '0';
++   }
++   return all || !fs || fs->fs.reads_input_attachments;
++}
++
+ template <chip CHIP>
+ static void
+ tu6_emit_prim_mode_sysmem(struct tu_cs *cs,
+@@ -3371,8 +3386,8 @@ tu6_emit_prim_mode_sysmem(struct tu_cs *cs,
+     * for advanced_blend in sysmem mode if a feedback loop is detected.
+     */
+    enum a6xx_single_prim_mode sysmem_prim_mode =
+-      (raster_order_attachment_access || feedback_loops ||
+-       fs->fs.dynamic_input_attachments_used) ?
++      (((raster_order_attachment_access || fs->fs.dynamic_input_attachments_used) && tu_orders_reads(fs)) ||
++       feedback_loops) ?
+       FLUSH_PER_OVERLAP_AND_OVERWRITE : NO_FLUSH;
+ 
+    if (sysmem_prim_mode == FLUSH_PER_OVERLAP_AND_OVERWRITE)
+@@ -3958,6 +3973,7 @@ tu_pipeline_builder_parse_rasterization_order(
+       pipeline->output.raster_order_attachment_access ||
+       pipeline->ds.raster_order_attachment_access ||
+       TU_DEBUG(RAST_ORDER);
++   raster_order_attachment_access &= tu_orders_reads(pipeline->shaders[MESA_SHADER_FRAGMENT]);
+ 
+    /* VK_EXT_blend_operation_advanced would also require ordered access
+     * when implemented in the future.
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 05322e2..736164e 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -2489,6 +2489,7 @@ tu_shader_create(struct tu_device *dev,
+    };
+    NIR_PASS_V(nir, nir_opt_access, &access_options);
+ 
++   bool reads_input_attachments = false; /* laurel: a pipeline that declares a read but has none needs no ordering */
+    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+       const nir_input_attachment_options att_options = {
+          .use_fragcoord_sysval = true,
+@@ -2506,7 +2507,7 @@ tu_shader_create(struct tu_device *dev,
+             ~(key->read_only_input_attachments >> 1) :
+             key->unscaled_input_fragcoord,
+       };
+-      NIR_PASS_V(nir, nir_lower_input_attachments, &att_options);
++      NIR_PASS(reads_input_attachments, nir, nir_lower_input_attachments, &att_options);
+    }
+ 
+    /* This has to happen before lower_input_attachments, because we have to
+@@ -2689,6 +2690,7 @@ tu_shader_create(struct tu_device *dev,
+       const struct ir3_shader_variant *fs = shader->variant;
+       shader->fs.per_samp = fs->per_samp || ir3_key->sample_shading;
+       shader->fs.has_fdm = key->fragment_density_map;
++      shader->fs.reads_input_attachments = reads_input_attachments;
+       if (fs->has_kill)
+          shader->fs.lrz.status |= TU_LRZ_FORCE_DISABLE_WRITE;
+       if (fs->no_earlyz || (fs->writes_pos && !fs->fs.early_fragment_tests))
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index ab1bade..1508ab4 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -94,6 +94,9 @@ struct tu_shader
+ 
+          uint16_t dynamic_input_attachments_used;
+ 
++         /* laurel: the compiled shader really reads an input attachment */
++         bool reads_input_attachments;
++
+          struct {
+             uint32_t status;
+             bool force_late_z;

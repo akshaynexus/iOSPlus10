@@ -1,0 +1,38 @@
+laurel (Mi A3, iOS 26): a linear image for a host allocation lies on the caller's rows (VkImageDrmFormatModifierExplicitCreateInfoEXT, read with this tiling too: metal2vulkan m2v-ios26/0002), or else on the tightest rows a 16x4 store allows, not on rows of 64 pixels. IOSurfaces of 720 pixels here have rows of 2880 and 3072 bytes [V phone: m2v's notices]. Docs: docs/laurel_sprout/ios26-default-speed.md.
+
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -757,6 +757,7 @@
+ {
+    uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+    const VkSubresourceLayout *plane_layouts = NULL;
++   VkSubresourceLayout host_plane = {};
+    VkResult result;
+ 
+    VK_FROM_HANDLE(tu_device, device, _device);
+@@ -824,6 +825,25 @@
+       modifier = eci.drmFormatModifier;
+    }
+ 
++   /* laurel (Mi A3, iOS 26): a linear image for a host allocation lies on rows it does not own: an IOSurface of 720 pixels has rows of 2880 bytes,
++    * and the layout's own 64 pixels gave 3072, so metal2vulkan kept a shadow of the surfaces. The caller's rows, or else rows as tight as a store of 16x4 blocks allows, as
++    * fdl6_layout takes an explicit layout. A row pitch that does not fit leaves metal2vulkan its shadow.
++    */
++   if (!plane_layouts && pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&
++       (image->vk.external_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) &&
++       image->vk.mip_levels == 1 && image->vk.array_layers == 1 && image->vk.extent.depth == 1 &&
++       vk_format_get_plane_count(image->vk.format) == 1) {
++      const uint32_t cpp = vk_format_get_blocksize(image->vk.format);
++      const uint32_t align_bytes = MAX2(64, 16 * cpp);
++      const uint32_t tight = align(DIV_ROUND_UP(image->vk.extent.width, vk_format_get_blockwidth(image->vk.format)) * cpp, align_bytes);
++      /* the caller's rows (metal2vulkan: m2v-ios26/0002), where a store of 16x4 blocks stays inside them */
++      const VkImageDrmFormatModifierExplicitCreateInfoEXT *rows =
++         vk_find_struct_const(pCreateInfo->pNext, IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
++      const uint64_t wanted = rows && rows->drmFormatModifierPlaneCount == 1 ? rows->pPlaneLayouts[0].rowPitch : 0;
++      host_plane.rowPitch = wanted >= tight && wanted % align_bytes == 0 ? wanted : tight;
++      plane_layouts = &host_plane;
++   }
++
+    result = tu_image_init(device, image, pCreateInfo);
+    if (result != VK_SUCCESS)
+       goto fail;

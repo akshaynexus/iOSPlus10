@@ -24,6 +24,10 @@
  * panel, so the surface that came into use last is the newest frame ("inferred" in the output).
  */
 #import <Foundation/Foundation.h>
+#include <mach/mach.h>
+#include <mach/mach_error.h>
+#include <mach-o/dyld_images.h>
+
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
@@ -556,6 +560,89 @@ num(const char *s, const char *what)
 	return (int)v;
 }
 
+/* laurel: where a process's running threads spend their time: for docs/laurel_sprout/ios26-default-speed.md. `sample PID SECONDS HZ` prints "I base path" per image, then "S thread pc lr frames...".
+ * Each sample stops one running thread for the time of its stack walk through frame pointers. */
+extern kern_return_t mach_vm_read_overwrite(vm_map_t, uint64_t, uint64_t, uint64_t, uint64_t *);
+extern kern_return_t task_for_pid(mach_port_t, int, mach_port_t *);
+
+static int
+read_task(task_t task, uint64_t at, void *to, uint64_t size)
+{
+	uint64_t got = 0;
+	return mach_vm_read_overwrite(task, at, size, (uint64_t)to, &got) == KERN_SUCCESS && got == size;
+}
+
+static void
+sample_images(task_t task)
+{
+	struct task_dyld_info info;
+	mach_msg_type_number_t n = TASK_DYLD_INFO_COUNT;
+	if (task_info(task, TASK_DYLD_INFO, (task_info_t)&info, &n) != KERN_SUCCESS)
+		return;
+	struct { uint32_t version, count; uint64_t array; } head;
+	if (!read_task(task, info.all_image_info_addr, &head, sizeof(head)))
+		return;
+	for (uint32_t i = 0; i < head.count; i++) {
+		struct { uint64_t base, path, date; } image;
+		char path[300] = "";
+		if (!read_task(task, head.array + i * sizeof(image), &image, sizeof(image)))
+			break;
+		for (uint32_t k = 0; k + 1 < sizeof(path); k++) {
+			if (!read_task(task, image.path + k, path + k, 1) || !path[k])
+				break;
+		}
+		printf("I %llx %s\n", image.base, path);
+	}
+}
+
+static int
+cmd_sample(int pid, int seconds, int hz)
+{
+	task_t task;
+	kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "sample: task_for_pid: %s\n", mach_error_string(kr));
+		return 1;
+	}
+	sample_images(task);
+	uint64_t ends = mach_absolute_time() + (uint64_t)seconds * 24000000;
+	while (mach_absolute_time() < ends) {
+		thread_act_array_t threads;
+		mach_msg_type_number_t count;
+		if (task_threads(task, &threads, &count) != KERN_SUCCESS)
+			break;
+		for (mach_msg_type_number_t t = 0; t < count; t++) {
+			struct thread_basic_info basic;
+			mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+			if (thread_info(threads[t], THREAD_BASIC_INFO, (thread_info_t)&basic, &n) == KERN_SUCCESS && basic.run_state == TH_STATE_RUNNING &&
+			    thread_suspend(threads[t]) == KERN_SUCCESS) {
+				arm_thread_state64_t state;
+				n = ARM_THREAD_STATE64_COUNT;
+				if (thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &n) == KERN_SUCCESS) {
+					printf("S %u %llx %llx", t, arm_thread_state64_get_pc(state), arm_thread_state64_get_lr(state));
+					uint64_t fp = arm_thread_state64_get_fp(state);
+					for (int d = 0; d < 48 && fp; d++) {
+						uint64_t frame[2];
+						if (!read_task(task, fp, frame, sizeof(frame)))
+							break;
+						printf(" %llx", frame[1] & 0xfffffffffULL);
+						if (frame[0] <= fp)
+							break;
+						fp = frame[0];
+					}
+					printf("\n");
+				}
+				thread_resume(threads[t]);
+			}
+			mach_port_deallocate(mach_task_self(), threads[t]);
+		}
+		vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(threads[0]));
+		usleep(1000000 / hz);
+	}
+	fflush(stdout);
+	return 0;
+}
+
 static int
 usage(void)
 {
@@ -598,6 +685,8 @@ main(int argc, char **argv)
 		return cmd_shot(argc > 2 ? (uint32_t)num(argv[2], "ID") : 0);
 	if (strcmp(c, "seq") == 0 && argc >= 3)
 		return cmd_seq(num(argv[2], "N"), argc > 3 ? num(argv[3], "MAX_MS") : 10000);
+	if (strcmp(argv[1], "sample") == 0 && argc >= 5)
+		return cmd_sample(num(argv[2], "PID"), num(argv[3], "SECONDS"), num(argv[4], "HZ"));
 	if (strcmp(c, "settle") == 0 && argc >= 4)
 		return cmd_settle(num(argv[2], "QUIET_MS"), num(argv[3], "MAX_MS"), argc > 4 && strcmp(argv[4], "change") == 0);
 	if (strcmp(c, "open") == 0 && argc == 3)

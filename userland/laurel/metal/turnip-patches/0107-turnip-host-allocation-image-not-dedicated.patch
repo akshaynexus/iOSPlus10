@@ -1,0 +1,15 @@
+laurel (Mi A3, iOS 26): an image for a host allocation needs no dedicated import: it is bound at an offset of the imported pages. With the old answer metal2vulkan made no image over a no-copy buffer's pages: every texture over an IOSurface was a shadow, with a copy in and a word-by-word merge per pass (m2v-ios26/0002). Docs: docs/laurel_sprout/ios26-default-speed.md.
+
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -1006,8 +1006,9 @@
+       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
+          VkMemoryDedicatedRequirements *req =
+             (VkMemoryDedicatedRequirements *) ext;
++         /* laurel: a host allocation is imported whole and bound at an offset: no dedicated import (metal2vulkan's texture in place over host pages) */
+          req->requiresDedicatedAllocation =
+-            image->vk.external_handle_types != 0;
++            (image->vk.external_handle_types & ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) != 0;
+          req->prefersDedicatedAllocation = req->requiresDedicatedAllocation;
+          break;
+       }
