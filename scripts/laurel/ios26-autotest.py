@@ -28,7 +28,7 @@ KERNEL_LINES = {
 MOTION = re.compile(r"LAUREL FRAME: motion ended: (\d+) frames in (\d+) ms")
 MOVING = re.compile(r"LAUREL FRAME: \d+ ticks .*moving: ([\d.]+) frames/s")
 SUBMIT_GPU = re.compile(r"LAUREL FRAME: after SwapEnd, (\d+) flips: .*?(\d+) us GPU fence")
-GPU_BUSY = re.compile(r"RedwoodGPU: \d+ submissions in \d+ ms: .*GPU busy ([\d.]+) %, clock (\d+) MHz")
+GPU_BUSY = re.compile(r"RedwoodGPU: (\d+) submissions in (\d+) ms: .*GPU busy ([\d.]+) %, clock (\d+) MHz")
 STACK = re.compile(r"(LAUREL METAL: on: stack .*|LAUREL METAL26: on: stack .*|LAUREL METAL NATIVE: off: .*|LAUREL METAL26: off: .*|LAUREL METAL: off: .*)")
 REFUSED = re.compile(r"native-metal: refused \(logged once per reason\): ([^:]+:[^:]+)|LAUREL METAL COUNT: .*refused .*")
 SEQ = re.compile(r"seq: (\d+) frames in (\d+) ms, (\d+) surfaces, (\d+) older, (\d+) black, (.*)")
@@ -46,6 +46,8 @@ class Step:
         self.moving = []
         self.fence_us = []
         self.busy = []
+        self.gpu_ms = 0.0
+        self.submissions = 0
         self.gpu = []
         self.flip = 0
         self.crashes = []
@@ -100,7 +102,9 @@ def read_lines(text, step):
             step.fence_us.append(int(m.group(2)))
         m = GPU_BUSY.search(line)
         if m:
-            step.busy.append((float(m.group(1)), int(m.group(2))))
+            step.busy.append((float(m.group(3)), int(m.group(4))))
+            step.gpu_ms += int(m.group(2)) * float(m.group(3)) / 100
+            step.submissions += int(m.group(1))
         for kind, rx in KERNEL_LINES.items():
             m = rx.search(line)
             if not m:
@@ -140,11 +144,12 @@ def step_row(s):
     fence = f"{sum(s.fence_us) / len(s.fence_us) / 1000:.0f} ms" if s.fence_us else "-"
     seq = f"{s.seq_frames}/{s.seq_ms} ms" if s.seq_frames else "-"
     busy = f"{max(b for b, _ in s.busy):.0f} %/{max(c for _, c in s.busy)}" if s.busy else "-"
+    per = f"{s.gpu_ms / s.submissions:.1f} ms" if s.submissions else "-"
     crash = ",".join(sorted(set(s.crashes)))[:28] or "-"
-    return [s.name, "ok" if s.ok else "FAIL", motion, moving, fence, busy, seq, str(s.older), str(s.black), str(s.flip), str(len(s.gpu)), str(len(s.panic)), crash]
+    return [s.name, "ok" if s.ok else "FAIL", motion, moving, fence, per, busy, seq, str(s.older), str(s.black), str(s.flip), str(len(s.gpu)), str(len(s.panic)), crash]
 
 
-HEADS = ["step", "result", "fps motion", "moving", "fence", "busy/MHz", "seq frames", "older", "black", "undrawn", "gpu", "panic", "crashes"]
+HEADS = ["step", "result", "fps motion", "moving", "fence", "gpu/sub", "busy/MHz", "seq frames", "older", "black", "undrawn", "gpu", "panic", "crashes"]
 
 
 def table(rows):
@@ -442,7 +447,7 @@ def main():
     lines = [f"Mi A3 iOS 26 UI test {date}", text.strip(), input_line, f"USB log: {log.path or 'none: no kernel lines in this table. make usblog'}", f"Files: {out}", ""]
     lines.append(table([step_row(s) for s in done]))
     lines.append("")
-    lines.append("fps motion: frames / time of all LAUREL FRAME: motion ended lines of the step (lowest-highest, count). moving: best frames/s while moving. fence: mean GPU fence wait of a flip. busy/MHz: the highest GPU busy share and clock of a RedwoodGPU window. "
+    lines.append("fps motion: frames / time of all LAUREL FRAME: motion ended lines of the step (lowest-highest, count). moving: best frames/s while moving. fence: mean GPU fence wait of a flip. gpu/sub: GPU busy time per submission in the step's RedwoodGPU windows. busy/MHz: the highest GPU busy share and clock of a RedwoodGPU window. "
                  "seq frames: frames seen in the sequence shots. older: frames equal to an older frame after a different one. black: mostly black frames. undrawn: flips that the kernel refused as not drawn.")
     lines.append("")
     lines.append("Stack selector (this boot):")
@@ -494,7 +499,7 @@ def self_test():
     assert s.motion == [(37, 967)] and s.moving == [13.1] and s.fence_us == [28131] and s.flip == 1 and len(s.gpu) == 1 and s.crashes == ["aonsensed"], vars(s)
     assert not s.panic
     row = step_row(s)
-    assert row[2] == "38.3 (38-38, 1x)" and row[4] == "28 ms" and row[12] == "aonsensed" and row[5] == "14 %/697", row
+    assert row[2] == "38.3 (38-38, 1x)" and row[4] == "28 ms" and row[13] == "aonsensed" and row[6] == "14 %/697" and row[5] == "13.8 ms", row
     t = table([row])
     assert t.splitlines()[0].startswith("| step") and len({len(x) for x in t.splitlines()}) == 1, t
     p = Step("p")
