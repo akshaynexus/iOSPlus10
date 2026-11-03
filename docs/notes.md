@@ -5400,3 +5400,10 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - Agent's slip: a first SSH command `ps ... > /tmp/.a` wrote one small file in the phone's `/tmp` in spite of the read-only rule. Pipe to the host from the first command.
 - Worktree: `INCR=1 kernel-ios26-linux.sh` builds in 60 s after a tree. A `grep -c '^diff --git'` guard in `rpm-scale-patch.sh`.
 - `scripts/laurel/gpu-opp-patch.sh` diffs from 2961's parent to the work tree: after 2985 it also takes 2985's hunks in the same files. Use it only on a tree of 2961 alone, or move the hunks by hand.
+
+## 2026-11-03: Mi A3 default stack: 73 % of backboardd's GPU time is metal2vulkan's own merge kernel, not drawing (branch t3/default-stack-glass-60fps). Full text: `docs/laurel_sprout/ios26-default-speed.md`
+- **Measure first:** `LAUREL GPU PASS` (Turnip 0105) names the shape of each compute dispatch. `64x1, 3x1560` = `shadow_merge_image` over a full screen, 16 ms a frame.
+- Every texture over an IOSurface is a shadow: 3 locks: `in_place()`, a check that answers `Unchecked` here for ever, Turnip's dedicated import.
+- `CA_ENABLE_MEMORYLESS=0` alone: 108 -> 36 tiles, pass 12 -> 3 ms [V].
+- `CASetDebugOption` is exported: the way to set the `CA_DISABLE_*` table after `init_debug` has read the environment.
+- m2v's notices have the exact reason for a shadow: `observe_message` in the bridge. Read them before you guess.
