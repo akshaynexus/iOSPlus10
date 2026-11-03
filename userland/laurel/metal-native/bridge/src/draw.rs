@@ -1311,9 +1311,10 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
     cb.held_baked.push(entry.baked.clone());
 
     let set_memory = write_descriptors(e, cb, &entry.plan.descriptors, &commands.descriptor_ranges, &entry.offsets, &entry.set_slots, &device_pipeline.pipeline.layout)?;
+    let mark = if crate::flight::on() { crate::flight::next_mark(&cb.gpu) } else { None };
     if crate::flight::on() {
         let at = unsafe { e.draws.start_iova + (e.draws.cur as u64).wrapping_sub(e.draws.start as u64) };
-        crate::flight::line(&format!("draw {} prim {primitive} counts {counts:?} at {at:#x}", device_pipeline.names));
+        crate::flight::line(&format!("draw {} prim {primitive} counts {counts:?} at {at:#x} id {}", device_pipeline.names, mark.map_or(0, |m| m.1)));
         for (i, s) in set_memory.iter().enumerate() {
             crate::flight::line(&crate::flight::set_words(i, s.0, s.1, entry.set_slots.get(i).copied().unwrap_or(0)));
         }
@@ -1419,6 +1420,9 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
                 cb.names.push(a.backing.bo() as usize);
             }
             nmn_cmd_draw_indirect(cs, primitive, a.backing.iova() + at, index_iova, max, wide);
+            if let Some((word, id)) = mark {
+                nmn_cmd_progress(cs, word, id);
+            }
             cb.held_buffers.push(a.clone());
             if let Some((b, ..)) = index {
                 if b.backing.must_name() {
@@ -1439,6 +1443,9 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
                 cb.held_buffers.push(b);
             }
             None => nmn_cmd_draw(cs, primitive, count, instances, first, first_instance),
+        }
+        if let Some((word, id)) = mark {
+            nmn_cmd_progress(cs, word, id);
         }
     }
     e.attachment_written |= entry.outputs;

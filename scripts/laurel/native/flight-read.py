@@ -7,6 +7,7 @@ HEAD = 64
 args = sys.argv[2:]
 data = open(sys.argv[1], "rb").read()
 end = struct.unpack_from("<Q", data, 0)[0]
+print(f"last finished draw id: {struct.unpack_from('<I', data, 8)[0]}")
 room = len(data) - HEAD
 at = end % room
 text = data[HEAD + at:] + data[HEAD:HEAD + at] if end >= room else data[HEAD:HEAD + end]

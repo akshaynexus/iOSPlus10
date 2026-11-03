@@ -1520,6 +1520,15 @@ static enum pc_di_primtype primtype(uint32_t metal)
 	}
 }
 
+/* The flight recorder's mark: the value reaches `iova` when the draws before it have left the render backend. It makes no wait, so a stream with marks keeps its timing. */
+void nmn_cmd_progress(struct nw_cs *cs, uint64_t iova, uint32_t value)
+{
+	pkt7(cs, CP_EVENT_WRITE, 4);
+	nw_cs_emit(cs, CP_EVENT_WRITE_0_EVENT(RB_DONE_TS));
+	nw_cs_emit_qw(cs, iova);
+	nw_cs_emit(cs, value);
+}
+
 void nmn_cmd_draw(struct nw_cs *cs, uint32_t primitive, uint32_t vertex_count, uint32_t instances, uint32_t first_vertex, uint32_t first_instance)
 {
 	REGS(cs, A6XX_VFD_INDEX_OFFSET(first_vertex), A6XX_VFD_INSTANCE_START_OFFSET(first_instance));

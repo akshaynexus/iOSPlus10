@@ -116,6 +116,7 @@ void nmn_cmd_descriptor_sets(struct nw_cs *, const uint64_t *set_iova, uint32_t 
 /* A stage's push range, as this stage's const file wants it (nmn_program_push_range). stage: 0 vertex, 1 fragment, 2 compute. */
 void nmn_cmd_push(struct nw_cs *, unsigned stage, uint32_t first_vec4, const void *data, uint32_t vec4s);
 void nmn_cmd_vertex_buffers(struct nw_cs *, const uint64_t *iova, const uint32_t *size, const uint32_t *stride, uint32_t count);
+void nmn_cmd_progress(struct nw_cs *, uint64_t iova, uint32_t value);
 void nmn_cmd_draw(struct nw_cs *, uint32_t primitive /* Metal's raw value */, uint32_t vertex_count, uint32_t instances, uint32_t first_vertex, uint32_t first_instance);
 void nmn_cmd_draw_indexed(struct nw_cs *, uint32_t primitive, uint32_t index_count, uint32_t instances, uint64_t index_iova, uint32_t index_bytes_max, bool wide, int32_t base_vertex, uint32_t first_instance);
 /* A draw whose arguments the GPU reads from a buffer: tu_CmdDrawIndirect, tu_CmdDrawIndexedIndirect, one draw. index_iova 0: not indexed. */
