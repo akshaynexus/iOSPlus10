@@ -158,11 +158,12 @@ pub fn analyse(frames: &[Frame]) -> Report {
     r
 }
 
-pub fn run_png(input: &Path, output: &Path) -> Result<()> {
+/// `prev`: an earlier frame record; the line then also says how much of the picture changed.
+pub fn run_png(input: &Path, output: &Path, prev: Option<&Path>) -> Result<()> {
     let b = fs::read(input).with_context(|| format!("read {}", input.display()))?;
     let (f, _) = parse_frame(&b)?;
     fs::write(output, png_bytes(&f)?).with_context(|| format!("write {}", output.display()))?;
-    println!(
+    let mut line = format!(
         "{}: {}x{}, surface {} ({}), {:.1} % dark",
         output.display(),
         f.w,
@@ -171,6 +172,12 @@ pub fn run_png(input: &Path, output: &Path) -> Result<()> {
         if f.inferred { "inferred from in-use marks" } else { "named by the kernel" },
         dark_share(&f) * 100.0
     );
+    if let Some(p) = prev {
+        let old = fs::read(p).with_context(|| format!("read {}", p.display()))?;
+        let (o, _) = parse_frame(&old)?;
+        line += &format!(", {:.2} % changed", diff_share(&f, &o) * 100.0);
+    }
+    println!("{line}");
     Ok(())
 }
 

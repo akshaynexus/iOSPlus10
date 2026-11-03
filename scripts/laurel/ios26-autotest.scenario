@@ -1,0 +1,79 @@
+# The UI test of scripts/laurel/ios26-autotest.sh. Docs: docs/laurel_sprout/ios26-autotest.md. Coordinates in panel pixels, 720x1560.
+#   step NAME                     a new row of the table
+#   wake                          power key, only if the panel is off
+#   key power|volup|voldown|home [MS]    tap X Y [MS]    swipe X0 Y0 X1 Y1 [MS]    edge bottom|top|left|right [LEN] [MS] [AT]
+#   open BUNDLE_ID                home   (the home key, then an edge swipe if the picture did not change)
+#   wait SECONDS                  shot TAG
+#   record N MAX_MS               starts a sequence shot, in the background, for the next gesture
+#   stop                          waits for it, then finds frames that equal an older frame, and black frames
+#   changed                       this step fails if the last two shots show the same picture
+
+step unlock
+wake
+wait 2
+shot locked
+record 40 2500
+edge bottom 800 300
+stop
+wait 2
+shot unlocked
+changed
+
+step home-page-swipe
+home
+wait 2
+shot page1
+record 40 2500
+swipe 620 800 100 800 300
+stop
+wait 2
+shot page2
+changed
+swipe 100 800 620 800 300
+wait 2
+shot page1-again
+changed
+
+step control-center
+shot before
+record 40 2500
+edge top 700 300 650
+stop
+wait 2
+shot open
+changed
+record 40 2500
+edge bottom 700 300
+stop
+wait 2
+shot closed
+changed
+
+step settings
+open com.apple.Preferences
+wait 8
+shot open
+changed
+record 60 3000
+swipe 360 1200 360 300 300
+stop
+wait 2
+shot scrolled
+changed
+home
+wait 3
+shot home
+
+step safari
+open com.apple.mobilesafari
+wait 10
+shot open
+changed
+record 60 3000
+swipe 360 1200 360 300 300
+stop
+wait 2
+shot scrolled
+home
+wait 3
+shot home

@@ -8,6 +8,7 @@
  *   laurel-autotest edge bottom|top|left|right [LEN_PX] [MS] [AT_PX]   from the screen edge, with the kernel's edge flag
  *   laurel-autotest key power|volup|voldown|home [HOLD_MS]
  *   laurel-autotest open BUNDLE_ID              SpringBoard's own service, then LaunchServices
+ *   laurel-autotest awake                       exit 0 if a surface is on the panel, 1 if the panel is off
  *   laurel-autotest surfaces                    all screen-size surfaces: id, format, use count
  *   laurel-autotest shot                        one whole frame to stdout (LATF record, see frame_head)
  *   laurel-autotest seq N [MAX_MS]              up to N flips to stdout: LATS head, then one record per frame, 1/4 size
@@ -187,6 +188,7 @@ key_send(uint32_t usage, int hold_ms)
 
 static IOSurfaceRef g_screen[MAX_SCREENS];
 static int g_screens;
+static int g_current;
 
 static void
 screens_release(void)
@@ -201,6 +203,7 @@ static void
 screens_find(void)
 {
 	screens_release();
+	g_current = -1;
 	for (uint32_t id = 1; id < MAX_SURFACE_ID && g_screens < MAX_SCREENS; id++) {
 		IOSurfaceRef s = IOSurfaceLookup(id);
 		if (s == NULL)
@@ -231,20 +234,22 @@ screen_by_id(uint32_t id)
 }
 
 /*
- * The kernel keeps the frame on the panel in use (sweet_hold, fShowHold) and the frame that has just left it until the next latch (fRetireHold), and a surface waiting for its flip.
- * On two surfaces: the one that came into use last is the newest flip.
+ * The kernel marks a surface in use at its swap, while the GPU can still be drawing it, and drops the mark of the frame before when the new one has latched (AppleCLCD::showDirect).
+ * So a surface with a new mark holds an old picture for up to 900 ms: reading it would look like a flash of the previous state. The rule: the current surface stays until its own mark goes.
  */
-static bool g_used[MAX_SCREENS];
-static int g_newest = -1;
-static void
-uses_update(void)
+
+static IOSurfaceRef
+screen_from_marks(void)
 {
-	for (int i = 0; i < g_screens; i++) {
-		const bool u = IOSurfaceIsInUse(g_screen[i]);
-		if (u && (!g_used[i] || g_newest < 0))
-			g_newest = i;
-		g_used[i] = u;
-	}
+	if (g_current >= 0 && g_current < g_screens && IOSurfaceIsInUse(g_screen[g_current]))
+		return g_screen[g_current];
+	g_current = -1;
+	for (int i = 0; i < g_screens; i++)
+		if (IOSurfaceIsInUse(g_screen[i])) {
+			g_current = i;
+			return g_screen[i];
+		}
+	return NULL;
 }
 
 /* Picks the surface on the panel. *how: "kernel" or "inferred". */
@@ -264,13 +269,7 @@ screen_current(const char **how)
 		}
 	}
 	*how = "inferred";
-	uses_update();
-	if (g_newest >= 0 && g_used[g_newest])
-		return g_screen[g_newest];
-	for (int i = 0; i < g_screens; i++)
-		if (g_used[i])
-			return g_screen[i];
-	return NULL;
+	return screen_from_marks();
 }
 
 /* Everything is little endian. Whole frames: LATF. Sequence: LATS, then the same record for each frame, 1/4 size. */
@@ -309,8 +308,6 @@ cmd_shot(uint32_t want_id)
 {
 	screens_find();
 	const char *how = "";
-	usleep(20000);
-	uses_update();
 	IOSurfaceRef s = want_id != 0 ? screen_by_id(want_id) : screen_current(&how);
 	if (s == NULL) {
 		fprintf(stderr, "laurel-autotest: no surface on the panel: %d screen surfaces, none in use (is the panel off?)\n", g_screens);
@@ -351,15 +348,20 @@ cmd_seq(int want, int max_ms)
 		return 1;
 	const char magic[4] = { 'L', 'A', 'T', 'S' };
 	write_all(magic, 4);
-	uses_update();
 	const uint64_t t0 = now_us();
+	uint64_t t_find = t0;
 	uint32_t last_id = 0;
 	for (int got = 0; got < want && now_us() - t0 < (uint64_t)max_ms * 1000;) {
 		usleep(2000);
 		IOSurfaceRef s = screen_current(&how);
 		const uint8_t *base = s != NULL ? IOSurfaceGetBaseAddress(s) : NULL;
-		if (base == NULL)
+		if (base == NULL) {
+			if (now_us() - t_find > 500000) { /* a compositor restart makes new surfaces */
+				screens_find();
+				t_find = now_us();
+			}
 			continue;
+		}
 		const size_t row = IOSurfaceGetBytesPerRow(s);
 		for (uint32_t y = 0; y < th; y++) {
 			const uint32_t *src = (const uint32_t *)(base + (size_t)y * THUMB_DIV * row);
@@ -455,7 +457,7 @@ num(const char *s, const char *what)
 static int
 usage(void)
 {
-	fprintf(stderr, "usage: laurel-autotest check | tap X Y [MS] | swipe X0 Y0 X1 Y1 [MS] | edge bottom|top|left|right [LEN] [MS] [AT] | key power|volup|voldown|home [MS] | open BUNDLE | surfaces | shot | seq N [MAX_MS]\n");
+	fprintf(stderr, "usage: laurel-autotest check | awake | tap X Y [MS] | swipe X0 Y0 X1 Y1 [MS] | edge bottom|top|left|right [LEN] [MS] [AT] | key power|volup|voldown|home [MS] | open BUNDLE | surfaces | shot | seq N [MAX_MS]\n");
 	return 2;
 }
 
@@ -485,6 +487,11 @@ main(int argc, char **argv)
 		screens_find();
 		printf("LAUREL AUTOTEST: on: touch service %#llx, buttons %#llx, %d screen surfaces, panel surface from %s\n", g_touch_id, g_buttons_id, g_screens, kernel_scan_id() ? "the kernel" : "in-use marks (inferred)");
 		return 0;
+	}
+	if (strcmp(c, "awake") == 0) {
+		screens_find();
+		const char *how = "";
+		return screen_current(&how) != NULL ? 0 : 1;
 	}
 	if (strcmp(c, "surfaces") == 0)
 		return cmd_surfaces();

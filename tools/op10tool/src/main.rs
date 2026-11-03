@@ -308,7 +308,13 @@ enum Cmd {
         host: String,
     },
     /// A frame from laurel-autotest shot (LATF) to a PNG (scripts/laurel/ios26-autotest.sh)
-    AutotestPng { input: PathBuf, output: PathBuf },
+    AutotestPng {
+        input: PathBuf,
+        output: PathBuf,
+        /// an earlier frame: also say how much of the picture changed
+        #[arg(long)]
+        prev: Option<PathBuf>,
+    },
     /// A sequence from laurel-autotest seq (LATS): frames that equal an older frame, black frames, PNGs of those
     AutotestSeq {
         input: PathBuf,
@@ -416,7 +422,7 @@ fn main() -> Result<()> {
         Cmd::A64Abi { cache, out } => abi::run(&cache, &out),
         Cmd::A64Dis { cache, image, symbol, xref, count } => abi::dis(&cache, &image, &symbol, xref, count, std::path::Path::new("out/ios26/tmp-dis")),
         Cmd::Ctl { command, host } => ctl::run(command, &host),
-        Cmd::AutotestPng { input, output } => autotest::run_png(&input, &output),
+        Cmd::AutotestPng { input, output, prev } => autotest::run_png(&input, &output, prev.as_deref()),
         Cmd::AutotestSeq { input, outdir, all } => autotest::run_seq(&input, &outdir, all),
         Cmd::Camframe { host, out, no_capture, raw, width, height, bayer } => {
             camframe::run(camframe::Args { host, out, no_capture, raw, width, height, bayer })
