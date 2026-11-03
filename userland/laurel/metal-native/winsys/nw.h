@@ -100,6 +100,8 @@ void nw_cs_finish(struct nw_cs *);      /* gives its chunks back */
 void nw_cs_reset(struct nw_cs *);       /* after the fence */
 void nw_cs_grow(struct nw_cs *, uint32_t dwords);
 void nw_cs_end_ib(struct nw_cs *);      /* the words since the last end become one IB */
+/* The IBs of `from` run here, in the order of this stream. They are IB1s, as this stream's own: an IB1 may call an IB2 (a program's state), and an a6xx has no third level (CP_IB1, CP_IB2, CP_SDS). `from` stays alive until the fence. */
+void nw_cs_append_ibs(struct nw_cs *, const struct nw_cs *from);
 static inline void nw_cs_reserve(struct nw_cs *cs, uint32_t dwords)
 {
 	if ((uint32_t)(cs->end - cs->cur) < dwords)
@@ -140,11 +142,29 @@ struct nw_submit {
 void nw_submit_begin(struct nw_submit *, struct nw_device *);
 void nw_submit_name(struct nw_submit *, struct nw_bo *);
 void nw_submit_stream(struct nw_submit *, struct nw_cs *);
-/* 0 and *fence, or a positive errno. The kernel takes at most NW_SUBMIT_MAX_IBS IBs and NW_SUBMIT_MAX_NAMES names. */
-#define NW_SUBMIT_MAX_IBS       128     /* kernel GPU_SUBMIT_CMDS */
+/* 0 and *fence, or a positive errno. The kernel takes at most NW_SUBMIT_MAX_IBS IBs and NW_SUBMIT_MAX_NAMES names. EFAULT: nw_stream_check refused a stream, nw_last_refusal says why, and nothing reached the GPU. */
+#define NW_SUBMIT_MAX_IBS       1024    /* kernel GPU_SUBMIT_CMDS, laurel 2980; an older kernel refuses more than 128 with EINVAL */
 #define NW_SUBMIT_MAX_NAMES     8192    /* kernel GPU_SUBMIT_BOS */
 int nw_submit_go(struct nw_submit *, uint32_t *fence);
 void nw_submit_end(struct nw_submit *);
+
+/*
+ * The last gate before the GPU (nw_check.c). A wrong word is a fault, a fault stalls the SMMU, and the watchdog then turns the GPU off for this boot for every stack. So each submission's streams are read here, before the kernel sees them: packet shape, a rule for each opcode, event forms, IB depth, and every address in a packet or an address register inside a live buffer of this device. NMN_STREAM_CHECK=0 turns it off.
+ * false: *why says what and where.
+ */
+bool nw_stream_check(struct nw_device *, const uint32_t *words, uint32_t dwords, uint64_t iova, int level, char *why, size_t why_size);
+/* A stream called as an IB2 from many places: read once, then known by its address until nw_ib2_forget. */
+bool nw_ib2_check(struct nw_device *, const uint32_t *words, uint32_t dwords, uint64_t iova, char *why, size_t why_size);
+void nw_ib2_forget(struct nw_device *, uint64_t iova);
+bool nw_ib2_known(struct nw_device *, uint64_t iova, uint32_t dwords);
+/* The live buffer that holds [iova, iova + bytes), or NULL. */
+struct nw_bo *nw_bo_of_address(struct nw_device *, uint64_t iova, uint64_t bytes);
+const char *nw_last_refusal(const struct nw_device *);
+/* for one line and the host test: submissions read, IB dwords read, packets, nanoseconds */
+void nw_check_stats(const struct nw_device *, uint64_t out[4]);
+/* A word the GPU may write and nothing reads (an event's time stamp). */
+void nw_device_set_scratch(struct nw_device *, uint64_t iova);
+uint64_t nw_device_scratch(const struct nw_device *);
 
 /* Fences are one global sequence of the ring (docs/gpu-abi.md section 3 item 8). */
 static inline bool nw_fence_at_least(uint32_t a, uint32_t b) { return (int32_t)(a - b) >= 0; }

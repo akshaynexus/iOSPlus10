@@ -110,14 +110,14 @@ static void test_submit_names(void)
 	/* more IBs than the kernel takes: refused here, not by the kernel */
 	nw_submit_begin(&s, d);
 	nw_cs_reset(&cs);
-	for (int i = 0; i < 300; i++) {
+	for (int i = 0; i < NW_SUBMIT_MAX_IBS + 1; i++) {
 		nw_cs_reserve(&cs, 2);
 		nw_cs_emit(&cs, nw_pkt7(0x10, 1));
 		nw_cs_emit(&cs, 0);
 		nw_cs_end_ib(&cs);
 	}
 	nw_submit_stream(&s, &cs);
-	CHECK(nw_submit_go(&s, &fence) == EINVAL, "300 IBs must be refused");
+	CHECK(nw_submit_go(&s, &fence) == EINVAL, "%d IBs must be refused", NW_SUBMIT_MAX_IBS + 1);
 	nw_submit_end(&s);
 	nw_cs_finish(&cs);
 	nw_bo_free(d, surface);
@@ -153,12 +153,131 @@ static void test_kinds(void)
 	fake_kernel_free(k);
 }
 
+/* The stream check. The first case is the stream of the first hang on the phone, word for word (FAR 0x1970460000). */
+static int check_one(struct nw_device *d, struct nw_bo *b, const uint32_t *w, uint32_t n, char *why, size_t why_size)
+{
+	memcpy(b->map, w, n * 4);
+	return nw_stream_check(d, b->map, n, b->iova, 1, why, why_size);
+}
+
+static void test_stream_check(void)
+{
+	char why[256];
+	struct fake_kernel *k = fake_kernel_new(NULL, 64 << 20);
+	struct nw_device *d = nw_device_open(&fake_kernel_ops, k, why, sizeof(why));
+	struct nw_bo *b = nw_bo_new(d, 65536, 0), *other = nw_bo_new(d, 65536, 0);
+	const uint32_t hi = (uint32_t)(other->iova >> 32), lo = (uint32_t)other->iova;
+	const uint32_t ev = nw_pkt7(0x46, 1), ev4 = nw_pkt7(0x46, 4);
+	/* PC_CCU_FLUSH_COLOR_TS with no address, then the next event: the CP's address is the next two words */
+	const uint32_t hang[] = {ev, 0x1d, ev, 0x19};
+	CHECK(!check_one(d, b, hang, 4, why, sizeof(why)) && strstr(why, "0x1970460001") != NULL, "the first hang's stream: %s", why);
+	/* each time stamp event */
+	static const uint32_t ts[] = {4, 8, 22, 26, 28, 29};
+	for (unsigned i = 0; i < 6; i++) {
+		const uint32_t w[] = {ev, ts[i], nw_pkt7(0x26, 0), nw_pkt7(0x26, 0)};
+		CHECK(!check_one(d, b, w, 4, why, sizeof(why)), "event %u with no address passed", ts[i]);
+		const uint32_t good[] = {ev4, ts[i], lo, hi, 0};
+		CHECK(check_one(d, b, good, 5, why, sizeof(why)), "event %u with an address: %s", ts[i], why);
+		const uint32_t bad[] = {ev4, ts[i], 0x70460001, 0x19, 0};
+		CHECK(!check_one(d, b, bad, 5, why, sizeof(why)), "event %u with a wild address passed", ts[i]);
+	}
+	const uint32_t plain[] = {ev, 0x19, ev, 0x31, nw_pkt7(0x26, 0)};
+	CHECK(check_one(d, b, plain, 5, why, sizeof(why)), "events with no time stamp: %s", why);
+	/* an address register: inside a buffer, outside, zero, half a pair. 0x8c18 RB_2D_DST, 0xab10 SP_BINDLESS_BASE[0] (low bits are a size) */
+	const uint32_t r1[] = {nw_pkt4(0x8c18, 2), lo + 64, hi};
+	CHECK(check_one(d, b, r1, 3, why, sizeof(why)), "RB_2D_DST inside: %s", why);
+	const uint32_t r2[] = {nw_pkt4(0x8c18, 2), 0x70460000, 0x19};
+	CHECK(!check_one(d, b, r2, 3, why, sizeof(why)), "RB_2D_DST outside passed");
+	const uint32_t r3[] = {nw_pkt4(0x8c18, 2), 0, 0};
+	CHECK(check_one(d, b, r3, 3, why, sizeof(why)), "RB_2D_DST zero: %s", why);
+	const uint32_t r4[] = {nw_pkt4(0x8c18, 1), lo};
+	CHECK(!check_one(d, b, r4, 2, why, sizeof(why)), "half an address passed");
+	const uint32_t r5[] = {nw_pkt4(0xab10, 2), lo | 3, hi};
+	CHECK(check_one(d, b, r5, 3, why, sizeof(why)), "bindless base: %s", why);
+	const uint32_t r6[] = {nw_pkt4(0x8c17, 4), 0, lo, hi, 0};
+	CHECK(check_one(d, b, r6, 5, why, sizeof(why)), "a run over an address register: %s", why);
+	const uint32_t r7[] = {nw_pkt4(0x8c17, 4), 0, 0x70460000, 0x19, 0};
+	CHECK(!check_one(d, b, r7, 5, why, sizeof(why)), "a run over a wild address register passed");
+	/* a word that is no packet, a count past the IB, bad parity, an opcode with no rule */
+	const uint32_t p1[] = {0x12345678};
+	CHECK(!check_one(d, b, p1, 1, why, sizeof(why)), "no header passed");
+	const uint32_t p2[] = {nw_pkt7(0x10, 5), 0};
+	CHECK(!check_one(d, b, p2, 2, why, sizeof(why)), "a count past the IB passed");
+	const uint32_t p3[] = {nw_pkt7(0x26, 0) ^ (1u << 15)};
+	CHECK(!check_one(d, b, p3, 1, why, sizeof(why)), "bad parity passed");
+	const uint32_t p4[] = {nw_pkt7(0x7e, 0)};
+	CHECK(!check_one(d, b, p4, 1, why, sizeof(why)), "an opcode with no rule passed");
+	/* calls: IB1 -> IB2 yes, IB2 -> IB3 no, outside a buffer no */
+	uint32_t *o = other->map;
+	o[0] = nw_pkt7(0x26, 0);
+	const uint32_t c1[] = {nw_pkt7(0x3f, 3), lo, hi, 1};
+	CHECK(check_one(d, b, c1, 4, why, sizeof(why)), "IB1 -> IB2: %s", why);
+	o[0] = nw_pkt7(0x3f, 3); o[1] = lo + 64; o[2] = hi; o[3] = 1; o[16] = nw_pkt7(0x26, 0);
+	const uint32_t c2[] = {nw_pkt7(0x3f, 3), lo, hi, 4};
+	CHECK(!check_one(d, b, c2, 4, why, sizeof(why)) && strstr(why, "third level") != NULL, "IB1 -> IB2 -> IB3 passed: %s", why);
+	const uint32_t c3[] = {nw_pkt7(0x3f, 3), 0x70460000, 0x19, 1};
+	CHECK(!check_one(d, b, c3, 4, why, sizeof(why)), "a call outside passed");
+	/* the bad word in an IB2 is found too; a known IB2 is not read again; a forgotten one is */
+	o[0] = ev; o[1] = 0x1d; o[2] = ev; o[3] = 0x19;
+	const uint32_t c4[] = {nw_pkt7(0x3f, 3), lo, hi, 4};
+	CHECK(!check_one(d, b, c4, 4, why, sizeof(why)), "a bad IB2 passed");
+	o[0] = nw_pkt7(0x26, 0);
+	CHECK(nw_ib2_check(d, o, 1, other->iova, why, sizeof(why)) && nw_ib2_known(d, other->iova, 1), "a good IB2: %s", why);
+	nw_ib2_forget(d, other->iova);
+	CHECK(!nw_ib2_known(d, other->iova, 1), "a forgotten IB2 stays known");
+	/* a freed buffer's address is refused */
+	uint64_t gone_iova = other->iova;
+	nw_bo_free(d, other);
+	const uint32_t f1[] = {nw_pkt4(0x8c18, 2), (uint32_t)gone_iova, (uint32_t)(gone_iova >> 32)};
+	CHECK(!check_one(d, b, f1, 3, why, sizeof(why)), "a freed buffer's address passed");
+	/* the submit refuses, the kernel sees nothing */
+	struct nw_cs cs;
+	nw_cs_init(&cs, d);
+	nw_cs_reserve(&cs, 4);
+	for (int i = 0; i < 4; i++)
+		nw_cs_emit(&cs, hang[i]);
+	nw_cs_end_ib(&cs);
+	struct nw_submit s;
+	nw_submit_begin(&s, d);
+	nw_submit_stream(&s, &cs);
+	uint32_t fence = 0;
+	uint64_t before = fake_kernel_stats(k)->submissions;
+	CHECK(nw_submit_go(&s, &fence) == EFAULT, "the submit took the first hang's stream");
+	CHECK(fake_kernel_stats(k)->submissions == before, "the kernel saw it");
+	CHECK(strstr(nw_last_refusal(d), "time stamp") != NULL, "refusal: %s", nw_last_refusal(d));
+	nw_submit_end(&s);
+	nw_cs_finish(&cs);
+	/* append: the other stream's IBs run between this stream's, in order, and its chunks are named */
+	struct nw_cs a, c;
+	nw_cs_init(&a, d);
+	nw_cs_init(&c, d);
+	nw_cs_reserve(&a, 1); nw_cs_emit(&a, nw_pkt7(0x26, 0));
+	nw_cs_reserve(&c, 1); nw_cs_emit(&c, nw_pkt7(0x12, 0));
+	nw_cs_end_ib(&c);
+	nw_cs_append_ibs(&a, &c);
+	nw_cs_reserve(&a, 1); nw_cs_emit(&a, nw_pkt7(0x13, 0));
+	nw_cs_end_ib(&a);
+	CHECK(a.ib_count == 3 && a.ibs[1].bo == c.ibs[0].bo && a.ibs[1].iova == c.ibs[0].iova && a.ibs[2].iova == a.ibs[0].iova + 4, "append: %u IBs", a.ib_count);
+	nw_submit_begin(&s, d);
+	nw_submit_stream(&s, &a);
+	before = fake_kernel_stats(k)->ibs;
+	CHECK(nw_submit_go(&s, &fence) == 0, "the submit of an appended stream: %s", nw_last_refusal(d));
+	CHECK(fake_kernel_stats(k)->ibs == before + 3, "3 IBs at the kernel");
+	nw_submit_end(&s);
+	nw_cs_finish(&a);
+	nw_cs_finish(&c);
+	nw_bo_free(d, b);
+	nw_device_close(d);
+	fake_kernel_free(k);
+}
+
 int main(void)
 {
 	test_open();
 	test_slices();
 	test_submit_names();
 	test_kinds();
+	test_stream_check();
 	printf(fails ? "winsys: FAIL, %d checks\n" : "winsys: PASS\n", fails);
 	return fails != 0;
 }

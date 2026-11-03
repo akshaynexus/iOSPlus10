@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* The winsys's kernel on the phone: RedwoodGPU's msm requests through IOKit (docs/gpu-abi.md section 4). As userland/negronigl/drm/negroni_drm.c, with no libdrm stand-in around it. NOT RUN YET: no phone was used for this stack. */
+/* The winsys's kernel on the phone: RedwoodGPU's msm requests through IOKit (docs/gpu-abi.md section 4). As userland/negronigl/drm/negroni_drm.c, with no libdrm stand-in around it. */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <errno.h>

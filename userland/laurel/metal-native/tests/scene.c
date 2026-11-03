@@ -13,6 +13,9 @@
 struct NmbTextureDescriptor;
 #include "NativeMetalObjects.h"
 
+/* the native stack only: the cost of its stream check, one line. The default stack has no such call. */
+const char *nmn_stream_check_line(NmbDevice *) __attribute__((weak));
+
 /* the bridge imports it (Darwin libSystem) */
 void sys_dcache_flush(void *start, size_t length) { (void)start; (void)length; }
 
@@ -255,8 +258,8 @@ int main(int argc, char **argv)
 	char err[256] = "";
 	nmb_command_buffer_error(cb, err, sizeof(err));
 	printf("scene: wait %d status %llu error '%s'\n", w, (unsigned long long)nmb_command_buffer_status(cb), err);
-	if (w != 0)
-		return 1;
+	if (w != 0 || nmb_command_buffer_status(cb) != 4)
+		return 1;       /* status 5: the GPU did not finish. Nothing after this can work, and more streams cost nothing but time */
 	/* blits: the 2D engine's paths, and a readback of the drawn target. On the fake kernel no GPU runs, so the bytes stay zero; on a phone this is the first pixel */
 	const uint32_t row = 720 * 4;
 	NmbBuffer *readback = nmb_buffer_new(dev, row * 1560, 0, NULL), *copy = nmb_buffer_new(dev, 4096, 0, NULL), *fill = nmb_buffer_new(dev, 4096, 0, NULL);
@@ -277,6 +280,12 @@ int main(int argc, char **argv)
 		FAIL("readback blit");
 	if (!nmb_encoder_end(bl) || !nmb_command_buffer_commit(b2) || nmb_command_buffer_wait(b2, 20000) != 0)
 		FAIL("blit commit");
+	if (nmb_command_buffer_status(b2) != 4) {
+		char e2[256] = "";
+		nmb_command_buffer_error(b2, e2, sizeof(e2));
+		printf("FAIL blit status %llu: %s\n", (unsigned long long)nmb_command_buffer_status(b2), e2);
+		return 1;
+	}
 	const uint32_t *px = nmb_buffer_contents(readback);
 	const unsigned char *cp = nmb_buffer_contents(copy);
 	printf("scene: pixel (0,0) %08x, (360,780) %08x, (719,1559) %08x; copied byte %02x (a GPU writes 5a)\n", px[0], px[780 * 720 + 360], px[1559 * 720 + 719], cp[128]);
@@ -307,6 +316,14 @@ int main(int argc, char **argv)
 	}
 	if (!nmb_encoder_end(ce) || !nmb_command_buffer_commit(b3) || nmb_command_buffer_wait(b3, 20000) != 0)
 		FAIL("compute commit");
+	if (nmb_command_buffer_status(b3) != 4) {
+		char e3[256] = "";
+		nmb_command_buffer_error(b3, e3, sizeof(e3));
+		printf("FAIL compute status %llu: %s\n", (unsigned long long)nmb_command_buffer_status(b3), e3);
+		return 1;
+	}
 	printf("scene: compute: PASS\n");
+	if (nmn_stream_check_line != NULL)
+		printf("%s\n", nmn_stream_check_line(dev));
 	return 0;
 }

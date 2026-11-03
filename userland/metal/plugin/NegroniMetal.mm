@@ -1278,6 +1278,13 @@ static void icon_store_start(void)
 	nlog("LAUREL ICONS: on: %d icons of older stacks taken out of the store (now generation %d): this process starts again and draws them at their next use", removed, LAUREL_ICON_GENERATION);
 	_exit(0);
 }
+#ifdef NMTL_HOT
+/* IOS-26-Hot's frontend has no flame-ios26/0003 and 0004: no counters and no pool of ours. Its own pool is its own. */
+static void metal_count_start(void)
+{
+	nlog("LAUREL TEXTURE POOL: off: stack hot has its own frontend, no counters and no pool of this kind");
+}
+#else
 extern "C" void native_bridge_metal_loss_counts(uint64_t out[8]);
 extern "C" void native_bridge_metal_texture_pool_limit(uint64_t bytes);
 extern "C" void native_bridge_metal_texture_pool_trim(bool all, uint64_t *held);
@@ -1320,6 +1327,7 @@ static void metal_count_start(void)
 	});
 	dispatch_resume(t);
 }
+#endif /* NMTL_HOT */
 #endif
 
 /*

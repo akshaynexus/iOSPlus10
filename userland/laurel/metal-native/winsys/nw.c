@@ -17,6 +17,9 @@
 #define NW_CHUNK_SIZE (256u * 1024u)
 #define NW_FREE_LISTS 16
 
+struct nw_range { uint64_t iova, end; struct nw_bo *bo; };
+struct nw_known_ib { uint64_t iova; uint32_t dwords; };
+
 struct nw_slab {
 	struct nw_bo *bo;
 	struct nw_slab *next;
@@ -38,7 +41,158 @@ struct nw_device {
 	struct nw_bo **free_big[NW_FREE_LISTS];
 	uint32_t free_big_count[NW_FREE_LISTS], free_big_cap[NW_FREE_LISTS];
 	uint64_t bo_count, bo_bytes, slice_bytes, slice_count, list_hits;
+	/* every live buffer by address, and the IB2s already read: for nw_stream_check */
+	pthread_rwlock_t table_lock;
+	struct nw_range *ranges;
+	uint32_t range_count, range_cap;
+	struct nw_known_ib *known;
+	uint32_t known_count, known_cap;
+	bool check_on;
+	uint64_t scratch;
+	char refusal[256];
+	uint64_t check_submissions, check_dwords, check_packets, check_ns;
 };
+
+/* index of the first entry with iova >= v */
+static uint32_t range_slot(const struct nw_device *d, uint64_t v)
+{
+	uint32_t lo = 0, hi = d->range_count;
+	while (lo < hi) {
+		uint32_t m = lo + (hi - lo) / 2;
+		if (d->ranges[m].iova < v)
+			lo = m + 1;
+		else
+			hi = m;
+	}
+	return lo;
+}
+
+/* false: no memory for the entry. The caller gives the buffer back: a buffer the table does not know could only be refused later. */
+static bool table_add(struct nw_device *d, struct nw_bo *b)
+{
+	bool ok = true;
+	pthread_rwlock_wrlock(&d->table_lock);
+	if (d->range_count == d->range_cap) {
+		uint32_t cap = d->range_cap ? d->range_cap * 2 : 64;
+		struct nw_range *n = realloc(d->ranges, cap * sizeof(*n));
+		if (n == NULL) {
+			ok = false;
+		} else {
+			d->ranges = n;
+			d->range_cap = cap;
+		}
+	}
+	if (ok) {
+		uint32_t at = range_slot(d, b->iova);
+		memmove(&d->ranges[at + 1], &d->ranges[at], (d->range_count - at) * sizeof(*d->ranges));
+		d->ranges[at] = (struct nw_range){b->iova, b->iova + b->size, b};
+		d->range_count++;
+	}
+	pthread_rwlock_unlock(&d->table_lock);
+	return ok;
+}
+
+static void table_remove(struct nw_device *d, struct nw_bo *b)
+{
+	pthread_rwlock_wrlock(&d->table_lock);
+	uint32_t at = range_slot(d, b->iova);
+	while (at < d->range_count && d->ranges[at].iova == b->iova && d->ranges[at].bo != b)
+		at++;
+	if (at < d->range_count && d->ranges[at].bo == b) {
+		memmove(&d->ranges[at], &d->ranges[at + 1], (d->range_count - at - 1) * sizeof(*d->ranges));
+		d->range_count--;
+	}
+	pthread_rwlock_unlock(&d->table_lock);
+}
+
+struct nw_bo *nw_bo_of_address(struct nw_device *d, uint64_t iova, uint64_t bytes)
+{
+	struct nw_bo *b = NULL;
+	pthread_rwlock_rdlock(&d->table_lock);
+	/* the last buffer that begins at or below iova */
+	uint32_t at = range_slot(d, iova + 1);
+	if (at > 0 && iova + bytes <= d->ranges[at - 1].end && iova + bytes >= iova)
+		b = d->ranges[at - 1].bo;
+	pthread_rwlock_unlock(&d->table_lock);
+	return b;
+}
+
+void nw_device_set_scratch(struct nw_device *d, uint64_t iova) { d->scratch = iova; }
+uint64_t nw_device_scratch(const struct nw_device *d) { return d->scratch; }
+const char *nw_last_refusal(const struct nw_device *d) { return d->refusal; }
+
+void nw_check_stats(const struct nw_device *d, uint64_t out[4])
+{
+	out[0] = d->check_submissions;
+	out[1] = d->check_dwords;
+	out[2] = d->check_packets;
+	out[3] = d->check_ns;
+}
+
+void nw_check_count(struct nw_device *d, uint64_t dwords, uint64_t packets)
+{
+	d->check_dwords += dwords;
+	d->check_packets += packets;
+}
+
+static uint32_t known_slot(const struct nw_device *d, uint64_t iova)
+{
+	uint32_t lo = 0, hi = d->known_count;
+	while (lo < hi) {
+		uint32_t m = lo + (hi - lo) / 2;
+		if (d->known[m].iova < iova)
+			lo = m + 1;
+		else
+			hi = m;
+	}
+	return lo;
+}
+
+bool nw_ib2_known(struct nw_device *d, uint64_t iova, uint32_t dwords)
+{
+	pthread_rwlock_rdlock(&d->table_lock);
+	uint32_t at = known_slot(d, iova);
+	bool ok = at < d->known_count && d->known[at].iova == iova && d->known[at].dwords == dwords;
+	pthread_rwlock_unlock(&d->table_lock);
+	return ok;
+}
+
+bool nw_ib2_check(struct nw_device *d, const uint32_t *words, uint32_t dwords, uint64_t iova, char *why, size_t why_size)
+{
+	if (!d->check_on)
+		return true;
+	if (!nw_stream_check(d, words, dwords, iova, 2, why, why_size))
+		return false;
+	pthread_rwlock_wrlock(&d->table_lock);
+	if (d->known_count == d->known_cap) {
+		uint32_t cap = d->known_cap ? d->known_cap * 2 : 64;
+		struct nw_known_ib *n = realloc(d->known, cap * sizeof(*n));
+		if (n == NULL) {
+			/* it is read again at each call: slower, not wrong */
+			pthread_rwlock_unlock(&d->table_lock);
+			return true;
+		}
+		d->known = n;
+		d->known_cap = cap;
+	}
+	uint32_t at = known_slot(d, iova);
+	memmove(&d->known[at + 1], &d->known[at], (d->known_count - at) * sizeof(*d->known));
+	d->known[at] = (struct nw_known_ib){iova, dwords};
+	d->known_count++;
+	pthread_rwlock_unlock(&d->table_lock);
+	return true;
+}
+
+void nw_ib2_forget(struct nw_device *d, uint64_t iova)
+{
+	pthread_rwlock_wrlock(&d->table_lock);
+	uint32_t at = known_slot(d, iova);
+	if (at < d->known_count && d->known[at].iova == iova) {
+		memmove(&d->known[at], &d->known[at + 1], (d->known_count - at - 1) * sizeof(*d->known));
+		d->known_count--;
+	}
+	pthread_rwlock_unlock(&d->table_lock);
+}
 
 static int get_param(struct nw_device *d, uint32_t param, uint64_t *value)
 {
@@ -60,6 +214,9 @@ struct nw_device *nw_device_open(const struct nw_ops *ops, void *ctx, char *why,
 	d->ops = ops;
 	d->ctx = ctx;
 	pthread_mutex_init(&d->lock, NULL);
+	pthread_rwlock_init(&d->table_lock, NULL);
+	const char *check = getenv("NMN_STREAM_CHECK");
+	d->check_on = check == NULL || strcmp(check, "0") != 0;
 	static const struct { uint32_t param; const char *name; } need[] = {
 		{MSM_PARAM_CHIP_ID, "CHIP_ID"}, {MSM_PARAM_GMEM_SIZE, "GMEM_SIZE"}, {MSM_PARAM_HIGHEST_BANK_BIT, "HIGHEST_BANK_BIT"},
 		{MSM_PARAM_UBWC_SWIZZLE, "UBWC_SWIZZLE"}, {MSM_PARAM_MACROTILE_MODE, "MACROTILE_MODE"}, {MSM_PARAM_MAX_FREQ, "MAX_FREQ"},
@@ -70,6 +227,7 @@ struct nw_device *nw_device_open(const struct nw_ops *ops, void *ctx, char *why,
 		if (e != 0) {
 			snprintf(why, why_size, "GET_PARAM %s: errno %d", need[i].name, e);
 			pthread_mutex_destroy(&d->lock);
+			pthread_rwlock_destroy(&d->table_lock);
 			free(d);
 			return NULL;
 		}
@@ -130,6 +288,10 @@ struct nw_bo *nw_bo_new(struct nw_device *d, uint64_t size, uint32_t flags)
 	b->map = d->ops->map(d->ctx, r.handle, size);
 	if (b->map == NULL)
 		goto bad;
+	if (!table_add(d, b)) {
+		d->ops->unmap(d->ctx, r.handle, b->map, size);
+		goto bad;
+	}
 	pthread_mutex_lock(&d->lock);
 	d->bo_count++;
 	d->bo_bytes += size;
@@ -167,6 +329,11 @@ struct nw_bo *nw_bo_import_surface(struct nw_device *d, uint32_t surface_id, uin
 		*offset = r.offset;
 	if (row_bytes != NULL)
 		*row_bytes = r.row_bytes;
+	if (!table_add(d, b)) {
+		bo_close_handle(d, r.handle);
+		free(b);
+		return NULL;
+	}
 	pthread_mutex_lock(&d->lock);
 	d->bo_count++;
 	pthread_mutex_unlock(&d->lock);
@@ -194,6 +361,11 @@ struct nw_bo *nw_bo_import_host(struct nw_device *d, void *pointer, uint64_t siz
 	b->size = size;
 	b->kind = NW_BO_HOST;
 	b->map = pointer;
+	if (!table_add(d, b)) {
+		bo_close_handle(d, r.handle);
+		free(b);
+		return NULL;
+	}
 	pthread_mutex_lock(&d->lock);
 	d->bo_count++;
 	pthread_mutex_unlock(&d->lock);
@@ -204,6 +376,7 @@ void nw_bo_free(struct nw_device *d, struct nw_bo *b)
 {
 	if (b == NULL)
 		return;
+	table_remove(d, b);
 	/* only what this file mapped: a surface's or host range's address is the caller's */
 	if (b->map != NULL && (b->kind == NW_BO_POOL || b->kind == NW_BO_SCATTERED))
 		d->ops->unmap(d->ctx, b->handle, b->map, b->size);
@@ -235,6 +408,9 @@ void nw_device_close(struct nw_device *d)
 		free(d->free_big[c]);
 	}
 	pthread_mutex_destroy(&d->lock);
+	pthread_rwlock_destroy(&d->table_lock);
+	free(d->ranges);
+	free(d->known);
 	free(d);
 }
 
@@ -533,6 +709,32 @@ void nw_cs_end_ib(struct nw_cs *cs)
 	cs->start = cs->cur;
 }
 
+static bool ib_push(struct nw_cs *cs, struct nw_ib entry)
+{
+	if (cs->ib_count == cs->ib_cap) {
+		uint32_t cap = cs->ib_cap ? cs->ib_cap * 2 : 8;
+		struct nw_ib *n = realloc(cs->ibs, cap * sizeof(*n));
+		if (n == NULL) {
+			cs->failed = true;
+			return false;
+		}
+		cs->ibs = n;
+		cs->ib_cap = cap;
+	}
+	cs->ibs[cs->ib_count++] = entry;
+	return true;
+}
+
+void nw_cs_append_ibs(struct nw_cs *cs, const struct nw_cs *from)
+{
+	nw_cs_end_ib(cs);
+	if (from->failed)
+		cs->failed = true;
+	for (uint32_t i = 0; i < from->ib_count; i++)
+		if (!ib_push(cs, from->ibs[i]))
+			return;
+}
+
 /* Scratch for a stream that lost its memory: its words go nowhere and cs->failed fails the submit. Never reaches the GPU. */
 static uint32_t nw_cs_lost[1u << 20];
 
@@ -628,10 +830,25 @@ int nw_submit_go(struct nw_submit *s, uint32_t *fence)
 	}
 	if (ibs == 0 || ibs > NW_SUBMIT_MAX_IBS || s->name_count == 0 || s->name_count > NW_SUBMIT_MAX_NAMES)
 		return EINVAL;
-	/* a stream's chunks were listed when it joined; one that grew after that is listed here */
-	for (uint32_t i = 0; i < s->stream_count; i++)
+	/* a stream's chunks were listed when it joined; one that grew after that is listed here, and the chunks of the IBs it took from another stream */
+	for (uint32_t i = 0; i < s->stream_count; i++) {
 		for (uint32_t j = 0; j < s->streams[i]->chunk_count; j++)
 			nw_submit_name(s, s->streams[i]->chunks[j]);
+		for (uint32_t j = 0; j < s->streams[i]->ib_count; j++)
+			nw_submit_name(s, s->streams[i]->ibs[j].bo);
+	}
+	if (s->dev->check_on) {
+		uint64_t began = nw_now_ns();
+		for (uint32_t i = 0; i < s->stream_count; i++) {
+			for (uint32_t j = 0; j < s->streams[i]->ib_count; j++) {
+				const struct nw_ib *ib = &s->streams[i]->ibs[j];
+				if (!nw_stream_check(s->dev, (const uint32_t *)((const char *)ib->bo->map + ib->offset), ib->dwords, ib->iova, 1, s->dev->refusal, sizeof(s->dev->refusal)))
+					return EFAULT;
+			}
+		}
+		s->dev->check_submissions++;
+		s->dev->check_ns += nw_now_ns() - began;
+	}
 	struct drm_msm_gem_submit_bo *bos = calloc(s->name_count, sizeof(*bos));
 	struct drm_msm_gem_submit_cmd *cmds = calloc(ibs, sizeof(*cmds));
 	int e = ENOMEM;

@@ -309,6 +309,10 @@ unsafe extern "C" {
     pub fn nw_cs_finish(cs: *mut NwCs);
     pub fn nw_cs_end_ib(cs: *mut NwCs);
     pub fn nw_reserve_copy(cs: *mut NwCs, words: *const u32, count: u32);
+    pub fn nw_cs_append_ibs(cs: *mut NwCs, from: *const NwCs);
+    pub fn nw_bo_of_address(d: *mut NwDevice, iova: u64, bytes: u64) -> *mut NwBoHead;
+    pub fn nw_last_refusal(d: *const NwDevice) -> *const c_char;
+    pub fn nw_check_stats(d: *const NwDevice, out: *mut u64);
     pub fn nw_submit_begin(s: *mut NwSubmit, d: *mut NwDevice);
     pub fn nw_submit_name(s: *mut NwSubmit, b: *mut NwBoHead);
     pub fn nw_submit_stream(s: *mut NwSubmit, cs: *mut NwCs);
@@ -328,6 +332,7 @@ unsafe extern "C" {
     pub fn nmn_image_pitch(i: *const NmnImage, level: u32) -> u32;
     pub fn nmn_image_layer_offset(i: *const NmnImage, level: u32, layer: u32) -> u64;
     pub fn nmn_image_bind(i: *mut NmnImage, iova: u64);
+    pub fn nmn_image_iova(im: *const NmnImage) -> u64;
     pub fn nmn_descriptor_image(i: *const NmnImage, f: u32, view: u32, base_level: u32, levels: u32, base_layer: u32, layers: u32, swizzle: *const u8, storage: bool, out: *mut u32);
     pub fn nmn_descriptor_buffer_texels(f: u32, iova: u64, bytes: u32, out: *mut u32);
     pub fn nmn_descriptor_ubo(iova: u64, bytes: u64, out: *mut u32);

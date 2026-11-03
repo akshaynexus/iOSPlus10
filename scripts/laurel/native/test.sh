@@ -7,11 +7,14 @@ N=$REPO/userland/laurel/metal-native
 S=$OUT/ios26/turnip-host/mesa
 W=$OUT/ios26/native/test
 mkdir -p "$W"
-CF="-O1 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -I$N/winsys -I$N/tests -I$S/include -I$S/src/freedreno/common"
+B=$OUT/ios26/native/mesa-host
+CF="-O1 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -I$N/winsys -I$N/tests -I$S/include -I$S/src/freedreno/common -I$B/src/freedreno/registers/adreno -I$B/src/freedreno/registers"
 for t in ${*:-winsys option}; do
   case $t in
   winsys)
-    clang -std=gnu11 $CF "$N/tests/test_winsys.c" "$N/tests/fake_kernel.c" "$N/winsys/nw.c" -lpthread -o "$W/test_winsys"
+    # the table in git is what Mesa's register file says
+    python3 -I "$REPO/scripts/laurel/native/addr-regs.py" "$S/src/freedreno/registers/adreno/a6xx.xml" --header | diff - "$N/winsys/nw_addr_regs.h"
+    clang -std=gnu11 $CF "$N/tests/test_winsys.c" "$N/tests/fake_kernel.c" "$N/winsys/nw.c" "$N/winsys/nw_check.c" -lpthread -o "$W/test_winsys"
     "$W/test_winsys"
     ;;
   option)
