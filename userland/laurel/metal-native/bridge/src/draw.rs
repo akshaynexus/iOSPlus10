@@ -610,7 +610,7 @@ pub extern "C" fn nmb_command_buffer_commit(c: *mut NmbCommandBuffer) -> bool {
                 st.error = if e == libc::EFAULT {
                     // nothing reached the GPU: this frame is lost, the GPU stays on
                     let why = std::ffi::CStr::from_ptr(nw_last_refusal(cb.gpu.dev)).to_string_lossy().into_owned();
-                    eprintln!("LAUREL METAL NATIVE: stream check: a submission refused: {why}");
+                    console_line(&format!("LAUREL METAL NATIVE: stream check: a submission refused: {why}"));
                     format!("stream check: {why}")
                 } else {
                     format!("the kernel refused the submission: errno {e}")
@@ -645,6 +645,9 @@ pub extern "C" fn nmb_command_buffer_commit(c: *mut NmbCommandBuffer) -> bool {
                 }
             }
             drop(retained);
+            if e == libc::ENODEV {
+                mark_gpu_off();
+            }
             for (event, value) in signals {
                 event.signal(value);
             }
@@ -1316,6 +1319,32 @@ fn write_neutral_image(e: &NmbEncoder, view: vk::ImageViewType, slot: *mut u32) 
     let identity = [0u8, 1, 2, 3];
     unsafe { nmn_descriptor_image(t.image as *const NmnImage, t.pipe_format, kind, 0, 1, 0, layers, identity.as_ptr(), false, slot) };
     Ok(())
+}
+
+/// One line where the selector's lines go: the console (the USB log) and metal.log. Failure of a log is nothing.
+pub(crate) fn console_line(text: &str) {
+    use std::io::Write;
+    let name = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default();
+    let line = format!("NMTL[{} {}]: {}\n", std::process::id(), name, text);
+    eprint!("{line}");
+    for path in ["/dev/console", "/private/var/db/negronimetal/metal.log"] {
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
+/// ENODEV from a fence: the kernel turned the GPU off (a hang), for every stack, until a reboot. The compositor marks this stack as failed: the next start takes the default and stays on it until the setting is written again (option_rule.h). Without this, a stack that hangs after the screen was lit would hang again at each boot: the lit screen has already cleared its count.
+fn mark_gpu_off() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let compositor = std::env::current_exe().ok().is_some_and(|p| p.file_name().is_some_and(|n| n == "backboardd"));
+    if compositor {
+        let _ = std::fs::write("/private/var/db/negronimetal/stack/failed", "the kernel turned the GPU off\n");
+        console_line("LAUREL METAL NATIVE: off: the kernel turned the GPU off: the next start takes stack default");
+    }
 }
 
 /// A descriptor's address reaches the GPU with no packet around it, so nw_stream_check cannot read it. It is checked where it is written.
