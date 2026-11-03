@@ -1208,3 +1208,8 @@ Next: owner's decision on a boot with 2985 (new kernel) and the plist. Read `LAU
 ## 2026-11-03: Mi A3 iOS 26: UI baseline with real touch, kernel 3d4671dd68 (DDR to 1805 MHz, memory floors)
 [V] Default stack, Metal on, kernel input (2983), surface named by the kernel, uptime about 520 s, `NEGRONIMETAL_TEXTURE_POOL=0`. `logs/autotest-20261103-084734.txt` (and 083242): unlock no motion line in 084734, 9.0 in 083242; Home swipe 9.3 and 8.8 fps; Control Center open 10.0 and 10.2; Settings scroll 5.2 (083242 not valid: a dark card over the UI, no scroll). 0 flash frames, 0 black in the valid row, 0 compositor crashes.
 Open: the Control Center close swipe: 1 of 3 closed clean, 1 left a dark Now Playing card, 1 got no reaction. Icons missing after the close and in the Settings list. [U] rendering, or slow.
+
+## 2026-11-03: Mi A3: hardware watchdog, stuck-CPU report, hang audit (branch `t3/mi-a3-watchdog-stuck-cpu-audit`, pushed, not merged, NOT BOOTED)
+[V] 2986 (both kernels), post/9015, 9016. Host test `wdog-test.sh` PASS. iOS 26 and iOS 16 kernels build; series 0 errors. Audit of 2970, 2972, 2973, 2975-2978, 2981, 2982, 2985, 9013: no unbounded spin with interrupts off, no leaked lock.
+[I] Best hang candidate: live bus scaling (2985). [U] why CPU 5 is late.
+Next: the owner flashes a new image. Read `LAUREL WDOG: on`, the minute line, `this thread ran`. A hang now ends in a reset in 20 to 28 s. Way back: `watchdog.md` section 7.
