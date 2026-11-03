@@ -255,6 +255,17 @@ pub(crate) struct TextureObj {
     pub(crate) base_layer: u32,
     pub(crate) layers: u32,
     pub(crate) memoryless: bool,
+    pub(crate) shadow: Option<Shadow>,
+}
+/// A texture over a buffer whose rows the GPU cannot read as they lie: an a6xx reads a pitch of 64 bytes at least (fdl6_layout), and a caller may choose 16. The image lies in this copy, with an aligned pitch, and each command buffer that reads the texture copies the rows first.
+/// Limit [I]: the buffer's content as the CPU sees it when the draw is encoded. A GPU write to that buffer in the same command buffer is not seen; a render or blit target with such rows is refused.
+pub(crate) struct Shadow {
+    pub(crate) copy: Arc<Slice>,
+    pub(crate) offset: u64,
+    pub(crate) row: u64,
+    pub(crate) pitch: u64,
+    pub(crate) line: u64,
+    pub(crate) rows: u64,
 }
 impl Drop for TextureObj {
     fn drop(&mut self) {
@@ -286,6 +297,26 @@ impl TextureObj {
     pub(crate) fn level_size(&self, level: u64) -> (u64, u64) {
         let l = self.base_level as u64 + level;
         ((self.desc.width >> l).max(1), (self.desc.height >> l).max(1))
+    }
+    /// The shadow of this texture or of the texture this view is of.
+    pub(crate) fn shadow(&self) -> Option<&Shadow> {
+        match &self.parent {
+            Some(p) => p.shadow(),
+            None => self.shadow.as_ref(),
+        }
+    }
+    pub(crate) fn root_id(&self) -> usize {
+        match &self.parent {
+            Some(p) => p.root_id(),
+            None => self as *const TextureObj as usize,
+        }
+    }
+    /// The buffer that holds what the CPU wrote (a shadow's source).
+    pub(crate) fn root_backing(&self) -> Option<&Arc<BufferObj>> {
+        match &self.parent {
+            Some(p) => p.root_backing(),
+            None => self.backing.as_ref(),
+        }
     }
     pub(crate) fn view_kind(metal: u64) -> u32 {
         // MTLTextureType: 0 1D, 1 1D array, 2 2D, 3 2D array, 4 2D MS, 5 cube, 6 cube array, 7 3D, 8 2D MS array, 9 buffer
@@ -320,7 +351,9 @@ pub(crate) fn new_texture(gpu: &Arc<Gpu>, d: &NmbTextureDescriptor, over: Option
     let mode = TextureObj::storage_mode(d);
     // private and memoryless render targets take the GPU's own layout; everything the CPU can touch stays linear, so replace and getBytes are plain copies
     let tiled = over.is_none() && mode >= 2;
-    let stride = over.map_or(0, |o| o.2 as u32);
+    // a row this GPU cannot read as it lies: the image gets its own memory, with an aligned pitch
+    let unaligned = over.is_some_and(|o| o.2 & 63 != 0);
+    let stride = over.map_or(0, |o| if unaligned { ((o.2 + 63) & !63) as u32 } else { o.2 as u32 });
     let layers = if d.kind == 5 || d.kind == 6 { (d.array_length.max(1) * 6) as u32 } else { d.array_length.max(1) as u32 };
     let image = unsafe { nmn_image_new(gpu.gpu, pipe, kind, d.width as u32, d.height.max(1) as u32, d.depth.max(1) as u32, d.levels.max(1) as u32, layers, d.samples.max(1) as u32, tiled, stride) };
     if image.is_null() {
@@ -329,8 +362,19 @@ pub(crate) fn new_texture(gpu: &Arc<Gpu>, d: &NmbTextureDescriptor, over: Option
     let size = unsafe { nmn_image_size(image) };
     let mut memory = None;
     let mut backing = None;
+    let mut shadow = None;
     let memoryless = mode == MEMORYLESS && over.is_none();
-    if let Some((b, offset, _)) = over {
+    if let (Some((b, offset, row)), true) = (over, unaligned) {
+        if d.levels.max(1) != 1 || d.kind == 7 || d.array_length.max(1) != 1 {
+            unsafe { nmn_image_free(image) };
+            return Err(format!("a texture of more than one level or layer over rows of {row} bytes has no native path yet"));
+        }
+        let copy = Slice::new(gpu, size, 4096)?;
+        unsafe { nmn_image_bind(image, copy.iova) };
+        let cpp = unsafe { nmn_format_blocksize(pipe) } as u64;
+        shadow = Some(Shadow { copy, offset, row, pitch: stride as u64, line: (d.width * cpp).min(row), rows: d.height.max(1) });
+        backing = Some(b.clone());
+    } else if let Some((b, offset, _)) = over {
         unsafe { nmn_image_bind(image, b.backing.iova() + offset) };
         backing = Some(b.clone());
     } else if memoryless {
@@ -353,7 +397,7 @@ pub(crate) fn new_texture(gpu: &Arc<Gpu>, d: &NmbTextureDescriptor, over: Option
         memory = Some(m);
     }
     let levels = d.levels.max(1) as u32;
-    Ok(Arc::new(TextureObj { gpu: gpu.clone(), image: image as usize, pipe_format: pipe, desc: *d, backing, memory, parent: None, view_type: kind, base_level: 0, levels, base_layer: 0, layers, memoryless }))
+    Ok(Arc::new(TextureObj { gpu: gpu.clone(), image: image as usize, pipe_format: pipe, desc: *d, backing, memory, parent: None, view_type: kind, base_level: 0, levels, base_layer: 0, layers, memoryless, shadow }))
 }
 
 #[unsafe(no_mangle)]
@@ -402,8 +446,11 @@ pub unsafe extern "C" fn nmb_texture_replace(t: *mut NmbTexture, region: *const 
         let map = t.memory.as_ref().map(|m| m.map as *mut u8).or(t.backing.as_ref().map(|b| b.backing.map() as *mut u8)).ok_or("no CPU mapping")?;
         unsafe {
             let cpp = nmn_format_blocksize(t.pipe_format) as u64;
-            let pitch = nmn_image_pitch(t.image as *const NmnImage, level as u32) as u64;
-            let base = nmn_image_layer_offset(t.image as *const NmnImage, level as u32, slice as u32);
+            // with a shadow, the buffer holds the truth, in the caller's rows at the caller's offset
+            let (pitch, base) = match &t.shadow {
+                Some(x) => (x.row, x.offset),
+                None => (nmn_image_pitch(t.image as *const NmnImage, level as u32) as u64, nmn_image_layer_offset(t.image as *const NmnImage, level as u32, slice as u32)),
+            };
             for y in 0..r[4] {
                 let dst = map.add((base + (r[1] + y) * pitch + r[0] * cpp) as usize);
                 let src = (bytes as *const u8).add((y * bytes_per_row) as usize);
@@ -485,6 +532,7 @@ pub struct NmbCommandBuffer {
     pub(crate) held_baked: Vec<Arc<Baked>>,
     pub(crate) held_streams: Vec<Box<NwCs>>,
     pub(crate) names: Vec<usize>,
+    pub(crate) shadows_done: Vec<usize>,
     upload: Option<Upload>,
     pub(crate) state: Arc<(Mutex<CbState>, Condvar)>,
     handlers: Vec<(extern "C" fn(*mut c_void), usize)>,
@@ -529,7 +577,7 @@ pub extern "C" fn nmb_command_buffer_new(q: *mut NmbQueue) -> *mut NmbCommandBuf
             nw_cs_init(&mut *cs, gpu.dev);
             nmn_cmd_init(&mut *cs, gpu.gpu);
         }
-        Ok(boxed(NmbCommandBuffer { gpu, cs, held_textures: vec![], held_buffers: vec![], held_slices: vec![], held_baked: vec![], held_streams: vec![], names: vec![], upload: None, state: Arc::new((Mutex::new(CbState::default()), Condvar::new())), handlers: vec![], scheduled: vec![], open: false, signals: vec![], waits: vec![] }))
+        Ok(boxed(NmbCommandBuffer { gpu, cs, held_textures: vec![], held_buffers: vec![], held_slices: vec![], held_baked: vec![], held_streams: vec![], names: vec![], shadows_done: vec![], upload: None, state: Arc::new((Mutex::new(CbState::default()), Condvar::new())), handlers: vec![], scheduled: vec![], open: false, signals: vec![], waits: vec![] }))
     })
 }
 
@@ -841,6 +889,9 @@ pub extern "C" fn nmb_render_encoder_new(c: *mut NmbCommandBuffer, d: *const Nmb
                 colors.push(None);
             } else {
                 let t = get(a.texture)?.t.clone();
+                if t.shadow().is_some() {
+                    return Err("a render target with rows the GPU cannot write has no native path".into());
+                }
                 fit(&t, a.level);
                 let (level, layer) = (t.base_level as u64 + a.level, t.base_layer as u64 + a.slice + a.depth_plane);
                 colors.push(Some((t, level, layer, a.load, a.store, a.clear)));

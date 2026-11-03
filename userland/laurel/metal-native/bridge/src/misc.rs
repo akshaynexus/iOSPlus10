@@ -262,7 +262,7 @@ pub extern "C" fn nmb_heap_new_texture(h: *const NmbHeap, descriptor: *const Nmb
         let image = new_texture_layout(&h.gpu, d)?;
         unsafe { nmn_image_bind(image, h.memory.iova + at) };
         let pipe = unsafe { nmn_format_from_metal(d.format) };
-        Ok(boxed(NmbTexture { t: Arc::new(TextureObj { gpu: h.gpu.clone(), image: image as usize, pipe_format: pipe, desc: *d, backing: None, memory: Some(h.memory.clone()), parent: None, view_type: TextureObj::view_kind(d.kind), base_level: 0, levels: d.levels.max(1) as u32, base_layer: 0, layers: d.array_length.max(1) as u32, memoryless: false }) }))
+        Ok(boxed(NmbTexture { t: Arc::new(TextureObj { gpu: h.gpu.clone(), image: image as usize, pipe_format: pipe, desc: *d, backing: None, memory: Some(h.memory.clone()), parent: None, view_type: TextureObj::view_kind(d.kind), base_level: 0, levels: d.levels.max(1) as u32, base_layer: 0, layers: d.array_length.max(1) as u32, memoryless: false, shadow: None }) }))
     })
 }
 
@@ -287,7 +287,7 @@ pub extern "C" fn nmb_texture_new_view(t: *mut NmbTexture, format: u64, kind: u6
         if !whole {
             desc.kind = kind;
         }
-        Ok(boxed(NmbTexture { t: Arc::new(TextureObj { gpu: parent.gpu.clone(), image: parent.image, pipe_format: pipe, desc, backing: None, memory: None, parent: Some(parent.clone()), view_type: TextureObj::view_kind(desc.kind), base_level: bl, levels: nl, base_layer: bs, layers: ns, memoryless: parent.memoryless }) }))
+        Ok(boxed(NmbTexture { t: Arc::new(TextureObj { gpu: parent.gpu.clone(), image: parent.image, pipe_format: pipe, desc, backing: None, memory: None, parent: Some(parent.clone()), view_type: TextureObj::view_kind(desc.kind), base_level: bl, levels: nl, base_layer: bs, layers: ns, memoryless: parent.memoryless, shadow: None }) }))
     })
 }
 /// One plane of a surface with planes. A format with no pipe format (a biplanar one taken whole) is refused.
@@ -306,8 +306,10 @@ pub unsafe extern "C" fn nmb_texture_get_bytes(t: *const NmbTexture, bytes: *mut
         let map = t.memory.as_ref().map(|m| m.map as *mut u8).or(t.backing.as_ref().map(|b| b.backing.map() as *mut u8)).ok_or("no CPU mapping")?;
         unsafe {
             let cpp = nmn_format_blocksize(t.pipe_format) as u64;
-            let pitch = nmn_image_pitch(t.image as *const NmnImage, level as u32) as u64;
-            let base = nmn_image_layer_offset(t.image as *const NmnImage, level as u32, slice as u32);
+            let (pitch, base) = match &t.shadow {
+                Some(x) => (x.row, x.offset),
+                None => (nmn_image_pitch(t.image as *const NmnImage, level as u32) as u64, nmn_image_layer_offset(t.image as *const NmnImage, level as u32, slice as u32)),
+            };
             for y in 0..r[4] {
                 let src = map.add((base + (r[1] + y) * pitch + r[0] * cpp) as usize);
                 let dst = (bytes as *mut u8).add((y * bytes_per_row) as usize);
@@ -623,6 +625,9 @@ pub extern "C" fn nmb_blit_copy_texture(e: *mut NmbEncoder, s: *mut NmbTexture, 
         if st.pipe_format == unsafe { nmn_format_from_metal(260) } || dt.pipe_format == unsafe { nmn_format_from_metal(260) } {
             return Err("a copy of a Depth32Float_Stencil8 texture has no native path yet".into());
         }
+        if st.shadow().is_some() || dt.shadow().is_some() {
+            return Err("a copy of a texture with rows the GPU cannot read has no native path yet".into());
+        }
         hold_texture(e, &st)?;
         hold_texture(e, &dt)?;
         let (so, size, dorigin) = unsafe { (std::slice::from_raw_parts(so, 3), std::slice::from_raw_parts(size, 3), std::slice::from_raw_parts(dorigin, 3)) };
@@ -636,6 +641,9 @@ pub extern "C" fn nmb_blit_buffer_to_texture(e: *mut NmbEncoder, b: *mut NmbBuff
     guard(false, || {
         let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
         let (sb, dt) = (get(b)?.b.clone(), get(t)?.t.clone());
+        if dt.shadow().is_some() {
+            return Err("a copy into a texture with rows the GPU cannot read has no native path yet".into());
+        }
         hold_buffer(e, &sb)?;
         hold_texture(e, &dt)?;
         let (size, origin) = unsafe { (std::slice::from_raw_parts(size, 3), std::slice::from_raw_parts(origin, 3)) };
@@ -653,6 +661,9 @@ pub extern "C" fn nmb_blit_texture_to_buffer(e: *mut NmbEncoder, t: *mut NmbText
     guard(false, || {
         let e = unsafe { e.as_mut() }.ok_or("null encoder")?;
         let (st, db) = (get(t)?.t.clone(), get(b)?.b.clone());
+        if st.shadow().is_some() {
+            return Err("a copy from a texture with rows the GPU cannot read has no native path yet".into());
+        }
         hold_texture(e, &st)?;
         hold_buffer(e, &db)?;
         let (size, origin) = unsafe { (std::slice::from_raw_parts(size, 3), std::slice::from_raw_parts(origin, 3)) };

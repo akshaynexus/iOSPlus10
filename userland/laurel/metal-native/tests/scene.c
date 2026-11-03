@@ -122,6 +122,15 @@ static NmbTexture *scene_surface_texture(NmbDevice *dev, uint32_t w, uint32_t h,
 
 static int scene_surfaces(NmbDevice *dev, NmbQueue *queue, NmbRenderPipeline *pipe, NmbTexture *memoryless, NmbTexture *image, NmbSampler *sampler, NmbBuffer *ib)
 {
+	/* a texture over a buffer with rows of 160 bytes, as SpringBoard's icons: the shadow copy: its creation, and a draw's read below */
+	{
+		NmbBuffer *rows = nmb_buffer_new(dev, 160 * 40, 0, NULL);
+		struct NmbTextureDescriptor d = {.type = 2, .format = 80, .width = 40, .height = 40, .depth = 1, .levels = 1, .samples = 1, .array_length = 1, .usage = 1, .options = 0};
+		NmbTexture *t = rows ? nmb_texture_new_on_buffer(rows, &d, 0, 160, false) : NULL;
+		if (t == NULL)
+			FAIL("a texture with rows of 160 bytes");
+		image = t;
+	}
 	void *small_base = NULL, *big_base = NULL;
 	NmbTexture *small = scene_surface_texture(dev, 32, 32, &small_base), *big = scene_surface_texture(dev, 720, 1560, &big_base);
 	if (small == NULL || big == NULL)
