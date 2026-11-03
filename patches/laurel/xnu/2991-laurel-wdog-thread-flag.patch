@@ -1,0 +1,49 @@
+laurel 2991: the stuck-CPU report decides "inside a system call" by the thread's own flag; both kernels. docs/laurel_sprout/watchdog.md section 10.
+
+[V 2026-11-03 18:51:35, kernel c68eeb19c9] CPU 5 silent 19.5 s, its last interrupt in vm_map_zap_dispose from vm_map_enter+0x1184, and the
+2988 line said "no EL0 trap open": the stamp is per CPU and belongs to the CPU where the trap entered; a thread preempted inside a system call
+that goes on here brought none. XNU keeps the flag in the thread (machine.el0_synchronous_trap: set in sleh_synchronous, cleared in
+thread_exception_return). The report now reads that flag by a copy that cannot fault; the CPU's stamp gives the class, ESR, FAR and user pc only
+when the trap entered here, else the line says so. The path lines of 2989 (frames, stack text, user registers) follow the flag too.
+
+diff --git a/osfmk/arm64/laurel_wdog.c b/osfmk/arm64/laurel_wdog.c
+index f1c44ba..ae3e6f9 100644
+--- a/osfmk/arm64/laurel_wdog.c
++++ b/osfmk/arm64/laurel_wdog.c
+@@ -393,7 +393,19 @@ laurel_wdog_report_cpu(int cpu, const char *prefix)
+ 	    c->worst / ticks, c->worst_pc, vm_kernel_slide);
+ 	/* laurel 2988: inside the kernel on an EL0 trap, or not; the redistributor's words; the dyld cache slide of the task that runs there */
+ 	uint64_t trap_t = c->trap_t, esr = c->trap_esr;
+-	bool open = trap_t != 0 && c->trap_thread == (volatile void *)cd->cpu_active_thread;
++	/*
++	 * laurel 2991: the thread's own flag says whether it is inside an EL0 synchronous trap (sleh_synchronous sets it, thread_exception_return
++	 * clears it). The CPU's stamp only matches when the trap entered on this CPU: a thread preempted inside a system call that goes on
++	 * here brought no stamp (the 18:51:35 catch: vm_map_enter on the CPU, the stamp of another thread closed).
++	 */
++	bool here = trap_t != 0 && c->trap_thread == (volatile void *)cd->cpu_active_thread;
++	bool in_trap = false;
++	thread_t th0 = (thread_t)cd->cpu_active_thread;
++
++	if (th0 != NULL) {
++		(void)ml_nofault_copy((vm_offset_t)&th0->machine.el0_synchronous_trap, (vm_offset_t)&in_trap, sizeof(in_trap));
++	}
++	bool open = in_trap || here;
+ 	uint32_t pend = 0, act = 0;
+ 	bool have_words = lwd_gicr_words((uint32_t)cd->cpu_phys_id, &pend, &act);
+ 	uint32_t dyld_slide = 0;
+@@ -408,10 +420,14 @@ laurel_wdog_report_cpu(int cpu, const char *prefix)
+ 	if (open && th != NULL) {
+ 		lwd_thread_path(prefix, cpu, th, c);
+ 	}
+-	if (open) {
++	if (open && here) {
+ 		kprintf("%s cpu %d is in the kernel since an EL0 trap %llu ms ago: class 0x%02llx (%s) esr 0x%llx far 0x%llx user pc 0x%llx, %u traps in all; GICR pending 0x%08x active 0x%08x%s; dyld slide 0x%x\n",
+ 		    prefix, cpu, now > trap_t ? (now - trap_t) / ticks : 0, esr >> 26, lwd_class_name((uint32_t)(esr >> 26)), esr, c->trap_far, c->trap_pc,
+ 		    c->trap_count, pend, act, have_words ? "" : " (unread)", dyld_slide);
++	} else if (open) {
++		kprintf("%s cpu %d is in the kernel on an EL0 synchronous trap that entered on another CPU (the thread's flag); this CPU's last trap %llu ms ago at user pc 0x%llx class 0x%02llx, %u in all; GICR pending 0x%08x active 0x%08x%s; dyld slide 0x%x\n",
++		    prefix, cpu, trap_t != 0 && now > trap_t ? (now - trap_t) / ticks : 0, c->trap_pc, esr >> 26, c->trap_count, pend, act,
++		    have_words ? "" : " (unread)", dyld_slide);
+ 	} else {
+ 		kprintf("%s cpu %d has no EL0 trap open (in EL0, or the trap ended): %u traps in all, the last %llu ms ago at user pc 0x%llx class 0x%02llx; GICR pending 0x%08x active 0x%08x%s; dyld slide 0x%x\n",
+ 		    prefix, cpu, c->trap_count, trap_t != 0 && now > trap_t ? (now - trap_t) / ticks : 0, c->trap_pc, esr >> 26, pend, act,
