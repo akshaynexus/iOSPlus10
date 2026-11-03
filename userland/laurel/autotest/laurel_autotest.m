@@ -441,7 +441,18 @@ cmd_settle(int quiet_ms, int max_ms, int must_change)
 			have = true;
 			still_since = now_us();
 		}
-		if ((changed || !must_change) && now_us() - still_since >= (uint64_t)quiet_ms * 1000) {
+		size_t dark = 0;
+		if (must_change) {
+			for (size_t i = 0; i < pixels; i++) {
+				const uint8_t *a = thumb + i * 4;
+				dark += a[0] <= 8 && a[1] <= 8 && a[2] <= 8;
+			}
+		}
+		/* an app's black launch screen is not the end of a change: a black screen that stays ends at MAX_MS, and the step says so */
+		const bool black = must_change && dark * 100 >= pixels * 98;
+		if (black && have)
+			still_since = now_us();
+		if ((changed || !must_change) && !black && now_us() - still_since >= (uint64_t)quiet_ms * 1000) {
 			printf("settled in %llu ms, %s\n", (now_us() - t0) / 1000, changed ? "changed" : "no change");
 			return 0;
 		}
