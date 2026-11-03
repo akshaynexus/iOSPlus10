@@ -1,6 +1,7 @@
 #!/bin/bash
 # One test round of the native Metal stack on the running phone, for the agent that works on it. Takes the phone lock for the whole round.
-#   scripts/bg.sh round scripts/laurel/native/compositor-round.sh [--reboot] [--keep] [SECONDS]
+#   scripts/bg.sh round scripts/laurel/native/compositor-round.sh [--reboot] [--keep] [--test STEPS] [SECONDS]
+# --test home-swipe,control-center: after SECONDS, the UI test tool's steps (unlock first), under the same lock; its table goes to the folder.
 # Hold the lock for one install and one run: a few minutes (default 150 s of run): other agents wait for it.
 # --reboot first: `sync`, then op10tool ctl reboot, and wait for SSH (a GPU hang leaves the GPU off until a reboot). Then: install this tree's out/ios26/metal-all/stage with the setting native, wait SECONDS (default 150) or until a hang, take a screenshot, print the stack's lines, and write the setting `default` again (--keep: stay on native, for a test that follows).
 # The UI test tool: AUTOTEST_DIR (default: this tree). Output: logs/round-TIME/ (screenshot, lines).
@@ -12,8 +13,8 @@ if [ "${ROUND_LOCKED:-0}" != 1 ]; then
   export ROUND_LOCKED=1
   exec "$MAIN/scripts/laurel/phone-lock.sh" native "$0" "$@"
 fi
-REBOOT=0; KEEP=0; WAIT=150
-for a in "$@"; do case "$a" in --reboot) REBOOT=1 ;; --keep) KEEP=1 ;; *) WAIT=$a ;; esac; done
+REBOOT=0; KEEP=0; WAIT=150; TEST=
+while [ $# -gt 0 ]; do case "$1" in --reboot) REBOOT=1 ;; --keep) KEEP=1 ;; --test) TEST=$2; shift ;; *) WAIT=$1 ;; esac; shift; done
 OP=$MAIN/out/bin/op10tool
 B=/System/Library/Extensions/NegroniMetal.bundle
 D=$REPO/logs/round-$(date +%H%M%S); mkdir -p "$D"
@@ -40,6 +41,12 @@ for _ in $(seq 1 $((WAIT / 5))); do
   L=$(usblog)
   if tail -n +"$FROM" "$L" | grep -qE 'watchdog: GPU hang|LAUREL METAL NATIVE: off|LAUREL PANIC: holding'; then say "stopped early: a hang, a fallback or a panic"; sleep 5; break; fi
 done
+A=${AUTOTEST_DIR:-$REPO}
+if [ -n "$TEST" ] && ! tail -n +"$FROM" "$(usblog)" | grep -qE 'watchdog: GPU hang|LAUREL METAL NATIVE: off|LAUREL PANIC: holding'; then
+  (cd "$A" && timeout 40 scripts/laurel/ios26-autotest.sh key power 2>&1 | tail -1; timeout 50 scripts/laurel/ios26-autotest.sh shot "round-$(basename "$D")-awake" 2>&1 | tail -1 | cut -c1-160; timeout 400 scripts/laurel/ios26-autotest.sh run --only "$TEST" 2>&1 | tail -14 | cut -c1-220)
+  (cd "$A" && timeout 50 scripts/laurel/ios26-autotest.sh shot "round-$(basename "$D")-after" 2>&1 | tail -1 | cut -c1-160)
+  cp "$A/logs/autotest-shots/round-$(basename "$D")-"*.png "$D/" 2>/dev/null
+fi
 L=$(usblog)
 tail -n +"$FROM" "$L" > "$D/usblog.txt"
 grep -E 'LAUREL METAL:|METAL NATIVE|METAL26: |stream check|GPU hang|SMMU gfsr|LAUREL GPU: off|CRASH (backboardd|SpringBoard)\[|LAUREL PANIC|Assertion failed|LAUREL FRAME: motion|native-metal: refused' "$D/usblog.txt" | cut -c1-260 | tail -40

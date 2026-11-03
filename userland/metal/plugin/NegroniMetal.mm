@@ -1159,19 +1159,19 @@ static void *bbd_screen_check(void *arg)
 			nlog(BBD_TAG ": screen: %u of 64 samples lit, %.0f s after the device opened; %llu command buffers completed", lit, now - t0, (unsigned long long)p[1]);
 		}
 		last_lit = lit;
+#ifdef NMTL_IOS26
+		/* 60 s after the first lit sample this start did not fail, whatever the screen shows then: a display that sleeps gives a black surface [V 10:32:18: 10 s after it first lit: "the screen surface stayed black"]. A start that dies before that counts in the selector's rule, so a crash loop after the first frame ends too. */
+		static double lit_at;
+		if (lit && lit_at == 0)
+			lit_at = now;
+		if (lit_at != 0 && now - lit_at >= 60) {
+			option_mark("ok", "lit");
+			nlog(BBD_TAG ": on: stack %s: the screen is lit 60 s after the first frame", getenv("NEGRONIMETAL_OPTION") ?: "default");
+			return NULL;
+		}
+#endif
 		if (lit) {
 			first_lit_wait = now;
-#ifdef NMTL_IOS26
-			/* Lit for 60 s: this start did not fail. A start that dies before that counts in the selector's rule, so a crash loop after the first frame ends too. Later black is the display's sleep, not a failure. */
-			static double lit_at;
-			if (lit_at == 0)
-				lit_at = now;
-			if (now - lit_at >= 60) {
-				option_mark("ok", "lit");
-				nlog(BBD_TAG ": on: stack %s: the screen is lit 60 s after the first frame", getenv("NEGRONIMETAL_OPTION") ?: "default");
-				return NULL;
-			}
-#endif
 		}
 #ifdef LAUREL_BBD_METAL
 		else if (now - first_lit_wait >= 30) {
@@ -1184,11 +1184,11 @@ static void *bbd_screen_check(void *arg)
 		}
 #else
 #ifdef NMTL_NATIVE
-		/* a cold start: the boot screen is black with a spinner the samples miss, while the render thread compiles [V log 07:38:18] */
-		else if (now - first_lit_wait >= 240)
+		/* a cold start: the boot screen is black with a spinner the samples miss, while the render thread compiles [V log 07:38:18]. Only before the first lit sample: later a sleeping display is black too */
+		else if (lit_at == 0 && now - first_lit_wait >= 240)
 			option_failed("the screen surface stayed black for 240 s after a frame");
 #else
-		else if (now - first_lit_wait >= 30)
+		else if (lit_at == 0 && now - first_lit_wait >= 30)
 			option_failed("the screen surface stayed black for 30 s after a frame");
 #endif
 		if (now - t0 >= 300)
