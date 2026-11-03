@@ -7,8 +7,9 @@
 #   scripts/laurel/ios26-autotest.sh shot [NAME]         the frame on the panel: logs/autotest-shots/NAME.png
 #   scripts/laurel/ios26-autotest.sh seq N [MAX_MS]      N flips: logs/autotest-shots/seq-TIME/ and one line with frames that equal an older frame, and black frames
 #   scripts/bg.sh autotest scripts/laurel/ios26-autotest.sh run [--only a,b] [--scenario FILE]    the scenario; the table is in logs/autotest-DATE.txt
+#   scripts/bg.sh autotest scripts/laurel/phone-lock.sh ui scripts/laurel/ios26-autotest.sh baseline [STACK]   the same under the owner's rule for a measure: stack STACK (default: default), Metal on. Only this command reboots: when Metal is off, since only a reboot brings it back
 #   scripts/laurel/ios26-autotest.sh test                the tests that need no phone
-# Env as scripts/net/ssh-phone.sh. Never flashes, never reboots, never restarts a process, never changes a setting on the phone.
+# Env as scripts/net/ssh-phone.sh. Never flashes, never restarts a process, never changes a setting on the phone. Only `baseline` reboots.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 . "$REPO/scripts/lib/env.sh"
@@ -53,6 +54,24 @@ run)
   shift
   OP10TOOL=$OP exec python3 -I "$REPO/scripts/laurel/ios26-autotest.py" "$@"
   ;;
+baseline)
+  need_op
+  stack=${2:-default}
+  export OP10TOOL=$OP
+  rc=0; python3 -I "$REPO/scripts/laurel/ios26-autotest.py" --gate-only --need-stack "$stack" || rc=$?
+  if [ "$rc" = 4 ] || [ "$rc" = 3 ]; then
+    echo "ios26-autotest: gate $rc: reboot, the GPU stays off until then"
+    "$OP" ctl reboot
+    sleep 30
+    "$SSHP" wait 300
+    # the first minutes hold the start's load (widgets, first LaunchServices work): no measure
+    while up=$("$OP" ctl state 2>/dev/null | sed -n '1s/.*up=\([0-9]*\).*/\1/p'); [ "${up:-0}" -lt 240 ]; do sleep 10; done
+    rc=0
+  elif [ "$rc" != 0 ]; then
+    exit "$rc"
+  fi
+  exec python3 -I "$REPO/scripts/laurel/ios26-autotest.py" --need-stack "$stack"
+  ;;
 test)
   OP10TOOL=$OP python3 -I "$REPO/scripts/laurel/ios26-autotest.py" --self-test
   cargo test --release --manifest-path "$REPO/tools/op10tool/Cargo.toml" --target-dir "$OUT/cargo" autotest
@@ -70,7 +89,7 @@ check|open|surfaces|awake|settle)
   exec "$SSHP" "$TOOL $args"
   ;;
 *)
-  sed -n 2,11p "$0"
+  sed -n 2,12p "$0"
   exit 2
   ;;
 esac

@@ -28,12 +28,15 @@ KERNEL_LINES = {
 MOTION = re.compile(r"LAUREL FRAME: motion ended: (\d+) frames in (\d+) ms")
 MOVING = re.compile(r"LAUREL FRAME: \d+ ticks .*moving: ([\d.]+) frames/s")
 SUBMIT_GPU = re.compile(r"LAUREL FRAME: after SwapEnd, (\d+) flips: .*?(\d+) us GPU fence")
+TOUCH_FLIP = re.compile(r"touch to next flip (\d+) us \((\d+)\)")
 GPU_BUSY = re.compile(r"RedwoodGPU: (\d+) submissions in (\d+) ms: .*GPU busy ([\d.]+) %, clock (\d+) MHz")
 STACK = re.compile(r"(LAUREL METAL: on: stack .*|LAUREL METAL26: on: stack .*|LAUREL METAL NATIVE: off: .*|LAUREL METAL26: off: .*|LAUREL METAL: off: .*)")
 REFUSED = re.compile(r"native-metal: refused \(logged once per reason\): ([^:]+:[^:]+)|LAUREL METAL COUNT: .*refused .*")
 SEQ = re.compile(r"seq: (\d+) frames in (\d+) ms, (\d+) surfaces, (\d+) older, (\d+) black, (.*)")
 CRITICAL = {"backboardd", "SpringBoard"}
 BLACK_PERCENT = 98.0
+UI_WAIT_S = 240
+UI_HOLD_S = 10
 BOOT = "exec launchd"  # once in a boot; LAUREL BUILD prints more than once
 
 
@@ -47,6 +50,7 @@ class Step:
         self.fence_us = []
         self.busy = []
         self.gpu_ms = 0.0
+        self.touch_us = []
         self.submissions = 0
         self.gpu = []
         self.flip = 0
@@ -100,6 +104,9 @@ def read_lines(text, step):
         m = SUBMIT_GPU.search(line)
         if m and int(m.group(1)) > 0:
             step.fence_us.append(int(m.group(2)))
+        m = TOUCH_FLIP.search(line)
+        if m and int(m.group(2)) > 0:
+            step.touch_us.append((int(m.group(1)), int(m.group(2))))
         m = GPU_BUSY.search(line)
         if m:
             step.busy.append((float(m.group(3)), int(m.group(4))))
@@ -129,6 +136,19 @@ def judge(step):
         step.fail("GPU lines")
 
 
+def renderer(text):
+    """From the newest boot in this log text: (state, line). state: gpu, cpu (Metal refused: a GPU hang, until a reboot), or None: no line yet."""
+    at = text.rfind(BOOT)
+    part = text[at:] if at >= 0 else text
+    state, why = None, ""
+    for line in part.splitlines():
+        if "LAUREL METAL26: on: Metal device" in line:
+            state, why = "gpu", line.strip()[:150]
+        elif "LAUREL METAL26: off: Metal device" in line or "LAUREL GPU: off" in line:
+            state, why = "cpu", line.strip()[:150]
+    return state, why
+
+
 def fps(frames, ms):
     return frames * 1000.0 / ms if ms else 0.0
 
@@ -145,11 +165,13 @@ def step_row(s):
     seq = f"{s.seq_frames}/{s.seq_ms} ms" if s.seq_frames else "-"
     busy = f"{max(b for b, _ in s.busy):.0f} %/{max(c for _, c in s.busy)}" if s.busy else "-"
     per = f"{s.gpu_ms / s.submissions:.1f} ms" if s.submissions else "-"
+    touches = sum(n for _, n in s.touch_us)
+    touch = f"{sum(u * n for u, n in s.touch_us) / touches / 1000:.0f} ms" if touches else "-"
     crash = ",".join(sorted(set(s.crashes)))[:28] or "-"
-    return [s.name, "ok" if s.ok else "FAIL", motion, moving, fence, per, busy, seq, str(s.older), str(s.black), str(s.flip), str(len(s.gpu)), str(len(s.panic)), crash]
+    return [s.name, "ok" if s.ok else "FAIL", motion, moving, touch, fence, per, busy, seq, str(s.older), str(s.black), str(s.flip), str(len(s.gpu)), str(len(s.panic)), crash]
 
 
-HEADS = ["step", "result", "fps motion", "moving", "fence", "gpu/sub", "busy/MHz", "seq frames", "older", "black", "undrawn", "gpu", "panic", "crashes"]
+HEADS = ["step", "result", "fps motion", "moving", "touch", "fence", "gpu/sub", "busy/MHz", "seq frames", "older", "black", "undrawn", "gpu", "panic", "crashes"]
 
 
 def table(rows):
@@ -348,6 +370,33 @@ class Run:
             time.sleep(3)
         self.step.fail(f"open {bundle}: refused 4 times")
 
+    def ui_ready(self, seconds=UI_WAIT_S):
+        """Another job can have restarted the UI just before the lock came free: a run in that time measures nothing [V phone 07:53]. Lit, and held for 10 s."""
+        self.step = Step("gate")
+        end = time.time() + seconds
+        raw = os.path.join(self.out, "gate.bin")
+        lit_since = None
+        while time.time() < end:
+            if self.panel_on() is False:
+                self.tool("key", "power")
+                self.panel_until(True)
+            with open(raw, "wb") as f:
+                rc, _ = self.phone.run(f"{TOOL} shot", stdout=f)
+            lit = False
+            if rc == 0:
+                p = subprocess.run([self.phone.op10, "autotest-png", raw, os.devnull], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                m = re.search(r"([\d.]+) % dark", p.stdout)
+                lit = m is not None and float(m.group(1)) < BLACK_PERCENT
+            if not lit:
+                lit_since = None
+            elif lit_since is None:
+                lit_since = time.time()
+            elif time.time() - lit_since >= UI_HOLD_S:
+                os.unlink(raw)
+                return True
+            time.sleep(2)
+        return False
+
     def panel_on(self):
         """SpringBoard's own state; None: no answer."""
         rc, _ = self.phone.run(f"{TOOL} awake")
@@ -413,6 +462,9 @@ def main():
     ap.add_argument("--scenario", default=os.path.join(REPO, "scripts/laurel/ios26-autotest.scenario"))
     ap.add_argument("--only", help="the names of the steps to run, with commas")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--allow-cpu", action="store_true", help="run with Metal off (the CPU renderer): a test of the UI, no measure")
+    ap.add_argument("--need-stack", help="stop with exit 5 if the selector's stack is not this one")
+    ap.add_argument("--gate-only", action="store_true", help="only the checks before step 1")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
@@ -439,24 +491,42 @@ def main():
     log = LiveLog(REPO)
     # patch 2983: the real HID path, so the CPU and GPU clock answer to touch as for a finger. AUTOTEST_INPUT=ssh: the tool, no kernel path.
     kernel_input = os.environ.get("AUTOTEST_INPUT") != "ssh" and subprocess.run([phone.op10, "input", "check"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    input_line = "Input: kernel HID path (patch 2983)" if kernel_input else "Input: laurel-autotest, event system in backboardd; no kernel clock answer to touch (CPU, GPU), so frame rates can be under those of a finger"
+    input_line = "Input: kernel HID path (patch 2983)" if kernel_input else "Input: laurel-autotest, event system in backboardd; no kernel clock answer to touch (CPU, GPU), so frame rates can be under those of a finger; do not compare with a kernel input run"
     print(input_line, flush=True)
     run = Run(phone, out, log, kernel_input)
+    if not run.ui_ready():
+        print(f"ios26-autotest: no lit UI in {UI_WAIT_S} s: no table, this is no measure. Kernel: {phone.ctl('ping').strip()}; logs/autotest-{date}/gate.bin holds the last frame")
+        return 3
+    state, why = renderer(log.whole())
+    render_line = f"RENDERER: {state or 'unknown: no line in the USB log'}: {why}"
+    print(render_line, flush=True)
+    if state == "cpu" and not a.allow_cpu:
+        print("ios26-autotest: Metal is off: the CPU renderer draws this UI, so no table: this is no measure. The GPU comes back at a reboot. --allow-cpu: run all the same")
+        return 4
+    if a.need_stack:
+        rc4, act = phone.run("head -c 20 /var/db/negronimetal/stack/active", timeout=20)
+        words = act.split()
+        if not words or words[0] != a.need_stack:
+            print(f"ios26-autotest: the stack is {words[0] if words else '?'}, not {a.need_stack}: no table. This tool changes no setting")
+            return 5
+    if a.gate_only:
+        return 0
     done = [run.run_step(n, c) for n, c in steps]
 
-    lines = [f"Mi A3 iOS 26 UI test {date}", text.strip(), input_line, f"USB log: {log.path or 'none: no kernel lines in this table. make usblog'}", f"Files: {out}", ""]
+    lines = [f"Mi A3 iOS 26 UI test {date}", text.strip(), render_line, input_line, f"USB log: {log.path or 'none: no kernel lines in this table. make usblog'}", f"Files: {out}", ""]
     lines.append(table([step_row(s) for s in done]))
     lines.append("")
-    lines.append("fps motion: frames / time of all LAUREL FRAME: motion ended lines of the step (lowest-highest, count). moving: best frames/s while moving. fence: mean GPU fence wait of a flip. gpu/sub: GPU busy time per submission in the step's RedwoodGPU windows. busy/MHz: the highest GPU busy share and clock of a RedwoodGPU window. "
+    lines.append("fps motion: frames / time of all LAUREL FRAME: motion ended lines of the step (lowest-highest, count). moving: best frames/s while moving. touch: finger event to the next flip (only on the kernel input). fence: mean GPU fence wait of a flip. gpu/sub: GPU busy time per submission in the step's RedwoodGPU windows. busy/MHz: the highest GPU busy share and clock of a RedwoodGPU window. "
                  "seq frames: frames seen in the sequence shots. older: frames equal to an older frame after a different one. black: mostly black frames. undrawn: flips that the kernel refused as not drawn.")
     lines.append("")
     lines.append("Stack selector (this boot):")
     whole = log.whole()
     lines += ["  " + x for x in stack_lines(whole)] or ["  no line in the USB log"]
     rc2, stk = phone.run("for f in /var/db/negronimetal/stack/* /var/db/negronimetal/option; do [ -f \"$f\" ] && echo \"$f: $(head -c 100 \"$f\" | tr '\\n' ' ')\"; done", timeout=20)
-    rc3, cfg = phone.run("echo env: $(tr '\\n' ' ' < /var/db/negronimetal/env); echo clients: $(tr '\\n' ' ' < /var/db/negronimetal/clients)", timeout=20)
-    stack_now = next((x.split(":", 1)[1].strip() for x in stk.splitlines() if x.startswith("/var/db/negronimetal/stack/active")), "?")
-    lines.insert(2, f"STACK: {stack_now}; {' '.join(cfg.split())[:300]}")
+    rc3, cfg = phone.run("echo env: $(grep -v '^#' /var/db/negronimetal/env | tr '\\n' ' '); echo clients: $(grep -v '^#' /var/db/negronimetal/clients | tr '\\n' ' ')", timeout=20)
+    setting = next((x.split(":", 1)[1].strip() for x in stk.splitlines() if x.startswith("/var/db/negronimetal/option")), "?")
+    active = next((x.split(":", 1)[1].strip() for x in stk.splitlines() if x.startswith("/var/db/negronimetal/stack/active")), "?")
+    lines.insert(2, f"STACK: {active.split()[0] if active.split() else '?'} (setting {setting}; selector: {active[:110]}); {' '.join(cfg.split())[:240]}")
     lines.append("Selector files (read only):")
     lines += ["  " + x for x in stk.strip().splitlines()] or ["  none"]
     lines.append("")
@@ -489,7 +559,7 @@ def self_test():
     s = Step("x")
     read_lines("""06:14:48 LAUREL FRAME: motion ended: 37 frames in 967 ms
 06:14:49 LAUREL FRAME: 63 ticks of 16940 us, worst 32470; moving: 13.1 frames/s for 532 ms of 1077; gaps <20 ms 0, <36 0, <52 0, longer 10
-06:14:49 LAUREL FRAME: after SwapEnd, 9 flips: 144 us to the presenter, 28131 us GPU fence, 9152 us flush to latch, 0 past one panel frame; touch to next flip 0
+06:14:49 LAUREL FRAME: after SwapEnd, 9 flips: 144 us to the presenter, 28131 us GPU fence, 9152 us flush to latch, 0 past one panel frame; touch to next flip 42000 us (3)
 06:47:05 LAUREL FLIP: surface 3 of swap 91 not drawn after 900 ms (fence 2652): the panel keeps its frame
 06:47:15 TopazGPU: watchdog: GPU hang: fence 2708 done 2705
 06:51:42 RedwoodGPU: 51 submissions in 5107 ms: 712 command buffers and 15205 buffers named, 356 KB out of the cache in 215 us a submission; GPU busy 13.8 %, clock 697 MHz over the window
@@ -499,7 +569,7 @@ def self_test():
     assert s.motion == [(37, 967)] and s.moving == [13.1] and s.fence_us == [28131] and s.flip == 1 and len(s.gpu) == 1 and s.crashes == ["aonsensed"], vars(s)
     assert not s.panic
     row = step_row(s)
-    assert row[2] == "38.3 (38-38, 1x)" and row[4] == "28 ms" and row[13] == "aonsensed" and row[6] == "14 %/697" and row[5] == "13.8 ms", row
+    assert row[2] == "38.3 (38-38, 1x)" and row[5] == "28 ms" and row[14] == "aonsensed" and row[7] == "14 %/697" and row[6] == "13.8 ms" and row[4] == "42 ms", row
     t = table([row])
     assert t.splitlines()[0].startswith("| step") and len({len(x) for x in t.splitlines()}) == 1, t
     p = Step("p")
@@ -527,6 +597,11 @@ def self_test():
     st = stack_lines(log)
     assert len(st) == 3 and "stack native" in st[0] and "gave no device" in st[1] and "refused" in st[2], st
     assert "default" not in st[0]
+    assert renderer("x\n1 exec launchd\n2 N: LAUREL METAL26: on: Metal device Turnip\n")[0] == "gpu"
+    assert renderer("1 exec launchd\n2 N: LAUREL METAL26: on: Metal device T\n3 LAUREL GPU: off: GPU hang\n")[0] == "cpu"
+    assert renderer("1 exec launchd\n2 N: LAUREL METAL26: off: Metal device refused\n")[0] == "cpu"
+    assert renderer("0 LAUREL GPU: off: x\n1 exec launchd\n")[0] is None
+    assert renderer("1 exec launchd\n2 N: LAUREL METAL26: on: stack default: the screen is lit\n")[0] is None
     print("ios26-autotest self-test: ok")
     return 0
 
