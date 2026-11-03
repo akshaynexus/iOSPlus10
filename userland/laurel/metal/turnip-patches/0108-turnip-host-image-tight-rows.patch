@@ -2,7 +2,15 @@ laurel (Mi A3, iOS 26): a linear image for a host allocation has the tightest ro
 
 --- a/src/freedreno/vulkan/tu_image.cc
 +++ b/src/freedreno/vulkan/tu_image.cc
-@@ -824,6 +824,21 @@
+@@ -757,6 +757,7 @@
+ {
+    uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+    const VkSubresourceLayout *plane_layouts = NULL;
++   VkSubresourceLayout host_plane = {};
+    VkResult result;
+ 
+    VK_FROM_HANDLE(tu_device, device, _device);
+@@ -824,6 +825,20 @@
        modifier = eci.drmFormatModifier;
     }
  
@@ -10,7 +18,6 @@ laurel (Mi A3, iOS 26): a linear image for a host allocation has the tightest ro
 +    * and the layout's own 64 pixels gave 3072, so metal2vulkan kept a shadow of every surface. Rows as tight as a store of 16x4 blocks allows, as
 +    * fdl6_layout takes an explicit layout. A row pitch that does not meet that stays what it was, and metal2vulkan keeps its shadow.
 +    */
-+   VkSubresourceLayout host_plane = {};
 +   if (!plane_layouts && pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&
 +       (image->vk.external_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) &&
 +       image->vk.mip_levels == 1 && image->vk.array_layers == 1 && image->vk.extent.depth == 1 &&
