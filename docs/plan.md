@@ -1178,3 +1178,9 @@ Next: boot. Read `LAUREL GPU PUSH`, `LAUREL GPU WC`, `LAUREL GPU TIME`, `push us
 ## 2026-11-03: Mi A3: native Metal stack, third option (branch `t3/native-adreno-metal-driver`, not merged)
 Done on the host, no phone: winsys, PM4, AIR -> ir3 with no Vulkan (141 of 154, 218 of 218 real keys), 148 frontend calls, third option, phone image passes abi, ARMv8.0 and import checks. Register state at a draw agrees with Turnip's on 2 scenes, 0 unexpected. **Never drew a pixel. The Objective-C frontend and the IOKit transport never ran.** GL ES: not built; route found.
 Next: owner's yes for `nmn-scene` on the phone (`docs/laurel_sprout/ios26-native-metal.md` section 8). Found on the way, for the default stack: a real CA pass runs in 108 tiles (section 3.3).
+
+## 2026-11-03: Mi A3 iOS 26: Control Center and widgets (branch `t3/laurel-control-center-modules`, not merged)
+
+Done, read on the phone with no write: one cause for no modules and no widget records: MobileGestalt `arm64e` = false. `post/9011`. bluetoothd loop on status 701: `post/9012`. Host test PASS; kernel build result: `docs/laurel_sprout/ios26-control-center.md`. Not booted.
+
+Next: boot image with both patches, then `dual-boot.sh install` or the test write of that doc (owner's yes), then its reads R1, R2.

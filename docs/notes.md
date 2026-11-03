@@ -5317,3 +5317,14 @@ Full text: `docs/laurel_sprout/ios26-native-metal.md`. Not merged. Never drew a 
 - Do not run `cd` into `out/` in a tool call: the tool shell keeps it. zsh does not split `$F`: use `bash -c` for a flag list.
 - `compute_apl` asks 32 x 32 threads a group: the host profile's floor refuses it; real value 1024 (`threadsize_base` 64 x `max_waves` 16) [V source].
 - Existing FD610 GL binaries (`libOSMesa`, `libtopaz-gl`, `libtopaz-inject`): 0 missing imports against 23F84 [V].
+
+## 2026-11-03: Mi A3 iOS 26: Control Center empty, widgets `Waiting…`: MobileGestalt `arm64e` = false (branch t3/laurel-control-center-modules; read on the phone, no write)
+
+Full text: `docs/laurel_sprout/ios26-control-center.md`.
+
+- `UIRequiredDeviceCapabilities` of all 54 Control Center modules and all 266 `/Applications/*/PlugIns/*.appex` has `arm64e`. MobileGestalt: `arm64e` = `CPUArchitecture == "arm64e"`; `CPUArchitecture` = `NXGetLocalArchInfo()` = `host_info(HOST_PREFERRED_USER_ARCH)`. Our kernel gave arm64. lsd log: `MismatchedCapabilities = { arm64e = 0 }`, 639 lines. `post/9011` tells user space arm64e; the kernel's own grading stays.
+- The answer stays in `/var`: the MobileGestalt plist, the csstore, and an empty `ControlsIconState.plist`. A new kernel alone is not enough: erase them or install a new root.
+- The earlier catalog idea (`enforce_xpc_cache_code_signing`) was not the limit: 0 lines of missing cache entry. chronod's Metal denial does not matter for this.
+- bluetoothd: 0x2041 (extended scan parameters) gets status 1 -> OI 701 -> `Bluetooth error - restarting`, each 10 s. `post/9012`: legacy commands to the chip. tccd's burst follows these restarts.
+- Tool: `scripts/laurel/ios26-unified-log.py` reads a copy of `/var/db/diagnostics` + `uuidtext`. Private text is in the file too (decompress, `strings`). Use it first: it had the exact reason, with bundle id.
+- Next: chronod's HEIC write fails (no HEVC encoder): `CMPhotoCompressionSessionAddImage` UnsupportedOperation. A control may lose its icon [I].
