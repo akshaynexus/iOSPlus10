@@ -442,15 +442,12 @@ static bool finish_stage(struct nmn_compiler *c, const struct nmn_layout *layout
 		snprintf(why, why_size, "ir3 refused stage %d", nir->info.stage);
 		return false;
 	}
-	if (ir3_exceeds_safe_constlen(out->variant)) {
-		struct ir3_shader_key safe = *key;
-		safe.safe_constlen = true;
-		struct ir3_shader_variant *v = ir3_shader_create_variant(out->shader, &safe, false);
-		if (v != NULL) {
-			ralloc_free(out->variant);
-			out->variant = v;
-		}
-	}
+	return true;
+}
+
+/* what the bridge reads of a stage, from the variant that runs */
+static void stage_info_fill(struct nmn_compiled *out, gl_shader_stage stage)
+{
 	const struct ir3_shader_variant *v = out->variant;
 	struct nmn_stage_info *i = &out->info;
 	i->instructions = v->info.instrs_count;
@@ -473,13 +470,42 @@ static bool finish_stage(struct nmn_compiler *c, const struct nmn_layout *layout
 	i->writes_z = v->writes_pos;
 	i->needs_full_quad = v->need_full_quad;
 	i->color_outputs = 0;
-	if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+	if (stage == MESA_SHADER_FRAGMENT) {
 		for (unsigned r = 0; r < 8; r++) {
 			int idx = ir3_find_output(v, (gl_varying_slot)(FRAG_RESULT_DATA0 + r));
 			if (idx >= 0 && VALIDREG(ir3_get_output_regid(&v->outputs[idx])))
 				i->color_outputs |= 1u << r;
 		}
 	}
+	}
+
+/*
+ * Which stages run their safe-constlen variant: tu_pipeline.cc tu_pipeline_builder's rule: Mesa's ir3_trim_constlen, only when the pipeline's constants pass the hardware's limit. The full variant otherwise, as on Turnip: a program of the size of CA's generic one is compiled and tested there in that form. Native took the safe variant whenever a stage alone passed the safe size [V 10:22:32: every hang of the generic program on this stack].
+ */
+static bool choose_variants(struct nmn_compiler *c, struct nmn_program *p, const struct ir3_shader_key *key, char *why, size_t why_size)
+{
+	const struct ir3_shader_variant *variants[MESA_SHADER_STAGES] = {0};
+	gl_shader_stage stages[2];
+	for (unsigned i = 0; i < p->count; i++) {
+		stages[i] = p->stage[i].variant->type;
+		variants[stages[i]] = p->stage[i].variant;
+	}
+	const uint32_t safe = ir3_trim_constlen(variants, c->ir3);
+	for (unsigned i = 0; i < p->count; i++) {
+		if (!(safe & (1u << stages[i])))
+			continue;
+		struct ir3_shader_key k = *key;
+		k.safe_constlen = true;
+		struct ir3_shader_variant *v = ir3_shader_create_variant(p->stage[i].shader, &k, false);
+		if (v == NULL) {
+			snprintf(why, why_size, "ir3 refused the safe variant of stage %d", stages[i]);
+			return false;
+		}
+		ralloc_free(p->stage[i].variant);
+		p->stage[i].variant = v;
+	}
+	for (unsigned i = 0; i < p->count; i++)
+		stage_info_fill(&p->stage[i], stages[i]);
 	return true;
 }
 
@@ -585,6 +611,8 @@ struct nmn_program *nmn_program_render(struct nmn_compiler *c, const struct nmn_
 		if (!finish_stage(c, layout, fs, &p->stage[1], &key, why, why_size))
 			goto bad;
 	}
+	if (!choose_variants(c, p, &key, why, why_size))
+		goto bad;
 	ralloc_free(mem_ctx);
 	return p;
 bad:
@@ -608,6 +636,8 @@ struct nmn_program *nmn_program_compute(struct nmn_compiler *c, const struct nmn
 	struct ir3_shader_key key = {0};
 	p->count = 1;
 	if (!finish_stage(c, layout, cs, &p->stage[0], &key, why, why_size))
+		goto bad;
+	if (!choose_variants(c, p, &key, why, why_size))
 		goto bad;
 	ralloc_free(mem_ctx);
 	return p;
