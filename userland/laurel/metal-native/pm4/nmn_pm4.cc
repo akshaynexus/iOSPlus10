@@ -1675,21 +1675,31 @@ void nmn_cmd_copy_image(struct nw_cs *cs, const struct nmn_image *src, uint32_t 
 	flush_color(cs);
 }
 
+/*
+ * SP_PS_2D_SRC_PITCH and RB_2D_DST_PITCH hold the row in units of 64 bytes, and a base address is 64-byte aligned: a row of 40 bytes reads as 0, a row of 96 as 64 (small icons as stripes on the phone).
+ * Such a copy goes line by line, each from an aligned base at a first texel (tu_copy_buffer_to_image, tu_copy_image_to_buffer).
+ */
 void nmn_cmd_buffer_to_image(struct nw_cs *cs, uint64_t src, uint32_t pitch, const struct nmn_image *dst, uint32_t level, uint32_t layer, const uint32_t o[2], const uint32_t size[2])
 {
 	enum pipe_format f = (enum pipe_format)dst->format;
 	enum a6xx_tile_mode tile = tile_of(&dst->layout, level);
 	enum a6xx_format fmt = fd6_color_format(f, tile);
 	uint32_t cpp = util_format_get_blocksize(f);
-	uint64_t base = src & ~0x3full;
-	uint32_t sx = (uint32_t)(src - base) / cpp;
+	if (pitch == 0)
+		pitch = size[0] * cpp;  /* Metal: 0 is tight rows, for one row or one column */
+	const bool lines = (src & 0x3f) != 0 || (pitch & 0x3f) != 0;
+	const uint32_t count = lines ? size[1] : 1, each = lines ? 1 : size[1];
 	r2d_common(cs, f, fmt, format_ifmt(f), false);
-	REGS(cs, SP_PS_2D_SRC_INFO(CHIP, .color_format = fd6_color_format(f, TILE6_LINEAR), .color_swap = fd6_color_swap(f, TILE6_LINEAR, false), .srgb = util_format_is_srgb(f), .unk20 = 1, .unk22 = 1), SP_PS_2D_SRC_SIZE(CHIP, .width = sx + size[0], .height = size[1]), SP_PS_2D_SRC(CHIP, .qword = base), SP_PS_2D_SRC_PITCH(CHIP, .pitch = pitch));
 	r2d_dst_image(cs, dst, level, layer, f, fmt);
-	REGS(cs, A6XX_GRAS_2D_DST_TL(.x = o[0], .y = o[1]), A6XX_GRAS_2D_DST_BR(.x = o[0] + size[0] - 1, .y = o[1] + size[1] - 1));
-	REGS(cs, A6XX_GRAS_2D_SRC_TL_X(sx), A6XX_GRAS_2D_SRC_BR_X(sx + size[0] - 1), A6XX_GRAS_2D_SRC_TL_Y(0), A6XX_GRAS_2D_SRC_BR_Y(size[1] - 1));
-	pkt7(cs, CP_BLIT, 1);
-	nw_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
+	for (uint32_t y = 0; y < count; y++, src += pitch) {
+		uint64_t base = src & ~0x3full;
+		uint32_t sx = (uint32_t)(src - base) / cpp;
+		REGS(cs, SP_PS_2D_SRC_INFO(CHIP, .color_format = fd6_color_format(f, TILE6_LINEAR), .color_swap = fd6_color_swap(f, TILE6_LINEAR, false), .srgb = util_format_is_srgb(f), .unk20 = 1, .unk22 = 1), SP_PS_2D_SRC_SIZE(CHIP, .width = sx + size[0], .height = each), SP_PS_2D_SRC(CHIP, .qword = base), SP_PS_2D_SRC_PITCH(CHIP, .pitch = lines ? 0 : pitch));
+		REGS(cs, A6XX_GRAS_2D_DST_TL(.x = o[0], .y = o[1] + y), A6XX_GRAS_2D_DST_BR(.x = o[0] + size[0] - 1, .y = o[1] + y + each - 1));
+		REGS(cs, A6XX_GRAS_2D_SRC_TL_X(sx), A6XX_GRAS_2D_SRC_BR_X(sx + size[0] - 1), A6XX_GRAS_2D_SRC_TL_Y(0), A6XX_GRAS_2D_SRC_BR_Y(each - 1));
+		pkt7(cs, CP_BLIT, 1);
+		nw_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
+	}
 	flush_color(cs);
 }
 
@@ -1698,15 +1708,21 @@ void nmn_cmd_image_to_buffer(struct nw_cs *cs, const struct nmn_image *src, uint
 	enum pipe_format f = (enum pipe_format)src->format;
 	enum a6xx_format fmt = fd6_color_format(f, TILE6_LINEAR);
 	uint32_t cpp = util_format_get_blocksize(f);
-	uint64_t base = dst & ~0x3full;
-	uint32_t dx = (uint32_t)(dst - base) / cpp;
+	if (pitch == 0)
+		pitch = size[0] * cpp;
+	const bool lines = (dst & 0x3f) != 0 || (pitch & 0x3f) != 0;
+	const uint32_t count = lines ? size[1] : 1, each = lines ? 1 : size[1];
 	r2d_common(cs, f, fmt, format_ifmt(f), false);
 	r2d_src_image(cs, src, level, layer);
-	REGS(cs, A6XX_RB_2D_DST_INFO(.color_format = fmt, .color_swap = fd6_color_swap(f, TILE6_LINEAR, false), .srgb = util_format_is_srgb(f)), A6XX_RB_2D_DST(.qword = base), A6XX_RB_2D_DST_PITCH(pitch));
-	REGS(cs, A6XX_GRAS_2D_DST_TL(.x = dx, .y = 0), A6XX_GRAS_2D_DST_BR(.x = dx + size[0] - 1, .y = size[1] - 1));
-	REGS(cs, A6XX_GRAS_2D_SRC_TL_X(o[0]), A6XX_GRAS_2D_SRC_BR_X(o[0] + size[0] - 1), A6XX_GRAS_2D_SRC_TL_Y(o[1]), A6XX_GRAS_2D_SRC_BR_Y(o[1] + size[1] - 1));
-	pkt7(cs, CP_BLIT, 1);
-	nw_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
+	for (uint32_t y = 0; y < count; y++, dst += pitch) {
+		uint64_t base = dst & ~0x3full;
+		uint32_t dx = (uint32_t)(dst - base) / cpp;
+		REGS(cs, A6XX_RB_2D_DST_INFO(.color_format = fmt, .color_swap = fd6_color_swap(f, TILE6_LINEAR, false), .srgb = util_format_is_srgb(f)), A6XX_RB_2D_DST(.qword = base), A6XX_RB_2D_DST_PITCH(lines ? 0 : pitch));
+		REGS(cs, A6XX_GRAS_2D_DST_TL(.x = dx, .y = 0), A6XX_GRAS_2D_DST_BR(.x = dx + size[0] - 1, .y = each - 1));
+		REGS(cs, A6XX_GRAS_2D_SRC_TL_X(o[0]), A6XX_GRAS_2D_SRC_BR_X(o[0] + size[0] - 1), A6XX_GRAS_2D_SRC_TL_Y(o[1] + y), A6XX_GRAS_2D_SRC_BR_Y(o[1] + y + each - 1));
+		pkt7(cs, CP_BLIT, 1);
+		nw_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
+	}
 	flush_color(cs);
 }
 

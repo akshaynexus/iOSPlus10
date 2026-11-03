@@ -100,7 +100,7 @@ impl Drop for Slice {
 /// Memory of a buffer: a slice of ours, an imported surface, or the caller's pages.
 pub(crate) enum Backing {
     Slice(Arc<Slice>),
-    Sub(Arc<Slice>, u64),
+    Sub(Arc<Slice>, u64, Option<crate::misc::HeapRange>),
     Bo { gpu: Arc<Gpu>, bo: usize, offset: u64 },
 }
 impl Drop for Backing {
@@ -114,20 +114,20 @@ impl Backing {
     pub(crate) fn iova(&self) -> u64 {
         match self {
             Backing::Slice(s) => s.iova,
-            Backing::Sub(s, o) => s.iova + o,
+            Backing::Sub(s, o, _) => s.iova + o,
             Backing::Bo { bo, offset, .. } => unsafe { (*(*bo as *mut NwBoHead)).iova + offset },
         }
     }
     pub(crate) fn bo(&self) -> *mut NwBoHead {
         match self {
-            Backing::Slice(s) | Backing::Sub(s, _) => s.bo(),
+            Backing::Slice(s) | Backing::Sub(s, _, _) => s.bo(),
             Backing::Bo { bo, .. } => *bo as *mut NwBoHead,
         }
     }
     pub(crate) fn map(&self) -> *mut c_void {
         match self {
             Backing::Slice(s) => s.map as *mut c_void,
-            Backing::Sub(s, o) => (s.map as u64 + o) as *mut c_void,
+            Backing::Sub(s, o, _) => (s.map as u64 + o) as *mut c_void,
             Backing::Bo { bo, offset, .. } => unsafe {
                 let b = *bo as *mut NwBoHead;
                 if (*b).map.is_null() { std::ptr::null_mut() } else { ((*b).map as *mut u8).add(*offset as usize) as *mut c_void }
@@ -136,7 +136,7 @@ impl Backing {
     }
     pub(crate) fn must_name(&self) -> bool {
         match self {
-            Backing::Slice(s) | Backing::Sub(s, _) => unsafe { (*s.bo()).kind == NW_BO_SCATTERED },
+            Backing::Slice(s) | Backing::Sub(s, _, _) => unsafe { (*s.bo()).kind == NW_BO_SCATTERED },
             Backing::Bo { .. } => true,
         }
     }
@@ -190,20 +190,21 @@ pub unsafe extern "C" fn nmb_buffer_new_no_copy(d: *mut NmbDevice, pointer: *mut
             let mut offset = 0u32;
             let mut row = 0u32;
             let bo = unsafe { nw_bo_import_surface(gpu.dev, id, &mut offset, &mut row) };
-            if bo.is_null() {
-                return Err(format!("the kernel refused IOSurface {id}"));
+            if !bo.is_null() {
+                unsafe { (*bo).map = pointer };
+                return Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Bo { gpu: gpu.clone(), bo: bo as usize, offset: offset as u64 }, length, surface_id: id }) }));
             }
-            unsafe { (*bo).map = pointer };
-            return Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Bo { gpu: gpu.clone(), bo: bo as usize, offset: offset as u64 }, length, surface_id: id }) }));
+            // a surface the kernel takes no import by ID of: its mapping in this process is whole pages too, as in Turnip's redwood_drm_host_import
         }
-        // the kernel takes whole pages (hostPages); the caller's range can start and end inside one, as Metal allows for newBufferWithBytesNoCopy on this device [V log: 6400 bytes at 0x...9c00]
-        let first = pointer as u64 & !4095;
-        let whole = ((pointer as u64 + length + 4095) & !4095) - first;
+        // the kernel takes whole pages of this process (hostPages: its PAGE_MASK, 16 KiB here); the caller's range can start and end inside one, as Metal allows for newBufferWithBytesNoCopy on this device [V log: 6400 bytes at 0x...9c00]
+        let page = (unsafe { libc::getpagesize() } as u64).max(4096);
+        let first = pointer as u64 & !(page - 1);
+        let whole = ((pointer as u64 + length + page - 1) & !(page - 1)) - first;
         let bo = unsafe { nw_bo_import_host(gpu.dev, first as *mut c_void, whole, false) };
         if bo.is_null() {
             return Err(format!("the kernel refused the host pages {first:#x} + {whole}: {}", unsafe { std::ffi::CStr::from_ptr(nw_last_refusal(gpu.dev)) }.to_string_lossy()));
         }
-        Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Bo { gpu: gpu.clone(), bo: bo as usize, offset: pointer as u64 - first }, length, surface_id: 0 }) }))
+        Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Bo { gpu: gpu.clone(), bo: bo as usize, offset: pointer as u64 - first }, length, surface_id: surface.unwrap_or(0) }) }))
     })
 }
 
@@ -248,6 +249,7 @@ pub(crate) struct TextureObj {
     pub(crate) desc: NmbTextureDescriptor,
     pub(crate) backing: Option<Arc<BufferObj>>, // over a buffer or a surface
     pub(crate) memory: Option<Arc<Slice>>,
+    pub(crate) heap: Option<crate::misc::HeapRange>, // in a heap: `memory` is the heap's, and the image starts here in it
     pub(crate) parent: Option<Arc<TextureObj>>,
     pub(crate) view_type: u32,
     pub(crate) base_level: u32,
@@ -310,6 +312,16 @@ impl TextureObj {
             Some(p) => p.root_id(),
             None => self as *const TextureObj as usize,
         }
+    }
+    /// Where the CPU reads and writes this image's first byte: its own memory (a heap's, at its place in the heap) or its buffer. A view's is its parent's: one image.
+    pub(crate) fn cpu_base(&self) -> Option<*mut u8> {
+        if let Some(p) = &self.parent {
+            return p.cpu_base();
+        }
+        if let Some(m) = &self.memory {
+            return Some((m.map as u64 + self.heap.as_ref().map_or(0, |h| h.at)) as *mut u8);
+        }
+        self.backing.as_ref().map(|b| b.backing.map() as *mut u8)
     }
     /// The buffer that holds what the CPU wrote (a shadow's source).
     pub(crate) fn root_backing(&self) -> Option<&Arc<BufferObj>> {
@@ -397,7 +409,7 @@ pub(crate) fn new_texture(gpu: &Arc<Gpu>, d: &NmbTextureDescriptor, over: Option
         memory = Some(m);
     }
     let levels = d.levels.max(1) as u32;
-    Ok(Arc::new(TextureObj { gpu: gpu.clone(), image: image as usize, pipe_format: pipe, desc: *d, backing, memory, parent: None, view_type: kind, base_level: 0, levels, base_layer: 0, layers, memoryless, shadow }))
+    Ok(Arc::new(TextureObj { gpu: gpu.clone(), image: image as usize, pipe_format: pipe, desc: *d, backing, memory, heap: None, parent: None, view_type: kind, base_level: 0, levels, base_layer: 0, layers, memoryless, shadow }))
 }
 
 #[unsafe(no_mangle)]
@@ -410,7 +422,7 @@ pub extern "C" fn nmb_texture_new_on_buffer(b: *mut NmbBuffer, descriptor: *cons
     guard(std::ptr::null_mut(), || {
         let buffer = &get(b)?.b;
         let gpu = match &buffer.backing {
-            Backing::Slice(s) | Backing::Sub(s, _) => s.gpu.clone(),
+            Backing::Slice(s) | Backing::Sub(s, _, _) => s.gpu.clone(),
             Backing::Bo { gpu, .. } => gpu.clone(),
         };
         Ok(boxed(NmbTexture { t: new_texture(&gpu, get(descriptor)?, Some((buffer, offset, bytes_per_row)))? }))
@@ -443,13 +455,14 @@ pub unsafe extern "C" fn nmb_texture_replace(t: *mut NmbTexture, region: *const 
         if TextureObj::storage_mode(&t.desc) >= 2 {
             return Err("replaceRegion on a private texture".into());
         }
-        let map = t.memory.as_ref().map(|m| m.map as *mut u8).or(t.backing.as_ref().map(|b| b.backing.map() as *mut u8)).ok_or("no CPU mapping")?;
+        let map = t.cpu_base().ok_or("no CPU mapping")?;
+        let (level, slice) = (level as u32 + t.base_level, slice as u32 + t.base_layer);
         unsafe {
             let cpp = nmn_format_blocksize(t.pipe_format) as u64;
             // with a shadow, the buffer holds the truth, in the caller's rows at the caller's offset
-            let (pitch, base) = match &t.shadow {
+            let (pitch, base) = match t.shadow() {
                 Some(x) => (x.row, x.offset),
-                None => (nmn_image_pitch(t.image as *const NmnImage, level as u32) as u64, nmn_image_layer_offset(t.image as *const NmnImage, level as u32, slice as u32)),
+                None => (nmn_image_pitch(t.image as *const NmnImage, level) as u64, nmn_image_layer_offset(t.image as *const NmnImage, level, slice)),
             };
             for y in 0..r[4] {
                 let dst = map.add((base + (r[1] + y) * pitch + r[0] * cpp) as usize);

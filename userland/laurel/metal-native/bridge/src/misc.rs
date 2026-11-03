@@ -194,18 +194,39 @@ pub extern "C" fn nmb_texture_make_aliasable(_t: *const NmbTexture) -> bool {
     true
 }
 
-// ---- heaps: one slice, a bump pointer. The compositor's heaps are short lived; a freed resource's bytes return with the heap. ----
+// ---- heaps: one slice. A resource placed by the heap holds its range until it goes, so the space comes back (first fit), as in Metal; a bump pointer ran a heap dry: "heap: 98304 bytes at 131072 do not fit in 131072". A placement heap's resources (the caller's offset) overlap as the caller says: no range. ----
+#[derive(Default)]
+struct HeapState {
+    live: Vec<(u64, u64)>, // start, end; sorted
+    placed_end: u64,
+}
+/// A resource's place in its heap. A placed resource has no entry in `live`.
+pub(crate) struct HeapRange {
+    state: Arc<Mutex<HeapState>>,
+    pub(crate) at: u64,
+    tracked: bool,
+}
+impl Drop for HeapRange {
+    fn drop(&mut self) {
+        if self.tracked {
+            let mut s = self.state.lock().unwrap();
+            if let Some(i) = s.live.iter().position(|r| r.0 == self.at) {
+                s.live.remove(i);
+            }
+        }
+    }
+}
 pub struct NmbHeap {
     gpu: Arc<Gpu>,
     memory: Arc<Slice>,
-    used: Mutex<u64>,
+    state: Arc<Mutex<HeapState>>,
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_heap_new(d: *mut NmbDevice, _kind: u64, size: u64, _options: u64) -> *mut NmbHeap {
     guard(std::ptr::null_mut(), || {
         let gpu = get(d)?.gpu.clone();
         let memory = Slice::new(&gpu, size, 65536)?;
-        Ok(boxed(NmbHeap { gpu, memory, used: Mutex::new(0) }))
+        Ok(boxed(NmbHeap { gpu, memory, state: Arc::default() }))
     })
 }
 #[unsafe(no_mangle)]
@@ -218,7 +239,10 @@ pub extern "C" fn nmb_heap_size(h: *const NmbHeap) -> u64 {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_heap_used_size(h: *const NmbHeap) -> u64 {
-    guard(0, || Ok(*get(h)?.used.lock().unwrap()))
+    guard(0, || {
+        let s = get(h)?.state.lock().unwrap();
+        Ok(s.live.iter().map(|r| r.1 - r.0).sum::<u64>().max(s.placed_end))
+    })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_heap_allocated_size(h: *const NmbHeap) -> u64 {
@@ -229,25 +253,55 @@ pub extern "C" fn nmb_heap_max_available_size(h: *const NmbHeap, alignment: u64)
     guard(0, || {
         let h = get(h)?;
         let a = alignment.max(1);
-        let at = (*h.used.lock().unwrap() + a - 1) & !(a - 1);
-        Ok(h.memory.size.saturating_sub(at))
+        let s = h.state.lock().unwrap();
+        let (mut from, mut best) = (s.placed_end, 0u64);
+        for r in &s.live {
+            let at = (from + a - 1) & !(a - 1);
+            best = best.max(r.0.saturating_sub(at));
+            from = from.max(r.1);
+        }
+        let at = (from + a - 1) & !(a - 1);
+        Ok(best.max(h.memory.size.saturating_sub(at)))
     })
 }
-fn heap_take(h: &NmbHeap, size: u64, align: u64, offset: u64) -> Result<u64, String> {
-    let mut used = h.used.lock().unwrap();
-    let at = if offset == u64::MAX { (*used + align - 1) & !(align - 1) } else { offset };
-    if at + size > h.memory.size {
-        return Err(format!("heap: {size} bytes at {at} do not fit in {}", h.memory.size));
+fn heap_take(h: &NmbHeap, size: u64, align: u64, offset: u64) -> Result<HeapRange, String> {
+    let mut s = h.state.lock().unwrap();
+    if offset != u64::MAX {
+        if offset.saturating_add(size) > h.memory.size {
+            return Err(format!("heap: {size} bytes at {offset} do not fit in {}", h.memory.size));
+        }
+        s.placed_end = s.placed_end.max(offset + size);
+        return Ok(HeapRange { state: h.state.clone(), at: offset, tracked: false });
     }
-    *used = (*used).max(at + size);
-    Ok(at)
+    let mut from = s.placed_end;
+    let mut place = None;
+    for (i, r) in s.live.iter().enumerate() {
+        let at = (from + align - 1) & !(align - 1);
+        if at + size <= r.0 {
+            place = Some((i, at));
+            break;
+        }
+        from = from.max(r.1);
+    }
+    let (i, at) = match place {
+        Some(p) => p,
+        None => {
+            let at = (from + align - 1) & !(align - 1);
+            if at + size > h.memory.size {
+                return Err(format!("heap: {size} bytes do not fit in {} ({} live, free from {at})", h.memory.size, s.live.len()));
+            }
+            (s.live.len(), at)
+        }
+    };
+    s.live.insert(i, (at, at + size));
+    Ok(HeapRange { state: h.state.clone(), at, tracked: true })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_heap_new_buffer(h: *const NmbHeap, length: u64, _options: u64, offset: u64) -> *mut NmbBuffer {
     guard(std::ptr::null_mut(), || {
         let h = get(h)?;
-        let at = heap_take(h, length, 256, offset)?;
-        Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Sub(h.memory.clone(), at), length, surface_id: 0 }) }))
+        let range = heap_take(h, length, 256, offset)?;
+        Ok(boxed(NmbBuffer { b: Arc::new(BufferObj { backing: Backing::Sub(h.memory.clone(), range.at, Some(range)), length, surface_id: 0 }) }))
     })
 }
 #[unsafe(no_mangle)]
@@ -258,11 +312,11 @@ pub extern "C" fn nmb_heap_new_texture(h: *const NmbHeap, descriptor: *const Nmb
         let probe = new_texture_layout(&h.gpu, d)?;
         let size = unsafe { nmn_image_size(probe) };
         unsafe { nmn_image_free(probe) };
-        let at = heap_take(h, size, 4096, offset)?;
+        let range = heap_take(h, size, 4096, offset)?;
         let image = new_texture_layout(&h.gpu, d)?;
-        unsafe { nmn_image_bind(image, h.memory.iova + at) };
+        unsafe { nmn_image_bind(image, h.memory.iova + range.at) };
         let pipe = unsafe { nmn_format_from_metal(d.format) };
-        Ok(boxed(NmbTexture { t: Arc::new(TextureObj { gpu: h.gpu.clone(), image: image as usize, pipe_format: pipe, desc: *d, backing: None, memory: Some(h.memory.clone()), parent: None, view_type: TextureObj::view_kind(d.kind), base_level: 0, levels: d.levels.max(1) as u32, base_layer: 0, layers: d.array_length.max(1) as u32, memoryless: false, shadow: None }) }))
+        Ok(boxed(NmbTexture { t: Arc::new(TextureObj { gpu: h.gpu.clone(), image: image as usize, pipe_format: pipe, desc: *d, backing: None, memory: Some(h.memory.clone()), heap: Some(range), parent: None, view_type: TextureObj::view_kind(d.kind), base_level: 0, levels: d.levels.max(1) as u32, base_layer: 0, layers: d.array_length.max(1) as u32, memoryless: false, shadow: None }) }))
     })
 }
 
@@ -287,7 +341,7 @@ pub extern "C" fn nmb_texture_new_view(t: *mut NmbTexture, format: u64, kind: u6
         if !whole {
             desc.kind = kind;
         }
-        Ok(boxed(NmbTexture { t: Arc::new(TextureObj { gpu: parent.gpu.clone(), image: parent.image, pipe_format: pipe, desc, backing: None, memory: None, parent: Some(parent.clone()), view_type: TextureObj::view_kind(desc.kind), base_level: bl, levels: nl, base_layer: bs, layers: ns, memoryless: parent.memoryless, shadow: None }) }))
+        Ok(boxed(NmbTexture { t: Arc::new(TextureObj { gpu: parent.gpu.clone(), image: parent.image, pipe_format: pipe, desc, backing: None, memory: None, heap: None, parent: Some(parent.clone()), view_type: TextureObj::view_kind(desc.kind), base_level: bl, levels: nl, base_layer: bs, layers: ns, memoryless: parent.memoryless, shadow: None }) }))
     })
 }
 /// One plane of a surface with planes. A format with no pipe format (a biplanar one taken whole) is refused.
@@ -303,12 +357,13 @@ pub unsafe extern "C" fn nmb_texture_get_bytes(t: *const NmbTexture, bytes: *mut
         if (t.desc.options >> 4) & 0xf >= 2 {
             return Err("getBytes on a private texture".into());
         }
-        let map = t.memory.as_ref().map(|m| m.map as *mut u8).or(t.backing.as_ref().map(|b| b.backing.map() as *mut u8)).ok_or("no CPU mapping")?;
+        let map = t.cpu_base().ok_or("no CPU mapping")?;
+        let (level, slice) = (level as u32 + t.base_level, slice as u32 + t.base_layer);
         unsafe {
             let cpp = nmn_format_blocksize(t.pipe_format) as u64;
-            let (pitch, base) = match &t.shadow {
+            let (pitch, base) = match t.shadow() {
                 Some(x) => (x.row, x.offset),
-                None => (nmn_image_pitch(t.image as *const NmnImage, level as u32) as u64, nmn_image_layer_offset(t.image as *const NmnImage, level as u32, slice as u32)),
+                None => (nmn_image_pitch(t.image as *const NmnImage, level) as u64, nmn_image_layer_offset(t.image as *const NmnImage, level, slice)),
             };
             for y in 0..r[4] {
                 let src = map.add((base + (r[1] + y) * pitch + r[0] * cpp) as usize);

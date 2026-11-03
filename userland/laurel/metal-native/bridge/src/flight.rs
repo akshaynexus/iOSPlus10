@@ -20,6 +20,8 @@ fn ring() -> Option<&'static Ring> {
             return None;
         }
         let name = std::env::current_exe().ok()?.file_name()?.to_string_lossy().into_owned();
+        // the file of the last start stays as .old: a hang outside a test round is then still readable after the next start
+        let _ = std::fs::rename(format!("{DIR}/flight-{name}"), format!("{DIR}/flight-{name}.old"));
         let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(format!("{DIR}/flight-{name}")).ok()?;
         f.set_len(SIZE as u64).ok()?;
         use std::os::fd::AsRawFd;

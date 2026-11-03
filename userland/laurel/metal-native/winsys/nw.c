@@ -376,7 +376,13 @@ struct nw_bo *nw_bo_import_host(struct nw_device *d, void *pointer, uint64_t siz
 {
 	struct nw_userptr_request r = {.pointer = (uint64_t)(uintptr_t)pointer, .size = size, .flags = read_only ? 1u : 0u};
 	struct nw_bo *b;
-	const int e = d->ops->call(d->ctx, NW_SEL_USERPTR, &r, sizeof(r));
+	int e = d->ops->call(d->ctx, NW_SEL_USERPTR, &r, sizeof(r));
+	if (e == EIO && !read_only) {
+		/* kIOReturnVMError: the pages are not writable (a compositor maps a client's memory read-only): the GPU only reads them (negroni_drm.c host_import_pages) */
+		struct nw_userptr_request ro = {.pointer = r.pointer, .size = r.size, .flags = 1u};
+		e = d->ops->call(d->ctx, NW_SEL_USERPTR, &ro, sizeof(ro));
+		r = ro;
+	}
 	if (e != 0) {
 		snprintf(d->refusal, sizeof(d->refusal), "errno %d", e);
 		return NULL;

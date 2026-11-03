@@ -1,7 +1,7 @@
 #!/bin/bash
 # One test round of the native Metal stack on the running phone, for the agent that works on it. Takes the phone lock for the whole round.
 #   scripts/bg.sh round scripts/laurel/native/compositor-round.sh [--reboot] [--keep] [--test STEPS] [SECONDS]
-# --test home-swipe,control-center: after SECONDS, the UI test tool's steps (unlock first), under the same lock; its table goes to the folder.
+# --no-flight: the recorder off, for a speed measure (it formats text for each draw). --test home-swipe,control-center: after SECONDS, the UI test tool's steps (unlock first), under the same lock; its table goes to the folder.
 # Hold the lock for one install and one run: a few minutes (default 150 s of run): other agents wait for it.
 # --reboot first: `sync`, then op10tool ctl reboot, and wait for SSH (a GPU hang leaves the GPU off until a reboot). Then: install this tree's out/ios26/metal-all/stage with the setting native, wait SECONDS (default 150) or until a hang, take a screenshot, print the stack's lines, and write the setting `default` again (--keep: stay on native, for a test that follows).
 # The UI test tool: AUTOTEST_DIR (default: this tree). Output: logs/round-TIME/ (screenshot, lines).
@@ -13,8 +13,8 @@ if [ "${ROUND_LOCKED:-0}" != 1 ]; then
   export ROUND_LOCKED=1
   exec "$MAIN/scripts/laurel/phone-lock.sh" native "$0" "$@"
 fi
-REBOOT=0; KEEP=0; WAIT=150; TEST=
-while [ $# -gt 0 ]; do case "$1" in --reboot) REBOOT=1 ;; --keep) KEEP=1 ;; --test) TEST=$2; shift ;; *) WAIT=$1 ;; esac; shift; done
+REBOOT=0; KEEP=0; WAIT=150; TEST=; FLIGHT=1
+while [ $# -gt 0 ]; do case "$1" in --reboot) REBOOT=1 ;; --keep) KEEP=1 ;; --no-flight) FLIGHT=0 ;; --test) TEST=$2; shift ;; *) WAIT=$1 ;; esac; shift; done
 OP=$MAIN/out/bin/op10tool
 B=/System/Library/Extensions/NegroniMetal.bundle
 D=$REPO/logs/round-$(date +%H%M%S); mkdir -p "$D"
@@ -33,7 +33,11 @@ fi
 # (the phone can be still coming up: the recorder's file must be there before the stack starts)
 wait_ssh 20 || { say "STOP: no SSH: phone-ensure-ios.sh, then again"; exit 1; }
 L=$(usblog); FROM=$(wc -l < "$L")
-sh_phone 'touch /private/var/db/negronimetal/stack/flight-on; chmod 644 /private/var/db/negronimetal/stack/flight-on; chown 501 /private/var/db/negronimetal/stack/flight-on' 2>/dev/null
+if [ "$FLIGHT" = 1 ]; then
+  sh_phone 'touch /private/var/db/negronimetal/stack/flight-on; chmod 644 /private/var/db/negronimetal/stack/flight-on; chown 501 /private/var/db/negronimetal/stack/flight-on' 2>/dev/null
+else
+  sh_phone 'rm -f /private/var/db/negronimetal/stack/flight-on' 2>/dev/null
+fi
 ONLY_NATIVE=1 RESET_FAILED=1 "$REPO/scripts/laurel/ios26-metal-install-options.sh" native 2>&1 | tail -1    # a round is a deliberate test of this build
 say "on native; waiting $WAIT s"
 for _ in $(seq 1 $((WAIT / 5))); do
