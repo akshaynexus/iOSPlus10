@@ -9,7 +9,11 @@ set -uo pipefail
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 MAIN=/home/akshay/Documents/GitHub/iOSPlus10
 if [ "${ROUND_LOCKED:-0}" != 1 ]; then
-  "$MAIN/scripts/laurel/phone-ensure-ios.sh" 2>&1 | tail -1     # it takes the lock itself when it must act: before ours
+  # No lock while the phone is away: other jobs wait for it. Only with ROUND_ENSURE=1 this script tries to bring iOS back (a flash may be under way).
+  if [ "${ROUND_ENSURE:-0}" = 1 ]; then "$MAIN/scripts/laurel/phone-ensure-ios.sh" 2>&1 | tail -1; fi
+  if [ "$(sshpass -p "${IOS_PASSWORD:-alpine}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=6 root@192.168.7.2 uname -s 2>/dev/null)" != Darwin ]; then
+    echo "$(date +%H:%M:%S) round: STOP: no SSH: no lock taken"; exit 3
+  fi
   export ROUND_LOCKED=1
   exec "$MAIN/scripts/laurel/phone-lock.sh" native "$0" "$@"
 fi
