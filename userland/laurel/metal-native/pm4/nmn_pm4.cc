@@ -952,6 +952,14 @@ static void emit_fs_inputs(struct nw_cs *cs, const struct nmn_gpu *g, const stru
 		enum a6xx_tex_prefetch_cmd c = p->tex_opc == OPC_SAM ? TEX_PREFETCH_SAM : p->tex_opc == OPC_SAMB ? TEX_PREFETCH_SAM : TEX_PREFETCH_SAM;
 		nw_cs_emit(cs, SP_FS_PREFETCH_CMD(CHIP, i, .src = p->src, .samp_id = p->samp_id, .tex_id = p->tex_id, .dst = p->dst, .wrmask = p->wrmask, .half = p->half_precision, .bindless = p->bindless, .cmd = c).value);
 	}
+	/* the slot of a bindless prefetch comes from here, not from the command above (tu6_emit_fs_inputs). Left out, the first texture read of a program read a stale slot, which other processes on the ring had left: FAR 0x124404820902, a read at a wild address, in the first programs of that shape [V logs 08:03:15, 08:24:18, 08:39:34] */
+	if (fs->num_sampler_prefetch > 0) {
+		pkt4(cs, REG_A6XX_SP_FS_BINDLESS_PREFETCH_CMD(0), fs->num_sampler_prefetch);
+		for (unsigned i = 0; i < fs->num_sampler_prefetch; i++) {
+			const struct ir3_sampler_prefetch *p = &fs->sampler_prefetch[i];
+			nw_cs_emit(cs, A6XX_SP_FS_BINDLESS_PREFETCH_CMD_SAMP_ID(p->samp_bindless_id) | A6XX_SP_FS_BINDLESS_PREFETCH_CMD_TEX_ID(p->tex_bindless_id));
+		}
+	}
 	REGS(cs, HLSQ_CONTROL_1_REG(CHIP, .primallocthreshold = g->info.a6xx.prim_alloc_threshold),
 	     HLSQ_CONTROL_2_REG(CHIP, .faceregid = face, .sampleid = samp_id, .samplemask = smask_in, .centerrhw = ij[IJ_PERSP_CENTER_RHW]),
 	     HLSQ_CONTROL_3_REG(CHIP, .ij_persp_pixel = ij[IJ_PERSP_PIXEL], .ij_linear_pixel = ij[IJ_LINEAR_PIXEL], .ij_persp_centroid = ij[IJ_PERSP_CENTROID], .ij_linear_centroid = ij[IJ_LINEAR_CENTROID]),
