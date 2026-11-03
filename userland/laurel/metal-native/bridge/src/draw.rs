@@ -659,6 +659,14 @@ pub extern "C" fn nmb_command_buffer_commit(c: *mut NmbCommandBuffer) -> bool {
             }
             let e = nw_submit_go(&mut s, &mut fence);
             crate::flight::line(&format!("submit fence={fence} errno {e}, {} names", s.name_count));
+            if crate::flight::on() {
+                let mut ibs = String::from("  ibs:");
+                for i in 0..(*cb.cs).ib_count as usize {
+                    let ib = &*(*cb.cs).ibs.add(i);
+                    ibs.push_str(&format!(" {:#x}+{}", ib.iova, ib.dwords));
+                }
+                crate::flight::line(&ibs);
+            }
             cb.gpu.names_total.fetch_add(s.name_count as u64, Ordering::Relaxed);
             nw_submit_end(&mut s);
             if e != 0 {
@@ -1304,9 +1312,15 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
 
     let set_memory = write_descriptors(e, cb, &entry.plan.descriptors, &commands.descriptor_ranges, &entry.offsets, &entry.set_slots, &device_pipeline.pipeline.layout)?;
     if crate::flight::on() {
-        crate::flight::line(&format!("draw {} prim {primitive} counts {counts:?}", device_pipeline.names));
+        let at = unsafe { e.draws.start_iova + (e.draws.cur as u64).wrapping_sub(e.draws.start as u64) };
+        crate::flight::line(&format!("draw {} prim {primitive} counts {counts:?} at {at:#x}", device_pipeline.names));
         for (i, s) in set_memory.iter().enumerate() {
             crate::flight::line(&crate::flight::set_words(i, s.0, s.1, entry.set_slots.get(i).copied().unwrap_or(0)));
+        }
+        for (k, b) in [("v", 1usize), ("f", 2)] {
+            for (slot, t) in &e.stages[b].textures {
+                crate::flight::line(&format!("  {k} texture {slot}: format {} {}x{} at {:#x}{}", t.desc.format, t.desc.width, t.desc.height, unsafe { nmn_image_iova(t.image as *const NmnImage) }, if t.memoryless { " memoryless" } else { "" }));
+            }
         }
         for w in &commands.push_constants {
             crate::flight::line(&format!("  push at {} stages {:?}: {}", w.offset, w.stages, crate::flight::hex(&w.bytes)));
