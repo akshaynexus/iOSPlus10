@@ -132,7 +132,8 @@ def fps(frames, ms):
 def step_row(s):
     if s.motion:
         rates = [fps(f, m) for f, m in s.motion]
-        motion = f"{len(rates)}x {min(rates):.0f}-{max(rates):.0f} fps"
+        total = fps(sum(f for f, _ in s.motion), sum(m for _, m in s.motion))
+        motion = f"{total:.1f} ({min(rates):.0f}-{max(rates):.0f}, {len(rates)}x)"
     else:
         motion = "-"
     moving = f"{max(s.moving):.1f}" if s.moving else "-"
@@ -143,7 +144,7 @@ def step_row(s):
     return [s.name, "ok" if s.ok else "FAIL", motion, moving, fence, busy, seq, str(s.older), str(s.black), str(s.flip), str(len(s.gpu)), str(len(s.panic)), crash]
 
 
-HEADS = ["step", "result", "motion", "moving", "fence", "busy/MHz", "seq frames", "older", "black", "undrawn", "gpu", "panic", "crashes"]
+HEADS = ["step", "result", "fps motion", "moving", "fence", "busy/MHz", "seq frames", "older", "black", "undrawn", "gpu", "panic", "crashes"]
 
 
 def table(rows):
@@ -441,13 +442,16 @@ def main():
     lines = [f"Mi A3 iOS 26 UI test {date}", text.strip(), input_line, f"USB log: {log.path or 'none: no kernel lines in this table. make usblog'}", f"Files: {out}", ""]
     lines.append(table([step_row(s) for s in done]))
     lines.append("")
-    lines.append("motion: LAUREL FRAME: motion ended, one line per finished motion. moving: best frames/s while moving. fence: mean GPU fence wait of a flip. busy/MHz: the highest GPU busy share and clock of a RedwoodGPU window. "
+    lines.append("fps motion: frames / time of all LAUREL FRAME: motion ended lines of the step (lowest-highest, count). moving: best frames/s while moving. fence: mean GPU fence wait of a flip. busy/MHz: the highest GPU busy share and clock of a RedwoodGPU window. "
                  "seq frames: frames seen in the sequence shots. older: frames equal to an older frame after a different one. black: mostly black frames. undrawn: flips that the kernel refused as not drawn.")
     lines.append("")
     lines.append("Stack selector (this boot):")
     whole = log.whole()
     lines += ["  " + x for x in stack_lines(whole)] or ["  no line in the USB log"]
     rc2, stk = phone.run("for f in /var/db/negronimetal/stack/* /var/db/negronimetal/option; do [ -f \"$f\" ] && echo \"$f: $(head -c 100 \"$f\" | tr '\\n' ' ')\"; done", timeout=20)
+    rc3, cfg = phone.run("echo env: $(tr '\\n' ' ' < /var/db/negronimetal/env); echo clients: $(tr '\\n' ' ' < /var/db/negronimetal/clients)", timeout=20)
+    stack_now = next((x.split(":", 1)[1].strip() for x in stk.splitlines() if x.startswith("/var/db/negronimetal/stack/active")), "?")
+    lines.insert(2, f"STACK: {stack_now}; {' '.join(cfg.split())[:300]}")
     lines.append("Selector files (read only):")
     lines += ["  " + x for x in stk.strip().splitlines()] or ["  none"]
     lines.append("")
@@ -470,7 +474,7 @@ def main():
 
 def self_test():
     steps = parse_scenario(open(os.path.join(REPO, "scripts/laurel/ios26-autotest.scenario")).read())
-    assert [s[0] for s in steps] == ["unlock", "home-page-swipe", "control-center", "settings", "safari"], steps
+    assert [s[0] for s in steps] == ["unlock", "home-swipe", "control-center", "settings-scroll"], steps
     for bad in ["tap 1 2", "step a\nnope 1", "step a\ntap 1", "step a b"]:
         try:
             parse_scenario(bad)
@@ -490,7 +494,7 @@ def self_test():
     assert s.motion == [(37, 967)] and s.moving == [13.1] and s.fence_us == [28131] and s.flip == 1 and len(s.gpu) == 1 and s.crashes == ["aonsensed"], vars(s)
     assert not s.panic
     row = step_row(s)
-    assert row[2] == "1x 38-38 fps" and row[4] == "28 ms" and row[12] == "aonsensed" and row[5] == "14 %/697", row
+    assert row[2] == "38.3 (38-38, 1x)" and row[4] == "28 ms" and row[12] == "aonsensed" and row[5] == "14 %/697", row
     t = table([row])
     assert t.splitlines()[0].startswith("| step") and len({len(x) for x in t.splitlines()}) == 1, t
     p = Step("p")

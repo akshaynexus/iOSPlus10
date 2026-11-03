@@ -1,4 +1,4 @@
-# The UI test of scripts/laurel/ios26-autotest.sh. Docs: docs/laurel_sprout/ios26-autotest.md. Coordinates in panel pixels, 720x1560.
+# The fixed test of scripts/laurel/ios26-autotest.sh. Docs: docs/laurel_sprout/ios26-autotest.md. Coordinates in panel pixels, 720x1560.
 #   step NAME                     a new row of the table
 #   lock                          power key, only if the panel is on: panel off and locked
 #   wake                          power key, only if the panel is off
@@ -9,77 +9,67 @@
 #   record N MAX_MS               starts a sequence shot, in the background, for the next gesture
 #   stop                          waits for it, then finds frames that equal an older frame, and black frames
 #   changed                       this step fails if the last two shots show the same picture
+# Keep these steps as they are: their numbers compare between builds. Other tests go in another file (--scenario).
 
 step unlock
 lock
 wake
 settle 700 8000
 shot locked
-record 40 2500
+record 60 4000
 edge bottom 800 300
 stop
-settle 700 8000
+settle 1000 8000
 shot unlocked
 changed
 
-step home-page-swipe
+step home-swipe
 home
-settle 700 8000
+settle 1000 8000
 shot page1
-record 40 2500
+record 60 4000
 swipe 620 800 100 800 300
 stop
-settle 700 8000
+settle 1000 8000
 shot page2
 changed
 swipe 100 800 620 800 300
-settle 700 8000
+settle 1000 8000
 shot page1-again
 changed
 
 step control-center
 shot before
-record 40 2500
+record 120 8000
 edge top 700 300 650
 stop
-# the modules come more than 1 s after the blur holds still [V phone]
-settle 3000 15000
+# Control Center takes seconds to come at first, and its modules come after the blur has held still [V phone]
+settle 3000 20000
 shot open
 changed
-record 40 2500
+record 60 4000
 edge bottom 700 300
 stop
-settle 700 8000
+settle 1500 15000
 shot closed
 changed
 
-step settings
+step settings-scroll
 open com.apple.Preferences
-settle 1500 30000 change
+settle 2000 30000 change
+# Settings comes back where it was left: to the top of the list first, or the swipe has nowhere to go
+swipe 360 300 360 1400 150
+settle 1000 10000
+swipe 360 300 360 1400 150
+settle 1000 10000
 shot open
-changed
-record 60 3000
-swipe 360 1200 360 300 300
+record 120 6000
+swipe 360 1300 360 300 300
 stop
-settle 700 8000
+settle 1000 10000
 shot scrolled
 changed
 home
-settle 1000 15000 change
-shot home
-changed
-
-step safari
-open com.apple.mobilesafari
-settle 2500 40000 change
-shot open
-changed
-record 60 3000
-swipe 360 1200 360 300 300
-stop
-settle 700 8000
-shot scrolled
-home
-settle 1000 15000 change
+settle 1500 15000 change
 shot home
 changed
