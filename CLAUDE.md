@@ -51,7 +51,8 @@ decision we learned; add yours before you stop), `docs/plan.md` (status and next
 
 - Bootloader unlocked; Magisk 30.7 installed in `boot_a` (adb root: `adb shell su -c ...`).
 - Test with `fastboot boot` first when the image type allows it.
-- **Ask the owner before each partition write.** Allowed targets: `boot_a`, `vendor_boot_a`,
+- **Mi A3 iOS work, owner's standing order (2026-11-03):** while a goal is active, or the owner has told you to act on your own, do not wait for a yes to flash and test. This covers `boot_b`, `dtbo_b`, `iosroot`, file copies to the iOS root over SSH, UI restarts and reboots. It does not cover Android (slot a, `userdata`), the GPT, `partition:0`, the unique partitions, `fastboot flashing lock` or any other phone: those keep every rule here. Tell the owner what was flashed, and report the result.
+- **Ask the owner before each partition write** outside that order. Allowed targets: `boot_a`, `vendor_boot_a`,
   `vbmeta_a`, `dtbo_a`, `userdata`. Never write slot B, the GPT, or the unique partitions
   (modemst1/2, fsg, fsc, persist, oplusreserve*, devinfo, ...). Never run `fastboot flashing lock`.
 - Do not install OxygenOS updates. Stay on `NE2211_16.0.3.530(EX01)`.

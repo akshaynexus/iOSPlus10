@@ -4,6 +4,7 @@
 mod a64;
 mod a64test;
 mod abi;
+mod autotest;
 mod lower;
 mod bootlog;
 mod camframe;
@@ -14,6 +15,7 @@ mod gpt;
 mod fat;
 mod hfs;
 mod im4p;
+mod input;
 mod img2simg;
 mod ipsw;
 mod portpatch;
@@ -306,6 +308,30 @@ enum Cmd {
         #[arg(long, default_value = "192.168.7.2")]
         host: String,
     },
+    /// Touch and keys through the Mi A3 kernel's HID path over USB (kernel patch 2983). Panel pixels 720x1560
+    Input {
+        #[command(subcommand)]
+        action: input::Action,
+        /// the phone's address
+        #[arg(long, default_value = "192.168.7.2")]
+        host: String,
+    },
+    /// A frame from laurel-autotest shot (LATF) to a PNG (scripts/laurel/ios26-autotest.sh)
+    AutotestPng {
+        input: PathBuf,
+        output: PathBuf,
+        /// an earlier frame: also say how much of the picture changed
+        #[arg(long)]
+        prev: Option<PathBuf>,
+    },
+    /// A sequence from laurel-autotest seq (LATS): frames that equal an older frame, black frames, PNGs of those
+    AutotestSeq {
+        input: PathBuf,
+        outdir: PathBuf,
+        /// a PNG of each frame, not only those worth a look
+        #[arg(long)]
+        all: bool,
+    },
     /// Mi A3 rear camera frame over USB (kernel patch 2771): new capture, read, OUT/camframe-genN.raw10 + .png
     /// (demosaic, white balance, gamma). --raw FILE: convert a saved RAW10 frame only.
     Camframe {
@@ -405,6 +431,9 @@ fn main() -> Result<()> {
         Cmd::A64Abi { cache, out } => abi::run(&cache, &out),
         Cmd::A64Dis { cache, image, symbol, xref, count } => abi::dis(&cache, &image, &symbol, xref, count, std::path::Path::new("out/ios26/tmp-dis")),
         Cmd::Ctl { command, host } => ctl::run(command, &host),
+        Cmd::Input { action, host } => input::run(action, &host),
+        Cmd::AutotestPng { input, output, prev } => autotest::run_png(&input, &output, prev.as_deref()),
+        Cmd::AutotestSeq { input, outdir, all } => autotest::run_seq(&input, &outdir, all),
         Cmd::Camframe { host, out, no_capture, raw, width, height, bayer } => {
             camframe::run(camframe::Args { host, out, no_capture, raw, width, height, bayer })
         }

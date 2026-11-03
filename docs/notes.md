@@ -5384,3 +5384,17 @@ Full text: `docs/laurel_sprout/ios26-control-center.md`.
 - pm4-diff reads the **last** draw of a file: a new part of the scene goes in a run of its own.
 - A worktree's build: reflink `out/ios26/*`, `out/laurel-metal`, `out/metal`, symlink `out/laurel-kernel`; `rm -rf out/ios26/metal-hot/build`. `compile_commands` of `mesa-host` keeps the path of the worktree that built it.
 - `xnutils-test.sh` fails on the base too: `XT_METAL_WIDE differs from root-add-metal-ios26.sh` (`-PosterBoard`). Not this branch's; not fixed here.
+
+## 2026-11-03: agents test the iOS 26 UI by themselves (branch t3/ios26-ui-autotest). Full text: `docs/laurel_sprout/ios26-autotest.md`
+- **`scripts/laurel/ios26-autotest.sh shot NAME` gives a PNG of the real frame; `tap`, `swipe`, `edge`, `key`, `open`, `home` need no finger; `run` is the whole test with a table.** No kernel change, no flash: install to `/usr/local/bin` over SSH.
+- [V] A binary in `/var/tmp` runs with csflags 0 and no blobs: no entitlement. In `/usr/local/bin`: 0x26000001. backboardd's log said the reason at once: `missing the 'com.apple.private.hid.client.event-dispatch' entitlement`. `oslogstream` first when a system service refuses.
+- [V] `IOSurfaceGetUseCount` reads 0 for the kernel's holds (state page +0x18); `IOSurfaceIsInUse` sees them.
+- [V] With the panel off the last surface keeps its mark and is drawn black. `com.apple.springboard.hasBlankedScreen` says off, more than 3 s after the key: a second key in that time undoes the first.
+- [V] The home key (0x40) does nothing on this model; an edge swipe goes Home.
+- [V] A hang of the whole boot: `ctl ps` says `ps busy` each time (`proc_list_mlock` held), last exec 465 s ago, `usernotificationsd` 60 s of CPU a minute, SSH no banner, `ctl ping` works. Reboot helps. [U] who holds the lock.
+- [V code] The no-flash input does not pass `laurel_input_touch`, so no CPU/GPU clock answer to touch. Do not compare its frame rates with a finger's. Patch 2983 is the real path (built, not booted).
+- At about 9 fps a fixed wait shows a frame of the animation, and a "picture changed" check passes on the wrong screen. Use `settle`, and look at the PNG.
+- Mistake to avoid: `git diff C~1` against the work tree of the series tree also takes every later `post/*` patch: use `git diff C~1 C`. A `$P` that a failed `&&` left empty makes `grep -c X $P` wait on stdin for ever: `</dev/null`.
+
+## 2026-11-03: panic `kern_stackshot.c:933 Assertion failed: stackshot_active()`
+[V 07:25:51] Follows `LAUREL DEBUG ACK: on: stackshot given up: cpu 5`. xnu-12377 stackshots use helper CPUs, so the iOS 16 way of giving up is not safe on its own. post/9013: single-threaded by default; a late CPU does no stackshot work. [U] why CPU 5 is late over 100 ms; the panics follow memory kills.
