@@ -5384,6 +5384,9 @@ Full text: `docs/laurel_sprout/ios26-control-center.md`.
 ## 2026-11-03: panic `kern_stackshot.c:933 Assertion failed: stackshot_active()`
 [V 07:25:51] Follows `LAUREL DEBUG ACK: on: stackshot given up: cpu 5`. xnu-12377 stackshots use helper CPUs, so the iOS 16 way of giving up is not safe on its own. post/9013: single-threaded by default; a late CPU does no stackshot work. [U] why CPU 5 is late over 100 ms; the panics follow memory kills.
 
+## 2026-11-03: UI test tool on the kernel input
+- [V] Kernel f24b7056ba has 2983: `op10tool input check` says `synth on`, `SWEET HID: touch 9 ... edge`. `kern.laurel_scan_surface` is 0 on the CPU renderer. A UI that works with no `LAUREL FRAME` line is the CPU renderer: read `LAUREL METAL26: off: Metal device refused`. A table from there measures nothing, so `run` stops first (exit 4).
+
 ## 2026-11-03: Mi A3: DDR, RPM scaling, kill loops (branch t3/laurel-ddr-rpm-cpu-waste; host and read-only SSH; 2985 NOT BOOTED)
 Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-parallel.md` section 6.
 - **The stock `rpm.mbn` can be read:** `scripts/laurel/rpm-fw-dis.py` (output in `out/rpm-re`). Code at 0x4600000 is 0 in its own view, data at 0x4690000 is 0x90000. Literal pools hold pointers to strings. The clock tables other than DDR are filled at run time: a dump of the static data gives zeros. Keep such work in `out/`: nothing of it in git.
