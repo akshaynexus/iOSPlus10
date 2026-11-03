@@ -201,7 +201,7 @@ int main(int argc, char **argv)
 	static unsigned char pool[8192];
 	struct NmbConstant cons[128];
 	uint32_t ncons = 0;
-	bool plan = argc == 6;
+	bool plan = argc == 6, no_vertex_descriptor = false;
 	if (plan) {
 		static char line[65536];
 		FILE *f = fopen(argv[4], "r");
@@ -221,6 +221,7 @@ int main(int argc, char **argv)
 			snprintf(vname, sizeof(vname), "%s", field[2]);
 			snprintf(fname, sizeof(fname), "%s", field[3]);
 			snprintf(colors, sizeof(colors), "%s", field[4]);
+			no_vertex_descriptor = strcmp(field[5], "-") == 0;
 			ncons = parse_constants(field[6], cons, 128, pool);
 			break;
 		}
@@ -269,16 +270,18 @@ int main(int argc, char **argv)
 		pd.depth_format = pd.stencil_format = 260;
 	pd.samples = 1;
 	pd.rasterization = 1;
-	pd.vertex_inputs = 1;
+	pd.vertex_inputs = no_vertex_descriptor ? 0 : 1;        /* a real key with no vertex descriptor: its vertex stage pulls its data from a buffer */
 	static const struct { uint64_t format, offset; } attr[4] = {{31, 0}, {29, 16}, {29, 24}, {27, 32}};
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < 4 && !no_vertex_descriptor; i++) {
 		pd.attributes[i].format = attr[i].format;
 		pd.attributes[i].offset = attr[i].offset;
 		pd.attributes[i].buffer = 1;
 	}
-	pd.layouts[1].stride = 48;
-	pd.layouts[1].step_function = 1;
-	pd.layouts[1].step_rate = 1;
+	if (!no_vertex_descriptor) {
+		pd.layouts[1].stride = 48;
+		pd.layouts[1].step_function = 1;
+		pd.layouts[1].step_rate = 1;
+	}
 	NmbRenderPipeline *pipe = nmb_render_pipeline_new(dev, &pd);
 	if (pipe == NULL)
 		FAIL("render pipeline");
