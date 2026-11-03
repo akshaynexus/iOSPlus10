@@ -1,0 +1,52 @@
+laurel 9013 (iOS 26): stackshots run on one CPU, so a late CPU cannot panic the phone
+
+[V 07:25:51] LAUREL DEBUG ACK: on: stackshot given up: cpu 5, then kern_stackshot.c:933 Assertion failed: stackshot_active(). post/9007 gave up the stackshot while the CPUs that answered wait in stackshot_aux_cpu_entry. xnu-12377 has helpers; xnu-8796 did not. Kill switch: stackshot_single_thread=0.
+
+--- a/osfmk/kern/kern_stackshot.c	2026-11-03 07:34:08.863803712 +0530
++++ b/osfmk/kern/kern_stackshot.c	2026-11-03 07:34:08.886932333 +0530
+@@ -136,7 +136,12 @@
+ /* The number of threads which will land a task in the hardest workqueue. */
+ #define STACKSHOT_HARDEST_THREADCOUNT 10
+ 
+-TUNABLE_DEV_WRITEABLE(unsigned int, stackshot_single_thread, "stackshot_single_thread", 0);
++/*
++ * laurel 9013: default 1. [V 07:25:51] a stackshot given up after a late CPU (post/9007) left the CPUs that had answered inside stackshot_aux_cpu_entry:
++ * assertion stackshot_active() at kern_stackshot.c:933. A single-threaded stackshot has no such helpers, so giving up is safe. Cost: a stackshot takes longer
++ * on one CPU; the others wait. stackshot_single_thread=0 returns Apple's way.
++ */
++TUNABLE_DEV_WRITEABLE(unsigned int, stackshot_single_thread, "stackshot_single_thread", 1);
+ 
+ extern unsigned int not_in_kdp;
+ 
+--- a/osfmk/arm/model_dep.c	2026-11-03 07:34:08.865803735 +0530
++++ b/osfmk/arm/model_dep.c	2026-11-03 07:34:08.889795981 +0530
+@@ -200,6 +200,7 @@
+ _Atomic unsigned int  debug_cpus_spinning = 0; /* Number of signalled CPUs still spinning on mp_kdp_trap (in DebuggerXCall). */
+ unsigned int          DebugContextCount = 0;
+ bool                  trap_is_stackshot = false; /* Whether the trap is for a stackshot */
++static volatile bool  laurel_stackshot_given_up; /* laurel 9013 */
+ 
+ #if defined(__arm64__)
+ uint8_t PE_smc_stashed_x86_system_state = 0xFF;
+@@ -1260,7 +1261,12 @@
+ 				 * error on. A late CPU takes its IPI later and finds mp_kdp_trap clear; the next entry zeroes the counts.
+ 				 */
+ 				static unsigned int laurel_late_count;
++				/* laurel 9013: a CPU that takes this IPI late has no stackshot to help: it does no preflight or helper work */
++				trap_is_stackshot = false;
++				laurel_stackshot_given_up = true;
++				__builtin_arm_dmb(DMB_ISH);
+ 				DebuggerXCallReturn();
++				laurel_stackshot_given_up = false;
+ 				/* [V 2026-11-03 06:15] printf here panics: "Console I/O from interrupt-disabled context": interrupts stay off in this path. kprintf, as this function does. */
+ 				if (laurel_late_count++ < 8) {
+ 					kprintf("LAUREL DEBUG ACK: on: stackshot given up: cpu %d is late by over %llu ticks (time %u)\n",
+@@ -1367,7 +1373,7 @@
+ 	os_atomic_clear_exclusive();
+ 
+ 	// checking debug_ack_timeout != 0 is a workaround for rdar://124242354
+-	if (current_mabs_time >= max_mabs_time && os_atomic_load(&debug_ack_timeout, relaxed) != 0 && !trap_is_stackshot) { /* laurel: a late CPU costs no more than the stackshot */
++	if (current_mabs_time >= max_mabs_time && os_atomic_load(&debug_ack_timeout, relaxed) != 0 && !trap_is_stackshot && !laurel_stackshot_given_up) { /* laurel: a late CPU costs no more than the stackshot */
+ 		panic("Resuming from debugger synchronization failed: waited %llu nanoseconds\n", os_atomic_load(&debug_ack_timeout, relaxed));
+ 	}
+ }

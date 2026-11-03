@@ -5380,3 +5380,6 @@ Full text: `docs/laurel_sprout/ios26-control-center.md`.
 - [V code] The no-flash input does not pass `laurel_input_touch`, so no CPU/GPU clock answer to touch. Do not compare its frame rates with a finger's. Patch 2983 is the real path (built, not booted).
 - At about 9 fps a fixed wait shows a frame of the animation, and a "picture changed" check passes on the wrong screen. Use `settle`, and look at the PNG.
 - Mistake to avoid: `git diff C~1` against the work tree of the series tree also takes every later `post/*` patch: use `git diff C~1 C`. A `$P` that a failed `&&` left empty makes `grep -c X $P` wait on stdin for ever: `</dev/null`.
+
+## 2026-11-03: panic `kern_stackshot.c:933 Assertion failed: stackshot_active()`
+[V 07:25:51] Follows `LAUREL DEBUG ACK: on: stackshot given up: cpu 5`. xnu-12377 stackshots use helper CPUs, so the iOS 16 way of giving up is not safe on its own. post/9013: single-threaded by default; a late CPU does no stackshot work. [U] why CPU 5 is late over 100 ms; the panics follow memory kills.
