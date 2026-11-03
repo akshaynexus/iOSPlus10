@@ -5370,3 +5370,17 @@ Full text: `docs/laurel_sprout/ios26-control-center.md`.
 ## 2026-11-03: first compositor run on `native`
 [V logs/native-compositor-1.txt, 06:47] `LAUREL METAL: on: stack native`, then `TopazGPU: watchdog: GPU hang: fence 2708 done 2705 ... IB1 83db042c`, SMMU FSR 80000402 FAR 0000000001068000. The selector fell back as designed: `LAUREL METAL NATIVE: off: option native failed in 2 starts`. The GPU is off until a reboot.
 [V 06:49] The fallback does not hold across a reboot: at the next boot the setting `native` was tried again, and it hung the GPU again. So the setting is back to `default` on the phone until `native` runs the compositor. Fix for the selector: a GPU hang must keep a mark that survives a reboot (native agent's task).
+
+## 2026-11-03: `native` came back at each boot; the compositor's first hang (branch t3/native-metal-ca-features). Details: `ios26-native-metal.md` section 12
+- [V phone] `stack/state`: root, 0 bytes. backboardd is `mobile`, the folder is sticky. **As root, never create a file in `stack/`: remove it.** `: > state` in the install script made the selector's write fail with no line, so the count never reached the disk, and SpringBoard took `native` too.
+- [V log] `LAUREL CTL: reboot` is a reset after 500 ms: no sync. A mark that must survive needs fsync + rename + a sync of the folder.
+- [V log] A hang: the kernel kills backboardd before the fence thread reports. Do not rely on a line or a mark from the dying process. Count before the stack loads.
+- A selector's write that fails must change the decision: no count on the disk = no risky stack. A failure to write is a failure of the feature.
+- [V code] `renderTargetWidth` and `renderTargetHeight`: 0 unless the caller sets them; 0 = the attachments' size. A scene with explicit sizes hides this. Test a pass the way CA builds it.
+- [V] A FAR of the allocator's range (`0x01000000` on, below `0x80000000`) at a 64 KiB start + a round number: a buffer's end, not a wild address. `FSYNR0` ending in 3: a missing leaf entry; ending in 0 (the first hang): out of the tables.
+- `RedwoodGPU: submission N: 2 command buffers` with a first IB of about 270 words: a pass with no draw: `IB1` at the first's end means the clear stalled.
+- [V kernel] One handle per surface and client; GEM_CLOSE drops the buffer. Count imports in user space.
+- `GRAS_2D_SRC_*` hold a position with 8 fraction bits; `GRAS_2D_DST_*` do not. The second decoder on Turnip's capture found this in my rule (3841 x 5889 on a 720 x 1560 read).
+- pm4-diff reads the **last** draw of a file: a new part of the scene goes in a run of its own.
+- A worktree's build: reflink `out/ios26/*`, `out/laurel-metal`, `out/metal`, symlink `out/laurel-kernel`; `rm -rf out/ios26/metal-hot/build`. `compile_commands` of `mesa-host` keeps the path of the worktree that built it.
+- `xnutils-test.sh` fails on the base too: `XT_METAL_WIDE differs from root-add-metal-ios26.sh` (`-PosterBoard`). Not this branch's; not fixed here.
