@@ -56,15 +56,21 @@ KEEP_FOR_PARITY = {'com.apple.wifid', 'com.apple.wifianalyticsd', 'com.apple.aud
 # Owner 2026-11-03: no job is removed, so what stays must live. Boot 11, one log of 52 min: gamepolicyd 271 kills, deviceaccessd 278, liveactivitiesd 204, linkd 34, intents_helper 29, and ended tasks took 28-55 s
 # of CPU a minute at rest, half of all CPU then [V LAUREL CPU TOP]. Each kill also asks for a corpse and can ask for a stackshot, and a stackshot caused the panic of post/9007 [I]. Memory is there: 715 MiB free at the kills [V].
 # Floors: 24 MB for a daemon that maps the store, 16 MB for the others that crossed their limit once or twice.
-JETSAM_FLOORS = {'Daemon': {'com.apple.iconservices.iconservicesagent': {'InactiveHardMemoryLimit': 96}, 'com.apple.liveactivitiesd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
+JETSAM_FLOORS = {'Daemon': {'com.apple.iconservices.iconservicesagent': {'InactiveHardMemoryLimit': 200}, 'com.apple.liveactivitiesd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
                             'com.apple.linkd': {'ActiveSoftMemoryLimit': 32, 'InactiveHardMemoryLimit': 32}, 'com.apple.watchlistd': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
                             'com.apple.managedappdistributiond': {'InactiveHardMemoryLimit': 16}, 'com.apple.nehelper': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
                             'com.apple.gamepolicyd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24}, 'com.apple.deviceaccessd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
                             'com.apple.contextstored': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24}, 'com.apple.appplaceholdersyncd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
                             'com.apple.tccd': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16}, 'com.apple.softposreaderd': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
-                            'com.apple.driverkitd': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16}},
+                            'com.apple.aonsensed': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
+                            'com.apple.localizationswitcherd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
+                            'com.apple.donotdisturbd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
+                            'com.apple.dasd': {'ActiveSoftMemoryLimit': 48, 'InactiveHardMemoryLimit': 48},
+                            'com.apple.driverkitd': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
+                            'com.apple.usernotificationsd': {'ActiveSoftMemoryLimit': 32, 'InactiveHardMemoryLimit': 32}},
                  'XPCService': {'com.apple.intents.intents-helper': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
-                                'com.apple.WorkflowKit.BackgroundShortcutRunner': {'InactiveHardMemoryLimit': 64}}}
+                                'com.apple.WorkflowKit.BackgroundShortcutRunner': {'InactiveHardMemoryLimit': 64},
+                                'com.apple.extensionkitservice': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24}}}
 
 
 class Node:
@@ -1686,7 +1692,7 @@ def perf_self_test(d):
     jetsam_floors(t, [j])
     o = plistlib.loads(t.read(j))['Version4']
     dm = o['Daemon']['Override']
-    checks += [dm['com.apple.iconservices.iconservicesagent'] == {'InactiveHardMemoryLimit': 96, 'ActiveSoftMemoryLimit': 200, 'JetsamPriority': 140},
+    checks += [dm['com.apple.iconservices.iconservicesagent'] == {'InactiveHardMemoryLimit': 200, 'ActiveSoftMemoryLimit': 200, 'JetsamPriority': 140},
                dm['com.apple.linkd'] == {'ActiveSoftMemoryLimit': 64, 'InactiveHardMemoryLimit': 32}, dm['com.apple.logd'] == {'JetsamPriority': 1},
                dm['com.apple.nehelper'] == {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
                dm['com.apple.gamepolicyd'] == {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24}, dm['com.apple.deviceaccessd'] == {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},

@@ -1,0 +1,369 @@
+laurel 2985: the RPM follows bus votes: the stock enable of its clock scaling (rpm_smd_clk_probe): BIMC INT_MAX, each rate clock of trinket_clks at the top vote in both sets, then clk0 2 Enab = 1, sleep set first. New iokit/Kernel/arm/laurel_rpm_scale.h, tested on the host by scripts/laurel/test-rpm-scale.sh. DDR then follows the GPU level and the stock Gold table, never below the boot clock. Self-check: the MCCC read rises; GCC reads of snoc, pnoc and bimc in one line. An IMEM word marks the first 30 s after the enable: a boot that finds it does not try. Kill switches rpmscale=0, gpupll=0, gpudcvs=0. Both kernels. docs/laurel_sprout/gpu.md "RPM scaling".
+
+diff --git a/bsd/dev/laurel_reboot.c b/bsd/dev/laurel_reboot.c
+index 9a76e5e..9bc12e3 100644
+--- a/bsd/dev/laurel_reboot.c
++++ b/bsd/dev/laurel_reboot.c
+@@ -110,6 +110,18 @@ static volatile uint32_t *lr_reason;      /* NULL: no IMEM reason (self-check fa
+ #define LR_PANIC_WORD    0x4C504E43u
+ static volatile int lr_in_panic;
+ static unsigned lr_mode;                   /* index in lr_modes */
++/*
++ * laurel 2985: the same word for a feature that can reset the SoC in a way no code sees (a wrong RPM message). The feature sets a mark while it is new; the next start of this kernel reads
++ * what the last boot left, before it writes the word back. Mu and ABL read only the panic word. [U] whether the word survives such a reset: no mark, no change.
++ */
++static uint32_t lr_boot_word;
++uint32_t laurel_imem_boot_word(void);
++bool laurel_imem_mark(bool armed);
++uint32_t
++laurel_imem_boot_word(void)
++{
++	return lr_boot_word;
++}
+ static int lr_on;
+ 
+ /* laurel 2005: the USB command server and the panic hold pick the mode by name. 0 = set, EINVAL, ENXIO = no IMEM reason. */
+@@ -126,6 +138,17 @@ laurel_reboot_set_mode(const char *name)
+ 	return EINVAL;
+ }
+ 
++bool
++laurel_imem_mark(bool armed)
++{
++	if (lr_reason == NULL) {
++		return false;
++	}
++	*lr_reason = armed ? 0x4c52504du : lr_modes[lr_mode].imem;      /* RS_IMEM_ARMED, laurel_rpm_scale.h */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return true;
++}
++
+ static int64_t
+ lr_psci(uint64_t fn)
+ {
+@@ -152,6 +175,7 @@ laurel_reboot_prepare(void)
+ 	} else {
+ 		volatile uint32_t *r = (volatile uint32_t *)(va + LAUREL_IMEM_RESTART_OFF);
+ 		uint32_t old = *r;
++		lr_boot_word = old;
+ 		*r = lr_modes[0].imem;
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		if (*r == lr_modes[0].imem) {
+diff --git a/iokit/Kernel/arm/LaurelGpuDcvs.cpp b/iokit/Kernel/arm/LaurelGpuDcvs.cpp
+index e474d41..7dd480e 100644
+--- a/iokit/Kernel/arm/LaurelGpuDcvs.cpp
++++ b/iokit/Kernel/arm/LaurelGpuDcvs.cpp
+@@ -11,6 +11,8 @@
+  * current if mitigation not done") and stays below when the vote times out. Client 5 of cx_ipeak_lm (TCSR 0x3ed000, v2).
+  * Bus [V trinket-gpu.dtsi]: the stock qcom,bus-freq of each level, on "clk2" (ddr_start in laurel_gpu_clock_read.h).
+  *
++ * laurel 2985: the RPM follows a bus vote only after the stock enable: laurel_rpm_scale.h. DDR then follows the GPU level and the Gold clock, never below the boot clock.
++ *
+  * Clock check: the GCC clock counter (debugcc-trinket.c: GCC mux 0xDD, GPUCC mux 0xB, GPUCC post divider 2; clk-debug.c run_measurement).
+  * The CP counter is logged next to it and is the check only when the GCC counter does not count.
+  * Self-check at start: each level with its PLL lock, a clock read, a CP fence. A level that fails goes out of the table, and the levels above it are
+@@ -48,9 +50,8 @@ bool redwood_gpu_ready(void);
+ #define RPM_MEMC        0x326b6c63u     /* "clk2" */
+ #define RPM_KHZ         0x007a484bu     /* "KHz" */
+ #define TOUCH_MS        300u
+-#define DDR_GOLD_MHZ    1017u           /* a fast Gold cluster: the stock bus level of 600 MHz, as in 2892 */
++#define DDR_GOLD_MHZ    1017u           /* gpupll=0: the top level of the 2892 path */
+ #define DDR_TOP_MHZ     1804u           /* stock bus level 11 */
+-#define GOLD_DDR_MHZ    1400u
+ 
+ /* PLL registers (clk-alpha-pll.c); PLL0 at GPUCC +0x0, PLL1 at +0x100 */
+ #define PLL_BASE(p)     ((p) ? 0x100u : 0u)
+@@ -91,6 +92,22 @@ static uint16_t read_gcc[OPP_N], read_cp[OPP_N];
+ static bool ipeak_feature;
+ static uint32_t ddr_boot, ddr_floor, ddr_vote;  /* MHz; ddr_floor: the boot clock as a bus level; ddr_vote 0: no vote is sent (no need, or the RPM does not follow) */
+ 
++/* laurel 2985: laurel_reboot.c, bsd side */
++extern "C" uint32_t laurel_imem_boot_word(void);
++extern "C" bool laurel_imem_mark(bool armed);
++static bool ddr_marked;
++static uint64_t ddr_mark_until;
++static void
++ddr_mark_clear(void)
++{
++	if (ddr_marked) {
++		(void)laurel_imem_mark(false);
++	}
++	ddr_marked = false;
++	ddr_mark_until = 0;
++}
++
++#include "laurel_rpm_scale.h"           /* the stock enable of the RPM's clock scaling */
+ #include "laurel_gpu_clock_read.h"      /* gfx3d_mhz, cp_mhz, clock_right, ddr_mhz, ddr_want, ddr_start */
+ 
+ /* --------------------------------------------------------------- the operations of opp_go */
+@@ -399,6 +416,7 @@ dcvs_thread(void *arg __unused, wait_result_t wr __unused)
+ 	pll_allowed = pll_arg != 0;
+ 	ddr_start();
+ 	if (!self_check()) {
++		ddr_mark_clear();
+ 		return;
+ 	}
+ 	(void)laurel_gpu_counters(&b0, &t0, &c);
+@@ -406,7 +424,11 @@ dcvs_thread(void *arg __unused, wait_result_t wr __unused)
+ 	lm_t0 = t0;
+ 	while (redwood_gpu_ready()) {
+ 		IOSleep(OPP_TICK_MS);
++		if (ddr_mark_until != 0 && mach_absolute_time() >= ddr_mark_until) {
++			ddr_mark_clear();
++		}
+ 		if (stalled && !after_stall()) {
++			ddr_mark_clear();
+ 			return;
+ 		}
+ 		uint64_t b1, t1, ns = 0, now = mach_absolute_time();
+@@ -454,7 +476,9 @@ dcvs_thread(void *arg __unused, wait_result_t wr __unused)
+ 		uint32_t want = opp_table[level].bus_mhz;
+ 
+ 		/* DDR up before the raise (opp_go) or at once for Gold, down only after OPP_LOWER_MS (each vote is one RPM message) */
+-		want = laurel_cpufreq_gold_mhz() >= GOLD_DDR_MHZ && want < DDR_GOLD_MHZ ? DDR_GOLD_MHZ : want;
++		uint32_t gold_bus = rs_gold_bus(laurel_cpufreq_gold_mhz());     /* laurel 2985: the stock table */
++
++		want = gold_bus > want ? gold_bus : want;
+ 		if (want >= ddr_vote) {
+ 			ddr_low_ms = 0;
+ 			(void)ddr_want(want);
+@@ -473,6 +497,7 @@ dcvs_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ 	uint32_t was = opp_table[level].mhz;
+ 
++	ddr_mark_clear();
+ 	all_down();
+ 	IOLog("LAUREL GPU CLOCK: off: the GPU went off at %u MHz\n", was);
+ }
+@@ -525,7 +550,7 @@ extern "C" int laurel_gpu_dcvs_stats(char *s, size_t n);
+ int
+ laurel_gpu_dcvs_stats(char *s, size_t n)
+ {
+-	return scnprintf(s, n, "gpu.level_mhz=%u\nddr.boot_mhz=%u\nddr.vote_mhz=%u\n", opp_table[level].mhz, ddr_boot, ddr_vote);
++	return scnprintf(s, n, "gpu.level_mhz=%u\nddr.boot_mhz=%u\nddr.vote_mhz=%u\nddr.now_mhz=%u\n", opp_table[level].mhz, ddr_boot, ddr_vote, mccc != NULL ? ddr_mhz() : 0);
+ }
+ #else
+ extern "C" int laurel_gpu_dcvs_stats(char *s, size_t n) { (void)s; (void)n; return 0; }
+diff --git a/iokit/Kernel/arm/laurel_gpu_clock_read.h b/iokit/Kernel/arm/laurel_gpu_clock_read.h
+index 2668052..8045c5a 100644
+--- a/iokit/Kernel/arm/laurel_gpu_clock_read.h
++++ b/iokit/Kernel/arm/laurel_gpu_clock_read.h
+@@ -99,37 +99,84 @@ ddr_want(uint32_t mhz)
+ 	return true;
+ }
+ 
++/* Any clock of the GCC debug mux, MHz (debugcc-trinket.c: snoc_clk 0x7, pnoc_clk 0x11, bimc_clk 0x97; no post divider); 0: the counter does not count */
++static uint32_t
++bus_mhz(uint32_t sel)
++{
++	const uint32_t full_ticks = 0x2000;
++
++	WR(gcc, 0x62000, (RD(gcc, 0x62000) & ~0x3ffu) | sel);
++	WR(gcc, 0x30000, RD(gcc, 0x30000) & ~0xfu);
++	WR(gcc, 0x30004, RD(gcc, 0x30004) | 1u);
++	WR(gcc, 0x28008, RD(gcc, 0x28008) | 1u);
++	uint32_t a = count_run(0x1000), b = count_run(full_ticks);
++
++	WR(gcc, 0x28008, RD(gcc, 0x28008) & ~1u);
++	WR(gcc, 0x30004, RD(gcc, 0x30004) & ~1u);
++	if (a == 0 || b == 0 || a == b) {
++		return 0;
++	}
++	return (uint32_t)(((uint64_t)b * 10 + 15) * 4800000 / (full_ticks * 10 + 35) / 1000000);
++}
++
++static uint32_t rs_ddr_read(void) { return ddr_mhz(); }
++static void rs_wait_ms(uint32_t ms) { IOSleep(ms); }
++static const struct rs_ops rs_kernel_ops = { topaz_rpm_write, rs_ddr_read, rs_wait_ms };
++
+ /*
+- * The stock bus levels go to DDR_TOP_MHZ, so a boot clock below it needs a vote that the RPM must follow. Stock votes bus level 11 at 900 and 950
+- * MHz through msm_bus: path 26 -> 512, ib 14432000 KBps / 8 = 1804 MHz, which is "clk2" 1804000 KHz here. No "clk0" Enab (2892).
++ * laurel 2985: the top bus level needs a vote that the RPM follows, and the RPM follows a vote only after the stock enable (laurel_rpm_scale.h). Kill switch rpmscale=0, and gpupll=0 as 2961.
++ * Failure modes: an RPM error or no ack before Enab: nothing moved, off, one line. An ack and no rise of the read: off, the votes stay, so no bus clock can fall. A reset by the RPM at Enab
++ * cannot be caught: the IMEM word is set for RS_ARMED_S from before the first message, and a boot that finds it does not try and says so ([U] whether the word survives such a reset).
+  */
+ static void
+ ddr_start(void)
+ {
+ 	uint32_t top = pll_allowed ? DDR_TOP_MHZ : DDR_GOLD_MHZ;       /* gpupll=0: no new vote, as 2892 */
++	uint32_t arg = 1;
+ 
++	(void)PE_parse_boot_argn("rpmscale", &arg, sizeof(arg));
+ 	ddr_boot = ddr_mhz();
+ 	ddr_floor = opp_ddr_snap(ddr_boot);
+ 	if (ddr_boot == 0) {
+ 		IOLog("LAUREL DDR: off: the MCCC period register reads %u: no DDR clock known, no vote\n", RD(mccc, 0x220));
+-	} else if (ddr_boot >= top) {
++		return;
++	}
++	if (ddr_boot >= top) {
+ 		IOLog("LAUREL DDR: on: %u MHz measured, not lower than the top bus level %u MHz: no vote needed\n", ddr_boot, top);
+-	} else if (!topaz_rpm_write(RPM_ACTIVE, RPM_MEMC, 0, RPM_KHZ, top * 1000)) {
+-		IOLog("LAUREL DDR: off: %u MHz measured, RPM refused a vote of %u MHz; clock as it is\n", ddr_boot, top);
+-	} else {
+-		IOSleep(5);
+-		uint32_t now = ddr_mhz();
+-
+-		if (now >= ddr_boot * 11 / 10) {
+-			ddr_vote = top;
+-			(void)ddr_want(opp_table[OPP_300].bus_mhz);
+-			IOLog("LAUREL DDR: on: %u MHz at boot, a vote of %u gave %u MHz, %u MHz now; stock bus level of each GPU level, never below %u MHz\n",
+-			    ddr_boot, top, now, ddr_mhz(), ddr_floor);
+-		} else {
+-			(void)topaz_rpm_write(RPM_ACTIVE, RPM_MEMC, 0, RPM_KHZ, ddr_floor * 1000);
+-			IOLog("LAUREL DDR: off: %u MHz at boot, %u MHz after a vote of %u MHz: the RPM does not follow (no scaling enable); 820+ MHz run on the boot clock\n",
+-			    ddr_boot, now, top);
+-		}
++		return;
+ 	}
+-}
++	if (arg == 0) {
++		IOLog("LAUREL DDR: off: boot-arg rpmscale=0: %u MHz stays, no vote\n", ddr_boot);
++		return;
++	}
++	if (laurel_imem_boot_word() == RS_IMEM_ARMED) {
++		IOLog("LAUREL DDR: off: the last boot ended within %u s of the RPM enable (IMEM word): no enable in this boot, %u MHz stays; rpmscale=0 turns it off for good\n", RS_ARMED_S, ddr_boot);
++		return;
++	}
++	uint32_t s0 = bus_mhz(0x7), p0 = bus_mhz(0x11), b0 = bus_mhz(0x97);
++	const char *why = "";
++
++	ddr_marked = laurel_imem_mark(true);
++	if (!rs_enable(&rs_kernel_ops, &why)) {
++		IOLog("LAUREL DDR: off: %u MHz at boot, the RPM refused or did not ack %s (TopazRpm lines); no enable sent, %u MHz stays\n", ddr_boot, why, ddr_boot);
++		ddr_mark_clear();
++		return;
++	}
++	uint32_t now = rs_read_rise(&rs_kernel_ops, ddr_boot);
+ 
++	uint64_t armed = 0;
++
++	nanoseconds_to_absolutetime((uint64_t)RS_ARMED_S * NSEC_PER_SEC, &armed);
++	ddr_mark_until = mach_absolute_time() + armed;
++	IOLog("LAUREL RPM SCALE: on: %u bus clocks at the stock top vote, Enab acked in both sets; GCC reads snoc %u -> %u, pnoc %u -> %u, bimc %u -> %u MHz\n",
++	    (unsigned)RS_N, s0, bus_mhz(0x7), p0, bus_mhz(0x11), b0, bus_mhz(0x97));
++	if (now < ddr_boot * 11 / 10) {
++		IOLog("LAUREL DDR: off: %u MHz at boot, %u MHz after the stock enable and a vote of the top: the RPM does not follow; all votes stay at the top\n", ddr_boot, now);
++		return;
++	}
++	ddr_vote = top;
++	(void)ddr_want(opp_table[OPP_300].bus_mhz);
++	IOSleep(5);
++	IOLog("LAUREL DDR: on: %u MHz at boot, the stock enable gave %u MHz, %u MHz now; stock bus level of each GPU level and Gold clock, never below %u MHz\n",
++	    ddr_boot, now, ddr_mhz(), ddr_floor);
++}
+diff --git a/iokit/Kernel/arm/laurel_rpm_scale.h b/iokit/Kernel/arm/laurel_rpm_scale.h
+new file mode 100644
+index 0000000..3199115
+--- /dev/null
++++ b/iokit/Kernel/arm/laurel_rpm_scale.h
+@@ -0,0 +1,108 @@
++/*
++ * laurel 2985 (a piece of LaurelGpuDcvs.cpp): the stock way to make the RPM follow bus votes on the Mi A3 (SM6125 "trinket"). No hardware access: the kernel
++ * gives the operations in struct rs_ops, and the host test scripts/laurel/test-rpm-scale.sh runs this same text with a fake RPM made from the firmware's rules.
++ *
++ * Why [V rpm.mbn of the stock ROM, docs/laurel_sprout/gpu.md "RPM scaling"]: resource clk0 id 2 is the node /clk/dcvs.ena. While it is 0, each gated bus node (snoc, cnoc,
++ * snoc_periph, snoc_lpass, bimc, ipa, qup) acks a vote and keeps its state. When it goes to 1, the firmware applies at once what the masters asked for. A node that nobody
++ * voted for goes to its lowest level. So stock votes all of them first.
++ * Order [V drivers/clk/qcom/clk-smd-rpm.c rpm_smd_clk_probe, every stock boot]: BIMC INT_MAX in the active set (clk_vote_bimc), then each clock in the order of
++ * trinket_clks with its rate INT_MAX / 1000, active set then sleep set (clk_smd_rpm_prepare), then Enab = 1, sleep set then active set (clk_smd_rpm_enable_scaling).
++ * Not sent, against stock: the XO, QDSS and XO buffer votes of the same loop (branch clocks, key Enab / swen). The /clk/dcvs.ena driver does not read them [V], and stock
++ * drops most of them again at late init, so their state stays as ABL left it, as today. The stock keepalive votes (19.2 MHz) are below the top vote.
++ * The votes are never lowered, only BIMC: stock lowers them by msm_bus clients, which do not exist here, and a lower vote with no client could break a block.
++ */
++#define RS_SET_ACTIVE   0u
++#define RS_SET_SLEEP    1u
++#define RS_CLK0         0x306b6c63u     /* QCOM_SMD_RPM_MISC_CLK "clk0" */
++#define RS_CLK1         0x316b6c63u     /* QCOM_SMD_RPM_BUS_CLK */
++#define RS_CLK2         0x326b6c63u     /* QCOM_SMD_RPM_MEM_CLK */
++#define RS_CE           0x00006563u     /* QCOM_SMD_RPM_CE_CLK */
++#define RS_IPA          0x00617069u     /* QCOM_SMD_RPM_IPA_CLK */
++#define RS_QUP          0x00707571u     /* QCOM_SMD_RPM_QUP_CLK */
++#define RS_MMXI         0x69786d6du     /* QCOM_SMD_RPM_MMXI_CLK */
++#define RS_KEY_KHZ      0x007a484bu     /* QCOM_RPM_SMD_KEY_RATE */
++#define RS_KEY_ENAB     0x62616e45u     /* QCOM_RPM_SMD_KEY_ENABLE */
++#define RS_SCALING_ID   2u              /* QCOM_RPM_SCALING_ENABLE_ID */
++#define RS_BIMC_FIRST   0x7fffffffu     /* clk_vote_bimc(INT_MAX): the raw value */
++#define RS_TOP_KHZ      2147484u        /* to_active_sleep: DIV_ROUND_UP(INT_MAX, 1000) */
++#define RS_IMEM_ARMED   0x4c52504du     /* "LRPM" in the IMEM restart word while an enable is new: laurel_reboot.c */
++#define RS_ARMED_S      30u
++#define RS_READ_MS      200u
++
++struct rs_clock {
++	uint32_t type, id;
++	const char *name;
++};
++
++/* The rate clocks of trinket_clks, in the index order of dt-bindings/clock/qcom,rpmcc.h [V: tools/rpm-scale-test/check-table.py] */
++static const struct rs_clock rs_clocks[] = {
++	{ RS_CLK1, 2, "snoc" },
++	{ RS_CLK2, 0, "bimc" },
++	{ RS_IPA, 0, "ipa" },
++	{ RS_QUP, 0, "qup" },
++	{ RS_MMXI, 1, "mmrt" },
++	{ RS_MMXI, 0, "mmnrt" },
++	{ RS_CLK1, 0, "snoc_periph" },
++	{ RS_CLK1, 5, "snoc_lpass" },
++	{ RS_CLK1, 1, "cnoc" },
++	{ RS_CE, 0, "ce1" },
++};
++#define RS_N            (sizeof(rs_clocks) / sizeof(rs_clocks[0]))
++
++struct rs_ops {
++	bool (*write)(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);  /* false: refused, or no ack */
++	uint32_t (*ddr)(void);                                                                  /* MHz; 0: no read */
++	void (*wait_ms)(uint32_t ms);
++};
++
++/* The stock order. false: *why says where it stopped, and no Enab went out: the RPM's gated nodes did not move. */
++static bool
++rs_enable(const struct rs_ops *ops, const char **why)
++{
++	if (!ops->write(RS_SET_ACTIVE, RS_CLK2, 0, RS_KEY_KHZ, RS_BIMC_FIRST)) {
++		*why = "the first BIMC vote";
++		return false;
++	}
++	for (uint32_t i = 0; i < RS_N; i++) {
++		if (!ops->write(RS_SET_ACTIVE, rs_clocks[i].type, rs_clocks[i].id, RS_KEY_KHZ, RS_TOP_KHZ) ||
++		    !ops->write(RS_SET_SLEEP, rs_clocks[i].type, rs_clocks[i].id, RS_KEY_KHZ, RS_TOP_KHZ)) {
++			*why = rs_clocks[i].name;
++			return false;
++		}
++	}
++	if (!ops->write(RS_SET_SLEEP, RS_CLK0, RS_SCALING_ID, RS_KEY_ENAB, 1)) {
++		*why = "Enab in the sleep set";
++		return false;
++	}
++	if (!ops->write(RS_SET_ACTIVE, RS_CLK0, RS_SCALING_ID, RS_KEY_ENAB, 1)) {
++		*why = "Enab in the active set";
++		return false;
++	}
++	return true;
++}
++
++/* The DDR read after the top vote: at most RS_READ_MS. A rise of 10 % says that the RPM follows; the value it stops at is what the line shows. */
++static uint32_t
++rs_read_rise(const struct rs_ops *ops, uint32_t boot)
++{
++	uint32_t now = 0;
++
++	for (uint32_t ms = 0; ms <= RS_READ_MS; ms += 5) {
++		ops->wait_ms(5);
++		now = ops->ddr();
++		if (now >= boot * 11 / 10) {
++			break;
++		}
++	}
++	return now;
++}
++
++/*
++ * The DDR level for a Gold clock: the stock table with the higher rows, cpu4_cpu_ddr_latmon of trinket.dtsi, ddr4-map (first row with core >= clock [V governor_memlat]). Stock asks a
++ * memory-bound load for this and asks only the row of 2016 MHz with no condition (cpu4_computemon). Here no PMU tells memory-bound load, and the owner asked for full speed.
++ */
++static inline uint32_t
++rs_gold_bus(uint32_t gold_mhz)
++{
++	return gold_mhz > 1804 ? 1804 : gold_mhz > 1401 ? 1555 : gold_mhz > 902 ? 1017 : 451;
++}
