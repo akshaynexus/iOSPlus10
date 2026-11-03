@@ -954,7 +954,7 @@ pub extern "C" fn nmb_render_encoder_new(c: *mut NmbCommandBuffer, d: *const Nmb
         unsafe { nw_cs_init(&mut *draws, cb.gpu.dev) };
         cb.open = true;
         let raster = default_raster(w, h);
-        Ok(boxed(NmbEncoder { cb: c, gpu: cb.gpu.clone(), kind: 0, pass: Some(PassRecord { colors, depth, depth_load: d.depth.load, clear_z: d.depth.clear[0], stencil, stencil_load: d.stencil.load, clear_s: d.stencil.clear[0] as u32, w, h, samples: d.samples.max(1) as u32 }), draws, stages: Default::default(), pipeline: None, raster, plan_cache: HashMap::new(), attachment_written: 0, target_dirty: false, compute: None }))
+        Ok(boxed(NmbEncoder { cb: c, gpu: cb.gpu.clone(), kind: 0, pass: Some(PassRecord { colors, depth, depth_load: d.depth.load, clear_z: d.depth.clear[0], stencil, stencil_load: d.stencil.load, clear_s: d.stencil.clear[0] as u32, w, h, samples: d.samples.max(1) as u32 }), draws, stages: Default::default(), pipeline: None, raster, plan_cache: HashMap::new(), attachment_written: 0, target_dirty: true, compute: None }))
     })
 }
 
