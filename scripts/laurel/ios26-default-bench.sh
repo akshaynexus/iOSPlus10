@@ -69,9 +69,17 @@ case "$active" in default*) ;; *) say "NOT stack default: $active"; exit 3 ;; es
 rc=0
 t=$(mktemp)
 start=$(log_at)
+cpu() { phone 'for n in backboardd SpringBoard; do p=; for w in $(ps -ax -o pid=,comm= | grep "/$n\$"); do p=$w; break; done; echo "== $n $p"; ps -M -p $p | cut -c1-60; done'; }
+cpu0=$(cpu)
+# SAMPLE_S=N: where backboardd's running threads spend their time, for N seconds (scripts/laurel/ios26-sample-sym.py logs/bench-NAME.samples)
+if [ -n "${SAMPLE_S:-}" ]; then
+  phone 'for w in $(ps -ax -o pid=,comm= | grep "/backboardd$"); do /usr/local/bin/laurel-autotest sample $w '"$SAMPLE_S"' 100; break; done' > "$REPO/logs/bench-$name.samples" 2>/dev/null &
+fi
 "$REPO/scripts/laurel/ios26-autotest.sh" run "$@" 2>&1 | tee "$t" || rc=$?
 { echo "bench $name: env + ${extra[*]:-nothing}"; sed -n '/^Mi A3 iOS 26 UI test/,$p' "$t"; } > "$REPO/logs/bench-$name.txt"
 rm -f "$t"
+cpu1=$(cpu)
+python3 -I "$REPO/scripts/laurel/ios26-thread-cpu.py" <(printf '%s\n' "$cpu0") <(printf '%s\n' "$cpu1") | tee -a "$REPO/logs/bench-$name.txt"
 tail -c +"$start" "$LOG" | grep -aE 'LAUREL GPU PASS|LAUREL FRAME|RedwoodGPU: [0-9]+ submissions|LAUREL FLIP' > "$REPO/logs/bench-$name.kernel.txt"
 python3 -I "$REPO/scripts/laurel/ios26-gpu-pass-sum.py" "$REPO/logs/bench-$name.kernel.txt" | tee -a "$REPO/logs/bench-$name.txt"
 say "table: logs/bench-$name.txt (test exit $rc)"
