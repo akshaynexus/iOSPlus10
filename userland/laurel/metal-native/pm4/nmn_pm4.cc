@@ -268,9 +268,16 @@ struct nmn_image *nmn_image_new(struct nmn_gpu *g, uint32_t format, enum nmn_ima
 	struct fdl_explicit_layout plane = {};
 	struct fdl_explicit_layout *pl = NULL;
 	im->layout.tile_mode = tiled ? TILE6_3 : TILE6_LINEAR;
+	/*
+	 * fdl6_layout wants 16 pixels a row above 4 bytes a pixel, for a store from tile memory: 1344-byte rows of RGBA16F were refused (78 lines in backboardd: 168 x 168). This stack has no tile memory, and a row of 64-byte units is what
+	 * the hardware reads: a layout at the next row, then the caller's row in it. One level: a smaller level's row comes from pitchalign.
+	 */
+	const uint32_t cpp = util_format_get_blocksize((enum pipe_format)format);
+	const uint32_t store_row = cpp > 4 ? 16 * cpp : 64;
+	const bool caller_row = stride != 0 && levels == 1 && (stride & 63) == 0 && (stride & (store_row - 1)) != 0;
 	if (stride != 0) {
 		plane.offset = 0;
-		plane.pitch = stride;
+		plane.pitch = caller_row ? ALIGN(stride, store_row) : stride;
 		pl = &plane;
 	}
 	im->layout.ubwc = false;        /* the first version has no UBWC: fewer flushes to get right, and an erratum to read first (doc section 5) */
@@ -281,6 +288,11 @@ struct nmn_image *nmn_image_new(struct nmn_gpu *g, uint32_t format, enum nmn_ima
 	if (!fdl6_layout(&im->layout, &g->info, separate ? PIPE_FORMAT_Z32_FLOAT : (enum pipe_format)format, samples, width, height, depth, levels, layers, type == NMN_IMAGE_3D, false, false, pl)) {
 		free(im);
 		return NULL;
+	}
+	if (caller_row) {
+		fdl_set_pitchalign(&im->layout, 6);
+		im->layout.pitch0 = stride;
+		im->layout.slices[0].size0 = (uint64_t)stride * height;
 	}
 	if (separate) {
 		im->stencil.tile_mode = TILE6_3;
