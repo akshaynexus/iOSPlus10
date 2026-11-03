@@ -579,6 +579,15 @@ Tool: `scripts/laurel/native/compositor-round.sh`, under `phone-lock.sh`: reboot
 
 **Correction [V]: the rows above that name a FAR read too much.** All these hangs have `FSR 00000400`: FSR.FORMAT, no fault bit, `gfsr 0`, `CP_HW_FAULT 0`. There was no bad read: FAR is a stale value. The GPU stays busy: `RBBM_STATUS 00e714e5` = SP, HLSQ, UCHE, VPC, PC_DCALL, LRZ, RB, RAS, TSE, CP busy; TPL1, VBIF, CCU, VFD idle. (`00e594e5` at 10:44: VFD busy, UCHE idle.) The line register and the prefetch register were real fixes and not the cause.
 
+| 12:55 | The picture causes below fixed, recorder off | **All four steps `ok`: unlock 56.0 fps, Home swipe 21.0, Control Center 19.2, Settings 33.2. Control Center 0.03 % off against the default stack (battery percent), Home 0.34 %** |
+| 13:01, 13:29 | The same, recorder off | Hang: fence 34266, 15533 |
+| 13:04 to 13:24 | The same, recorder on, 4 rounds | No hang |
+| 13:42 | `RB_DONE_TS` after each draw, recorder off | Hang: fence 8007, 30 s after the start. The event alone is not what the recorder gives |
+
+**Picture causes, all [V]:** see docs/notes.md "native stack, wrong pictures and their causes".
+
+**The hang, state at 14:20.** Not solved. [V] Recorder on after the private-memory split and the target flush: 0 hangs in 9 rounds. Recorder off: 3 hangs in 4 starts (one of them with the per-draw event). [V] With the recorder on, the one named stuck draw (11:47) was `gen+cpf`, id 1635, with bindings like draws that ended. The generic program has 30 loops and private memory. [I] What the recorder changes: CPU time per draw (fewer submissions in flight), a thread, reads of uniform buffers, and until 14:11 the value of UCHE_CLIENT_PF. Next: the lite recorder (name and id only).
+
 The recorder now names the draw: each draw has an id, the stream writes it at `RB_DONE_TS` (no wait), a thread keeps the last id in the ring's head, `flight-read.py FILE --stuck` prints the first unfinished draw.
 
 Cold pipeline compile [V `pipelines.log`]: 100 to 560 ms per CA pipeline, 17.9 s for the generic one. With the disk cache: no compile.
