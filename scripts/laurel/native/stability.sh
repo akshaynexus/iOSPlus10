@@ -1,0 +1,23 @@
+#!/bin/bash
+# The native stack over a long run: the fixed scenario N times, each round under the phone lock, with the lock free between them. One line a round: hangs, the table's results, the frames per second. Output: logs/stability-TIME.txt.
+#   scripts/bg.sh stability env AUTOTEST_DIR=... scripts/laurel/native/stability.sh [N]
+# The last round puts the setting back on default. Stops at a hang: the round's folder has the recorder's files when it was on (FLIGHT=1).
+set -uo pipefail
+REPO=$(cd "$(dirname "$0")/../../.." && pwd)
+N=${1:-5}
+O=$REPO/logs/stability-$(date +%H%M%S).txt
+A=${AUTOTEST_DIR:-$REPO}
+for i in $(seq 1 "$N"); do
+  keep=--keep; [ "$i" = "$N" ] && keep=
+  flight=--no-flight; [ "${FLIGHT:-0}" = 1 ] && flight=
+  # a hang leaves the GPU off until a reboot: only then, each boot of slot b counts
+  U=$(ls -t /home/akshay/Documents/GitHub/iOSPlus10/logs/usblog-*.txt | head -1); up=$(grep -n 'exec hangtelemetryd' "$U" | tail -1 | cut -d: -f1); hang=$(grep -n 'watchdog: GPU hang' "$U" | tail -1 | cut -d: -f1); R=; [ "${hang:-0}" -gt "${up:-0}" ] && R=--reboot
+  "$REPO/scripts/laurel/native/compositor-round.sh" $R $keep $flight --test unlock,home-swipe,control-center,settings-scroll 40 > "$O.round" 2>&1
+  D=$(ls -dt "$REPO"/logs/round-* | head -1)
+  T=$(ls -t "$A"/logs/autotest-*.txt | head -1)
+  H=$(grep -c 'TopazGPU: watchdog: GPU hang' "$D/usblog.txt")
+  echo "$(date +%H:%M:%S) round $i of $N: $(basename "$D"), hangs $H, table $(basename "$T")" | tee -a "$O"
+  [ "$T" -nt "$D" ] && grep -E '^\| (unlock|home-swipe|control-center|settings-scroll)' "$T" | cut -c1-135 | tee -a "$O"
+  if [ "$H" != 0 ]; then grep -m2 -E 'watchdog: GPU hang|SMMU gfsr' "$D/usblog.txt" | cut -c1-170 | tee -a "$O"; echo "stopped at a hang" | tee -a "$O"; exit 1; fi
+done
+echo "no hang in $N rounds" | tee -a "$O"
