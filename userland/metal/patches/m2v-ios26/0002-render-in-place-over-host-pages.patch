@@ -1,0 +1,73 @@
+metal2vulkan (Mi A3, iOS 26): a render target over host pages renders on them: an IOSurface is its own attachment. The shadow cost a copy in, a keep and a word-by-word merge per pass. [V phone 2026-11-03, LAUREL GPU PASS] compute 64x1 x 3x1560: 16 ms of GPU per frame, 70 % of backboardd's GPU time. Kill switch NEGRONIMETAL_RENDER_IN_PLACE=0. Docs: docs/laurel_sprout/ios26-default-speed.md.
+
+--- a/crates/metal2vulkan-runtime/src/in_place.rs
++++ b/crates/metal2vulkan-runtime/src/in_place.rs
+@@ -251,7 +251,7 @@
+     if policy == HostPageTexturePolicy::Shadow {
+         return Err(ShadowCause::Exact);
+     }
+-    if usage.contains(TextureUsage::RENDER_TARGET) {
++    if usage.contains(TextureUsage::RENDER_TARGET) && !renders_in_place() {
+         return Err(ShadowCause::RenderTarget);
+     }
+     if usage.intersects(TextureUsage::SHADER_WRITE | TextureUsage::SHADER_ATOMIC) {
+@@ -259,12 +259,24 @@
+     }
+     match verdict(class) {
+         Verdict::Passed => Ok(()),
++        // laurel: on Turnip the first move of a linear image writes no byte [V tu_barrier, no layout code]; the check itself makes no 40 MiB
++        // no-copy buffer on this phone, so it answers Unchecked for ever, and every surface was a shadow.
++        Verdict::Pending | Verdict::Unchecked if class == PagesClass::Pointer && renders_in_place() => Ok(()),
+         Verdict::Pending => Err(ShadowCause::CheckPending(class)),
+         Verdict::Failed => Err(ShadowCause::CheckFailed(class)),
+         Verdict::Unchecked => Err(ShadowCause::Unchecked(class)),
+     }
+ }
+ 
++/// laurel (Mi A3, iOS 26): a texture that renders over host pages renders on them, on a device whose linear
++/// images take color attachment usage beside any other (Turnip), so an IOSurface is its own attachment. The
++/// shadow cost a copy in, a keep and a word-by-word merge per pass: 16 ms of GPU per frame at 950 MHz on the
++/// Adreno 610. A pass writes only the texels its draws write, as Metal does. Kill switch NEGRONIMETAL_RENDER_IN_PLACE=0.
++fn renders_in_place() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("NEGRONIMETAL_RENDER_IN_PLACE").is_none_or(|v| v != "0"))
++}
++
+ /// A device's check verdicts (`DeviceShared::in_place`): one per class, and whether its check
+ /// started and settled.
+ pub(crate) struct InPlaceChecks {
+--- a/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
++++ b/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
+@@ -307,7 +307,7 @@
+                     features,
+                 }))
+             }
+-            None => self.host_linear_image(plan)?,
++            None => self.host_linear_image(plan, layout)?,
+         };
+         // Whether the driver made its linear image and laid it out otherwise.
+         let (linear, elsewhere) = match made {
+@@ -346,17 +346,23 @@
+     fn host_linear_image(
+         &self,
+         plan: &ImagePlan,
++        layout: &BufferLayout,
+     ) -> Result<Result<LinearMade, LinearRefusal>, Error> {
+         let raw_device = self.shared().vk();
+         let view_formats = plan.ash_view_formats();
+         let mut list = vk::ImageFormatListCreateInfo::default();
+         let mut external = vk::ExternalMemoryImageCreateInfo::default()
+             .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
++        // laurel (Mi A3, iOS 26): the rows the texels lie on, for Turnip 0108: an IOSurface of 720 pixels has rows of 2880 or 3072 bytes, and only the driver can
++        // make its image so. Outside this port's Turnip the struct is not defined with this tiling: this bridge runs only on it.
++        let planes = [vk::SubresourceLayout::default().row_pitch(layout.row_pitch)];
++        let mut rows = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default().plane_layouts(&planes);
+         let info = plan
+             .create_info(self.shared().sharing(), &view_formats, &mut list)
+             .tiling(vk::ImageTiling::LINEAR)
+             .initial_layout(vk::ImageLayout::UNDEFINED)
+             .push_next(&mut external);
++        let info = if plan.layers == 1 { info.push_next(&mut rows) } else { info };
+         let limits = match self.host_image_limits(&info, &view_formats)? {
+             Ok(limits) => limits,
+             Err(refusal) => return Ok(Err(refusal)),

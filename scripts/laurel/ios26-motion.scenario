@@ -1,0 +1,29 @@
+# Only motion, for CPU per frame: scripts/laurel/ios26-default-bench.sh NAME -- --scenario scripts/laurel/ios26-motion.scenario. Verbs: ios26-autotest.scenario.
+step swipes
+lock
+wake
+settle 700 8000
+edge bottom 800 300
+settle 1500 8000
+home
+settle 1000 8000
+swipe 620 800 100 800 300
+settle 500 4000
+swipe 100 800 620 800 300
+settle 500 4000
+swipe 620 800 100 800 300
+settle 500 4000
+swipe 100 800 620 800 300
+settle 500 4000
+swipe 620 800 100 800 300
+settle 500 4000
+swipe 100 800 620 800 300
+settle 500 4000
+edge top 700 300 650
+settle 2500 15000
+edge bottom 700 300
+settle 1500 10000
+edge top 700 300 650
+settle 1500 15000
+edge bottom 700 300
+settle 1500 10000

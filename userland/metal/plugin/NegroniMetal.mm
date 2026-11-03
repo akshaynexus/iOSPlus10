@@ -123,6 +123,13 @@ __attribute__((constructor)) static void nmtl_error_mode(void)
 	setenv("CA_USE_CGTEXTUREDATA", "0", 0);
 	setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
 	setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+#if defined(NMTL_IOS26) && !defined(NMTL_NATIVE) && !defined(NMTL_HOT)
+	/*
+	 * laurel: no memoryless RGBA16F beside each screen pass on Turnip: 108 tiles -> 36, a pass 12 ms -> 3 ms, the same picture (scripts/laurel/ios26-png-compare.py:
+	 * Control Center 0.00 % off) [V phone, docs/laurel_sprout/ios26-default-speed.md]. Apple's own switch, read at the Metal context. CA_ENABLE_MEMORYLESS=1 in NMTL_DIR/env undoes it.
+	 */
+	setenv("CA_ENABLE_MEMORYLESS", "0", 0);
+#endif
 	/*
 	 * RB_COLOR_MODE=fixed (2026-10-27, blank/white widgets): RenderBox (SwiftUI's renderer: chronod's widget snapshots,
 	 * SpringBoard, SwiftUI apps) picks its RBLayer drawable format in RB::ColorMode::pixel_format from the colour mode and
@@ -728,6 +735,51 @@ static void memory_watch(void)
 	dispatch_resume(t);
 }
 
+/*
+ * laurel iOS 26: CoreAnimation's own switches, through its own exported calls (CAGetDebugOptionEnvVariableName, CASetDebugOption, 23F84 QuartzCore 0x1841d0d70, 0x1841d0e24).
+ * The environment is too late for them: init_debug reads it once, before this bundle loads. Only switches with the same picture go in NMTL_CA_OPTIONS_DEFAULT
+ * (the test: scripts/laurel/ios26-png-compare.py, docs/laurel_sprout/ios26-default-speed.md). NEGRONIMETAL_CA_OPTIONS=A,B in NMTL_DIR/env takes the place of the list; empty: none.
+ */
+#ifndef NMTL_CA_OPTIONS_DEFAULT
+#define NMTL_CA_OPTIONS_DEFAULT ""
+#endif
+static void ca_options(void)
+{
+#if defined(NMTL_IOS26)
+	const char *list = getenv("NEGRONIMETAL_CA_OPTIONS");
+	if (!list)
+		list = NMTL_CA_OPTIONS_DEFAULT;
+	if (!list[0])
+		return;
+	const char *(*name_of)(unsigned) = (const char *(*)(unsigned))dlsym(RTLD_DEFAULT, "CAGetDebugOptionEnvVariableName");
+	void (*set)(unsigned, unsigned) = (void (*)(unsigned, unsigned))dlsym(RTLD_DEFAULT, "CASetDebugOption");
+	if (!name_of || !set) {
+		nlog("LAUREL CA OPTIONS: off: QuartzCore has no CASetDebugOption");
+		return;
+	}
+	char on[512] = "", miss[256] = "";
+	while (*list) {
+		size_t n = strcspn(list, ",");
+		char want[64];
+		snprintf(want, sizeof(want), "%.*s", (int)n, list);
+		bool found = false;
+		for (unsigned i = 0; !found; i++) {
+			const char *name = name_of(i);
+			if (!name)
+				break;
+			if (strcmp(name, want) == 0) {
+				set(i, 1);
+				found = true;
+			}
+		}
+		strlcat(found ? on : miss, want, found ? sizeof(on) : sizeof(miss));
+		strlcat(found ? on : miss, " ", found ? sizeof(on) : sizeof(miss));
+		list += n + (list[n] == ',');
+	}
+	nlog("LAUREL CA OPTIONS: on: %s%s%s", on, miss[0] ? "; not in this QuartzCore: " : "", miss);
+#endif
+}
+
 /* KEY=VALUE lines of NMTL_DIR/env into this process before the device opens (TU_DEBUG, MESA_*, METAL2VULKAN_*). */
 static void load_env(void)
 {
@@ -736,8 +788,10 @@ static void load_env(void)
 		return;
 	done = true;
 	FILE *ef = fopen(NMTL_DIR "/env", "r");
-	if (!ef)
+	if (!ef) {
+		ca_options();
 		return;
+	}
 	char line[256];
 	while (fgets(line, sizeof(line), ef)) {
 		line[strcspn(line, "\r\n")] = 0;
@@ -749,6 +803,7 @@ static void load_env(void)
 		}
 	}
 	fclose(ef);
+	ca_options();
 }
 
 /* __TEXT vmsize of the Mach-O image loaded at `base` (0 if none) */

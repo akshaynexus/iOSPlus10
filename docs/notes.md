@@ -5431,3 +5431,9 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - `/tmp` is another file system: `cp --reflink=always` to it fails, and the following `rm` loses the source. Keep scratch copies under `out/`.
 - `minimumLinearTextureAlignmentForPixelFormat`: the default stack's 16 is its own (it can copy behind the caller). An a6xx reads a pitch of 64 at least: the native stack answers 64.
 - A first native start now takes 5 s to its first frame (3 min with no disk cache): 17.9 s for one generic pipeline, cold.
+## 2026-11-03: Mi A3 default stack: 73 % of backboardd's GPU time is metal2vulkan's own merge kernel, not drawing (branch t3/default-stack-glass-60fps). Full text: `docs/laurel_sprout/ios26-default-speed.md`
+- **Measure first:** `LAUREL GPU PASS` (Turnip 0105) names the shape of each compute dispatch. `64x1, 3x1560` = `shadow_merge_image` over a full screen, 16 ms a frame.
+- Every texture over an IOSurface is a shadow: 3 locks: `in_place()`, a check that answers `Unchecked` here for ever, Turnip's dedicated import.
+- `CA_ENABLE_MEMORYLESS=0` alone: 108 -> 36 tiles, pass 12 -> 3 ms [V].
+- `CASetDebugOption` is exported: the way to set the `CA_DISABLE_*` table after `init_debug` has read the environment.
+- m2v's notices have the exact reason for a shadow: `observe_message` in the bridge. Read them before you guess.

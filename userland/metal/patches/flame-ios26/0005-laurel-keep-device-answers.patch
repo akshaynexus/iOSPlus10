@@ -1,0 +1,30 @@
+laurel iOS 26 frontend: an answer of the device is kept per selector and argument. CoreAnimation asks per draw and per surface through MTLPixelFormatGetInfoForDevice, and the runtime works each answer out from its whole tables: 34 % of CA's render thread [V phone, 2026-11-03]. Docs: docs/laurel_sprout/ios26-default-speed.md.
+
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -13,6 +13,7 @@
+ #import <objc/message.h>   // NegroniMetal (flame/0009): objc_msgSend for the MSL front end's private library accessors
+ #include <algorithm>
+ #include <atomic>
++#include <map>
+ #include <mutex>
+ #include <pthread.h>
+ #include <string>
+@@ -2845,9 +2846,16 @@
+ static std::unordered_map<SEL,uint64_t> gAnswers;
+ static NSUInteger countAnswer(id,SEL cmd) {return (NSUInteger)gAnswers.at(cmd);}
+ static BOOL flagAnswer(id,SEL cmd) {return gAnswers.at(cmd)!=0;}
++// laurel iOS 26: an answer of the device never changes, and the runtime works it out from its whole family and format tables each time (families::audit).
++// [V phone, ios26-sample-sym.py] CoreAnimation asks per draw and per surface through MTLPixelFormatGetInfoForDevice: 34 % of its render thread. Kept per selector and argument.
+ static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
++ static std::mutex lock;
++ static std::map<std::pair<SEL,NSUInteger>,uint64_t> known;
++ const std::pair<SEL,NSUInteger> key(cmd,arg);
++ {std::lock_guard<std::mutex> held(lock);auto it=known.find(key);if(it!=known.end())return it->second;}
+  uint64_t value=0;
+- if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());return 0;}
++ if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());value=0;}
++ {std::lock_guard<std::mutex> held(lock);known[key]=value;}
+  return value;
+ }
+ static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}

@@ -1,0 +1,36 @@
+metal2vulkan (Mi A3, iOS 26): a heap texture is an image bound in the heap's memory, at the device's size and alignment, not a shadow of Metal's tiles. [V phone 2026-11-03, LAUREL GPU PASS] the merges of those shadows took 12.4 s of 15 s of backboardd's GPU time, up to 200 ms each. Kill switch NEGRONIMETAL_HEAP_IMAGES=0. Docs: docs/laurel_sprout/ios26-default-speed.md.
+
+--- a/crates/metal2vulkan-runtime/src/texture/heap.rs
++++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
+@@ -1280,12 +1280,21 @@
+     if shape.apart || (!shape.four_two_two && images_fit(images, metal)) {
+         return HeldToMetal::Images;
+     }
+-    match shape.multisample || shape.shadowable {
++    match shape.multisample || (shape.shadowable && !images_in_heap()) {
+         true => HeldToMetal::Shadow,
+         false => HeldToMetal::Nothing,
+     }
+ }
+ 
++/// laurel (Mi A3, iOS 26): a heap texture is an image bound in the heap's memory, at the device's size and alignment, not a shadow of Metal's tiles. The program
++/// sizes its heap by this answer, so nothing it placed moves; its bytes in the heap are not Metal's layout, which only a program that reads a heap's bytes as a
++/// texture's could see (CoreAnimation's and RenderBox's heaps are for targets and images). The shadow cost a merge of its words per pass: [V phone 2026-11-03]
++/// 12.4 s of 15 s of backboardd's GPU time, up to 200 ms each. Kill switch NEGRONIMETAL_HEAP_IMAGES=0.
++pub(crate) fn images_in_heap() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("NEGRONIMETAL_HEAP_IMAGES").is_none_or(|v| v != "0"))
++}
++
+ /// Whether a heap texture whose image takes `route` is held to the heap's base at all
+ /// ([`check_heap_base`]): an image of it binds into the heap's own memory, which starts at a
+ /// multiple of [`HEAP_BASE_ALIGNMENT`] alone, so an image whose alignment passes that base has no
+@@ -1854,7 +1863,7 @@
+         // is measured and the moves fit (`heap_tiled.rs`): its bytes are Metal's (a texture Metal
+         // keeps losslessly compressed, its uncompressed tiles), and it takes Metal's answer.
+         let shadowed = matches!(image.route, AliasRoute::Shadow | AliasRoute::MemoryShadow)
+-            || self.keeps_optimized_layout(descriptor, &layout);
++            || (!images_in_heap() && self.keeps_optimized_layout(descriptor, &layout));
+         if shadowed {
+             let tiles = shadow_tiles(&layout, image.plan.format, &metal_layout);
+             if let (Some(tiles), Some(answer)) = (tiles, metal_answer) {
