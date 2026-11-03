@@ -54,4 +54,8 @@ header or kernelcache is in git: they stay in `out/` and `~/op10-apple/`.
 
 `post/9008`: `LAUREL FRAME: on: vsync gives CoreAnimation the refresh period`: the third number of the vsync message is the period on 23F84, not a counter (`docs/laurel_sprout/gpu.md` "The 24 fps windows"). Kill switch `sweetfb_period=0`.
 
+`post/9011`: `LAUREL ARCH: on`: user space is told arm64e, so MobileGestalt's capability `arm64e` is true: Control Center modules and app extensions (`docs/laurel_sprout/ios26-control-center.md`). Kill switch `laurelarch=0`.
+
+`post/9012`: `LAUREL BT SCAN: on`: extended LE scan commands go to the chip as legacy ones; bluetoothd no longer restarts on status 701. Kill switch `laurelbtscan=0`; host test `scripts/laurel/test-bt-scan.sh`.
+
 Host tests of what lives in `post/9000`: `scripts/laurel/test-a64emu.sh` (emulator), `scripts/laurel/test-slide.sh` (slide on 4 KiB pages), `scripts/laurel/test-apple80211.sh` (23F84 Apple80211).

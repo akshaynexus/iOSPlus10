@@ -46,6 +46,8 @@ Decision with evidence: PosterBoard asked no device in any of the 4 boots [V], s
 
 ## 2. Widgets
 
+**Correction, 2026-11-03, boot of 05:11, read on the phone: the catalog is not the limit. lsd drops each app extension because MobileGestalt says `arm64e` = false: `docs/laurel_sprout/ios26-control-center.md`. R1 gave 0 for `com.apple.weather.widget`; `missing extension cache entry` has 0 lines.**
+
 - [V] `SpringBoardHome.loctable`: `WAITING_ICON_LABEL` = `Waiting…`. Two users: `-[SBHProxiedApplicationPlaceholder icon:statusDescriptionForLocation:]` and `-[SBHWidget displayName]`.
 - [V] `-[SBHWidget displayName]` 0x1c113a2bc: `SBHContainingBundleRecordForWidgetWithBundleIdentifier(extensionBundleIdentifier)` is nil gives this text. That function: `[[LSApplicationExtensionRecord alloc] initWithBundleIdentifier:error:]`, then `containingBundleRecord`.
 - [V] `DefaultIconState~iphone.plist`: the two stacks are `com.apple.weather.widget`, `com.apple.Maps.GeneralMapsWidget`, `com.apple.mobilenotes.WidgetExtension`, and `com.apple.mobilecal.CalendarWidgetExtension`, `com.apple.news.widget`, `com.apple.mobileslideshow.PhotosReliveWidget`. All in apps of the `staged-apps` hook.
