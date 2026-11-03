@@ -122,7 +122,6 @@ void nmn_cmd_fill_buffer(struct nw_cs *, uint64_t dst, uint64_t bytes, uint8_t v
 void nmn_cmd_copy_image(struct nw_cs *, const struct nmn_image *src, uint32_t src_level, uint32_t src_layer, const uint32_t src_origin[2], const struct nmn_image *dst, uint32_t dst_level, uint32_t dst_layer, const uint32_t dst_origin[2], const uint32_t size[2]);
 void nmn_cmd_buffer_to_image(struct nw_cs *, uint64_t src, uint32_t pitch, const struct nmn_image *dst, uint32_t level, uint32_t layer, const uint32_t origin[2], const uint32_t size[2]);
 void nmn_cmd_image_to_buffer(struct nw_cs *, const struct nmn_image *src, uint32_t level, uint32_t layer, const uint32_t origin[2], const uint32_t size[2], uint64_t dst, uint32_t pitch);
-void nmn_cmd_end_marker(struct nw_cs *, uint64_t iova, uint32_t value);
 /* generateMipmaps: one level from the level above, filtered */
 void nmn_cmd_mip_down(struct nw_cs *, const struct nmn_image *, uint32_t level, uint32_t layer);
 

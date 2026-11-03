@@ -1189,3 +1189,9 @@ Next: kernel flash, then the owner's test in that section. GPU cost of a glass f
 Done, read on the phone with no write: one cause for no modules and no widget records: MobileGestalt `arm64e` = false. `post/9011`. bluetoothd loop on status 701: `post/9012`. Host test PASS; kernel build result: `docs/laurel_sprout/ios26-control-center.md`. Not booted.
 
 Next: boot image with both patches, then `dual-boot.sh install` or the test write of that doc (owner's yes), then its reads R1, R2.
+## 2026-11-03: Mi A3: native Metal on the real GPU (branch `t3/native-metal-scene-hang-fix`, not merged)
+Done: cause of the first hang [V]: `PC_CCU_FLUSH_COLOR_TS` with no address: the CP took the next 2 stream words as one. Also no third IB level, compute program order, flush after a pass. `nw_check.c`: each submission is read before the kernel. `stream-check.py`, `pm4-actions.py`. `hot` links; the bundle has 3 stacks.
+Results [V phone, 4 runs of 8, no hang]: `scene: wait 0 status 4 error ''`; `copied byte 5a`; `scene: compute: PASS`; first pixels `ffffffff` with a real CA key. [V host] 0 unexpected registers at the draw, blits and dispatch; 0 errors on Turnip's captures.
+Not proven: a texture read on the GPU (the run did not start: the phone was in another kernel's panic), an IOSurface target, the compositor.
+Next: the owner's step `ios26-native-metal.md` section 11.7; then the `refused` lines of section 11.6.
+

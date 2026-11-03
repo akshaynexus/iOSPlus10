@@ -1,7 +1,7 @@
 # Mi A3 iOS 26: the `native` Metal stack on the Adreno 610 (third option)
 
 Date: 2026-11-03. Branch `t3/native-adreno-metal-driver`, base 4818e4c. Owner's request of 2026-11-03.
-**No phone was used. Nothing here ran on a GPU. No pixel and no frame time exists for this stack.**
+**State 2026-11-03: the scene tool ran on the real GPU, section 11: it draws, blits and dispatches. The compositor never ran on this stack. No frame time exists.** Sections 1 to 9 are the host work, as written then.
 Marks: **[V]** read or run here (file, command, log). **[I]** inference or estimate. **[U]** unknown.
 
 ## 1. Verdict
@@ -367,3 +367,141 @@ Known test limit: the tool has no `metallib` on its own: the path above must exi
 | XNUtils with `native` | `xnutils-build.sh`: host-tested, not rebuilt for the phone here |
 
 Rebuild: `scripts/bg.sh ios26-metal-native scripts/laurel/ios26-metal-native-build.sh`. Tests: `scripts/laurel/native/test.sh`, `ref-capture.sh`, `pm4-compare.sh`, `ir3-native.sh`.
+
+## 11. First runs on the real GPU (2026-11-03, branch `t3/native-metal-scene-hang-fix`)
+
+Mi A3, iOS 26 23F84, kernel ee30323a57. Scene tool only. **No compositor.**
+
+### 11.1 The first hang: cause
+
+| Fact | Mark |
+|---|---|
+| `LAUREL GPU SMMU: fault FSR 00000402 FAR 0000001970460000 FSYNR0 00040010`: a write, outside the 32-bit GPU VA | [V] log |
+| The phone's IB1 was 270 words; the host's stream of the same scene is 270 words | [V] log, `pm4/plain.rd` |
+| Words in that stream: `70460001 0000001d` (`CP_EVENT_WRITE` with one dword, `PC_CCU_FLUSH_COLOR_TS`), then `70460001 00000019` (the next `CP_EVENT_WRITE`, `PC_CCU_INVALIDATE_COLOR`) | [V] cffdump |
+| `PC_CCU_FLUSH_COLOR_TS` writes a time stamp. The CP took the next two words as its address: low `0x70460001`, high `0x19`. That is the FAR, with the low bits dropped | [V] the numbers; [I] the dropped bits |
+| Turnip gives these events 4 dwords (address + value): `tu_emit_raw_event_write`, Mesa `fd_gpu_events<A6XX>` `needs_seqno` | [V] source, capture |
+| The hang followed the fault; with the fix there is no fault and no hang | [V] logs; [I] that the stall caused the watchdog |
+
+**So the address came from no reloc and no shift: it was two packet words.** The register comparison could not see it: it compares state at a draw, and an event is not state.
+
+### 11.2 What else the host proof found before the next run
+
+| Defect | Effect on the GPU | Fix | Mark |
+|---|---|---|---|
+| A draw called its program's state from an IB2: RB -> IB1 -> IB2 -> "IB3" | a6xx has `CP_IB1`, `CP_IB2`, `CP_SDS` and no third level; Turnip never goes deeper: 217 calls in the largest capture, all level 2 | The draw stream runs as IB1s of the submission (`nw_cs_append_ibs`) | [V] register file and captures; [U] what this CP does with it: it never ran |
+| Compute called its program a second time, after its constants and sets: `HLSQ_INVALIDATE_CMD` undid them | Wrong constants in the shader | `nmn_cmd_dispatch` has no call | [V] code, register at the dispatch |
+| A pass ended with a CCU flush only | A later pass or blit in the same command buffer can read old lines | Full barrier at the end of a pass, as Turnip for an external dependency | [I] no run shows it |
+| Cache invalidate missing after a 2D write | A read through the texture cache of what a 2D blit wrote | In `flush_color` | [I] |
+| Fill and copy pitches not as Turnip; `HLSQ_CS_KERNEL_GROUP` written, Turnip's packet sets it; the instrlen workaround of `tu_dispatch` was absent | | As Turnip | [V] code |
+
+### 11.3 The gate: a bad address cannot reach the GPU
+
+`winsys/nw_check.c`, in `nw_submit_go`, on by default; `NMN_STREAM_CHECK=0` is the kill switch. Before the kernel sees a submission:
+
+- parity and length of each packet, and **a rule for each opcode; no rule, no submission**;
+- a time stamp event must have its address (`CACHE_FLUSH_TS`, `WT_DONE_TS`, `RB_DONE_TS`, `PC_CCU_RESOLVE_TS`, `PC_CCU_FLUSH_DEPTH_TS`, `PC_CCU_FLUSH_COLOR_TS`);
+- no call from an IB2;
+- each address in a packet, and each of the 131 address registers of Mesa's a6xx file (`scripts/laurel/native/addr-regs.py` -> `winsys/nw_addr_regs.h`; `test.sh` checks that they agree), lies in a live buffer of this device or is 0;
+- a descriptor's address is checked where it is written (`check_descriptor_address`): it has no packet around it.
+
+A refusal is `EFAULT`: one line `LAUREL METAL NATIVE: stream check: a submission refused: ...`, that frame is lost, the GPU stays on. A program's state is read once at bake, not at each draw.
+
+Cost [V phone]: 111 to 117 us for 3 submissions, 1,340 to 1,372 dwords, about 510 packets. [U] on a real frame.
+
+Limit [V code]: it does not read shaders. A shader that computes a wild address still faults.
+
+If a future stream hangs anyway: `mark_gpu_off`: on `ENODEV` from a fence, backboardd writes `stack/failed`, so the next start takes the default and stays on it until the setting is written again. Before this, a stack that hung **after** the screen was lit had its count cleared by that lit screen, and it would hang at each boot [V `option_rule.h`].
+
+### 11.4 Host proof
+
+`scripts/laurel/native/pm4-compare.sh` exits 1 on any of these:
+
+| Check | Result [V host] |
+|---|---|
+| `test.sh`: `winsys` under ASan and UBSan, with the first hang's stream word for word; `option` | PASS |
+| `stream-check.py`: a second decoder with no code in common with `nw_check.c` | Old stream: reports `PC_CCU_FLUSH_COLOR_TS has no address ... writes to 0x1970460001` at `0x808922e4`, and `a call ... from level 2`. New stream: 0 errors |
+| The same decoder on Turnip's captures | 0 errors, deepest call level 2: **the rules hold on a driver that draws on this GPU** |
+| `pm4-diff.py`: registers at the draw | plain: 153 same, 0 unexpected. Real CA key: 157 same, 0 unexpected |
+| `pm4-actions.py`: the clear, copies, 6 mips, readback, dispatch | 161 same, 27 explained, 0 unexpected. New: before this, blits and compute had no comparison |
+| Descriptors of the draw against Turnip's | Equal but for addresses. Read once by hand; **not a script** |
+
+### 11.5 Runs on the phone
+
+Limit 8. **4 ran.** No hang. Logs: `logs/nmn-scene-2.txt` to `-5.txt`.
+
+| Run | Time | Stream | Output | What it proves |
+|---|---|---|---|---|
+| 1 | 05:53 | Plain scene, as the first hang | `scene: wait 0 status 4 error ''`; pixels `ff000000`; `copied byte 5a`; `scene: compute: PASS` | IOKit transport, clear, fill, copy, mips, readback, a dispatch that ends, with no fault |
+| 2 | 05:57 | Identity matrix | `ff000000`: the draw showed nothing | The scene's fault: it bound the wrong slots: the planner gave a zero buffer |
+| 3 | 06:05 | CA's slots: vertex 2, 3; fragment 1; texture 3 | `ff000000` | `luma_boost_lph` reads only the target, so black stays black: correct, and no proof |
+| 4 | 06:06 | Real CA key, `fixed_vert_lph_spc` + `fixed_frag_lph_cph`, white vertices | **`ffffffff` at (0,0), (360,780), (719,1559); `the draw wrote: yes`** | **First pixels: the vertex stage, the rasterizer, the fragment stage and the target** |
+
+Attempt 5 (row 26, `narrow_blur_15`: a texture read) did not start: SSH timed out. The phone was in a panic from 06:15:41 on another kernel (`-348-g5f85e63`, rebooted at 06:07). No `nmn-scene` ran in that boot [V log]. Cause of that panic: [U]; not read here.
+
+**Not proven on the phone [V: no run]: a texture read, a blur, framebuffer fetch that shows, a compute that writes a checked value, an IOSurface target, depth and stencil, more than one pass in a command buffer.**
+
+To run next: `scripts/net/phone-run.sh -s -f out/ios26/native/plans/ca-real.txt out/ios26/metal-native/nmn-scene none /var/tmp/nmn-cache /System/Library/Frameworks/QuartzCore.framework/default.metallib ca-real.txt 26`. Rows that read a texture [V host scan of 0 to 31]: 1, 2, 3, 5 to 31.
+
+### 11.6 What the compositor will hit first, and the plan
+
+The order is [I]. `refused` lines lead (`native-metal: refused`).
+
+| What | State | Why it matters | Plan | Mark |
+|---|---|---|---|---|
+| IOSurface render target, plane offsets | Written, no test | Every CA frame | The scene with a surface through `nw_bo_import_surface`; the surface must be named in the submission for the display's wait | [V] no test |
+| Argument buffers | Refused | `MTLArgumentEncoder`: QuartzCore 11 sites `setBuffer`, 11 `setTexture`; CoreImage, RenderBox | Plain words in a buffer in m2v's argument layout (`bind/heap.rs`); set 1 of the bindless model points at it; each address through `check_descriptor_address` | [V] census |
+| Indirect draws and dispatches | Refused | Not in CA's fast path list; CoreImage and apps [I] | `CP_DRAW_INDIRECT` and `CP_EXEC_CS_INDIRECT` as Turnip, with a rule in `nw_check.c` first; the indirect buffer's address through the gate | [I] |
+| Planar YUV | Refused when a format is taken whole | Video, camera layers | One texture per plane (`nmb_texture_new_on_surface_plane` exists); Metal's 4:2:2 formats only over linear memory | [V] code, [I] use |
+| Formats outside the table, `BGR10_XR` and others | Refused | Wide colour targets | `metal.md` table; add a row only with a Turnip capture of it | [V] |
+| Pipeline variants a plan asks for | Refused | Real keys with other bound shapes | A variant is one more ir3 compile, keyed by the plan | [V] |
+| Compute descriptor with options | Refused | CoreImage [I] | Map the options the frontend passes | [I] |
+| Depth + stencil | Written, no test; the stencil clear is not written | CA's path rendering | A scene row with a depth target, with Turnip's capture | [V] code |
+| Framebuffer fetch | Texture read + flush mode; never shown on the GPU | 78 of 218 real keys | Row with a non-black clear: the first real check of the flush mode | [U] |
+| Shader events | The CPU waits at most 100 ms | Order of frames | A real wait once the frame path works | [I] |
+| A long frame | One thread per command buffer; 1,024 IB limit: a pass costs up to 3 IBs | Live glass made 144 command buffers | The limit is checked before the kernel; a worker for the fences | [I] |
+| Hang in a shader | The gate does not read shaders | One hang = the GPU off until a reboot | `mark_gpu_off` returns to the default stack at the next start | [V] code |
+
+### 11.7 Making `native` the default: the owner's step
+
+**Do not change `NMTL_OPTION_DEFAULT`: it is where the fallback goes.** The default is a setting: the file `/private/var/db/negronimetal/option`, plus `NegroniMetal.bundle/option.local` for sandboxed processes. The bundle: `scripts/laurel/ios26-metal-options.sh` -> `out/ios26/metal-all/stage`.
+
+Build, after the merge, in the main checkout:
+
+```
+scripts/bg.sh ios26-metal-native scripts/laurel/ios26-metal-native-build.sh
+scripts/bg.sh ios26-metal-all scripts/laurel/ios26-metal-options.sh
+```
+
+Route A, a new root (the root is mounted at `R`):
+
+```
+METAL_STAGE=out/ios26/metal-all/stage sudo scripts/laurel/root-add-metal-ios26.sh "$R"
+echo native | sudo tee "$R/private/var/db/negronimetal/option" "$R/System/Library/Extensions/NegroniMetal.bundle/option.local"
+sudo chmod 644 "$R/private/var/db/negronimetal/option" "$R/System/Library/Extensions/NegroniMetal.bundle/option.local"
+```
+
+Route B, a running rw root, no flash. Order: the stacks first, the selector last, because the selector needs `options/default`:
+
+```
+S=out/ios26/metal-all/stage/System/Library/Extensions/NegroniMetal.bundle; B=/System/Library/Extensions/NegroniMetal.bundle
+scp -r "$S/options" root@192.168.7.2:"$B/"
+scp "$S/Info.plist" root@192.168.7.2:"$B/Info.plist"
+scp "$S/NegroniMetal" root@192.168.7.2:"$B/NegroniMetal.new"
+ssh root@192.168.7.2 "mv $B/NegroniMetal.new $B/NegroniMetal; echo native > /private/var/db/negronimetal/option; echo native > $B/option.local; rm -f /private/var/db/negronimetal/stack/state"
+```
+
+Then Restart UI (XNUtils), or a reboot. XNUtils `metaloption native` writes the same two files and clears the state, when XNUtils from this stage is on the root (`out/ios26/xnutils/root`).
+
+| Line in the log | Meaning |
+|---|---|
+| `LAUREL METAL: on: stack native (setting native)` | The selector took it |
+| `LAUREL METAL26: on: stack native: the screen is lit 60 s after the first frame` | It holds |
+| `LAUREL METAL NATIVE: off: <reason>: restart on stack default` | No frame in 240 s, a black surface for 30 s, or no device: the next start is the default stack |
+| `LAUREL METAL NATIVE: off: option native failed in 2 starts of the compositor: stack default` | 2 starts with no lit screen |
+| `LAUREL METAL NATIVE: off: the kernel turned the GPU off: the next start takes stack default` | A hang. Reboot: the GPU stays off until then |
+
+The way back: `echo default` into both files, or XNUtils. To try `native` again after a failure, write the setting again: the failure count stays until then.
+
+Known limit [V code]: when backboardd fell back, a sandboxed app that cannot read `stack/state` still takes `native` from `option.local`. With a GPU that is on this is two stacks on one kernel, which the kernel allows. [U] on the phone.
+

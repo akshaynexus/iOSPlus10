@@ -2,7 +2,7 @@
  * One fixed scene through the C ABI of the bridge (NativeMetalObjects.h), with no Objective-C and no phone: the same calls the frontend makes for a CoreAnimation frame.
  * Linked with the default bridge (+ Turnip + Mesa's drm-shim) it gives the reference command stream. Linked with the native stack (+ the fake kernel) it gives ours. scripts/laurel/native/pm4-compare.sh compares them.
  *   scene LOADER CACHE_DIR QUARTZCORE_METALLIB [PLAN_FILE ROW]
- * Scene: a BGRA8 target 720 x 1560 like the framebuffer; clear; one image quad with CA's vertex layout (buffer 1, stride 48), a texture and a sampler; commit, wait.
+ * Scene: a BGRA8 target 720 x 1560 like the framebuffer; clear; one image quad over the whole target with CA's vertex layout (buffer 1, stride 48), a texture and a sampler; commit, wait.
  * With no plan: std_vert1_lph + luma_boost_lph, source-over blend. With a plan (scripts/ios26/real-plan.py, a key the phone really asked): that row's functions, formats and constants, no blend state, as CA's fetch pipelines, and a memoryless second target when the row asks for one.
  */
 #include <stdbool.h>
@@ -12,6 +12,9 @@
 #include <string.h>
 struct NmbTextureDescriptor;
 #include "NativeMetalObjects.h"
+
+/* the native stack only: the cost of its stream check, one line. The default stack has no such call. */
+const char *nmn_stream_check_line(NmbDevice *) __attribute__((weak));
 
 /* the bridge imports it (Darwin libSystem) */
 void sys_dcache_flush(void *start, size_t length) { (void)start; (void)length; }
@@ -232,15 +235,20 @@ int main(int argc, char **argv)
 	const uint64_t scissor[4] = {0, 0, 720, 1560};
 	nmb_render_set_viewport(en, viewport);
 	nmb_render_set_scissor(en, scissor);
-	static const float vb[4][12] = {
-		{-1, -1, 0, 1, 0, 1, 0, 1, 0x3f80, 0, 0, 0}, {1, -1, 0, 1, 1, 1, 1, 1, 0x3f80, 0, 0, 0},
-		{-1, 1, 0, 1, 0, 0, 0, 0, 0x3f80, 0, 0, 0}, {1, 1, 0, 1, 1, 0, 1, 0, 0x3f80, 0, 0, 0},
+	/* CA's layout: position, 2 texture coordinates, colour as half floats (0x3c00 = 1.0) */
+	static const struct { float position[4], uv0[2], uv1[2]; uint16_t color[4]; uint32_t pad[2]; } vb[4] = {
+		{{-1, -1, 0, 1}, {0, 1}, {0, 1}, {0x3c00, 0x3c00, 0x3c00, 0x3c00}, {0, 0}}, {{1, -1, 0, 1}, {1, 1}, {1, 1}, {0x3c00, 0x3c00, 0x3c00, 0x3c00}, {0, 0}},
+		{{-1, 1, 0, 1}, {0, 0}, {0, 0}, {0x3c00, 0x3c00, 0x3c00, 0x3c00}, {0, 0}}, {{1, 1, 0, 1}, {1, 0}, {1, 0}, {0x3c00, 0x3c00, 0x3c00, 0x3c00}, {0, 0}},
 	};
-	static const float uniforms[32];
-	if (!nmb_encoder_set_bytes(en, 1, vb, sizeof(vb), 1) || !nmb_encoder_set_bytes(en, 1, uniforms, sizeof(uniforms), 0) || !nmb_encoder_set_bytes(en, 2, uniforms, sizeof(uniforms), 0))
+	/* the vertex stage reads a matrix here: identity, or the quad has no area and the draw writes nothing. The rest: 1.0, as a neutral tint */
+	static const float uniforms[32] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+	/* the slots CA's functions declare (their layout's Buffer and Texture sources): vertex 2 and 3, fragment 1, texture 3. Elsewhere the planner binds a zero buffer and a neutral image, the quad has no area, and nothing shows on the target. */
+	if (!nmb_encoder_set_bytes(en, 1, vb, sizeof(vb), 1) || !nmb_encoder_set_bytes(en, 1, uniforms, sizeof(uniforms), 2) || !nmb_encoder_set_bytes(en, 1, uniforms, sizeof(uniforms), 3) || !nmb_encoder_set_bytes(en, 2, uniforms, sizeof(uniforms), 1))
 		FAIL("set bytes");
-	if (!nmb_encoder_set_texture(en, 2, image, 0) || !nmb_encoder_set_sampler(en, 2, sampler, 0))
-		FAIL("set texture");
+	/* a plan's row may read another slot: the same image and sampler in each of them */
+	for (uint32_t slot = 0; slot < 8; slot++)
+		if (!nmb_encoder_set_texture(en, 2, image, slot) || !nmb_encoder_set_sampler(en, 2, sampler, slot))
+			FAIL("set texture");
 	static const uint16_t ib_data[6] = {0, 1, 2, 2, 1, 3};
 	NmbBuffer *ib = nmb_buffer_new(dev, sizeof(ib_data), 0, ib_data);
 	if (ib == NULL)
@@ -255,8 +263,8 @@ int main(int argc, char **argv)
 	char err[256] = "";
 	nmb_command_buffer_error(cb, err, sizeof(err));
 	printf("scene: wait %d status %llu error '%s'\n", w, (unsigned long long)nmb_command_buffer_status(cb), err);
-	if (w != 0)
-		return 1;
+	if (w != 0 || nmb_command_buffer_status(cb) != 4)
+		return 1;       /* status 5: the GPU did not finish. Nothing after this can work, and more streams cost nothing but time */
 	/* blits: the 2D engine's paths, and a readback of the drawn target. On the fake kernel no GPU runs, so the bytes stay zero; on a phone this is the first pixel */
 	const uint32_t row = 720 * 4;
 	NmbBuffer *readback = nmb_buffer_new(dev, row * 1560, 0, NULL), *copy = nmb_buffer_new(dev, 4096, 0, NULL), *fill = nmb_buffer_new(dev, 4096, 0, NULL);
@@ -277,9 +285,17 @@ int main(int argc, char **argv)
 		FAIL("readback blit");
 	if (!nmb_encoder_end(bl) || !nmb_command_buffer_commit(b2) || nmb_command_buffer_wait(b2, 20000) != 0)
 		FAIL("blit commit");
+	if (nmb_command_buffer_status(b2) != 4) {
+		char e2[256] = "";
+		nmb_command_buffer_error(b2, e2, sizeof(e2));
+		printf("FAIL blit status %llu: %s\n", (unsigned long long)nmb_command_buffer_status(b2), e2);
+		return 1;
+	}
 	const uint32_t *px = nmb_buffer_contents(readback);
 	const unsigned char *cp = nmb_buffer_contents(copy);
 	printf("scene: pixel (0,0) %08x, (360,780) %08x, (719,1559) %08x; copied byte %02x (a GPU writes 5a)\n", px[0], px[780 * 720 + 360], px[1559 * 720 + 719], cp[128]);
+	/* The clear gives ff000000. A pixel that differs proves that the draw reached the target: a texture on a quad over the whole target. */
+	printf("scene: the draw wrote: %s\n", px[780 * 720 + 360] != 0xff000000u && px[780 * 720 + 360] != 0 ? "yes" : "no");
 	/* compute: the first kernel of the library that compiles with no arguments bound */
 	NmbFunction *kf = nmb_function_new(lib, "compute_apl");
 	if (kf == NULL) {
@@ -307,6 +323,14 @@ int main(int argc, char **argv)
 	}
 	if (!nmb_encoder_end(ce) || !nmb_command_buffer_commit(b3) || nmb_command_buffer_wait(b3, 20000) != 0)
 		FAIL("compute commit");
+	if (nmb_command_buffer_status(b3) != 4) {
+		char e3[256] = "";
+		nmb_command_buffer_error(b3, e3, sizeof(e3));
+		printf("FAIL compute status %llu: %s\n", (unsigned long long)nmb_command_buffer_status(b3), e3);
+		return 1;
+	}
 	printf("scene: compute: PASS\n");
+	if (nmn_stream_check_line != NULL)
+		printf("%s\n", nmn_stream_check_line(dev));
 	return 0;
 }

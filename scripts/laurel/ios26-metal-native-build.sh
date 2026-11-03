@@ -38,6 +38,7 @@ INC="@$W/flags.rsp -I$S/src/freedreno -I$S/include -I$B/src/compiler -I$S/src/co
 pids=()
 clang -std=gnu11 $TARGET $INC -c "$N/shader/nmn_shader.c" -o "$W/nmn_shader.o" & pids+=($!)
 clang -std=gnu11 $TARGET $INC -c "$N/winsys/nw.c" -o "$W/nw.o" & pids+=($!)
+clang -std=gnu11 $TARGET $INC -c "$N/winsys/nw_check.c" -o "$W/nw_check.o" & pids+=($!)
 clang -std=gnu11 $TARGET $INC -c "$N/winsys/winsys_iokit.c" -o "$W/winsys_iokit.o" & pids+=($!)
 clang++ -std=c++17 -fno-exceptions -fno-rtti $TARGET -Wno-c99-designator -Wno-c++11-narrowing -Wno-missing-field-initializers -Wno-deprecated-declarations $INC -c "$N/pm4/nmn_pm4.cc" -o "$W/nmn_pm4.o" & pids+=($!)
 for p in "${pids[@]}"; do wait "$p"; done
@@ -69,14 +70,14 @@ clang++ -std=c++17 -fobjc-arc $TARGET -Wno-deprecated-declarations -DNMTL_IOS26=
 clang++ -std=c++17 -fobjc-arc $TARGET -Wno-deprecated-declarations -DNMTL_IOS26=1 -I"$FRONT" -I"$REPO/userland/metal/plugin" -c "$FRONT/NativeBridgeMetalFrontend.mm" -o "$W/frontend.o" &
 wait
 clang++ -target arm64-apple-ios16.0 -isysroot "$SDK" -fuse-ld=lld -bundle -Wl,-dead_strip -Wl,-exported_symbol,_OBJC_CLASS_\$_NegroniMTLDeviceImpl -Wl,-exported_symbol,_OBJC_METACLASS_\$_NegroniMTLDeviceImpl \
-  "$W/plugin.o" "$W/frontend.o" "$W/nmn_shader.o" "$W/nw.o" "$W/winsys_iokit.o" "$W/nmn_pm4.o" "$RLIB" $LIBS -lz -lc++ -framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation -framework Security -o "$OBJ.unstripped"
+  "$W/plugin.o" "$W/frontend.o" "$W/nmn_shader.o" "$W/nw.o" "$W/nw_check.o" "$W/winsys_iokit.o" "$W/nmn_pm4.o" "$RLIB" $LIBS -lz -lc++ -framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation -framework Security -o "$OBJ.unstripped"
 cp "$OBJ.unstripped" "$OBJ"
 llvm-strip -x "$OBJ"
 ldid -S "$OBJ"
 ls -la "$OBJ"
 # the first phone test: the fixed scene as a tool, no Metal.framework, no compositor. It draws into its own memory and prints pixels. Docs: section 8.
 clang -target arm64-apple-ios16.0 -isysroot "$SDK" $LAUREL_CPU_FLAGS -O2 -c -I"$FRONT/bridge" "$N/tests/scene.c" -o "$W/scene.o"
-clang++ -target arm64-apple-ios16.0 -isysroot "$SDK" -fuse-ld=lld -Wl,-dead_strip "$W/scene.o" "$W/nmn_shader.o" "$W/nw.o" "$W/winsys_iokit.o" "$W/nmn_pm4.o" "$RLIB" $LIBS -lz -lc++ -framework Foundation -framework IOKit -framework CoreFoundation -framework Security -o "$W/nmn-scene"
+clang++ -target arm64-apple-ios16.0 -isysroot "$SDK" -fuse-ld=lld -Wl,-dead_strip "$W/scene.o" "$W/nmn_shader.o" "$W/nw.o" "$W/nw_check.o" "$W/winsys_iokit.o" "$W/nmn_pm4.o" "$RLIB" $LIBS -lz -lc++ -framework Foundation -framework IOKit -framework CoreFoundation -framework Security -o "$W/nmn-scene"
 llvm-strip -x "$W/nmn-scene"
 ldid -S "$W/nmn-scene"
 # the selector of the bundle, with the option's lines: it must build against the same SDK

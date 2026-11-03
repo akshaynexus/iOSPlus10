@@ -5354,3 +5354,15 @@ Full text: `docs/laurel_sprout/ios26-control-center.md`.
 
 ## 2026-11-03: boot with `TU_DEBUG=sysmem` + `CA_ENABLE_MEMORYLESS=0`: no UI at 3.5 min
 [V 06:21-06:25] Stuck on the Apple logo: SpringBoard 60.6 s, usernotificationsd 60.2 s, PerfPowerServices 60.7 s a minute; usernotificationsd, aonsensed, localizationswitcher, extensionkitservice killed in a loop (sig 9); SSH: `Connection timed out during banner exchange`. Same kernel as the UI boots but with 9007's kprintf. Test: settings off, next boot. [U] whether the settings or the loop are the cause.
+## 2026-11-03: native Metal: first hang found, first pixels (branch t3/native-metal-scene-hang-fix). Details: `ios26-native-metal.md` section 11
+- [V] `FAR 0x1970460000` = two packet words: `PC_CCU_FLUSH_COLOR_TS` with one dword, then `70460001 00000019`. **A "wild" FAR with a high word under 0x100 and a low word that begins 0x4 or 0x7: read it as packet headers first.**
+- A6XX `*_TS` events take 4 dwords: `CACHE_FLUSH_TS`, `WT_DONE_TS`, `RB_DONE_TS`, `PC_CCU_RESOLVE_TS`, `PC_CCU_FLUSH_DEPTH_TS`, `PC_CCU_FLUSH_COLOR_TS` (`fd_gpu_events<A6XX>`). The CP reads what the opcode needs, not what the count says.
+- [V] An a6xx has `CP_IB1`, `CP_IB2`, `CP_SDS`. No IB3. Turnip: IB1 -> IB2 -> `CP_SET_DRAW_STATE`, never a call from an IB2.
+- cffdump shows every word and hides nothing, but a comparison of state hides order and events. Compare at each action and walk packets.
+- [V] A .rd of Turnip is gzip; each RD_CMD begins a submission.
+- CA's functions have fixed slots: read `layout.sets[].bindings[].source`. An unbound slot gets a zero buffer (a matrix of zeros: no area, no fault, a draw that "passes"). `luma_boost_lph` only reads the target: black stays black. Use `ca-real.txt` row 0 (white vertices) to prove a draw.
+- The scene's `wait 0 status 5`: `wait` returns 0 at a lost GPU: check the status too.
+- A lit screen clears the failure count of `option_rule.h`: a stack that hangs after the lit screen has no fallback unless it writes `stack/failed`.
+- A test of a phone tool: count its words against the kernel's `RedwoodGPU: submission` line: same size = same stream, which makes the host capture evidence.
+- Reflink a worktree's `out/` with `cp -a --reflink=always`: 13 GB in 3 s; hot needs `rm -rf out/ios26/metal-hot/build` after that (CMake's old path).
+

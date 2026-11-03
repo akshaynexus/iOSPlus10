@@ -156,7 +156,7 @@ static int do_submit(struct fake_kernel *k, struct drm_msm_gem_submit *r)
 {
 	const struct drm_msm_gem_submit_bo *bos = (void *)(uintptr_t)r->bos;
 	const struct drm_msm_gem_submit_cmd *cmds = (void *)(uintptr_t)r->cmds;
-	if (r->nr_cmds == 0 || r->nr_cmds > 128 || r->nr_bos == 0 || r->nr_bos > 8192)
+	if (r->nr_cmds == 0 || r->nr_cmds > 1024 || r->nr_bos == 0 || r->nr_bos > 8192)
 		return EINVAL;
 	for (uint32_t i = 0; i < r->nr_cmds; i++) {
 		if (cmds[i].type != MSM_SUBMIT_CMD_BUF)

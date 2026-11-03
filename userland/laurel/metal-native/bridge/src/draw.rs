@@ -607,7 +607,14 @@ pub extern "C" fn nmb_command_buffer_commit(c: *mut NmbCommandBuffer) -> bool {
             if e != 0 {
                 let mut st = cb.state.0.lock().unwrap();
                 st.status = 5;
-                st.error = format!("the kernel refused the submission: errno {e}");
+                st.error = if e == libc::EFAULT {
+                    // nothing reached the GPU: this frame is lost, the GPU stays on
+                    let why = std::ffi::CStr::from_ptr(nw_last_refusal(cb.gpu.dev)).to_string_lossy().into_owned();
+                    console_line(&format!("LAUREL METAL NATIVE: stream check: a submission refused: {why}"));
+                    format!("stream check: {why}")
+                } else {
+                    format!("the kernel refused the submission: errno {e}")
+                };
                 cb.state.1.notify_all();
                 return Err(st.error.clone());
             }
@@ -638,6 +645,9 @@ pub extern "C" fn nmb_command_buffer_commit(c: *mut NmbCommandBuffer) -> bool {
                 }
             }
             drop(retained);
+            if e == libc::ENODEV {
+                mark_gpu_off();
+            }
             for (event, value) in signals {
                 event.signal(value);
             }
@@ -1118,7 +1128,7 @@ pub(crate) fn write_descriptors(e: &mut NmbEncoder, cb: &mut NmbCommandBuffer, d
                     }
                     None => (e.gpu.zero_iova(), 65536),
                 };
-                write_buffer_descriptor(w.ty, iova, length, slot)?;
+                write_buffer_descriptor(e.gpu.dev, w.ty, iova, length, slot)?;
             }
             WriteSource::Texture { slot: s, view } => write_texture(e, cb, s.stage, s.index, Some(view), w.ty == vk::DescriptorType::STORAGE_IMAGE, slot)?,
             WriteSource::CombinedImageSampler { image, sampler } => {
@@ -1146,7 +1156,7 @@ pub(crate) fn write_descriptors(e: &mut NmbEncoder, cb: &mut NmbCommandBuffer, d
                 unsafe { std::ptr::copy_nonoverlapping(x.0.as_ptr(), slot, 16) };
             }
             WriteSource::Neutral(n) => match n {
-                metal2vulkan::bind::NeutralResource::ZeroBuffer { .. } | metal2vulkan::bind::NeutralResource::Sink { .. } => write_buffer_descriptor(w.ty, e.gpu.zero_iova(), 65536, slot)?,
+                metal2vulkan::bind::NeutralResource::ZeroBuffer { .. } | metal2vulkan::bind::NeutralResource::Sink { .. } => write_buffer_descriptor(e.gpu.dev, w.ty, e.gpu.zero_iova(), 65536, slot)?,
                 metal2vulkan::bind::NeutralResource::Sampler { .. } => write_neutral_sampler(slot),
                 metal2vulkan::bind::NeutralResource::Image { view_type, .. } => write_neutral_image(e, *view_type, slot)?,
                 other => return Err(format!("neutral resource {other:?} has no native path yet")),
@@ -1311,7 +1321,42 @@ fn write_neutral_image(e: &NmbEncoder, view: vk::ImageViewType, slot: *mut u32) 
     Ok(())
 }
 
-fn write_buffer_descriptor(ty: vk::DescriptorType, iova: u64, length: u64, slot: *mut u32) -> Result<(), String> {
+/// One line where the selector's lines go: the console (the USB log) and metal.log. Failure of a log is nothing.
+pub(crate) fn console_line(text: &str) {
+    use std::io::Write;
+    let name = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default();
+    let line = format!("NMTL[{} {}]: {}\n", std::process::id(), name, text);
+    eprint!("{line}");
+    for path in ["/dev/console", "/private/var/db/negronimetal/metal.log"] {
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
+/// ENODEV from a fence: the kernel turned the GPU off (a hang), for every stack, until a reboot. The compositor marks this stack as failed: the next start takes the default and stays on it until the setting is written again (option_rule.h). Without this, a stack that hangs after the screen was lit would hang again at each boot: the lit screen has already cleared its count.
+fn mark_gpu_off() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let compositor = std::env::current_exe().ok().is_some_and(|p| p.file_name().is_some_and(|n| n == "backboardd"));
+    if compositor {
+        let _ = std::fs::write("/private/var/db/negronimetal/stack/failed", "the kernel turned the GPU off\n");
+        console_line("LAUREL METAL NATIVE: off: the kernel turned the GPU off: the next start takes stack default");
+    }
+}
+
+/// A descriptor's address reaches the GPU with no packet around it, so nw_stream_check cannot read it. It is checked where it is written.
+pub(crate) fn check_descriptor_address(dev: *mut NwDevice, iova: u64) -> Result<(), String> {
+    if iova != 0 && unsafe { nw_bo_of_address(dev, iova, 1) }.is_null() {
+        return Err(format!("stream check: a descriptor at {iova:#x}: no live buffer holds it"));
+    }
+    Ok(())
+}
+
+fn write_buffer_descriptor(dev: *mut NwDevice, ty: vk::DescriptorType, iova: u64, length: u64, slot: *mut u32) -> Result<(), String> {
+    check_descriptor_address(dev, iova)?;
     match ty {
         vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => unsafe { nmn_descriptor_ubo(iova, length, slot) },
         vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => unsafe { nmn_descriptor_ssbo(iova, length, slot) },
@@ -1343,6 +1388,7 @@ fn swizzle_of(view: Option<&metal2vulkan::bind::ImageViewDesc>) -> [u8; 4] {
 fn write_texture(e: &NmbEncoder, cb: &mut NmbCommandBuffer, stage: Stage, index: u32, view: Option<&metal2vulkan::bind::ImageViewDesc>, storage: bool, slot: *mut u32) -> Result<(), String> {
     let t = e.stages[stage_slot(stage)?].textures.get(&index).ok_or("a texture slot with nothing bound")?.clone();
     let swizzle = swizzle_of(view);
+    check_descriptor_address(e.gpu.dev, unsafe { nmn_image_iova(t.image as *const NmnImage) })?;
     unsafe { nmn_descriptor_image(t.image as *const NmnImage, t.pipe_format, t.view_type, t.base_level, t.levels, t.base_layer, t.layers, swizzle.as_ptr(), storage, slot) };
     if t.must_name() {
         cb.names.push(t.bo() as usize);
@@ -1375,7 +1421,7 @@ pub extern "C" fn nmb_render_draw_indexed(e: *mut NmbEncoder, primitive: u64, co
     })
 }
 
-/// A pass is written at the end of the encoder, when it is known which targets its programs write. A target that no program wrote and whose store is "don't care" is not bound: no memory, no bandwidth (doc section 3.3). The draws stream is one IB, called.
+/// A pass is written at the end of the encoder, when it is known which targets its programs write. A target that no program wrote and whose store is "don't care" is not bound: no memory, no bandwidth (doc section 3.3). The draws stream runs as IB1s of the submission, between the pass's begin and end.
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_encoder_end(e: *mut NmbEncoder) -> bool {
     guard(false, || {
@@ -1389,14 +1435,8 @@ pub extern "C" fn nmb_encoder_end(e: *mut NmbEncoder) -> bool {
                 let mut d = draws;
                 nw_cs_end_ib(&mut *d);
                 let cs: *mut NwCs = &mut *cb.cs;
-                for i in 0..d.ib_count {
-                    let ib = &*d.ibs.add(i as usize);
-                    let words = [nw_pkt7(0x3f, 3), ib.iova as u32, (ib.iova >> 32) as u32, ib.dwords];
-                    nw_reserve_copy(cs, words.as_ptr(), 4);
-                }
-                for i in 0..d.chunk_count {
-                    cb.names.push(*d.chunks.add(i as usize) as usize);
-                }
+                // IB1s of the submission, not calls: a compute program's state is an IB2, and an a6xx has no third level
+                nw_cs_append_ibs(cs, &*d);
                 nmn_cmd_barrier(cs);
                 cb.held_streams.push(d);
             }
@@ -1435,16 +1475,8 @@ pub extern "C" fn nmb_encoder_end(e: *mut NmbEncoder) -> bool {
             unsafe {
                 nmn_cmd_pass_begin(cs, enc.gpu.gpu, &p);
                 nw_cs_end_ib(&mut *enc.draws);
-                // the draws' chunks are copied into the main stream as calls
-                for i in 0..enc.draws.ib_count {
-                    let ib = &*enc.draws.ibs.add(i as usize);
-                    let (iova, dwords) = (ib.iova, ib.dwords);
-                    let words = [nw_pkt7(0x3f, 3), iova as u32, (iova >> 32) as u32, dwords];
-                    nw_reserve_copy(cs, words.as_ptr(), 4);
-                }
-                for i in 0..enc.draws.chunk_count {
-                    cb.names.push(*enc.draws.chunks.add(i as usize) as usize);
-                }
+                // IB1s of the submission, not calls: a draw calls its program's state as an IB2, and an a6xx has no third level
+                nw_cs_append_ibs(cs, &*enc.draws);
                 nmn_cmd_pass_end(cs, &p);
             }
         }

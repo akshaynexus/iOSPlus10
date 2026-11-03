@@ -70,6 +70,7 @@ struct nmn_baked {
 	uint32_t dwords;
 	bool reads_framebuffer;
 	const struct ir3_shader_variant *vs, *fs, *cs;
+	bool instrlen_fix;              /* tu_dispatch: the program is longer than the instruction cache */
 };
 
 /* ---- packets ---- */
@@ -111,6 +112,17 @@ static void event(struct nw_cs *cs, enum vgt_event_type e)
 	pkt7(cs, CP_EVENT_WRITE, 1);
 	nw_cs_emit(cs, CP_EVENT_WRITE_0_EVENT(e));
 }
+/*
+ * An event that writes a time stamp takes an address and a value (Mesa fd_gpu_events<A6XX>: needs_seqno). With one dword the CP takes the next two stream words as the address: on the phone PC_CCU_FLUSH_COLOR_TS + the next CP_EVENT_WRITE wrote to 0x19_70460001 (FAR 0x1970460000), the stall hung the GPU.
+ * Only this function may emit such an event; nw_stream_check refuses any other form. The value goes to a scratch word: nothing reads it, as Turnip's seqno_dummy.
+ */
+static void event_ts(struct nw_cs *cs, enum vgt_event_type e)
+{
+	pkt7(cs, CP_EVENT_WRITE, 4);
+	nw_cs_emit(cs, CP_EVENT_WRITE_0_EVENT(e));
+	nw_cs_emit_qw(cs, nw_device_scratch(cs->dev));
+	nw_cs_emit(cs, 0);
+}
 static void wfi(struct nw_cs *cs) { pkt7(cs, CP_WAIT_FOR_IDLE, 0); }
 
 /* ---- device ---- */
@@ -144,12 +156,13 @@ struct nmn_gpu *nmn_gpu_new(struct nw_device *dev, char *why, size_t why_size)
 	g->ccu_depth_bypass = 0;
 	g->ccu_color_bypass = g->ccu_depth_bypass + depth;
 	(void)color;
-	if (!nw_slice_new(dev, NMN_BORDER_STRIDE * 16, 128, &g->border)) {
+	if (!nw_slice_new(dev, NMN_BORDER_STRIDE * 16 + 64, 128, &g->border)) {
 		snprintf(why, why_size, "no GPU memory for the border colors");
 		free(g);
 		return NULL;
 	}
 	memset(g->border.map, 0, g->border.size);
+	nw_device_set_scratch(dev, g->border.iova + NMN_BORDER_STRIDE * 16);
 	return g;
 }
 
@@ -504,10 +517,12 @@ static void r2d_dst_image(struct nw_cs *cs, const struct nmn_image *im, uint32_t
 	nw_cs_emit(cs, 0);
 }
 
+/* A 2D write reaches memory and the next read through the texture cache sees it (Turnip: FD_CCU_CLEAN_COLOR, FD_CCU_INVALIDATE_COLOR, FD_CACHE_INVALIDATE, WFI). */
 static void flush_color(struct nw_cs *cs)
 {
-	event(cs, PC_CCU_FLUSH_COLOR_TS);
+	event_ts(cs, PC_CCU_FLUSH_COLOR_TS);
 	event(cs, PC_CCU_INVALIDATE_COLOR);
+	event(cs, CACHE_INVALIDATE);
 	wfi(cs);
 }
 
@@ -656,23 +671,24 @@ void nmn_cmd_pass_begin(struct nw_cs *cs, struct nmn_gpu *g, const struct nmn_pa
 	REGS(cs, A6XX_GRAS_SU_DEPTH_PLANE_CNTL(.z_mode = A6XX_LATE_Z));
 }
 
-/* The end of a pass: what the CCU holds goes to memory, so the next pass or the display can read it. */
+/* The end of a pass, as tu6_sysmem_render_end + Turnip's flush for an external dependency: the next pass, blit, compute or the display reads what this pass wrote. A stream has no other barrier: Metal has no barrier call between passes. */
 void nmn_cmd_pass_end(struct nw_cs *cs, const struct nmn_pass *p)
 {
+	(void)p;
 	pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
 	nw_cs_emit(cs, 0);
-	event(cs, PC_CCU_FLUSH_COLOR_TS);
-	if (p->depth != NULL)
-		event(cs, PC_CCU_FLUSH_DEPTH_TS);
+	event(cs, LRZ_FLUSH);
+	nmn_cmd_barrier(cs);
 }
 
+/* tu_emit_cache_flush with all bits on */
 void nmn_cmd_barrier(struct nw_cs *cs)
 {
-	event(cs, PC_CCU_FLUSH_COLOR_TS);
-	event(cs, PC_CCU_FLUSH_DEPTH_TS);
+	event_ts(cs, PC_CCU_FLUSH_COLOR_TS);
+	event_ts(cs, PC_CCU_FLUSH_DEPTH_TS);
 	event(cs, PC_CCU_INVALIDATE_COLOR);
 	event(cs, PC_CCU_INVALIDATE_DEPTH);
-	event(cs, CACHE_FLUSH_TS);
+	event_ts(cs, CACHE_FLUSH_TS);
 	event(cs, CACHE_INVALIDATE);
 	pkt7(cs, CP_WAIT_MEM_WRITES, 0);
 	wfi(cs);
@@ -1082,6 +1098,17 @@ static enum a3xx_rb_blend_opcode blend_op(uint32_t m)
 	}
 }
 
+/* A program's stream is called from every draw: it is read here once, and a submission does not read it again. A refusal frees the program. */
+static bool baked_check(struct nmn_gpu *g, struct nmn_baked *b, uint32_t dwords, char *why, size_t why_size)
+{
+	if (nw_ib2_check(g->dev, (const uint32_t *)b->state.map, dwords, b->state.iova, why, why_size))
+		return true;
+	nw_slice_free(g->dev, &b->code);
+	nw_slice_free(g->dev, &b->state);
+	free(b);
+	return false;
+}
+
 struct nmn_baked *nmn_bake_render(struct nmn_gpu *g, const void *vsv, const void *fsv, const struct nmn_fixed *fx, char *why, size_t why_size)
 {
 	const struct ir3_shader_variant *vs = (const struct ir3_shader_variant *)vsv, *fs = (const struct ir3_shader_variant *)fsv;
@@ -1189,6 +1216,8 @@ struct nmn_baked *nmn_bake_render(struct nmn_gpu *g, const void *vsv, const void
 		at += cs.ibs[i].dwords;
 	}
 	nw_cs_finish(&cs);
+	if (!baked_check(g, b, dwords, why, why_size))
+		return NULL;
 	b->dwords = dwords;
 	b->vs = vs;
 	b->fs = fs;
@@ -1249,8 +1278,11 @@ struct nmn_baked *nmn_bake_compute(struct nmn_gpu *g, const void *csv, char *why
 		at += cs.ibs[i].dwords;
 	}
 	nw_cs_finish(&cs);
+	if (!baked_check(g, b, dwords, why, why_size))
+		return NULL;
 	b->dwords = dwords;
 	b->cs = v;
+	b->instrlen_fix = v->instrlen > g->info.a6xx.instr_cache_size;
 	return b;
 }
 
@@ -1258,6 +1290,7 @@ void nmn_baked_free(struct nmn_gpu *g, struct nmn_baked *b)
 {
 	if (b == NULL)
 		return;
+	nw_ib2_forget(g->dev, b->state.iova);
 	nw_slice_free(g->dev, &b->code);
 	nw_slice_free(g->dev, &b->state);
 	free(b);
@@ -1427,9 +1460,16 @@ void nmn_cmd_draw_indexed(struct nw_cs *cs, uint32_t primitive, uint32_t index_c
 	nw_cs_emit(cs, index_max);
 }
 
+/* tu_dispatch. The caller has called the program and written its sets and constants: calling it here again would invalidate them. */
 void nmn_cmd_dispatch(struct nw_cs *cs, const struct nmn_baked *b, const uint32_t groups[3], const uint32_t local[3])
 {
-	nmn_cmd_program(cs, b);
+	if (b->instrlen_fix) {
+		/* Mesa issue 5892, all known generations: a long program's branch fetch reads the FS length of the other register context */
+		emit_reg(cs, REG_A6XX_SP_FS_INSTRLEN, b->cs->instrlen);
+		event(cs, LABEL);
+	}
+	pkt7(cs, CP_SET_MARKER, 1);
+	nw_cs_emit(cs, A6XX_CP_SET_MARKER_0_MODE(RM6_COMPUTE));
 	pkt4(cs, REG_A6XX_HLSQ_CS_NDRANGE_0, 7);
 	nw_cs_emit(cs, A6XX_HLSQ_CS_NDRANGE_0_KERNELDIM(3) | A6XX_HLSQ_CS_NDRANGE_0_LOCALSIZEX(local[0] - 1) | A6XX_HLSQ_CS_NDRANGE_0_LOCALSIZEY(local[1] - 1) | A6XX_HLSQ_CS_NDRANGE_0_LOCALSIZEZ(local[2] - 1));
 	nw_cs_emit(cs, local[0] * groups[0]);
@@ -1438,9 +1478,6 @@ void nmn_cmd_dispatch(struct nw_cs *cs, const struct nmn_baked *b, const uint32_
 	nw_cs_emit(cs, 0);
 	nw_cs_emit(cs, local[2] * groups[2]);
 	nw_cs_emit(cs, 0);
-	REGS(cs, A6XX_HLSQ_CS_KERNEL_GROUP_X(1), A6XX_HLSQ_CS_KERNEL_GROUP_Y(1), A6XX_HLSQ_CS_KERNEL_GROUP_Z(1));
-	pkt7(cs, CP_SET_MARKER, 1);
-	nw_cs_emit(cs, A6XX_CP_SET_MARKER_0_MODE(RM6_COMPUTE));
 	pkt7(cs, CP_EXEC_CS, 4);
 	nw_cs_emit(cs, 0);
 	nw_cs_emit(cs, CP_EXEC_CS_1_NGROUPS_X(groups[0]));
@@ -1456,8 +1493,8 @@ void nmn_cmd_copy_buffer(struct nw_cs *cs, uint64_t src, uint64_t dst, uint64_t 
 	while (bytes > 0) {
 		uint32_t s = (uint32_t)(src & 0x3f), d = (uint32_t)(dst & 0x3f);
 		uint32_t w = (uint32_t)MIN2(bytes, (uint64_t)(0x4000 - 0x40));
-		REGS(cs, SP_PS_2D_SRC_INFO(CHIP, .color_format = FMT6_8_UNORM, .color_swap = WZYX, .unk20 = 1, .unk22 = 1), SP_PS_2D_SRC_SIZE(CHIP, .width = s + w, .height = 1), SP_PS_2D_SRC(CHIP, .qword = src - s), SP_PS_2D_SRC_PITCH(CHIP, .pitch = 0x40));
-		REGS(cs, A6XX_RB_2D_DST_INFO(.color_format = FMT6_8_UNORM, .color_swap = WZYX), A6XX_RB_2D_DST(.qword = dst - d), A6XX_RB_2D_DST_PITCH(0x4000));
+		REGS(cs, SP_PS_2D_SRC_INFO(CHIP, .color_format = FMT6_8_UNORM, .color_swap = WZYX, .unk20 = 1, .unk22 = 1), SP_PS_2D_SRC_SIZE(CHIP, .width = s + w, .height = 1), SP_PS_2D_SRC(CHIP, .qword = src - s), SP_PS_2D_SRC_PITCH(CHIP, .pitch = 0));
+		REGS(cs, A6XX_RB_2D_DST_INFO(.color_format = FMT6_8_UNORM, .color_swap = WZYX), A6XX_RB_2D_DST(.qword = dst - d), A6XX_RB_2D_DST_PITCH(0));
 		REGS(cs, A6XX_GRAS_2D_DST_TL(.x = d, .y = 0), A6XX_GRAS_2D_DST_BR(.x = d + w - 1, .y = 0));
 		REGS(cs, A6XX_GRAS_2D_SRC_TL_X(s), A6XX_GRAS_2D_SRC_BR_X(s + w - 1), A6XX_GRAS_2D_SRC_TL_Y(0), A6XX_GRAS_2D_SRC_BR_Y(0));
 		pkt7(cs, CP_BLIT, 1);
@@ -1480,7 +1517,7 @@ void nmn_cmd_fill_buffer(struct nw_cs *cs, uint64_t dst, uint64_t bytes, uint8_t
 	while (bytes > 0) {
 		uint32_t d = (uint32_t)(dst & 0x3f);
 		uint32_t w = (uint32_t)MIN2(bytes, (uint64_t)(0x4000 - 0x40));
-		REGS(cs, A6XX_RB_2D_DST_INFO(.color_format = FMT6_8_UNORM, .color_swap = WZYX), A6XX_RB_2D_DST(.qword = dst - d), A6XX_RB_2D_DST_PITCH(0x4000));
+		REGS(cs, A6XX_RB_2D_DST_INFO(.color_format = FMT6_8_UNORM, .color_swap = WZYX), A6XX_RB_2D_DST(.qword = dst - d), A6XX_RB_2D_DST_PITCH(0));
 		REGS(cs, A6XX_GRAS_2D_DST_TL(.x = d, .y = 0), A6XX_GRAS_2D_DST_BR(.x = d + w - 1, .y = 0));
 		pkt7(cs, CP_BLIT, 1);
 		nw_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
@@ -1568,13 +1605,4 @@ void nmn_cmd_mip_down(struct nw_cs *cs, const struct nmn_image *im, uint32_t lev
 	pkt7(cs, CP_BLIT, 1);
 	nw_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
 	flush_color(cs);
-}
-
-/* A value the CPU can poll, when the GPU has reached this point. */
-void nmn_cmd_end_marker(struct nw_cs *cs, uint64_t iova, uint32_t value)
-{
-	pkt7(cs, CP_EVENT_WRITE, 4);
-	nw_cs_emit(cs, CP_EVENT_WRITE_0_EVENT(RB_DONE_TS) | CP_EVENT_WRITE_0_TIMESTAMP);
-	nw_cs_emit_qw(cs, iova);
-	nw_cs_emit(cs, value);
 }

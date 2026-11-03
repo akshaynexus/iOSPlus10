@@ -868,3 +868,15 @@ pub extern "C" fn nmb_binary_archive_add_compute_descriptor(_a: *mut NmbBinaryAr
 pub extern "C" fn m2v_negroni_host_invalidate_stat(_which: u32) -> u64 {
     0
 }
+
+/// One line for the scene tool: what the stream check cost in this process.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmn_stream_check_line(d: *mut NmbDevice) -> *const c_char {
+    use std::sync::OnceLock;
+    static LINE: OnceLock<std::ffi::CString> = OnceLock::new();
+    let Some(device) = (unsafe { d.as_ref() }) else { return std::ptr::null() };
+    let mut s = [0u64; 4];
+    unsafe { nw_check_stats(device.gpu.dev, s.as_mut_ptr()) };
+    let line = format!("scene: stream check: {} submissions, {} dwords, {} packets, {} us", s[0], s[1], s[2], s[3] / 1000);
+    LINE.get_or_init(|| std::ffi::CString::new(line).unwrap_or_default()).as_ptr()
+}
