@@ -192,7 +192,7 @@ struct nw_device *nmn_gpu_device(struct nmn_gpu *g) { return g->dev; }
 uint32_t nmn_format_from_metal(uint64_t f)
 {
 	switch (f) {
-	case 1: return PIPE_FORMAT_A8_UNORM;
+	case 1: return PIPE_FORMAT_R8_UNORM; /* metal2vulkan FormatEmulation::AlphaInRed: the plan's swizzle is (0, 0, 0, R), for R8. With FMT6_A8_UNORM, whose value is in alpha, R read 0: no text at all */
 	case 10: return PIPE_FORMAT_R8_UNORM;
 	case 11: return PIPE_FORMAT_R8_SRGB;
 	case 12: return PIPE_FORMAT_R8_SNORM;
