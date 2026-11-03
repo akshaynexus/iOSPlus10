@@ -574,7 +574,12 @@ Tool: `scripts/laurel/native/compositor-round.sh`, under `phone-lock.sh`: reboot
 | 08:54 | `SP_FS_BINDLESS_PREFETCH_CMD` | The same hang: `FAR 0x126404820902`. That fix was real, and not the cause |
 | 09:05 | Lines as Turnip's | **Not read yet: the phone did not return to iOS after the reboot** |
 
-**Not proven: that the line register is the cause [I].** Its evidence: the mark in the flight data, and the register differs from Turnip's only for lines.
+| 10:32 | Full ir3 variant unless the pipeline's constants pass the limit; lit rule | Lock Screen correct on the screen (`logs/round-104142/*-awake.png`). No hang only because the display slept 10 s after the first lit frame |
+| 10:44 | The same, with unlock + Home swipe | Hang 75 s after start, at the first submission after the unlock. The CP is 1840 dwords into a 2222-dword IB; with the safe variant it stopped at 860 to 1004 dwords, at the generic draws. So the variant moved the hang [V]; it did not cure it |
+
+**Correction [V]: the rows above that name a FAR read too much.** All these hangs have `FSR 00000400`: FSR.FORMAT, no fault bit, `gfsr 0`, `CP_HW_FAULT 0`. There was no bad read: FAR is a stale value. The GPU stays busy: `RBBM_STATUS 00e714e5` = SP, HLSQ, UCHE, VPC, PC_DCALL, LRZ, RB, RAS, TSE, CP busy; TPL1, VBIF, CCU, VFD idle. (`00e594e5` at 10:44: VFD busy, UCHE idle.) The line register and the prefetch register were real fixes and not the cause.
+
+The recorder now names the draw: each draw has an id, the stream writes it at `RB_DONE_TS` (no wait), a thread keeps the last id in the ring's head, `flight-read.py FILE --stuck` prints the first unfinished draw.
 
 Cold pipeline compile [V `pipelines.log`]: 100 to 560 ms per CA pipeline, 17.9 s for the generic one. With the disk cache: no compile.
 

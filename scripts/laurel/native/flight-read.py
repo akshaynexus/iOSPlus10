@@ -12,6 +12,20 @@ room = len(data) - HEAD
 at = end % room
 text = data[HEAD + at:] + data[HEAD:HEAD + at] if end >= room else data[HEAD:HEAD + end]
 lines = text.decode("latin-1").split("\n")
+if "--stuck" in args:
+    # the draw after the last finished one, with its lines (bridge/src/flight.rs next_mark)
+    done = struct.unpack_from("<I", data, 8)[0]
+    at = next((i for i, l in enumerate(lines) if l.startswith("draw ") and l.endswith(f" id {done + 1}")), None)
+    if at is None:
+        print(f"draw id {done + 1} is not in the ring: no draw of this process was waiting")
+    else:
+        fence = next((l.split()[1] for l in lines[at:] if l.startswith("submit fence=")), "not submitted yet")
+        print(f"first unfinished draw, {fence}:")
+        for l in lines[at:at + 40]:
+            if l.startswith(("draw ", "submit ")) and l is not lines[at]:
+                break
+            print(l)
+    sys.exit(0)
 finds = [args[i + 1].lower() for i, a in enumerate(args) if a == "--find"]
 fence = next((int(args[i + 1]) for i, a in enumerate(args) if a == "--fence"), None)
 if finds:

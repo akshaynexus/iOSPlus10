@@ -55,10 +55,10 @@ pub(crate) fn line(text: &str) {
 /// Progress of the GPU: each draw gets an id, and the stream writes the id to one word when that draw has left the render backend (nmn_cmd_progress). A thread copies the word into the ring's head (byte 8),
 /// so after a hang the file says the last finished draw: the next id in the ring is the stuck draw. None: the recorder is off, or the word is not in pool memory (a scattered buffer would have to be named in each submission).
 pub(crate) fn next_mark(gpu: &std::sync::Arc<crate::draw::Gpu>) -> Option<(u64, u32)> {
-    static WORD: OnceLock<Option<(std::sync::Arc<crate::draw::Slice>, u64)>> = OnceLock::new();
+    static WORD: OnceLock<Option<u64>> = OnceLock::new();
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
     let r = ring()?;
-    let (_, iova) = WORD
+    let iova = WORD
         .get_or_init(|| {
             let s = crate::draw::Slice::new(gpu, 4096, 4096).ok()?;
             if s.iova < 0x8000_0000 {
@@ -71,7 +71,8 @@ pub(crate) fn next_mark(gpu: &std::sync::Arc<crate::draw::Gpu>) -> Option<(u64, 
                 std::thread::sleep(std::time::Duration::from_millis(1));
             });
             let iova = s.iova;
-            Some((s, iova))
+            std::mem::forget(s); // for the process's life: the stream and the thread use it
+            Some(iova)
         })
         .as_ref()?;
     Some((*iova, NEXT.fetch_add(1, Ordering::Relaxed)))

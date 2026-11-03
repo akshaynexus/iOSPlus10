@@ -34,7 +34,7 @@ fi
 wait_ssh 20 || { say "STOP: no SSH: phone-ensure-ios.sh, then again"; exit 1; }
 L=$(usblog); FROM=$(wc -l < "$L")
 sh_phone 'touch /private/var/db/negronimetal/stack/flight-on; chmod 644 /private/var/db/negronimetal/stack/flight-on; chown 501 /private/var/db/negronimetal/stack/flight-on' 2>/dev/null
-RESET_FAILED=1 "$REPO/scripts/laurel/ios26-metal-install-options.sh" native 2>&1 | tail -1    # a round is a deliberate test of this build
+ONLY_NATIVE=1 RESET_FAILED=1 "$REPO/scripts/laurel/ios26-metal-install-options.sh" native 2>&1 | tail -1    # a round is a deliberate test of this build
 say "on native; waiting $WAIT s"
 for _ in $(seq 1 $((WAIT / 5))); do
   sleep 5
@@ -55,16 +55,14 @@ grep -E 'RedwoodGPU: [0-9]+ submissions' "$D/usblog.txt" | tail -3 | cut -c1-200
 cp "${AUTOTEST_DIR:-$REPO}/logs/autotest-shots/round-$(basename "$D").png" "$D/screen.png" 2>/dev/null
 sh_phone 'grep -E "native-metal: (program|compute program)" /private/var/db/negronimetal/metal.log | tail -6; grep -E "this (draw|dispatch)|refused" /private/var/db/negronimetal/metal.log | tail -20; cat /private/var/db/negronimetal/stack/state' 2>/dev/null > "$D/metal-log.txt"
 tail -n 30 "$D/metal-log.txt" | cut -c1-230
-# the hang: the words of the failed submissions, and who wrote the address it read
+# the hang: each process's last finished draw and the draw after it. (FSR 00000400 in the SMMU line is FSR.FORMAT, no fault bit: FAR means nothing then.)
 H=$(grep -m1 'watchdog: GPU hang' "$D/usblog.txt" || true)
 if [ -n "$H" ]; then
   for p in backboardd SpringBoard; do sh_phone "cat /private/var/db/negronimetal/stack/flight-$p" > "$D/flight-$p" 2>/dev/null || true; done
-  FAR=$(grep -m1 'SMMU gfsr' "$D/usblog.txt" | sed -n 's/.*FAR \([0-9a-f]*\).*/\1/p')
-  say "hang: FAR $FAR; words: ${FAR:8}, ${FAR:0:8}"
   for p in backboardd SpringBoard; do
     [ -s "$D/flight-$p" ] || continue
-    echo "--- $p"; python3 -I "$REPO/scripts/laurel/native/flight-read.py" "$D/flight-$p" --find "${FAR:8:5}" --find "${FAR:4:4}${FAR:8:4}" | tail -8 | cut -c1-400
-    python3 -I "$REPO/scripts/laurel/native/flight-read.py" "$D/flight-$p" > "$D/flight-$p.txt" 2>/dev/null; tail -n 12 "$D/flight-$p.txt" | cut -c1-260
+    echo "--- $p"; python3 -I "$REPO/scripts/laurel/native/flight-read.py" "$D/flight-$p" --stuck | cut -c1-400
+    python3 -I "$REPO/scripts/laurel/native/flight-read.py" "$D/flight-$p" > "$D/flight-$p.txt" 2>/dev/null
   done
 fi
 if [ "$KEEP" = 0 ]; then

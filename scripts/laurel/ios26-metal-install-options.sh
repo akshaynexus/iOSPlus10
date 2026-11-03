@@ -4,6 +4,7 @@
 #   NO_RESTART=1 ...      the setting acts at the next start of the UI
 # Each file: written as NAME.new, read back by SHA-256, then moved over NAME. The stacks go first and the selector last: the selector needs options/default.
 # Fallback to `default` is the selector's: no frame in 240 s, 30 s black, no device, 2 starts with no lit screen, or a GPU hang (a GPU hang also needs a reboot). The fallback holds across reboots for that build (option_store.h).
+#   ONLY_NATIVE=1 ...     of the stacks only options/native: the phone keeps the default stack another agent installed (this tree's copy can be older)
 #   RESET_FAILED=1 ...    the owner's reset: try a build again that already failed. Without it this script does not remove a failed mark; a new build needs no reset.
 set -eu
 cd "$(dirname "$0")/../.."
@@ -29,11 +30,15 @@ put() {
   say "written: $_rel"
 }
 # Stacks and what they load, then the Info.plist, then the selector.
-for f in $(cd "$S" && find options -type f | sort); do
-  case "$f" in */NegroniMetal|*.dylib) put "$f" 755 ;; *) put "$f" 644 ;; esac
-done
-[ ! -s "$S/libvulkan_freedreno.dylib" ] || put libvulkan_freedreno.dylib 755
-put Info.plist 644
+if [ "${ONLY_NATIVE:-0}" = 1 ]; then
+  put options/native/NegroniMetal 755
+else
+  for f in $(cd "$S" && find options -type f | sort); do
+    case "$f" in */NegroniMetal|*.dylib) put "$f" 755 ;; *) put "$f" 644 ;; esac
+  done
+  [ ! -s "$S/libvulkan_freedreno.dylib" ] || put libvulkan_freedreno.dylib 755
+  put Info.plist 644
+fi
 put NegroniMetal 755
 # As root this script must not create a file in stack/: backboardd runs as mobile, the sticky bit then stops every write (06:49: `: > state` here made the fallback forget its count at each reboot). Remove, and let the compositor create them.
 K=/private/var/db/negronimetal/stack
