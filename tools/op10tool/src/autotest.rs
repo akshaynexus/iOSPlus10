@@ -18,6 +18,8 @@ const PIXEL_DIFF: u8 = 8;
 const SAME_SHARE: f64 = 0.002;
 /// A return to an older picture counts only if the frame before it differs by at least this share: the last slow frames of an animation can differ by a little and come back.
 const FLASH_SHARE: f64 = 0.02;
+/// A flash comes back at once: an older picture from longer ago is a scroll that returned.
+const FLASH_MAX_US: u64 = 500_000;
 /// A pixel is dark at or below this value in all channels.
 const DARK: u8 = 8;
 /// A frame is mostly black from this share of dark pixels.
@@ -151,6 +153,9 @@ pub fn analyse(frames: &[Frame]) -> Report {
             continue;
         }
         for j in (i.saturating_sub(WINDOW)..i - 1).rev() {
+            if f.t_us - frames[j].t_us > FLASH_MAX_US {
+                break;
+            }
             if diff_share(f, &frames[j]) < SAME_SHARE {
                 r.older.push((i, j));
                 break;
@@ -331,6 +336,13 @@ mod tests {
             p[0] = 200; // 1 % of the pixels
         }
         let fs = vec![base.clone(), near, base];
+        assert!(analyse(&fs).older.is_empty());
+    }
+
+    #[test]
+    fn a_scroll_that_returns_after_seconds_is_not_a_flash() {
+        let (a, b) = ([200, 10, 10, 255], [10, 200, 10, 255]);
+        let fs = vec![frame(1, 0, a), frame(2, 900, b), frame(1, 1800, a)];
         assert!(analyse(&fs).older.is_empty());
     }
 

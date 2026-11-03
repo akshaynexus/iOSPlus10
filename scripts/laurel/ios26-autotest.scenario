@@ -42,7 +42,8 @@ shot before
 record 40 2500
 edge top 700 300 650
 stop
-settle 700 8000
+# the modules come more than 1 s after the blur holds still [V phone]
+settle 3000 15000
 shot open
 changed
 record 40 2500

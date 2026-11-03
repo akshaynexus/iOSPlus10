@@ -42,6 +42,8 @@ The tool never flashes, reboots, restarts a process, or changes a setting. A los
 - [I] Which surface, with no patch: the kernel marks a surface in use at its swap, and drops the mark of the frame before when the new one has latched (`AppleCLCD::showDirect`). A surface with a new mark can hold its old picture for up to 900 ms (the wait for the GPU). So the rule: the current surface stays until its own mark goes. If CoreAnimation holds a use count of its own at that time, the current surface stays too long [U if it does]. The output says `inferred`. A flash result from `inferred` is a lead, not proof: confirm it with 2983, or by eye.
 - [V] With the panel off, the last surface keeps its mark, and CoreAnimation has drawn it black: `shot` gives a black frame. `awake` reads SpringBoard's `com.apple.springboard.hasBlankedScreen`: exit 1 when off.
 - The copy path of the framebuffer (`showPending`) is not read. On all boots here the frames took the direct path [V `LAUREL FB CANVAS: ... direct path`].
+- `older` needs: at least 2 % of the picture changed from the frame before, under 0.2 % from a frame at most 8 frames and 500 ms back.
+- A step fails on: `changed` with the same or a black picture, a `settle ... change` with no end, a crash of backboardd or SpringBoard, a panic line, a GPU line (`LAUREL GPU: off`, watchdog, SMMU fault, `LAUREL METAL NATIVE: off`). Other crashes only show in the column.
 - A sequence reads 1 row and 1 column in 4 (180x390). It cannot see a change that is only in the skipped pixels.
 
 ## 3. Facts found on the phone [V]
@@ -55,6 +57,8 @@ The tool never flashes, reboots, restarts a process, or changes a setting. A los
 | The compositor uses surfaces 1 and 3 at first, and adds 197, 198 with an app in front | `surfaces` |
 | A boot can hang with `ps busy` on each try: `proc_list_mlock` held, no exec for 465 s, `usernotificationsd` 60 s of CPU a minute, SSH `Connection timed out during banner exchange`, `ctl ping` works. So the old note "dropbear stops answering" has this one cause in this case | 06:30-06:38, logs/usblog-20261103-000638.txt. Cause of the hold: [U] |
 | A fixed wait of 2 to 8 s gives frames of an animation: the first run's "settings-open" showed Home, "control-center-closed" showed Control Center, and the table said ok | So `settle`. **Look at the PNGs: `changed` only says that the picture moved** |
+
+| **backboardd crash, stack default, the first full run:** sig 11 at 07:07:45 during the Control Center close, with `far` in a gap of 0x20000 between two maps of tag 21, pc in a library at 0x11fc1e294; one second before: `native-metal: refused ...: no-copy buffer 0x124f84000 length 16384 options 0x0`. Then 22 black frames, and the Metal start again. That the two lines are linked: [I]. Not symbolized. The tool holds views of surfaces and only reads them: if that can matter [U] | `logs/autotest-20261103-070713.txt` of this work, USB log 07:07:44-07:07:51 |
 
 ## 4. Tests
 

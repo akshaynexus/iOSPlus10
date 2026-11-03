@@ -32,7 +32,9 @@ GPU_BUSY = re.compile(r"RedwoodGPU: \d+ submissions in \d+ ms: .*GPU busy ([\d.]
 STACK = re.compile(r"(LAUREL METAL: on: stack .*|LAUREL METAL26: on: stack .*|LAUREL METAL NATIVE: off: .*|LAUREL METAL26: off: .*|LAUREL METAL: off: .*)")
 REFUSED = re.compile(r"native-metal: refused \(logged once per reason\): ([^:]+:[^:]+)|LAUREL METAL COUNT: .*refused .*")
 SEQ = re.compile(r"seq: (\d+) frames in (\d+) ms, (\d+) surfaces, (\d+) older, (\d+) black, (.*)")
-BOOT = "LAUREL BUILD: "
+CRITICAL = {"backboardd", "SpringBoard"}
+BLACK_PERCENT = 98.0
+BOOT = "exec launchd"  # once in a boot; LAUREL BUILD prints more than once
 
 
 class Step:
@@ -111,6 +113,16 @@ def read_lines(text, step):
                 step.flip += 1
             else:
                 step.crashes.append(m.group(1))
+
+
+def judge(step):
+    """The kernel's lines can fail a step that all its pictures passed."""
+    if step.panic:
+        step.fail("panic lines")
+    for name in sorted(set(step.crashes) & CRITICAL):
+        step.fail(f"{name} crashed")
+    if step.gpu:
+        step.fail("GPU lines")
 
 
 def fps(frames, ms):
@@ -275,6 +287,9 @@ class Run:
         m = re.search(r"([\d.]+) % changed", p.stdout)
         if not m or float(m.group(1)) < 0.2:
             self.step.fail(f"changed: the picture did not change ({m.group(1) if m else '?'} %)")
+        dark = re.search(r"([\d.]+) % dark", p.stdout)
+        if dark and float(dark.group(1)) >= BLACK_PERCENT:
+            self.step.fail(f"changed: the picture is black ({dark.group(1)} % dark)")
 
     def record(self, n, ms):
         self.nseq += 1
@@ -316,6 +331,17 @@ class Run:
         if rc != 0 and change:
             self.step.fail(f"no new picture in {most} ms")
 
+    def open_app(self, bundle):
+        # SBSLaunchApplicationWithIdentifier gave 11 during the animation to Home [V phone]: try again, with a note
+        for _ in range(4):
+            rc, text = self.phone.run(f"{TOOL} open {bundle}")
+            if rc == 0:
+                self.step.notes.append(text.strip().splitlines()[-1][:120])
+                return
+            self.step.notes.append(f"open {bundle}: rc {rc}: {text.strip().splitlines()[0][:100] if text.strip() else ''}")
+            time.sleep(3)
+        self.step.fail(f"open {bundle}: refused 4 times")
+
     def panel_on(self):
         """SpringBoard's own state; None: no answer."""
         rc, _ = self.phone.run(f"{TOOL} awake")
@@ -332,7 +358,9 @@ class Run:
 
     def do(self, words):
         c = words[0]
-        if c in ("key", "tap", "swipe", "edge", "open"):
+        if c == "open":
+            self.open_app(words[1])
+        elif c in ("key", "tap", "swipe", "edge"):
             self.tool(*words)
         elif c == "lock":
             if self.panel_on() is True:
@@ -370,8 +398,7 @@ class Run:
         if self.recording:
             self.stop()
         read_lines(self.log.take(), self.step)
-        if self.step.panic:
-            self.step.fail("panic lines")
+        judge(self.step)
         return self.step
 
 
@@ -469,10 +496,20 @@ def self_test():
     p = Step("p")
     read_lines("06:15:41 panic(cpu 5 caller 0x1): boom\n", p)
     assert len(p.panic) == 1
+    judge(p)
+    assert not p.ok
+    c = Step("c")
+    read_lines("07:07:45 CRASH backboardd[66] sig 11 code 0x100000001 sub 0x175cc0000\n07:07:45 CRASH backboardd pc 0x11fc1e294\n", c)
+    judge(c)
+    assert not c.ok and c.crashes == ["backboardd"], vars(c)
+    d = Step("d")
+    read_lines("07:07:45 CRASH aonsensed[66] sig 9 code 0x0\n", d)
+    judge(d)
+    assert d.ok
     log = """old line
-06:20:00 LAUREL BUILD: 070a 349 patches
+06:20:00 exec launchd
 06:20:01 NMTL[66 backboardd]: LAUREL METAL: on: stack default (setting absent)
-06:30:00 LAUREL BUILD: 070a 349 patches
+06:30:00 exec launchd
 06:30:01 NMTL[840 backboardd]: LAUREL METAL: on: stack native (setting native)
 06:30:02 NMTL[862 backboardd]: LAUREL METAL: on: stack native (setting native)
 06:30:03 NMTL[862 backboardd]: LAUREL METAL NATIVE: off: stack native gave no device: restart on stack default
