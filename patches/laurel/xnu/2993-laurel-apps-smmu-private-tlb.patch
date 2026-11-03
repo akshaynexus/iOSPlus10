@@ -1,0 +1,70 @@
+laurel 2993: LAUREL APPS SMMU: the system's SMMU takes no broadcast TLB maintenance (sCR0.PTM | VMIDPNE), as the stock driver; both kernels. docs/laurel_sprout/watchdog.md section 12.
+
+[V 2026-11-03 19:31:11, kernel 48e56e9 with 2992 on] CPU 5 silent 19 s again, this time in EL0 (audiomxd, no system call open): the GPU's SMMU
+was out of the broadcast, the system's SMMU was not: `TopazModem: smmu: sCR0 00270406 ID0 4c017e36`: BTM set, PTM clear. A `dsb ish` in EL0
+(dyld and libsystem: `ic ivau; dsb ish` after writing code or data pages) blocks the same way and no interrupt can come in. The stock arm-smmu
+sets both bits at reset on every instance it owns. Our banks on this SMMU are identity with sTLBGSYNC after programming: nothing needs the
+broadcast. Self-check: the bits must read back, else off with the reason (the secure world may own the register). Kill switch appssmmuptm=0.
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 7ec6804..1569e3c 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -2667,6 +2667,49 @@ smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+ 	return ok;
+ }
+ 
++/*
++ * laurel 2993: LAUREL APPS SMMU: the system's SMMU (apps_smmu, 0x15000000: modem, WLAN, IPA, audio, camera, Bluetooth banks here) takes no
++ * broadcast TLB maintenance, as the GPU's since 2992. Boot: ID0 0x4c017e36 (BTM, bit 13: a DVM slave), sCR0 0x00270406 (PTM, bit 12, clear):
++ * every `tlbi ...is` of a CPU, in the kernel or from EL0 (`ic ivau; dsb ish` of dyld and libsystem), waits for this SMMU in `dsb ish`.
++ * [V 2026-11-03 19:31:11, 2992 on] CPU 5 silent 19 s in EL0 of audiomxd: the apps SMMU was the agent left. The stock driver sets
++ * sCR0.VMIDPNE | PTM at reset ("Disable TLB broadcasting"). Our banks are identity (no table changes, sTLBGSYNC after programming), so
++ * nothing of ours needs the broadcast. Self-check: the two bits must read back (the secure world may own this register), else off, one line.
++ * Kill switch appssmmuptm=0.
++ */
++static void
++smmu_private_tlb(volatile uint8_t *s)
++{
++	static bool said;
++	uint32_t on = 1;
++	const uint32_t PTM = 1u << 12, VMIDPNE = 1u << 11, BTM = 1u << 13;
++
++	if (said) {
++		return;
++	}
++	said = true;
++	(void)PE_parse_boot_argn("appssmmuptm", &on, sizeof(on));
++	uint32_t id0 = r32(s, 0x20), before = r32(s, 0x0), after;
++	const char *why = NULL;
++
++	if (!on) {
++		why = "kill switch appssmmuptm=0";
++	} else if (!(id0 & BTM)) {
++		why = "ID0.BTM is 0: this SMMU takes no broadcast TLB maintenance anyway";
++	} else {
++		w32(s, 0x0, before | VMIDPNE | PTM);
++		after = r32(s, 0x0);
++		if ((after & (VMIDPNE | PTM)) != (VMIDPNE | PTM)) {
++			w32(s, 0x0, before);
++			why = "sCR0.PTM does not hold (a Secure-owned register)";
++		}
++	}
++	if (why != NULL) {
++		LOG("LAUREL APPS SMMU: off: %s: sCR0 %08x, the CPUs' broadcast TLB invalidates wait for this SMMU", why, before);
++	} else {
++		LOG("LAUREL APPS SMMU: on: private TLB maintenance, as the stock driver: sCR0 %08x -> %08x; a CPU's tlbi/dsb no longer waits for the system's SMMU (kill switch appssmmuptm=0)", before, r32(s, 0x0));
++	}
++}
++
+ static bool
+ smmu_identity_locked(uint32_t sid, uint32_t mask, const char *name)
+ {
+@@ -2678,6 +2721,7 @@ smmu_identity_locked(uint32_t sid, uint32_t mask, const char *name)
+ 		LOG("smmu: map failed");
+ 		return false;
+ 	}
++	smmu_private_tlb(s);                        /* laurel 2993, once */
+ 	uint32_t cr0 = r32(s, 0x0), id0 = r32(s, 0x20), id1 = r32(s, 0x24);
+ 	uint32_t nsmr = id0 & 0xFF, ncb = id1 & 0xFF;
+ 	uint32_t psize = (id1 & (1u << 31)) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
