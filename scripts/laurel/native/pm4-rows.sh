@@ -17,7 +17,7 @@ C=$(find "$H/" -type f -name cffdump | head -1)
 SHIM=$(find "$H/" -name libfreedreno_noop_drm_shim.so | head -1)
 export RNN_PATH=$OUT/ios26/turnip-host/mesa/src/freedreno/registers
 [ -x "$R/scene-default" ] || { echo "pm4-rows: no $R/scene-default: scripts/laurel/native/ref-capture.sh"; exit 2; }
-rows=$(python3 -I -c '
+rows=${ROWS:-$(python3 -I -c '
 import sys
 seen=set(); out=[]
 for i,l in enumerate(open(sys.argv[1])):
@@ -25,7 +25,7 @@ for i,l in enumerate(open(sys.argv[1])):
     if len(f)<7: continue
     if f[3] not in seen or i % int(sys.argv[2])==0:
         seen.add(f[3]); out.append(i)
-print(" ".join(map(str,out)))' "$PLAN" "$STEP")
+print(" ".join(map(str,out)))' "$PLAN" "$STEP")}
 echo "rows: $rows"
 rc=0; : > "$W/all-diff.txt"
 for r in $rows; do

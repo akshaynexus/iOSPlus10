@@ -892,7 +892,7 @@ impl NmbEncoder {
 }
 
 pub(crate) fn default_raster(w: u32, h: u32) -> NmnRaster {
-    NmnRaster { early_z: false, viewport: [0.0, 0.0, w as f64, h as f64, 0.0, 1.0], scissor: [0, 0, w, h], cull_mode: 0, winding: 0, fill_mode: 0, depth_bias: 0.0, slope_scale: 0.0, bias_clamp: 0.0, line_width: 1.0, blend_color: [0.0; 4], stencil_front: 0, stencil_back: 0, depth_func: 7, depth_write: false, depth_test: false, reads_framebuffer: false, pass_width: w, pass_height: h, stencil_enable: false, st_func: [7, 7], st_fail: [0, 0], st_zpass: [0, 0], st_zfail: [0, 0], st_read: [0xff, 0xff], st_write: [0xff, 0xff] }
+    NmnRaster { lines: false, early_z: false, viewport: [0.0, 0.0, w as f64, h as f64, 0.0, 1.0], scissor: [0, 0, w, h], cull_mode: 0, winding: 0, fill_mode: 0, depth_bias: 0.0, slope_scale: 0.0, bias_clamp: 0.0, line_width: 1.0, blend_color: [0.0; 4], stencil_front: 0, stencil_back: 0, depth_func: 7, depth_write: false, depth_test: false, reads_framebuffer: false, pass_width: w, pass_height: h, stencil_enable: false, st_func: [7, 7], st_fail: [0, 0], st_zpass: [0, 0], st_zfail: [0, 0], st_read: [0xff, 0xff], st_write: [0xff, 0xff] }
 }
 
 fn stage_index(stage: u32) -> Result<usize, String> {
@@ -1269,6 +1269,8 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
         }
         let mut raster = e.raster;
         raster.reads_framebuffer = entry.baked.reads_fb;
+        // MTLPrimitiveType: 1 line, 2 line strip. Turnip's register for lines at one sample: Bresenham, no polygon offset. The rectangular form is for MSAA; these draws marked each hang of 08:39 and 08:54
+        raster.lines = primitive == 1 || primitive == 2;
         // a state's depth or stencil test acts only on a pass that has that attachment (Metal's rule)
         let (has_depth, has_stencil) = e.pass.as_ref().map_or((false, false), |p| (p.depth.is_some(), p.stencil.is_some()));
         raster.depth_test &= has_depth;

@@ -263,6 +263,7 @@ pub struct NmnRaster {
     pub depth_write: bool,
     pub depth_test: bool,
     pub reads_framebuffer: bool,
+    pub lines: bool,
     pub early_z: bool,
     pub pass_width: u32,
     pub pass_height: u32,

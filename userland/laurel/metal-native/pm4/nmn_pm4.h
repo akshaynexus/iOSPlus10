@@ -104,6 +104,7 @@ struct nmn_raster {
 	uint32_t stencil_front, stencil_back;
 	uint32_t depth_func;    /* 7: always */
 	bool depth_write, depth_test, reads_framebuffer;
+	bool lines;             /* this draw's primitives are lines or a strip of them: GRAS_SU_CNTL as Turnip's */
 	bool early_z;           /* tu6_build_depth_plane_z_mode: the bridge decides it per draw, from the program and this state */
 	uint32_t pass_width, pass_height;
 	bool stencil_enable;

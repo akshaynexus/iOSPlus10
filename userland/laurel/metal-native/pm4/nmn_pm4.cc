@@ -1422,7 +1422,7 @@ void nmn_cmd_raster(struct nw_cs *cs, const struct nmn_raster *r)
 		nw_cs_emit(cs, A6XX_GRAS_SC_SCREEN_SCISSOR_BR_X(x + w - 1) | A6XX_GRAS_SC_SCREEN_SCISSOR_BR_Y(y + h - 1));
 	}
 	/* raster. MTLCullMode: 0 none, 1 front, 2 back. MTLWinding: 0 clockwise, 1 counter-clockwise. */
-	REGS(cs, A6XX_GRAS_SU_CNTL(.cull_front = r->cull_mode == 1, .cull_back = r->cull_mode == 2, .front_cw = r->winding == 0, .linehalfwidth = r->line_width / 2.0f, .poly_offset = true, .line_mode = RECTANGULAR));
+	REGS(cs, A6XX_GRAS_SU_CNTL(.cull_front = r->cull_mode == 1, .cull_back = r->cull_mode == 2, .front_cw = r->winding == 0, .linehalfwidth = r->line_width / 2.0f, .poly_offset = !r->lines, .line_mode = r->lines ? BRESENHAM : RECTANGULAR));
 	REGS(cs, A6XX_GRAS_CL_CNTL(.znear_clip_disable = false, .zfar_clip_disable = false, .z_clamp_enable = false, .zero_gb_scale_z = 1, .vp_clip_code_ignore = 1));
 	enum a6xx_polygon_mode pm = r->fill_mode == 1 ? POLYMODE6_LINES : POLYMODE6_TRIANGLES;
 	REGS(cs, A6XX_VPC_POLYGON_MODE(pm));

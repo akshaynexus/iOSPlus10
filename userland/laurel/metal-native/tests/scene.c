@@ -362,7 +362,9 @@ int main(int argc, char **argv)
 	NmbBuffer *ib = nmb_buffer_new(dev, sizeof(ib_data), 0, ib_data);
 	if (ib == NULL)
 		FAIL("index buffer");
-	if (!nmb_render_draw_indexed(en, 3 /* triangle */, 6, 0 /* uint16 */, ib, 0, 1, 0, 0))
+	/* NMN_SCENE_PRIM=1: line lists, as CA's generic program draws paths: the mark of the hangs of 08:39 and 08:54. A row of 6 indices is 3 lines */
+	const uint64_t prim = getenv("NMN_SCENE_PRIM") ? strtoull(getenv("NMN_SCENE_PRIM"), NULL, 10) : 3;
+	if (!nmb_render_draw_indexed(en, prim, 6, 0 /* uint16 */, ib, 0, 1, 0, 0))
 		FAIL("draw");
 	if (!nmb_encoder_end(en))
 		FAIL("end");
