@@ -279,6 +279,11 @@ impl TextureObj {
         }
         self.memory.as_ref().map_or(std::ptr::null_mut(), |m| m.bo())
     }
+    /// Width and height of a level of this view, counted from its first level.
+    pub(crate) fn level_size(&self, level: u64) -> (u64, u64) {
+        let l = self.base_level as u64 + level;
+        ((self.desc.width >> l).max(1), (self.desc.height >> l).max(1))
+    }
     pub(crate) fn view_kind(metal: u64) -> u32 {
         // MTLTextureType: 0 1D, 1 1D array, 2 2D, 3 2D array, 4 2D MS, 5 cube, 6 cube array, 7 3D, 8 2D MS array, 9 buffer
         match metal {
@@ -818,23 +823,42 @@ pub extern "C" fn nmb_render_encoder_new(c: *mut NmbCommandBuffer, d: *const Nmb
             return Err("another encoder is open".into());
         }
         let d = get(d)?;
+        // a view's level and slice count from its own first level and slice: the image behind it is the parent's
         let mut colors = vec![];
+        let mut smallest: Option<(u64, u64)> = None;
+        let mut fit = |t: &TextureObj, level: u64| {
+            let (w, h) = t.level_size(level);
+            smallest = Some(smallest.map_or((w, h), |s: (u64, u64)| (s.0.min(w), s.1.min(h))));
+        };
         for a in &d.colors {
             if a.texture.is_null() {
                 colors.push(None);
             } else {
-                colors.push(Some((get(a.texture)?.t.clone(), a.level, a.slice, a.load, a.store, a.clear)));
+                let t = get(a.texture)?.t.clone();
+                fit(&t, a.level);
+                let (level, layer) = (t.base_level as u64 + a.level, t.base_layer as u64 + a.slice + a.depth_plane);
+                colors.push(Some((t, level, layer, a.load, a.store, a.clear)));
+            }
+        }
+        for a in [&d.depth, &d.stencil] {
+            if !a.texture.is_null() {
+                fit(&get(a.texture)?.t, a.level);
             }
         }
         while colors.last().is_some_and(|c| c.is_none()) {
             colors.pop();
         }
         let depth = if d.depth.texture.is_null() { None } else { Some(get(d.depth.texture)?.t.clone()) };
+        // Metal's renderTargetWidth and renderTargetHeight stay 0 unless the caller sets them, and CoreAnimation leaves them: 0 is the attachments' size. Taken as it is, w - 1 made a clear of 16384 x 16384 that ran past a small surface: the hang of the first compositor run (FAR 0x1008000, 0x1068000). A size above an attachment's is cut to it: a target must not be written past its end.
+        let (w, h) = match smallest {
+            Some((sw, sh)) => (if d.width == 0 { sw } else { d.width.min(sw) }, if d.height == 0 { sh } else { d.height.min(sh) }),
+            None if d.width != 0 && d.height != 0 => (d.width, d.height),
+            None => return Err("a pass with no attachment and no size".into()),
+        };
+        let (w, h) = (w as u32, h as u32);
         let mut draws: Box<NwCs> = Box::new(unsafe { std::mem::zeroed() });
         unsafe { nw_cs_init(&mut *draws, cb.gpu.dev) };
         cb.open = true;
-        let w = d.width as u32;
-        let h = d.height as u32;
         let raster = default_raster(w, h);
         Ok(boxed(NmbEncoder { cb: c, gpu: cb.gpu.clone(), kind: 0, pass: Some(PassRecord { colors, depth, depth_load: d.depth.load, depth_store: d.depth.store, clear_z: d.depth.clear[0], w, h, samples: d.samples.max(1) as u32 }), draws, stages: Default::default(), pipeline: None, raster, plan_cache: HashMap::new(), attachment_written: 0, compute: None }))
     })
@@ -1119,7 +1143,10 @@ pub(crate) fn write_descriptors(e: &mut NmbEncoder, cb: &mut NmbCommandBuffer, d
                         }
                         cb.held_buffers.push(b.clone());
                         let r = range.map(|r| r.range);
-                        (b.backing.iova() + r.map_or(*off, |r| r.offset), r.map_or(b.length - off, |r| r.range))
+                        // a range past the buffer's end (the planner's whole size) stops at its end: the shader's bounds come from this descriptor
+                        let at = r.map_or(*off, |r| r.offset);
+                        let left = b.length.saturating_sub(at);
+                        (b.backing.iova() + at, r.map_or(left, |r| r.range.min(left)))
                     }
                     Some(BoundBuf::Bytes(d)) => {
                         let (iova, map) = cb.upload((d.len() as u64).max(16), 64)?;
@@ -1359,15 +1386,15 @@ fn mark_gpu_off() {
 }
 
 /// A descriptor's address reaches the GPU with no packet around it, so nw_stream_check cannot read it. It is checked where it is written.
-pub(crate) fn check_descriptor_address(dev: *mut NwDevice, iova: u64) -> Result<(), String> {
-    if iova != 0 && unsafe { nw_bo_of_address(dev, iova, 1) }.is_null() {
-        return Err(format!("stream check: a descriptor at {iova:#x}: no live buffer holds it"));
+pub(crate) fn check_descriptor_address(dev: *mut NwDevice, iova: u64, bytes: u64) -> Result<(), String> {
+    if iova != 0 && unsafe { nw_bo_of_address(dev, iova, bytes.max(1)) }.is_null() {
+        return Err(format!("stream check: a descriptor at {iova:#x} of {bytes} bytes: no live buffer holds it"));
     }
     Ok(())
 }
 
 fn write_buffer_descriptor(dev: *mut NwDevice, ty: vk::DescriptorType, iova: u64, length: u64, slot: *mut u32) -> Result<(), String> {
-    check_descriptor_address(dev, iova)?;
+    check_descriptor_address(dev, iova, length)?;
     match ty {
         vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => unsafe { nmn_descriptor_ubo(iova, length, slot) },
         vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => unsafe { nmn_descriptor_ssbo(iova, length, slot) },
@@ -1399,7 +1426,8 @@ fn swizzle_of(view: Option<&metal2vulkan::bind::ImageViewDesc>) -> [u8; 4] {
 fn write_texture(e: &NmbEncoder, cb: &mut NmbCommandBuffer, stage: Stage, index: u32, view: Option<&metal2vulkan::bind::ImageViewDesc>, storage: bool, slot: *mut u32) -> Result<(), String> {
     let t = e.stages[stage_slot(stage)?].textures.get(&index).ok_or("a texture slot with nothing bound")?.clone();
     let swizzle = swizzle_of(view);
-    check_descriptor_address(e.gpu.dev, unsafe { nmn_image_iova(t.image as *const NmnImage) })?;
+    // the first level the view reaches, up to its last layer: a read past the buffer's end is a fault as a write is
+    check_descriptor_address(e.gpu.dev, unsafe { nmn_image_iova(t.image as *const NmnImage) }, unsafe { nmn_image_extent(t.image as *const NmnImage, t.base_level, t.base_layer + t.layers.max(1) - 1) })?;
     unsafe { nmn_descriptor_image(t.image as *const NmnImage, t.pipe_format, t.view_type, t.base_level, t.levels, t.base_layer, t.layers, swizzle.as_ptr(), storage, slot) };
     if t.must_name() {
         cb.names.push(t.bo() as usize);

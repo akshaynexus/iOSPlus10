@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """stream-check.py A6XX_XML FILE.rd [--strict]: the host decoder of a captured command stream (fake_kernel's .rd or Turnip's FD_RD_DUMP). It reads what the CP reads, and it has no code in common with nw_check.c: it is a second opinion, and it runs on Turnip's captures too.
+What a CP_BLIT or a draw writes must fit its buffer (rows x pitch, from the registers of this submission; FAR 0x1008000: a clear of 16384 x 16384 over a small surface).
 For each CP packet: parity, length; events that write a time stamp have an address; a call goes no deeper than IB1 -> IB2 (an SDS group is another level and is walked as such); every address register and packet address lies in a buffer of this capture. An address outside any buffer is printed with what the GPU would do with it.
 --strict (the native stack): an opcode with no rule is also an error.
 Exit 0: no error. Run with python3 -I."""
@@ -74,6 +75,34 @@ class Walk:
         self.errors = []
         self.packets = 0
         self.depth = {1: 0, 2: 0, 3: 0}
+        self.r = {}
+
+    def q(self, reg):
+        return self.r.get(reg, 0) | (self.r.get(reg + 1, 0) << 32)
+
+    def fits(self, at, what, base, bytes_):
+        if base and self.find(base, bytes_) is None:
+            self.err(at, f"{what} at {base:#x}, {bytes_} bytes: runs past its buffer")
+
+    def check_blit(self, at):
+        br = self.r.get(0x8406, 0)
+        columns, rows = (br & 0x3fff) + 1, ((br >> 16) & 0x3fff) + 1
+        pitch = (self.r.get(0x8c1a, 0) & 0xffff) << 6
+        self.fits(at, f"a 2D write of {columns} x {rows}, pitch {pitch}", self.q(0x8c18), rows * pitch if pitch else columns)
+        if not self.r.get(0x8c00, 0) & 0x80:
+            src_rows, src_columns = ((self.r.get(0x8404, 0) >> 8) & 0x1ffff) + 1, ((self.r.get(0x8402, 0) >> 8) & 0x1ffff) + 1
+            src_pitch = ((self.r.get(0xb4c4, 0) >> 9) & 0x7fff) << 6
+            self.fits(at, f"a 2D read of {src_columns} x {src_rows}, pitch {src_pitch}", self.q(0xb4c2), src_rows * src_pitch if src_pitch else src_columns)
+
+    def check_targets(self, at):
+        rows = ((self.r.get(0x80f1, 0) >> 16) & 0x3fff) + 1
+        if not self.r.get(0x80f1, 0):
+            return
+        for i in range(8):
+            pitch = self.r.get(0x8823 + 8 * i, 0) << 6
+            self.fits(at, f"target {i}: {rows} rows, pitch {pitch}", self.q(0x8825 + 8 * i), rows * pitch if pitch else 1)
+        pitch = self.r.get(0x8873, 0) << 6
+        self.fits(at, f"depth: {rows} rows, pitch {pitch}", self.q(0x8875), rows * pitch if pitch else 1)
 
     def find(self, a, n=1):
         for lo, hi, body in self.bos:
@@ -114,6 +143,8 @@ class Walk:
                 if i + 1 + c > n:
                     self.err(at, f"pkt4 {h:08x}: past the IB")
                     return
+                for j in range(c):
+                    self.r[reg + j] = w[i + 1 + j]
                 j = 0
                 while j < c:
                     r = reg + j
@@ -136,6 +167,15 @@ class Walk:
                     self.err(at, f"pkt7 {h:08x}: past the IB")
                     return
                 p = w[i + 1:i + 1 + c]
+                if op == 0x2c:
+                    self.check_blit(at)
+                elif op == 0x38:
+                    self.check_targets(at)
+                elif op == 0x65 and c == 1 and (p[0] & 0xf) == 1:
+                    # a new pass: RM6_DIRECT_RENDER
+                    for i2 in range(8):
+                        self.r[0x8825 + 8 * i2] = self.r[0x8826 + 8 * i2] = 0
+                    self.r[0x8875] = self.r[0x8876] = 0
                 if op == 0x46:
                     e = p[0] & 0xff if c else -1
                     if e in TS_EVENTS and c == 1:

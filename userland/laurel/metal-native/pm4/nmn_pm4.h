@@ -32,6 +32,8 @@ uint64_t nmn_image_size(const struct nmn_image *);
 uint32_t nmn_image_pitch(const struct nmn_image *, uint32_t level);
 uint64_t nmn_image_layer_offset(const struct nmn_image *, uint32_t level, uint32_t layer);
 uint32_t nmn_image_format(const struct nmn_image *);
+/* the bytes from the image's base to the end of this level's last row of this layer: what the GPU reaches at this level */
+uint64_t nmn_image_extent(const struct nmn_image *, uint32_t level, uint32_t layer);
 void nmn_image_bind(struct nmn_image *, uint64_t iova);
 uint64_t nmn_image_iova(const struct nmn_image *);
 

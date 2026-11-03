@@ -138,6 +138,12 @@ static void test_kinds(void)
 	uint32_t offset = 99, row = 0;
 	struct nw_bo *s = nw_bo_import_surface(d, id, &offset, &row);
 	CHECK(s && s->kind == NW_BO_SURFACE && offset == 0 && row == 2880, "surface");
+	/* the kernel has one handle per surface and client, and GEM_CLOSE drops the buffer: a second import shares the object, the first free closes nothing (the second reason a surface could be unmapped under a draw) */
+	struct nw_bo *s2 = nw_bo_import_surface(d, id, NULL, NULL);
+	CHECK(s2 == s, "a second import of a surface is the same object");
+	uint64_t closes = fake_kernel_stats(k)->gem_close;
+	nw_bo_free(d, s2);
+	CHECK(fake_kernel_stats(k)->gem_close == closes && nw_bo_of_address(d, s->iova, 4096) == s, "the first free left the surface mapped");
 	/* the CPU address of a surface is its owner's: nw_bo_free must not unmap it (the fake kernel's unmap counts) */
 	s->map = (void *)0x1000;
 	CHECK(nw_bo_import_surface(d, 77, NULL, NULL) == NULL, "no such surface");
@@ -171,6 +177,30 @@ static void test_stream_check(void)
 	/* PC_CCU_FLUSH_COLOR_TS with no address, then the next event: the CP's address is the next two words */
 	const uint32_t hang[] = {ev, 0x1d, ev, 0x19};
 	CHECK(!check_one(d, b, hang, 4, why, sizeof(why)) && strstr(why, "0x1970460001") != NULL, "the first hang's stream: %s", why);
+	/* A write past its buffer: the compositor's first frame: a clear of a page with a pass size of 0, so a bottom right of 16383, 16383 (FAR 0x1008000) */
+	{
+		const uint32_t page = 4096, pitch = 128;
+		struct nw_bo *small = nw_bo_new(d, page, 0);
+		const uint32_t lo2 = (uint32_t)small->iova, hi2 = (uint32_t)(small->iova >> 32);
+		const uint32_t clear_16384[] = {
+			nw_pkt4(0x8c00, 1), 0x80, nw_pkt4(0x8406, 1), 0x3fff3fff, nw_pkt4(0x8c18, 3), lo2, hi2, pitch >> 6, nw_pkt7(0x2c, 1), 3,
+		};
+		CHECK(!check_one(d, b, clear_16384, 10, why, sizeof(why)) && strstr(why, "16384 x 16384") != NULL, "a clear past its buffer: %s", why);
+		const uint32_t clear_32[] = {
+			nw_pkt4(0x8c00, 1), 0x80, nw_pkt4(0x8406, 1), 0x001f001f, nw_pkt4(0x8c18, 3), lo2, hi2, pitch >> 6, nw_pkt7(0x2c, 1), 3,
+		};
+		CHECK(check_one(d, b, clear_32, 10, why, sizeof(why)), "a clear of the surface itself: %s", why);
+		/* the same rule for a draw: a window of 1560 rows on a target of one page; the state comes from another IB of the submission */
+		struct nw_check_state st;
+		memset(&st, 0, sizeof(st));
+		const uint32_t pass[] = {nw_pkt4(0x80f1, 1), (1559u << 16) | 719u, nw_pkt4(0x8823, 1), 2880 >> 6, nw_pkt4(0x8825, 2), lo2, hi2};
+		memcpy(b->map, pass, sizeof(pass));
+		CHECK(nw_stream_check_with(d, &st, b->map, 7, b->iova, 1, why, sizeof(why)), "the pass's registers: %s", why);
+		const uint32_t draw[] = {nw_pkt7(0x38, 3), 0, 1, 3};
+		memcpy(b->map, draw, sizeof(draw));
+		CHECK(!nw_stream_check_with(d, &st, b->map, 4, b->iova, 1, why, sizeof(why)) && strstr(why, "target 0") != NULL, "a draw past its target: %s", why);
+		nw_bo_free(d, small);
+	}
 	/* each time stamp event */
 	static const uint32_t ts[] = {4, 8, 22, 26, 28, 29};
 	for (unsigned i = 0; i < 6; i++) {

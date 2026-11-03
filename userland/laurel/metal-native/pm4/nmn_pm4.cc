@@ -22,6 +22,11 @@
 #include "adreno_common.xml.h"
 #include "adreno_pm4.xml.h"
 #include "a6xx.xml.h"
+#include "nw_check_regs.h"
+static_assert(NW_RB_2D_BLIT_CNTL == REG_A6XX_RB_2D_BLIT_CNTL && NW_RB_2D_BLIT_CNTL_SOLID == A6XX_RB_2D_BLIT_CNTL_SOLID_COLOR && NW_RB_2D_DST == REG_A6XX_RB_2D_DST && NW_RB_2D_DST_PITCH == REG_A6XX_RB_2D_DST_PITCH, "nw_check_regs.h");
+static_assert(NW_GRAS_2D_DST_BR == REG_A6XX_GRAS_2D_DST_BR && NW_GRAS_2D_SRC_BR_X == REG_A6XX_GRAS_2D_SRC_BR_X && NW_GRAS_2D_SRC_BR_Y == REG_A6XX_GRAS_2D_SRC_BR_Y && NW_SP_PS_2D_SRC == REG_A6XX_SP_PS_2D_SRC && NW_SP_PS_2D_SRC_PITCH == REG_A6XX_SP_PS_2D_SRC_PITCH, "nw_check_regs.h");
+static_assert(NW_GRAS_SC_WINDOW_SCISSOR_BR == REG_A6XX_GRAS_SC_WINDOW_SCISSOR_BR && NW_RB_DEPTH_BUFFER_PITCH == REG_A6XX_RB_DEPTH_BUFFER_PITCH && NW_RB_DEPTH_BUFFER_BASE == REG_A6XX_RB_DEPTH_BUFFER_BASE && NW_RB_MRT == REG_A6XX_RB_MRT(0) && NW_MARKER_DIRECT_RENDER == RM6_DIRECT_RENDER, "nw_check_regs.h");
+static_assert(A6XX_SP_PS_2D_SRC_PITCH_PITCH__SHIFT == 9 && A6XX_GRAS_SC_WINDOW_SCISSOR_BR_Y__SHIFT == 16, "nw_check_regs.h");
 
 struct fd_reg_pair {
    uint32_t reg;
@@ -272,6 +277,10 @@ uint64_t nmn_image_size(const struct nmn_image *im) { return im->layout.size; }
 uint32_t nmn_image_pitch(const struct nmn_image *im, uint32_t level) { return fdl_pitch(&im->layout, level); }
 uint64_t nmn_image_layer_offset(const struct nmn_image *im, uint32_t level, uint32_t layer) { return fdl_surface_offset(&im->layout, level, layer); }
 uint32_t nmn_image_format(const struct nmn_image *im) { return im->format; }
+uint64_t nmn_image_extent(const struct nmn_image *im, uint32_t level, uint32_t layer)
+{
+	return fdl_surface_offset(&im->layout, level, layer) + (uint64_t)fdl_pitch(&im->layout, level) * u_minify(im->layout.height0, level);
+}
 void nmn_image_bind(struct nmn_image *im, uint64_t iova) { im->iova = iova; }
 uint64_t nmn_image_iova(const struct nmn_image *im) { return im->iova; }
 

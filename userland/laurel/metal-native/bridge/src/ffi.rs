@@ -107,6 +107,7 @@ pub struct NwBoHead {
     pub fence: u32,
     pub list_index: u32,
     pub list_stamp: u32,
+    pub extra_refs: u32,
 }
 pub const NW_BO_POOL: u32 = 0;
 pub const NW_BO_SCATTERED: u32 = 1;
@@ -331,6 +332,7 @@ unsafe extern "C" {
     pub fn nmn_image_size(i: *const NmnImage) -> u64;
     pub fn nmn_image_pitch(i: *const NmnImage, level: u32) -> u32;
     pub fn nmn_image_layer_offset(i: *const NmnImage, level: u32, layer: u32) -> u64;
+    pub fn nmn_image_extent(i: *const NmnImage, level: u32, layer: u32) -> u64;
     pub fn nmn_image_bind(i: *mut NmnImage, iova: u64);
     pub fn nmn_image_iova(im: *const NmnImage) -> u64;
     pub fn nmn_descriptor_image(i: *const NmnImage, f: u32, view: u32, base_level: u32, levels: u32, base_layer: u32, layers: u32, swizzle: *const u8, storage: bool, out: *mut u32);

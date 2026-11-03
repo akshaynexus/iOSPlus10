@@ -32,11 +32,13 @@ run() {
   python3 -I "$REPO/scripts/laurel/native/stream-check.py" "$X" "$W/$name.rd" --strict | cut -c1-200
 }
 rc=0
-run plain || rc=1
+NMN_SCENE_NO_SURFACES=1 run plain || rc=1
 python3 -I "$REPO/scripts/laurel/native/pm4-diff.py" "$R/plain-sysmem-1-summary.txt" "$W/plain-summary.txt" | tee "$W/plain-diff.txt" || rc=1
 python3 -I "$REPO/scripts/laurel/native/pm4-actions.py" "$R" "$W/plain-summary.txt" | tee "$W/plain-actions.txt" || rc=1
-run row0 "$OUT/ios26/native/plans/ca-real.txt" 0 || rc=1
+NMN_SCENE_NO_SURFACES=1 run row0 "$OUT/ios26/native/plans/ca-real.txt" 0 || rc=1
 python3 -I "$REPO/scripts/laurel/native/pm4-diff.py" "$R/row0-sysmem-1-summary.txt" "$W/row0-summary.txt" | tee "$W/row0-diff.txt" || rc=1
+# the compositor's first frames: IOSurface targets, a pass size of 0 (the hang of logs/native-compositor-1.txt). No Turnip capture: the walk and the gate are the proof
+run surfaces "$OUT/ios26/native/plans/ca-real.txt" 0 || rc=1
 # the rules must hold on the driver that is known to draw on this GPU: if Turnip fails a rule, the rule is wrong
 for f in plain-sysmem-1 plain-sysmem-2 plain-sysmem-3 row0-sysmem-1; do
   python3 -I "$REPO/scripts/laurel/native/stream-check.py" "$X" "$R/$f.rd" | cut -c1-200 || rc=1

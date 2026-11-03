@@ -13,4 +13,5 @@ extern const struct nw_ops fake_kernel_ops;
 const struct fake_stats *fake_kernel_stats(const struct fake_kernel *);
 /* a surface the kernel can import: returns its id */
 uint32_t fake_kernel_add_surface(struct fake_kernel *, uint64_t size, uint32_t width, uint32_t height, uint32_t row_bytes, uint32_t fourcc);
+void *fake_kernel_surface_memory(struct fake_kernel *, uint32_t id);
 #endif

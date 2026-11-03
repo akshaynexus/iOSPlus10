@@ -45,6 +45,7 @@ struct nw_bo {
 	uint32_t fence;         /* the last submission that named it */
 	/* the submit's list: this buffer's index in it, valid when stamp is the submit's */
 	uint32_t list_index, list_stamp;
+	uint32_t extra_refs;    /* a surface: the kernel gives one handle per surface and client, so a second import shares this object; the kernel's buffer goes with the last nw_bo_free */
 };
 
 struct nw_device;
@@ -153,6 +154,13 @@ void nw_submit_end(struct nw_submit *);
  * false: *why says what and where.
  */
 bool nw_stream_check(struct nw_device *, const uint32_t *words, uint32_t dwords, uint64_t iova, int level, char *why, size_t why_size);
+/* The registers of one submission, across its IBs: what a blit or a draw writes must fit its buffer. Program streams hold none of these registers, so a known IB2 needs no second read. */
+struct nw_check_state {
+	uint64_t dst, src, depth, mrt_base[8];
+	uint32_t dst_pitch, dst_br, src_pitch, src_br_x, src_br_y, depth_pitch, mrt_pitch[8], window_rows;
+	bool blit_solid;
+};
+bool nw_stream_check_with(struct nw_device *, struct nw_check_state *, const uint32_t *words, uint32_t dwords, uint64_t iova, int level, char *why, size_t why_size);
 /* A stream called as an IB2 from many places: read once, then known by its address until nw_ib2_forget. */
 bool nw_ib2_check(struct nw_device *, const uint32_t *words, uint32_t dwords, uint64_t iova, char *why, size_t why_size);
 void nw_ib2_forget(struct nw_device *, uint64_t iova);
