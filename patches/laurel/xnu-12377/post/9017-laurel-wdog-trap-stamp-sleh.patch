@@ -1,0 +1,37 @@
+laurel 9017 (iOS 26): the sleh.c calls of 2988: the base owns that file (owned.txt). An exception from EL0 opens the CPU's trap stamp in sleh_synchronous; thread_exception_return and the end of sleh_synchronous close it.
+
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 0250e4c..324a4f8 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -703,6 +703,9 @@ thread_exception_return(void)
+ 	}
+ 
+ 	thread->machine.el0_synchronous_trap = false;
++	/* laurel 2988: the EL0 trap of this CPU is over (osfmk/arm64/laurel_wdog.c) */
++	extern void laurel_wdog_trap_out(void);
++	laurel_wdog_trap_out();
+ 
+ #if KASAN_TBI
+ 	kasan_unpoison_curstack(true);
+@@ -809,6 +812,12 @@ sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, __unused
+ 	// Lockdown should only be initiated for kernel exceptions
+ 	assert(!(is_user && did_initiate_panic_lockdown));
+ #endif /* CONFIG_SPTM */
++	/* laurel 2988: the open EL0 trap of this CPU, for the report of a silent CPU (osfmk/arm64/laurel_wdog.c) */
++	extern void laurel_wdog_trap_in(uint64_t esr, uint64_t far, uint64_t pc);
++	extern void laurel_wdog_trap_out(void);
++	if (is_user) {
++		laurel_wdog_trap_in(esr, far, get_saved_state_pc(state));
++	}
+ 
+ 	/*
+ 	 * Use KERNEL_DEBUG_CONSTANT_IST here to avoid producing tracepoints
+@@ -1175,6 +1184,7 @@ sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, __unused
+ 
+ 	if (is_user) {
+ 		thread->machine.el0_synchronous_trap = false;
++		laurel_wdog_trap_out();         /* laurel 2988 */
+ 	}
+ }
+ 
