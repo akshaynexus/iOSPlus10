@@ -1100,6 +1100,12 @@ fn plan_entry(e: &mut NmbEncoder, device_pipeline: &NmbRenderPipeline, state: &B
     }
     let reads_fb = program.stage_info(1).is_some_and(|i| i.reads_framebuffer);
     let outputs = program.stage_info(1).map_or(0, |i| i.color_outputs);
+    // the file only: one line a program, at its first use in this process. The last of these before a GPU hang names the suspect; a hang's process is killed, so nothing later can say it
+    {
+        let names: Vec<&str> = pipeline.stages.iter().map(|m| m.entry_point.as_str()).collect();
+        let f = program.stage_info(1).unwrap_or_default();
+        file_line(&format!("native-metal: program {} key {}: {} fragment instructions, {} texture reads, reads the target: {reads_fb}", names.join(" + "), &device_pipeline.key[..device_pipeline.key.len().min(48)], f.instructions, f.tex_ops));
+    }
     let entry = Arc::new(PlanEntry { plan, baked: Arc::new(Baked { gpu: e.gpu.clone(), b: baked as usize, reads_fb, program }), offsets, set_slots, outputs });
     device_pipeline.plans.lock().unwrap().insert(key.1.clone(), entry.clone());
     e.plan_cache.insert(key, entry.clone());
@@ -1226,6 +1232,16 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
     let state = build_state(e)?;
     let entry = plan_entry(e, device_pipeline, &state)?;
     let commands = entry.plan.instantiate_draw(&state, &draw).map_err(|x| format!("draw: {x:?}"))?;
+    // what a draw needs beside its descriptors and constants. Each of these fills memory or a pointer the shader reads: left out, the shader reads garbage and the GPU can fault. Refused, with the reason in the line
+    if !commands.descriptor_bytes.is_empty() {
+        return Err(format!("this draw uploads {} descriptor tables (argument or handle tables), which have no native path yet", commands.descriptor_bytes.len()));
+    }
+    if !commands.root_tables.is_empty() || !commands.push_holes.is_empty() {
+        return Err(format!("this draw needs {} root tables and {} address holes in its constants, which have no native path yet", commands.root_tables.len(), commands.push_holes.len()));
+    }
+    if !commands.amplifications.is_empty() || commands.mesh_dispatch.is_some() || commands.tessellation_dispatch.is_some() || commands.mesh_arguments.is_some() || commands.object_fold.is_some() || commands.index_bounds_pass || commands.index_overrun.is_some() {
+        return Err("this draw needs a pass before it (amplification, mesh, tessellation, an index check), which has no native path yet".into());
+    }
     let cb = unsafe { e.cb.as_mut() }.ok_or("the command buffer")?;
     cb.held_baked.push(entry.baked.clone());
 
@@ -1375,6 +1391,15 @@ fn write_neutral_image(e: &NmbEncoder, view: vk::ImageViewType, slot: *mut u32) 
     let identity = [0u8, 1, 2, 3];
     unsafe { nmn_descriptor_image(t.image as *const NmnImage, t.pipe_format, kind, 0, 1, 0, layers, identity.as_ptr(), false, slot) };
     Ok(())
+}
+
+/// One line in metal.log only: for what is too many lines for the console.
+pub(crate) fn file_line(text: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open("/private/var/db/negronimetal/metal.log") {
+        let name = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default();
+        let _ = f.write_all(format!("NMTL[{} {}]: {}\n", std::process::id(), name, text).as_bytes());
+    }
 }
 
 /// One line where the selector's lines go: the console (the USB log) and metal.log. Failure of a log is nothing.

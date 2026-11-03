@@ -733,6 +733,10 @@ pub extern "C" fn nmb_compute_dispatch(e: *mut NmbEncoder, size: *const u64, per
             return Err(format!("this dispatch asks for variant {:?}, which has no native path yet", plan.variant));
         }
         let commands = plan.instantiate_dispatch(&state, &dispatch).map_err(|x| format!("dispatch: {x:?}"))?;
+        // as a draw (emit_draw): what fills memory or a pointer the shader reads is refused, not left out
+        if !commands.descriptor_bytes.is_empty() || commands.root_table.is_some() || !commands.push_holes.is_empty() || commands.region_record.is_some() || commands.indirect_clamp.is_some() {
+            return Err(format!("this dispatch needs {} descriptor tables, a root table or address holes in its constants, which have no native path yet", commands.descriptor_bytes.len()));
+        }
         let bindings = lay_out(&pipeline.pipeline.layout)?;
         let mut offsets = HashMap::new();
         let mut set_slots = vec![];
@@ -760,6 +764,7 @@ pub extern "C" fn nmb_compute_dispatch(e: *mut NmbEncoder, size: *const u64, per
                     }).collect();
                     let program: Program = crate::compile::cached_program(&dev.cache, dev.compiler, &pipeline.key, &spec, || compute_program_spec(dev.compiler, &pipeline.pipeline, &spec))?;
                     let mut why = [0 as c_char; 256];
+                    crate::draw::file_line(&format!("native-metal: compute program {} key {}: {} instructions", pipeline.pipeline.stage.entry_point, &pipeline.key[..pipeline.key.len().min(48)], program.stage_info(0).unwrap_or_default().instructions));
                     let baked = unsafe { nmn_bake_compute(e.gpu.gpu, nmn_program_variant(program.0, 0), why.as_mut_ptr(), why.len()) };
                     if baked.is_null() {
                         return Err(unsafe { CStr::from_ptr(why.as_ptr()) }.to_string_lossy().into_owned());
