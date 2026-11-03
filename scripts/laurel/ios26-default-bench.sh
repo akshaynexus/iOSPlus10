@@ -33,6 +33,7 @@ phone "cp $DB/env $DB/env.bench-saved" || { say "no SSH"; exit 2; }
 restore() {
   [ "${NO_RESTORE:-0}" = 1 ] && { say "stays: option default, env and files of this run"; return; }
   back "$B/libvulkan_freedreno.dylib"; back "$B/options/default/NegroniMetal"
+  phone "tail -c +${meta_at:-1} $DB/metal.log; rm -f $DB/telemetry" > "$REPO/logs/bench-$name.metal.log" 2>/dev/null
   phone "mv -f $DB/env.bench-saved $DB/env; printf '%s\n' '$old_option' > $DB/option"
   say "restored: option $old_option, env"
   restart_ui
@@ -40,7 +41,7 @@ restore() {
 trap restore EXIT
 [ -z "${TURNIP:-}" ] || put "$TURNIP" "$B/libvulkan_freedreno.dylib"
 [ -z "${PLUGIN:-}" ] || put "$PLUGIN" "$B/options/default/NegroniMetal"
-{ phone "printf '%s\n' default > $DB/option"; for e in ${extra[@]+"${extra[@]}"}; do phone "printf '%s\n' '$e' >> $DB/env"; done; }
+{ phone "printf '%s\n' default > $DB/option; touch $DB/telemetry"; meta_at=$(phone "wc -c < $DB/metal.log"); for e in ${extra[@]+"${extra[@]}"}; do phone "printf '%s\n' '$e' >> $DB/env"; done; }
 # Another agent's test can leave the GPU off until a reboot (LAUREL GPU: off, then NoDevice at each open). Then this run reboots the phone once: the standing order allows it.
 main_log() { local m; m=$(git -C "$REPO" worktree list --porcelain | sed -n '1s/^worktree //p'); ls -t "$REPO"/logs/usblog-*.txt "$m"/logs/usblog-*.txt 2>/dev/null | head -1; }
 LOG=$(main_log)

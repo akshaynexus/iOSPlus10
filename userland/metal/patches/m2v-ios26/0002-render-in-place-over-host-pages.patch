@@ -1,0 +1,38 @@
+metal2vulkan (Mi A3, iOS 26): a render target over host pages renders on them: an IOSurface is its own attachment. The shadow cost a copy in, a keep and a word-by-word merge per pass. [V phone 2026-11-03, LAUREL GPU PASS] compute 64x1 x 3x1560: 16 ms of GPU per frame, 70 % of backboardd's GPU time. Kill switch NEGRONIMETAL_RENDER_IN_PLACE=0. Docs: docs/laurel_sprout/ios26-default-speed.md.
+
+--- a/crates/metal2vulkan-runtime/src/in_place.rs
++++ b/crates/metal2vulkan-runtime/src/in_place.rs
+@@ -251,7 +251,7 @@
+     if policy == HostPageTexturePolicy::Shadow {
+         return Err(ShadowCause::Exact);
+     }
+-    if usage.contains(TextureUsage::RENDER_TARGET) {
++    if usage.contains(TextureUsage::RENDER_TARGET) && !renders_in_place() {
+         return Err(ShadowCause::RenderTarget);
+     }
+     if usage.intersects(TextureUsage::SHADER_WRITE | TextureUsage::SHADER_ATOMIC) {
+@@ -259,12 +259,24 @@
+     }
+     match verdict(class) {
+         Verdict::Passed => Ok(()),
++        // laurel: on Turnip the first move of a linear image writes no byte [V tu_barrier, no layout code]; the check itself makes no 40 MiB
++        // no-copy buffer on this phone, so it answers Unchecked for ever, and every surface was a shadow.
++        Verdict::Pending | Verdict::Unchecked if class == PagesClass::Pointer && renders_in_place() => Ok(()),
+         Verdict::Pending => Err(ShadowCause::CheckPending(class)),
+         Verdict::Failed => Err(ShadowCause::CheckFailed(class)),
+         Verdict::Unchecked => Err(ShadowCause::Unchecked(class)),
+     }
+ }
+ 
++/// laurel (Mi A3, iOS 26): a texture that renders over host pages renders on them, on a device whose linear
++/// images take color attachment usage beside any other (Turnip), so an IOSurface is its own attachment. The
++/// shadow cost a copy in, a keep and a word-by-word merge per pass: 16 ms of GPU per frame at 950 MHz on the
++/// Adreno 610. A pass writes only the texels its draws write, as Metal does. Kill switch NEGRONIMETAL_RENDER_IN_PLACE=0.
++fn renders_in_place() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("NEGRONIMETAL_RENDER_IN_PLACE").is_none_or(|v| v != "0"))
++}
++
+ /// A device's check verdicts (`DeviceShared::in_place`): one per class, and whether its check
+ /// started and settled.
+ pub(crate) struct InPlaceChecks {
