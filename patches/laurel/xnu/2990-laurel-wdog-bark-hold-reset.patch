@@ -1,0 +1,43 @@
+laurel 2990: after a watchdog bark the panic hold resets by itself in 20 s, whatever laurelpanic says.
+
+[V 2026-11-03 18:48:00, kernel c68eeb19c9] 2987 kept the bite armed: `on: bark: the phone resets in 30 s by the bite` printed, and at 90 s the phone was still in the hold, answering `pong (panic)`. So the bite does not reset here, cause [U]. The hold's own timed reset does not depend on it. Any other panic holds as before.
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -107,6 +107,7 @@
+ extern int laurel_reboot_set_mode(const char *name);
+ extern void laurel_wdog_stop(void);     /* laurel 2986 */
+ extern void laurel_wdog_hold(void);     /* laurel 2987 */
++extern int laurel_wdog_barked(void);    /* laurel 2990 */
+ extern void laurel_wdog_poll(void);
+ extern void laurel_restart(void);
+ extern void laurel_power_off(void);
+@@ -1749,6 +1750,9 @@
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("laurelpanic", &secs, sizeof(secs));
++	if (secs <= 0 && laurel_wdog_barked()) {
++		secs = 20;                      /* laurel 2990: a stuck CPU: the text is out, reset with no key press */
++	}
+ 	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sec);
+ 	nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &half);
+ 	now = mach_absolute_time();
+diff --git a/osfmk/arm64/laurel_wdog.c b/osfmk/arm64/laurel_wdog.c
+--- a/osfmk/arm64/laurel_wdog.c
++++ b/osfmk/arm64/laurel_wdog.c
+@@ -392,6 +392,14 @@
+ 	laurel_wdog_stop();
+ }
+ 
++/* laurel 2990: the hold asks: was this panic the bark? */
++int laurel_wdog_barked(void);
++int
++laurel_wdog_barked(void)
++{
++	return lwd_barked != 0;
++}
++
+ /* SPI 3, from sleh_irq, already acknowledged. No pet for 12 s and this CPU has interrupts on: the text, then the panic, with the hold and its timed reset. */
+ void laurel_wdog_bark(void);
+ void
