@@ -5383,4 +5383,23 @@ Full text: `docs/laurel_sprout/ios26-control-center.md`.
 
 ## 2026-11-03: panic `kern_stackshot.c:933 Assertion failed: stackshot_active()`
 [V 07:25:51] Follows `LAUREL DEBUG ACK: on: stackshot given up: cpu 5`. xnu-12377 stackshots use helper CPUs, so the iOS 16 way of giving up is not safe on its own. post/9013: single-threaded by default; a late CPU does no stackshot work. [U] why CPU 5 is late over 100 ms; the panics follow memory kills.
+
+## 2026-11-03: UI test tool on the kernel input
 - [V] Kernel f24b7056ba has 2983: `op10tool input check` says `synth on`, `SWEET HID: touch 9 ... edge`. `kern.laurel_scan_surface` is 0 on the CPU renderer. A UI that works with no `LAUREL FRAME` line is the CPU renderer: read `LAUREL METAL26: off: Metal device refused`. A table from there measures nothing, so `run` stops first (exit 4).
+
+## 2026-11-03: Mi A3: DDR, RPM scaling, kill loops (branch t3/laurel-ddr-rpm-cpu-waste; host and read-only SSH; 2985 NOT BOOTED)
+Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-parallel.md` section 6.
+- **The stock `rpm.mbn` can be read:** `scripts/laurel/rpm-fw-dis.py` (output in `out/rpm-re`). Code at 0x4600000 is 0 in its own view, data at 0x4690000 is 0x90000. Literal pools hold pointers to strings. The clock tables other than DDR are filled at run time: a dump of the static data gives zeros. Keep such work in `out/`: nothing of it in git.
+- **[V] `clk0` id 2 `Enab` = `/clk/dcvs.ena`: before it a flagged bus node acks a vote and does nothing. At 1, each node takes its votes at once, and no vote = lowest level.** That is why `1355 MHz after a vote of 1804` had an ack.
+- [V] Stock sends the top vote on all rate clocks first, in both sets. `rs_enable` is this order; `check-table.py` compares it with the source.
+- [V] `Enab = 0` restores the boot levels in the firmware. Stock never sends it. Not used.
+- [V] No L3 clock and no CCI devfreq on trinket: `clk_cpu_osm_driver_trinket_fixup`.
+- **A daemon killed in `_xpc_transaction_end` is not leaking:** at the end of the transaction it goes clean and the inactive limit applies. Limit below its footprint at rest = it dies after each request.
+- A walk of the LaunchServices store counts against the walker: 10.5 MB store, 8 MB limit.
+- **`LAUREL CPU TOP` shows a job at 60 s a minute, and that job is killed each 10 s: it is the loop.** It is alive at the snapshot.
+- dasd at boot is about 7,000 SQLite opens per boot, not a fault that a floor fixes. Do not chase it for steady-state fps: quiet after minute 5.
+- Do not run `spindump` on this phone while another agent tests: stackshot.
+- `ps -M -p PID` gives thread times. Times only.
+- Agent's slip: a first SSH command `ps ... > /tmp/.a` wrote one small file in the phone's `/tmp` in spite of the read-only rule. Pipe to the host from the first command.
+- Worktree: `INCR=1 kernel-ios26-linux.sh` builds in 60 s after a tree. A `grep -c '^diff --git'` guard in `rpm-scale-patch.sh`.
+- `scripts/laurel/gpu-opp-patch.sh` diffs from 2961's parent to the work tree: after 2985 it also takes 2985's hunks in the same files. Use it only on a tree of 2961 alone, or move the hunks by hand.
