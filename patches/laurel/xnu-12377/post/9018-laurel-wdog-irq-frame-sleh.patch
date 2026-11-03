@@ -1,0 +1,16 @@
+laurel 9018 (iOS 26): the sleh.c call of 2989: sleh_irq gives the watchdog the frame pointer each interrupt found (the base owns sleh.c).
+
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 324a4f8..cf55b14 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3125,6 +3125,9 @@ sleh_irq(arm_saved_state_t *state)
+ 	extern void laurel_wdog_irq(unsigned int cpu, uint64_t pc, uint64_t lr, bool el0);
+ 	extern void laurel_wdog_bark(void);
+ 	laurel_wdog_irq(cdp->cpu_number, get_saved_state_pc(state), get_saved_state_lr(state), PSR64_IS_USER(get_saved_state_cpsr(state)));
++	/* laurel 2989: the frame the interrupt found, for the path of a silent CPU */
++	extern void laurel_wdog_irq_frame(unsigned int cpu, uint64_t fp);
++	laurel_wdog_irq_frame(cdp->cpu_number, get_saved_state_fp(state));
+ 	if (intid == sweet_vtimer_intid) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
