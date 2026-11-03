@@ -1,0 +1,135 @@
+laurel 2989: the kernel path of a thread stuck on a silent CPU, read from another CPU; both kernels. docs/laurel_sprout/watchdog.md section 10.
+
+[V 2026-11-03 18:47:43, kernel c68eeb19c9] The third line of 2988 settled the kind of stall: CPU 5 was in the kernel on a Unix system call (madvise, by
+the dyld slide of the line) for 19 s with interrupts off, its last interrupt taken at the enable in ml_set_interrupts_enabled. What that call does on
+the CPU is the next question, and no debugger exists here. Three more lines, all reads by copies that cannot fault: the frame chain from the fp the
+CPU's last interrupt found (sleh_irq passes it, post/9018; a spin in a leaf keeps its callers), every pointer into kernel text on the thread's kernel
+stack (deepest first), and the thread's saved user registers (x16 = the system call number, x0-x3, sp, lr, pc). iOS 16: the fp line says none.
+
+diff --git a/osfmk/arm64/laurel_wdog.c b/osfmk/arm64/laurel_wdog.c
+index 7704105..85daeea 100644
+--- a/osfmk/arm64/laurel_wdog.c
++++ b/osfmk/arm64/laurel_wdog.c
+@@ -79,7 +79,8 @@ struct lwd_cpu {
+ 	volatile uint64_t trap_esr;
+ 	volatile void *trap_thread;     /* the thread that trapped: the stamp is stale when another thread runs on this CPU */
+ 	volatile uint32_t trap_count;
+-	uint32_t pad[3];
++	uint32_t pad;
++	volatile uint64_t fp;           /* laurel 2989: the frame pointer at the last interrupt (post/9018) */
+ } __attribute__((aligned(64)));
+ 
+ static struct lwd_cpu lwd_cpu[LWD_CPUS];
+@@ -176,6 +177,16 @@ laurel_wdog_trap_in(uint64_t esr, uint64_t far, uint64_t pc)
+ 	c->trap_t = mach_absolute_time();
+ }
+ 
++/* laurel 2989: sleh_irq (post/9018): the frame pointer the interrupt found. A CPU that spins in a leaf keeps the same callers: the chain from this fp is its path */
++void laurel_wdog_irq_frame(unsigned int cpu, uint64_t fp);
++void
++laurel_wdog_irq_frame(unsigned int cpu, uint64_t fp)
++{
++	if (cpu < LWD_CPUS) {
++		lwd_cpu[cpu].fp = fp;
++	}
++}
++
+ /* the thread goes back to EL0 (thread_exception_return, the end of sleh_synchronous): the trap is over */
+ void laurel_wdog_trap_out(void);
+ void
+@@ -253,6 +264,85 @@ lwd_thread_text(cpu_data_t *cd, char *out, size_t n)
+ 	snprintf(out, n, "%s%s%s", comm, name[0] ? "/" : "", name);
+ }
+ 
++/*
++ * laurel 2989: the kernel path of the thread on a silent CPU, read from this CPU with copies that cannot fault, nothing written:
++ * the frame chain from the fp its last interrupt found (a spin in a leaf keeps the same callers), every pointer into kernel text on its
++ * kernel stack (deepest first: the newest frames come first), and its saved user registers (x16 is the Unix system call number).
++ * Addresses carry the kernel slide (the `slide` of the line before).
++ */
++static void
++lwd_thread_path(const char *prefix, int cpu, thread_t th, struct lwd_cpu *c)
++{
++	vm_offset_t stack = 0;
++	char line[232];
++	int n;
++
++	(void)ml_nofault_copy((vm_offset_t)&th->kernel_stack, (vm_offset_t)&stack, sizeof(stack));
++	uint64_t lo = stack, hi = stack + kernel_stack_size;
++
++	/* the frame chain at the last interrupt */
++	uint64_t fp = c->fp;
++	n = 0;
++	for (int i = 0; i < 16 && fp >= lo && fp + 16 <= hi && (fp & 7) == 0; i++) {
++		uint64_t frame[2] = { 0, 0 };
++
++		if (ml_nofault_copy((vm_offset_t)fp, (vm_offset_t)frame, sizeof(frame)) != sizeof(frame)) {
++			break;
++		}
++		n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
++		if (n >= (int)sizeof(line) - 20) {
++			break;
++		}
++		fp = frame[0];
++	}
++	kprintf("%s cpu %d callers at its last interrupt, fp 0x%llx%s%s\n", prefix, cpu, c->fp, n ? ":" : ": none in its kernel stack", n ? line : "");
++
++	/* the text pointers on its kernel stack */
++	uint64_t stext = vm_kernel_stext, etext = vm_kernel_etext;
++	int found = 0, lines = 0;
++
++	n = 0;
++	for (uint64_t at = lo; stack != 0 && at + 8 <= hi && lines < 4; at += 512) {
++		uint64_t words[64];
++		size_t len = MIN(512, hi - at);
++
++		if (ml_nofault_copy((vm_offset_t)at, (vm_offset_t)words, len) != len) {
++			break;
++		}
++		for (size_t k = 0; k < len / 8; k++) {
++			if (words[k] >= stext && words[k] < etext) {
++				n += snprintf(line + n, sizeof(line) - n, " 0x%llx", words[k]);
++				found++;
++				if (n >= (int)sizeof(line) - 20) {
++					kprintf("%s cpu %d kernel text on its stack, deepest first:%s\n", prefix, cpu, line);
++					n = 0;
++					lines++;
++					if (lines >= 4) {
++						break;
++					}
++				}
++			}
++		}
++	}
++	if (n > 0 || found == 0) {
++		kprintf("%s cpu %d kernel text on its stack%s: %s (stack 0x%llx..0x%llx, %d pointers)\n", prefix, cpu, found ? ", deepest first" : "", n ? line : "none", lo, hi, found);
++	}
++
++	/* its user registers */
++	arm_saved_state_t *pcb = NULL;
++	arm_saved_state_t ss;
++
++	if (ml_nofault_copy((vm_offset_t)&th->machine.upcb, (vm_offset_t)&pcb, sizeof(pcb)) == sizeof(pcb) && pcb != NULL &&
++	    ml_nofault_copy((vm_offset_t)pcb, (vm_offset_t)&ss, sizeof(ss)) == sizeof(ss) && is_saved_state64(&ss)) {
++		arm_saved_state64_t *u = saved_state64(&ss);
++
++		kprintf("%s cpu %d user state: x16 0x%llx (unix syscall %llu) x0 0x%llx x1 0x%llx x2 0x%llx x3 0x%llx sp 0x%llx lr 0x%llx pc 0x%llx\n",
++		    prefix, cpu, u->x[16], u->x[16], u->x[0], u->x[1], u->x[2], u->x[3], u->sp, u->lr, u->pc);
++	} else {
++		kprintf("%s cpu %d user state: not readable\n", prefix, cpu);
++	}
++}
++
+ /* laurel 2988: ESR exception class of an EL0 trap, by name */
+ static const char *
+ lwd_class_name(uint32_t cls)
+@@ -315,6 +405,9 @@ laurel_wdog_report_cpu(int cpu, const char *prefix)
+ 	    ml_nofault_copy((vm_offset_t)&ro->tro_task, (vm_offset_t)&task, sizeof(task)) == sizeof(task) && task != NULL) {
+ 		(void)ml_nofault_copy((vm_offset_t)&task->task_shared_region_slide, (vm_offset_t)&dyld_slide, sizeof(dyld_slide));
+ 	}
++	if (open && th != NULL) {
++		lwd_thread_path(prefix, cpu, th, c);
++	}
+ 	if (open) {
+ 		kprintf("%s cpu %d is in the kernel since an EL0 trap %llu ms ago: class 0x%02llx (%s) esr 0x%llx far 0x%llx user pc 0x%llx, %u traps in all; GICR pending 0x%08x active 0x%08x%s; dyld slide 0x%x\n",
+ 		    prefix, cpu, now > trap_t ? (now - trap_t) / ticks : 0, esr >> 26, lwd_class_name((uint32_t)(esr >> 26)), esr, c->trap_far, c->trap_pc,
