@@ -560,8 +560,8 @@ num(const char *s, const char *what)
 	return (int)v;
 }
 
-/* laurel: where a process's running threads spend their time: for docs/laurel_sprout/ios26-default-speed.md. `sample PID SECONDS HZ [all]` prints "I base path" per image, then "S thread pc lr frames...": running threads, or all (where a thread waits).
- * Each sample stops one running thread for the time of its stack walk through frame pointers. */
+/* laurel: where a process's running threads spend their time: for docs/laurel_sprout/ios26-default-speed.md. `sample PID SECONDS HZ [all|only=N[,N...]]` prints "I base path" per image, then "S thread pc lr frames...": running threads, all (where a thread waits), or only the threads with these indexes, running or not.
+ * Each sample stops one thread for the time of its stack walk through frame pointers. So `all` at 100 Hz changes what it measures; `only=` stops just the thread under study. */
 extern kern_return_t mach_vm_read_overwrite(vm_map_t, uint64_t, uint64_t, uint64_t, uint64_t *);
 extern kern_return_t task_for_pid(mach_port_t, int, mach_port_t *);
 
@@ -596,8 +596,23 @@ sample_images(task_t task)
 }
 
 static int
-cmd_sample(int pid, int seconds, int hz, bool all)
+cmd_sample(int pid, int seconds, int hz, const char *mode)
 {
+	bool all = mode && strcmp(mode, "all") == 0;
+	uint64_t only = 0;
+	if (mode && strncmp(mode, "only=", 5) == 0) {
+		all = true;
+		for (const char *at = mode + 5; *at;) {
+			char *end;
+			unsigned long index = strtoul(at, &end, 10);
+			if (end == at || index > 63) {
+				fprintf(stderr, "sample: bad thread list: %s\n", mode);
+				return 1;
+			}
+			only |= 1ULL << index;
+			at = *end == ',' ? end + 1 : end;
+		}
+	}
 	task_t task;
 	kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
 	if (kr != KERN_SUCCESS) {
@@ -615,6 +630,10 @@ cmd_sample(int pid, int seconds, int hz, bool all)
 		for (mach_msg_type_number_t t = 0; t < count; t++) {
 			struct thread_basic_info basic;
 			mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+			if (only && (t > 63 || !(only >> t & 1))) {
+				mach_port_deallocate(mach_task_self(), threads[t]);
+				continue;
+			}
 			if (thread_info(threads[t], THREAD_BASIC_INFO, (thread_info_t)&basic, &n) == KERN_SUCCESS && (all || basic.run_state == TH_STATE_RUNNING) &&
 			    thread_suspend(threads[t]) == KERN_SUCCESS) {
 				arm_thread_state64_t state;
@@ -644,7 +663,63 @@ cmd_sample(int pid, int seconds, int hz, bool all)
 	return 0;
 }
 
-/* laurel: how a process's CPU time splits over Gold (P) and Silver: `cores SECONDS PID...`: proc_pid_rusage, flavor 6: the kernel's recount per kind of core. */
+/* laurel: where the threads of a process are in the kernel: `kstack PID`: a stackshot, read only. "K thread sys_ms user_ms lr...", symbols by scripts/laurel/ios26-kstack-sym.py. A thread in a kernel loop cannot be stopped for `sample`; this reads it all the same. */
+extern void *stackshot_config_create(void);
+extern int stackshot_config_set_pid(void *, int);
+extern int stackshot_config_set_flags(void *, uint64_t);
+extern int stackshot_capture_with_config(void *);
+extern void *stackshot_config_get_stackshot_buffer(void *);
+extern uint32_t stackshot_config_get_stackshot_size(void *);
+extern int stackshot_config_dealloc(void *);
+extern int kas_info(int, void *, size_t *);
+
+static int
+cmd_kstack(int pid)
+{
+	enum { KCDATA_FORMAT = 0x10000, TRYLOCK = 0x100000, NO_IO_STATS = 0x800000, WAITINFO = 0x1000000 };
+	void *config = stackshot_config_create();
+	if (!config || stackshot_config_set_pid(config, pid) != 0 || stackshot_config_set_flags(config, KCDATA_FORMAT | TRYLOCK | NO_IO_STATS | WAITINFO) != 0) {
+		fprintf(stderr, "kstack: no config\n");
+		return 1;
+	}
+	int err = stackshot_capture_with_config(config);
+	if (err != 0) {
+		fprintf(stderr, "kstack: capture: %s\n", strerror(err));
+		return 1;
+	}
+	uint64_t slide = 0;
+	size_t slide_size = sizeof(slide);
+	if (kas_info(0, &slide, &slide_size) == 0)
+		printf("L %llx\n", slide);
+	const uint8_t *at = stackshot_config_get_stackshot_buffer(config);
+	const uint8_t *end = at + stackshot_config_get_stackshot_size(config);
+	uint64_t thread = 0, sys = 0, user = 0;
+	while (at + 16 <= end) {
+		uint32_t type = *(const uint32_t *)at, size = *(const uint32_t *)(at + 4);
+		uint64_t flags = *(const uint64_t *)(at + 8);
+		const uint8_t *data = at + 16;
+		if (type == 0xF19158EDu || data + size > end)
+			break;
+		if (type == 0x906 && size >= 64) { /* thread_snapshot: id, ..., user_time, sys_time */
+			const uint64_t *t = (const uint64_t *)data;
+			thread = t[0];
+			user = t[6];
+			sys = t[7];
+		} else if ((type & ~0xfu) == 0x20 && flags >> 32 == 0x914) { /* an array of 64 bit return addresses, kernel stack */
+			uint32_t count = (uint32_t)flags;
+			printf("K %llu %llu %llu", thread, sys / 24000, user / 24000);
+			for (uint32_t i = 0; i < count && (i + 1) * 8 <= size; i++)
+				printf(" %llx", ((const uint64_t *)data)[i]);
+			printf("\n");
+		}
+		at = data + size;
+	}
+	stackshot_config_dealloc(config);
+	fflush(stdout);
+	return 0;
+}
+
+/* laurel: how a process's CPU time splits over Gold (P) and Silver: `cores SECONDS PID...`: proc_pid_rusage, flavor 6: the kernel's recount per kind of core. The P time reads 0 on all runs here, while `cpus` shows the work on Gold: why is [U]; trust `cpus`. */
 extern int proc_pid_rusage(int pid, int flavor, void *buffer);
 struct laurel_rusage6 {
 	uint8_t uuid[16];
@@ -682,7 +757,7 @@ cmd_cores(int seconds, int argc, char **argv)
 	return 0;
 }
 
-/* laurel: how busy each CPU is, per second: `cpus SECONDS`: host_processor_info. CPU 0-3 Silver, 4-7 Gold is what the log says of this SoC; the line says what it reads. */
+/* laurel: how busy each CPU is, per second: `cpus SECONDS`: host_processor_info. CPU 0-3 Gold, 4-7 Silver: mkadt --boot gold, and the boot log gives cpu 5, 6, 7 = MPIDR 0x1, 0x2, 0x3. */
 static int
 cmd_cpus(int seconds)
 {
@@ -758,8 +833,10 @@ main(int argc, char **argv)
 		return cmd_cpus(num(argv[2], "SECONDS"));
 	if (strcmp(argv[1], "cores") == 0 && argc >= 4)
 		return cmd_cores(num(argv[2], "SECONDS"), argc - 3, argv + 3);
+	if (strcmp(argv[1], "kstack") == 0 && argc >= 3)
+		return cmd_kstack(num(argv[2], "PID"));
 	if (strcmp(argv[1], "sample") == 0 && argc >= 5)
-		return cmd_sample(num(argv[2], "PID"), num(argv[3], "SECONDS"), num(argv[4], "HZ"), argc > 5 && strcmp(argv[5], "all") == 0);
+		return cmd_sample(num(argv[2], "PID"), num(argv[3], "SECONDS"), num(argv[4], "HZ"), argc > 5 ? argv[5] : NULL);
 	if (strcmp(c, "settle") == 0 && argc >= 4)
 		return cmd_settle(num(argv[2], "QUIET_MS"), num(argv[3], "MAX_MS"), argc > 4 && strcmp(argv[4], "change") == 0);
 	if (strcmp(c, "open") == 0 && argc == 3)
