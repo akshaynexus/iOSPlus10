@@ -5370,3 +5370,13 @@ Full text: `docs/laurel_sprout/ios26-control-center.md`.
 ## 2026-11-03: first compositor run on `native`
 [V logs/native-compositor-1.txt, 06:47] `LAUREL METAL: on: stack native`, then `TopazGPU: watchdog: GPU hang: fence 2708 done 2705 ... IB1 83db042c`, SMMU FSR 80000402 FAR 0000000001068000. The selector fell back as designed: `LAUREL METAL NATIVE: off: option native failed in 2 starts`. The GPU is off until a reboot.
 [V 06:49] The fallback does not hold across a reboot: at the next boot the setting `native` was tried again, and it hung the GPU again. So the setting is back to `default` on the phone until `native` runs the compositor. Fix for the selector: a GPU hang must keep a mark that survives a reboot (native agent's task).
+## 2026-11-03: agents test the iOS 26 UI by themselves (branch t3/ios26-ui-autotest). Full text: `docs/laurel_sprout/ios26-autotest.md`
+- **`scripts/laurel/ios26-autotest.sh shot NAME` gives a PNG of the real frame; `tap`, `swipe`, `edge`, `key`, `open`, `home` need no finger; `run` is the whole test with a table.** No kernel change, no flash: install to `/usr/local/bin` over SSH.
+- [V] A binary in `/var/tmp` runs with csflags 0 and no blobs: no entitlement. In `/usr/local/bin`: 0x26000001. backboardd's log said the reason at once: `missing the 'com.apple.private.hid.client.event-dispatch' entitlement`. `oslogstream` first when a system service refuses.
+- [V] `IOSurfaceGetUseCount` reads 0 for the kernel's holds (state page +0x18); `IOSurfaceIsInUse` sees them.
+- [V] With the panel off the last surface keeps its mark and is drawn black. `com.apple.springboard.hasBlankedScreen` says off, more than 3 s after the key: a second key in that time undoes the first.
+- [V] The home key (0x40) does nothing on this model; an edge swipe goes Home.
+- [V] A hang of the whole boot: `ctl ps` says `ps busy` each time (`proc_list_mlock` held), last exec 465 s ago, `usernotificationsd` 60 s of CPU a minute, SSH no banner, `ctl ping` works. Reboot helps. [U] who holds the lock.
+- [V code] The no-flash input does not pass `laurel_input_touch`, so no CPU/GPU clock answer to touch. Do not compare its frame rates with a finger's. Patch 2983 is the real path (built, not booted).
+- At about 9 fps a fixed wait shows a frame of the animation, and a "picture changed" check passes on the wrong screen. Use `settle`, and look at the PNG.
+- Mistake to avoid: `git diff C~1` against the work tree of the series tree also takes every later `post/*` patch: use `git diff C~1 C`. A `$P` that a failed `&&` left empty makes `grep -c X $P` wait on stdin for ever: `</dev/null`.

@@ -1,0 +1,203 @@
+laurel 2983: touch and keys from the USB command server, and kern.laurel_scan_surface: the real kernel path for scripts/laurel/ios26-autotest.sh; kill switch laurelsynth=0
+
+diff --git a/bsd/dev/laurel_stats.c b/bsd/dev/laurel_stats.c
+--- a/bsd/dev/laurel_stats.c
++++ b/bsd/dev/laurel_stats.c
+@@ -148,6 +148,10 @@
+ 	kfree_data(out, LS_OUT_MAX);
+ 	return error;
+ }
++/* laurel 2983: the IOSurface id of the frame that has latched on the panel; 0: the panel is off, or no direct frame yet. Read by laurel-autotest (screenshot), written by AppleCLCD::showDirect. */
++uint32_t laurel_scan_surface;
++SYSCTL_UINT(_kern, OID_AUTO, laurel_scan_surface, CTLFLAG_RD | CTLFLAG_LOCKED, &laurel_scan_surface, 0, "IOSurface on the panel");
++
+ SYSCTL_PROC(_kern, OID_AUTO, laurel_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, laurel_stats_sysctl, "A",
+     "laurel 2911: the drivers' last console lines and live values, for XNUtils");
+ #else
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1217,7 +1217,7 @@
+ 		ud_ctl_reply(f, "error: unknown command");
+ 		return true;
+ 	}
+-	if (strncmp(cmd, "camread", 7) != 0) {         /* laurel 2771: ~830 per frame: not logged */
++	if (strncmp(cmd, "camread", 7) != 0 && strncmp(cmd, "touch ", 6) != 0) {         /* laurel 2771: ~830 per frame: not logged; laurel 2983: one per 8 ms of a swipe */
+ 		printf("LAUREL CTL: \"%s\" from 192.168.7.1:%u\n", cmd, ud_be16(udp));
+ 	}
+ 	{
+@@ -1260,6 +1260,15 @@
+ 		return true;
+ 	}
+ 	{
++		/* laurel 2983: synthetic touch and keys for iokit/Kernel/arm/hid/SweetHID.cpp: never blocks */
++		extern bool laurel_synth_ctl(const char *, char *, size_t);
++		char ireply[32];
++		if (laurel_synth_ctl(cmd, ireply, sizeof(ireply))) {
++			ud_ctl_reply(f, ireply);
++			return true;
++		}
++	}
++	{
+ 		/* laurel 2720: calendar commands (no reset: also while one is pending) */
+ 		char treply[128];
+ 		if (laurel_calendar_ctl(cmd, treply, sizeof(treply))) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -92,6 +92,7 @@
+ 	uint64_t fence_longest;
+ } lf;
+ extern "C" kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority, thread_t *new_thread);
++extern "C" uint32_t laurel_scan_surface;        /* laurel 2983 */
+ extern "C" uint64_t laurel_touch_event_at;      /* bsd/dev/sweet_touch.c: mach time of the last finger event not yet followed by a flip */
+ 
+ /* boot-arg sweetfb_nohold=1 (a test): frames on the panel are not marked in use */
+@@ -1611,6 +1612,11 @@
+ 		lf.latch += latched - flushed;
+ 		lf.missed += latched - flushed > panel;
+ 		lf.shown++;
++		for (uint32_t i = 0; i < 4; i++) {      /* laurel 2983 */
++			if (held[i] != NULL) {
++				laurel_scan_surface = held[i]->id;
++			}
++		}
+ 		if (laurel_touch_event_at != 0) {
+ 			uint64_t since = latched - laurel_touch_event_at, limit;
+ 
+@@ -3193,6 +3199,9 @@
+ 			IOLockLock(fFB->fLock);
+ 			if (changed) {
+ 				fFB->fPowerOff = off;
++				if (off) {
++					laurel_scan_surface = 0;        /* laurel 2983 */
++				}
+ 				fFB->fFadeStep = 0;
+ 				if (!off) {
+ 					fFB->fWakeShow = true;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -19,8 +19,10 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <kern/thread_call.h>
+ #include <libkern/c++/OSArray.h>
+ #include <pexpert/pexpert.h>
++static const char *laurel_synth_init(void);     /* laurel 2983 */
+ extern "C" void laurel_input_touch(void);       /* bsd/dev/laurel_thermal.c (laurel 2890) */
+ 
+ #include "IOHIDEventService.h"
+@@ -472,6 +474,14 @@
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered\n");
++	{
++		const char *why = laurel_synth_init();     /* laurel 2983 */
++		if (why != NULL) {
++			IOLog("LAUREL SYNTH: off: %s\n", why);
++		} else {
++			IOLog("LAUREL SYNTH: on: touch and keys from the USB command server, kern.laurel_scan_surface (kill switch laurelsynth=0)\n");
++		}
++	}
+ 	return true;
+ }
+ 
+@@ -586,6 +596,96 @@
+ }
+ 
+ /*
++ * laurel 2983: touch and keys from the USB command server (bsd/dev/sweet_usb.c, only from 192.168.7.1 on the USB link), for scripts/laurel/ios26-autotest.sh:
++ * "touch F D X Y" (finger, down 0|1, panel pixels), "key K D" (K as sweet_hid_key), "synth" (the answer says if it is on). The events take the same way as those of the
++ * touch IC, also the CPU and GPU clock answer to touch. The command server must not block: it only fills a ring, a thread call empties it. Kill switch laurelsynth=0.
++ */
++#define LAUREL_SYNTH_RING 64
++static struct laurel_synth_event {
++	int8_t kind, a, down;   /* kind: 0 touch, 1 key */
++	int16_t x, y;
++} laurel_synth_ring[LAUREL_SYNTH_RING];
++static volatile uint32_t laurel_synth_head, laurel_synth_tail;  /* one writer (the command server), one reader (the thread call) */
++static thread_call_t laurel_synth_call;
++static int laurel_synth_on = -1;
++extern "C" uint64_t laurel_touch_event_at;      /* bsd/dev/sweet_touch.c */
++extern "C" void sweet_hid_touch(int finger, int down, int x, int y);
++
++static void
++laurel_synth_drain(thread_call_param_t, thread_call_param_t)
++{
++	while (laurel_synth_tail != laurel_synth_head) {
++		const struct laurel_synth_event e = laurel_synth_ring[laurel_synth_tail % LAUREL_SYNTH_RING];
++		OSMemoryBarrier();
++		laurel_synth_tail = laurel_synth_tail + 1;
++		if (e.kind == 0) {
++			sweet_hid_touch(e.a, e.down, e.x, e.y);
++			laurel_touch_event_at = mach_absolute_time();
++		} else {
++			sweet_hid_key(e.a, e.down);
++		}
++	}
++}
++
++static const char *
++laurel_synth_init(void)
++{
++	if (laurel_synth_on >= 0) {
++		return NULL;
++	}
++	uint32_t want = 1;
++	if (PE_parse_boot_argn("laurelsynth", &want, sizeof(want)) && want == 0) {
++		laurel_synth_on = 0;
++		return "laurelsynth=0";
++	}
++	laurel_synth_call = thread_call_allocate_with_priority(laurel_synth_drain, NULL, THREAD_CALL_PRIORITY_HIGH);
++	if (laurel_synth_call == NULL) {
++		laurel_synth_on = 0;
++		return "no thread call";
++	}
++	laurel_synth_on = 1;
++	return NULL;
++}
++
++/* true = the word was for this file; reply holds the answer */
++extern "C" bool
++laurel_synth_ctl(const char *cmd, char *reply, size_t size)
++{
++	int a, b, x = 0, y = 0;
++	struct laurel_synth_event e = {};
++
++	if (strcmp(cmd, "synth") == 0) {
++		snprintf(reply, size, "synth %s", laurel_synth_on == 1 ? "on" : "off");
++		return true;
++	}
++	if (sscanf(cmd, "touch %d %d %d %d", &a, &b, &x, &y) == 4 && a >= 0 && a < SWEET_TOUCH_FINGERS && (b == 0 || b == 1) && x >= 0 && x < 8192 && y >= 0 && y < 8192) {
++		e.kind = 0;
++	} else if (sscanf(cmd, "key %d %d", &a, &b) == 2 && a >= 0 && a <= 3 && (b == 0 || b == 1)) {
++		e.kind = 1;
++	} else {
++		return false;
++	}
++	if (laurel_synth_on != 1) {
++		snprintf(reply, size, "error: synth off");
++		return true;
++	}
++	if (laurel_synth_head - laurel_synth_tail >= LAUREL_SYNTH_RING) {
++		snprintf(reply, size, "error: busy");
++		return true;
++	}
++	e.a = (int8_t)a;
++	e.down = (int8_t)b;
++	e.x = (int16_t)x;
++	e.y = (int16_t)y;
++	laurel_synth_ring[laurel_synth_head % LAUREL_SYNTH_RING] = e;
++	OSMemoryBarrier();
++	laurel_synth_head = laurel_synth_head + 1;
++	thread_call_enter(laurel_synth_call);
++	snprintf(reply, size, "ok");
++	return true;
++}
++
++/*
+  * laurel 2200: SweetFramebuffer.cpp tells where the panel sits on the presented display:
+  * logical = off + panel * num / den (num = den = 1: the panel 1:1 at an offset, the topaz/laurel crop).
+  */
