@@ -32,13 +32,13 @@ if [ "$REBOOT" = 1 ]; then
 fi
 # (the phone can be still coming up: the recorder's file must be there before the stack starts)
 wait_ssh 20 || { say "STOP: no SSH: phone-ensure-ios.sh, then again"; exit 1; }
-L=$(usblog); FROM=$(wc -l < "$L")
 if [ "$FLIGHT" = 1 ]; then
   sh_phone 'touch /private/var/db/negronimetal/stack/flight-on; chmod 644 /private/var/db/negronimetal/stack/flight-on; chown 501 /private/var/db/negronimetal/stack/flight-on' 2>/dev/null
 else
   sh_phone 'rm -f /private/var/db/negronimetal/stack/flight-on' 2>/dev/null
 fi
 ONLY_NATIVE=1 RESET_FAILED=1 "$REPO/scripts/laurel/ios26-metal-install-options.sh" native 2>&1 | tail -1    # a round is a deliberate test of this build
+L=$(usblog); FROM=$(wc -l < "$L")   # after the install: a fallback line of the last start must not end this round
 say "on native; waiting $WAIT s"
 for _ in $(seq 1 $((WAIT / 5))); do
   sleep 5
