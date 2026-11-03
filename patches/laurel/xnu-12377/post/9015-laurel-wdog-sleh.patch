@@ -1,0 +1,29 @@
+laurel 9015 (iOS 26): the sleh.c hunk of 2986: the base owns that file (owned.txt). Each interrupt stamps its CPU; SPI 3 is the bark. Without this hunk no CPU answers the heartbeat.
+
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 9e6f9cf..0250e4c 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3111,6 +3111,10 @@ sleh_irq(arm_saved_state_t *state)
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
++	/* laurel 2986: this CPU lives; what it interrupted (osfmk/arm64/laurel_wdog.c) */
++	extern void laurel_wdog_irq(unsigned int cpu, uint64_t pc, uint64_t lr, bool el0);
++	extern void laurel_wdog_bark(void);
++	laurel_wdog_irq(cdp->cpu_number, get_saved_state_pc(state), get_saved_state_lr(state), PSR64_IS_USER(get_saved_state_cpsr(state)));
+ 	if (intid == sweet_vtimer_intid) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+@@ -3124,6 +3128,11 @@ sleh_irq(arm_saved_state_t *state)
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
++	} else if (intid == 35) {       /* laurel 2986: the bark of the APSS watchdog, SPI 3 */
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		__builtin_arm_isb(ISB_SY);
++		laurel_wdog_bark();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 		if (cdp->interrupt_handler) {
