@@ -36,3 +36,38 @@ metal2vulkan (Mi A3, iOS 26): a render target over host pages renders on them: a
  /// A device's check verdicts (`DeviceShared::in_place`): one per class, and whether its check
  /// started and settled.
  pub(crate) struct InPlaceChecks {
+--- a/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
++++ b/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
+@@ -307,7 +307,7 @@
+                     features,
+                 }))
+             }
+-            None => self.host_linear_image(plan)?,
++            None => self.host_linear_image(plan, layout)?,
+         };
+         // Whether the driver made its linear image and laid it out otherwise.
+         let (linear, elsewhere) = match made {
+@@ -346,17 +346,23 @@
+     fn host_linear_image(
+         &self,
+         plan: &ImagePlan,
++        layout: &BufferLayout,
+     ) -> Result<Result<LinearMade, LinearRefusal>, Error> {
+         let raw_device = self.shared().vk();
+         let view_formats = plan.ash_view_formats();
+         let mut list = vk::ImageFormatListCreateInfo::default();
+         let mut external = vk::ExternalMemoryImageCreateInfo::default()
+             .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
++        // laurel (Mi A3, iOS 26): the rows the texels lie on, for Turnip 0108: an IOSurface of 720 pixels has rows of 2880 or 3072 bytes, and only the driver can
++        // make its image so. Outside this port's Turnip the struct is not defined with this tiling: this bridge runs only on it.
++        let planes = [vk::SubresourceLayout::default().row_pitch(layout.row_pitch)];
++        let mut rows = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default().plane_layouts(&planes);
+         let info = plan
+             .create_info(self.shared().sharing(), &view_formats, &mut list)
+             .tiling(vk::ImageTiling::LINEAR)
+             .initial_layout(vk::ImageLayout::UNDEFINED)
+             .push_next(&mut external);
++        let info = if plan.layers == 1 { info.push_next(&mut rows) } else { info };
+         let limits = match self.host_image_limits(&info, &view_formats)? {
+             Ok(limits) => limits,
+             Err(refusal) => return Ok(Err(refusal)),
