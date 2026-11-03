@@ -339,6 +339,10 @@
 2976-laurel-gpu-kept-need.patch                                applied
 2977-laurel-gpu-push-rule.patch                                applied
 2978-laurel-gpu-table-runs.patch                               applied
+2979-laurel-dsi-high-buffer.patch                              applied
+2980-laurel-gpu-submit-1024.patch                              applied
+2981-laurel-flip-not-before-drawn.patch                        applied
+2982-laurel-flip-fence-at-swap.patch                           applied
 9000-series-12377-api.patch                                    post
 9001-laurel-release-only-initialized-pages.patch               post
 9002-laurel-no-panic-region.patch                              post
@@ -349,4 +353,5 @@
 9007-laurel-stackshot-late-cpu.patch                           post
 9008-laurel-vsync-refresh-period.patch                         post
 9009-laurel-backlight-retry.patch                              post
-== series: 224 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
+9010-laurel-blastdoor-sandbox-check.patch                      post
+== series: 228 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
