@@ -1184,3 +1184,8 @@ Done: 2981 (a surface waits for the GPU, up to 900 ms on the presenter; a late f
 Results [V log]: the steady 10.0 frames/s windows have no touch, one command buffer a submission, the same in boot 16: not a limit. In use the compositor's GPU work is 70 to 430 ms a submission, and that is the frame rate. Details: `docs/laurel_sprout/gpu.md` "Previous state on each update".
 Next: kernel flash, then the owner's test in that section. GPU cost of a glass frame stays the limit: tiles (`ios26-native-metal.md`), DDR at 1355 MHz.
 
+## 2026-11-03: Mi A3 iOS 26: Control Center and widgets (branch `t3/laurel-control-center-modules`, not merged)
+
+Done, read on the phone with no write: one cause for no modules and no widget records: MobileGestalt `arm64e` = false. `post/9011`. bluetoothd loop on status 701: `post/9012`. Host test PASS; kernel build result: `docs/laurel_sprout/ios26-control-center.md`. Not booted.
+
+Next: boot image with both patches, then `dual-boot.sh install` or the test write of that doc (owner's yes), then its reads R1, R2.

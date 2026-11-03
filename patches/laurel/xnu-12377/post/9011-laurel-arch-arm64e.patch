@@ -1,0 +1,63 @@
+laurel 9011 (iOS 26): user space is told arm64e. Control Center gets its modules, and the app extensions (widgets, controls, posters) are registered.
+
+--- a/osfmk/kern/host.c
++++ b/osfmk/kern/host.c
+@@ -200,6 +200,40 @@
+ 
+ extern int sched_allow_NO_SMT_threads;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * laurel 9011 (iOS 26): the answer to "which CPU is this", for user space only. The kernel's own grading of a binary
++ * (cpu_subtype(), ml_grade_binary) does not change. 23F84 is an arm64e userland: the lowering runs it here with no PAC.
++ * MobileGestalt: CPUArchitecture = NXGetLocalArchInfo()->name = host_info(HOST_PREFERRED_USER_ARCH), and capability
++ * arm64e = (CPUArchitecture == "arm64e") [V libMobileGestalt 0x1b1c3f504 -> 0x1b1c2b670, 0x1b1c37df0; libmacho].
++ * All 54 Control Center modules and all 266 app extensions in /Applications/x.app/PlugIns have arm64e in
++ * UIRequiredDeviceCapabilities. With the true answer "arm64" CCSModuleRepository loads 0 modules and installd code in lsd
++ * drops the extensions: "MismatchedCapabilities = { arm64e = 0 }" [V phone log, 2026-11-03]. The donor is an iPhone12,1,
++ * which answers arm64e. Kill switch laurelarch=0: the old answer, as before.
++ */
++static cpu_subtype_t
++laurel_user_subtype(cpu_type_t type, cpu_subtype_t real)
++{
++	static int on = -1;
++
++	if (on < 0) {
++		uint32_t v = 1;
++
++		(void)PE_parse_boot_argn("laurelarch", &v, sizeof(v));
++		on = v != 0;
++		printf("LAUREL ARCH: %s\n", on ? "on: user space is told arm64e: the capability of Control Center modules and app extensions; laurelarch=0" :
++		    "off: laurelarch=0: Control Center has no modules, app extensions are not registered");
++	}
++	if (on && type == CPU_TYPE_ARM64 && (real == CPU_SUBTYPE_ARM64_ALL || real == CPU_SUBTYPE_ARM64_V8)) {
++		return CPU_SUBTYPE_ARM64E;
++	}
++	return real;
++}
++#define LAUREL_USER_SUBTYPE(id) laurel_user_subtype(slot_type(id), slot_subtype(id))
++#else
++#define LAUREL_USER_SUBTYPE(id) slot_subtype(id)
++#endif
++
+ kern_return_t
+ host_info(host_t host, host_flavor_t flavor, host_info_t info, mach_msg_type_number_t * count)
+ {
+@@ -223,7 +257,7 @@
+ 
+ 		basic_info->memory_size = machine_info.memory_size;
+ 		basic_info->cpu_type = slot_type(master_id);
+-		basic_info->cpu_subtype = slot_subtype(master_id);
++		basic_info->cpu_subtype = LAUREL_USER_SUBTYPE(master_id);
+ 		basic_info->max_cpus = machine_info.max_cpus;
+ #if CONFIG_SCHED_SMT
+ 		if (sched_allow_NO_SMT_threads && current_task()->t_flags & TF_NO_SMT) {
+@@ -411,7 +445,7 @@
+ #else
+ 		int master_id               = master_processor->cpu_id;
+ 		user_arch_info->cpu_type    = slot_type(master_id);
+-		user_arch_info->cpu_subtype = slot_subtype(master_id);
++		user_arch_info->cpu_subtype = LAUREL_USER_SUBTYPE(master_id);
+ #endif
+ 
+ 

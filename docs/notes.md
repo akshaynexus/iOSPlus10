@@ -5335,3 +5335,13 @@ Full text: `docs/laurel_sprout/gpu.md` "Previous state on each update".
 - `LAUREL GPU WC` is printed once per boot: its absence in boot 18 means no scattered buffer, so 2977's WC path did not run there.
 - [U] the owner of the 10 Hz drawing; SpringBoard's commit rate during a touch; the flash with `sync` on (pool was on in that run).
 
+## 2026-11-03: Mi A3 iOS 26: Control Center empty, widgets `Waiting…`: MobileGestalt `arm64e` = false (branch t3/laurel-control-center-modules; read on the phone, no write)
+
+Full text: `docs/laurel_sprout/ios26-control-center.md`.
+
+- `UIRequiredDeviceCapabilities` of all 54 Control Center modules and all 266 `/Applications/*/PlugIns/*.appex` has `arm64e`. MobileGestalt: `arm64e` = `CPUArchitecture == "arm64e"`; `CPUArchitecture` = `NXGetLocalArchInfo()` = `host_info(HOST_PREFERRED_USER_ARCH)`. Our kernel gave arm64. lsd log: `MismatchedCapabilities = { arm64e = 0 }`, 639 lines. `post/9011` tells user space arm64e; the kernel's own grading stays.
+- The answer stays in `/var`: the MobileGestalt plist, the csstore, and an empty `ControlsIconState.plist`. A new kernel alone is not enough: erase them or install a new root.
+- The earlier catalog idea (`enforce_xpc_cache_code_signing`) was not the limit: 0 lines of missing cache entry. chronod's Metal denial does not matter for this.
+- bluetoothd: 0x2041 (extended scan parameters) gets status 1 -> OI 701 -> `Bluetooth error - restarting`, each 10 s. `post/9012`: legacy commands to the chip. tccd's burst follows these restarts.
+- Tool: `scripts/laurel/ios26-unified-log.py` reads a copy of `/var/db/diagnostics` + `uuidtext`. Private text is in the file too (decompress, `strings`). Use it first: it had the exact reason, with bundle id.
+- Next: chronod's HEIC write fails (no HEVC encoder): `CMPhotoCompressionSessionAddImage` UnsupportedOperation. A control may lose its icon [I].

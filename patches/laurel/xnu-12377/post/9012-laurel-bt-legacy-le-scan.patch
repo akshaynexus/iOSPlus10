@@ -1,0 +1,235 @@
+laurel 9012 (iOS 26): LE scan: extended commands go to the chip as legacy ones. bluetoothd no longer restarts each 10 s, and tccd no longer gets its requests each 10 s.
+
+--- a/bsd/dev/laurel_bt.h
++++ b/bsd/dev/laurel_bt.h
+@@ -116,10 +116,16 @@
+ #define LBT_LOCAL_EVENT_MAX     16u
+ struct lbt_shim {
+ 	bool mask_known, err_rd, err_wr;
++	bool scan_ext;                  /* laurel 9012: the host scans with the extended commands */
++	uint8_t params_out, enable_out; /* laurel 9012: sent as legacy, the answer goes back under the extended opcode */
+ };
+ unsigned lbt_local_answer(struct lbt_shim *s, const uint8_t *cmd, size_t n, uint8_t ev[LBT_LOCAL_EVENT_MAX]);
+ unsigned lbt_fix_event(struct lbt_shim *s, uint8_t *e, size_t n);     /* bit 0 mask seen, bit 1 status rewritten */
+ int lbt_fix_command(uint8_t *c, size_t n);                             /* 1 if changed */
++int lbt_scan_command(struct lbt_shim *s, uint8_t *c, uint32_t *n);      /* laurel 9012: 1 if changed */
++#define LBT_SCAN_EVENT_MAX      300u
++/* laurel 9012: report i of a legacy LE Advertising Report as one extended report; bytes in out, 0 = no more or not one */
++unsigned lbt_scan_report(const struct lbt_shim *s, const uint8_t *e, size_t n, unsigned i, uint8_t out[LBT_SCAN_EVENT_MAX]);
+ 
+ /* ---- FAT + firmware (laurel_bt_fat.c, laurel_bt_fw.c) ------------------------------------------ */
+ 
+--- a/bsd/dev/laurel_bt_h4.c
++++ b/bsd/dev/laurel_bt_h4.c
+@@ -7,6 +7,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <pexpert/pexpert.h>
+ #include "laurel_bt.h"
+ 
+ extern void laurel_awdl_hci_note(const uint8_t *cmd, size_t n);
+@@ -227,6 +228,19 @@
+ 		e[7 + 18] |= 0x0c;
+ 		r |= 1;
+ 	}
++	if (n >= 7 && e[0] == 4 && e[1] == 0x0e && e[2] + 3u == n) {
++		uint16_t op = lbt_le16(e + 4);
++
++		if (op == 0x200b && s->params_out) {
++			s->params_out--;
++			e[4] = 0x41;
++			r |= 4;
++		} else if (op == 0x200c && s->enable_out) {
++			s->enable_out--;
++			e[4] = 0x42;
++			r |= 4;
++		}
++	}
+ 	if (n >= 7 && e[0] == 4 && e[1] == 0x0e && e[2] + 3u == n && e[6] != 0) {
+ 		uint16_t op = lbt_le16(e + 4);
+ 
+@@ -241,6 +255,153 @@
+ 	return r;
+ }
+ 
++/*
++ * laurel 9012 (iOS 26): LE scan on a chip that refuses the extended commands. bluetoothd of 23F84 starts its scan with
++ * LE Set Extended Scan Parameters 0x2041 (table id 0xd7) when its flag at 0x100b5660e is set. The answer is status 1,
++ * OI status 701: "Could not start LE scan", then "Bluetooth error - restarting { reason=701 }": a new bluetoothd each
++ * 10 s, and each client asks tccd again [V phone log 2026-11-03: 125 scan failures, 125 restarts, 119 processes]. This
++ * file answers only OGF 0x3f, so the status comes from the chip [I: it is the only one left]. 20H392 scans with 0x200b.
++ * Here: 0x2041 -> 0x200b, 0x2042 -> 0x200c, the answer goes back under the extended opcode, LE event mask bit 1
++ * (LE Advertising Report) stays on, and each legacy report goes up as one extended report (subevent 0x0d).
++ * Lost: coded PHY scanning, which this path never had. Kill switch laurelbtscan=0.
++ */
++static bool
++lbt_scan_on(void)
++{
++	static int on = -1;
++
++	if (on < 0) {
++		uint32_t v = 1;
++
++		(void)PE_parse_boot_argn("laurelbtscan", &v, sizeof(v));
++		on = v != 0;
++		printf("LAUREL BT SCAN: %s\n", on ? "on: extended LE scan commands go to the chip as legacy ones; laurelbtscan=0" :
++		    "off: laurelbtscan=0: bluetoothd restarts each 10 s on its first LE scan");
++	}
++	return on == 1;
++}
++
++int
++lbt_scan_command(struct lbt_shim *s, uint8_t *c, uint32_t *n)
++{
++	uint16_t op;
++
++	if (*n < 4 || c[0] != 1 || (uint32_t)c[3] + 4 != *n) {
++		return 0;
++	}
++	op = lbt_le16(c + 1);
++	if (op != 0x2041 && op != 0x2042 && op != 0x2001) {
++		return 0;
++	}
++	if (!lbt_scan_on()) {
++		return 0;
++	}
++	if (op == 0x2001) {
++		if (c[3] != 8 || (c[4] & 0x02) != 0) {
++			return 0;
++		}
++		c[4] |= 0x02;
++		return 1;
++	}
++	if (op == 0x2041) {
++		/* own, filter, phys, then for each PHY: type, interval, window. The first PHY's values go on. */
++		uint8_t own, filter, type, i0, i1, w0, w1;
++
++		if (c[3] < 8 || c[6] == 0) {
++			return 0;
++		}
++		own = c[4];
++		filter = c[5];
++		type = c[7];
++		i0 = c[8];
++		i1 = c[9];
++		w0 = c[10];
++		w1 = c[11];
++		c[1] = 0x0b;
++		c[2] = 0x20;
++		c[3] = 7;
++		c[4] = type;
++		c[5] = i0;
++		c[6] = i1;
++		c[7] = w0;
++		c[8] = w1;
++		c[9] = own;
++		c[10] = filter;
++		*n = 11;
++		s->params_out++;
++	} else {
++		/* enable, filter duplicates, duration, period. Filter 2 (reset each period) has no legacy value: 1. */
++		if (c[3] < 6) {
++			return 0;
++		}
++		c[1] = 0x0c;
++		c[2] = 0x20;
++		c[3] = 2;
++		c[5] = c[5] != 0;
++		*n = 6;
++		s->enable_out++;
++	}
++	s->scan_ext = true;
++	return 1;
++}
++
++unsigned
++lbt_scan_report(const struct lbt_shim *s, const uint8_t *e, size_t n, unsigned i, uint8_t out[LBT_SCAN_EVENT_MAX])
++{
++	static const uint8_t props[5] = { 0x13, 0x15, 0x12, 0x10, 0x1b };       /* Core 7.7.65.13, legacy PDU types */
++	size_t p = 5;
++	unsigned count, q;
++
++	if (!s->scan_ext || n < 5 || e[0] != 4 || e[1] != 0x3e || e[2] + 3u != n || e[3] != 0x02) {
++		return 0;
++	}
++	count = e[4];
++	if (i >= count) {
++		return 0;
++	}
++	for (unsigned k = 0;; k++) {
++		size_t len;
++
++		if (p + 9 > n) {
++			return 0;
++		}
++		len = e[p + 8];
++		if (p + 9 + len + 1 > n) {
++			return 0;
++		}
++		if (k == i) {
++			if (e[p] > 4 || len > LBT_SCAN_EVENT_MAX - 29) {
++				return 0;
++			}
++			break;
++		}
++		p += 9 + len + 1;
++	}
++	bzero(out, LBT_SCAN_EVENT_MAX);
++	q = 0;
++	out[q++] = 4;
++	out[q++] = 0x3e;
++	out[q++] = (uint8_t)(2 + 24 + e[p + 8]);
++	out[q++] = 0x0d;
++	out[q++] = 1;
++	out[q++] = props[e[p]];                 /* event type, low byte */
++	out[q++] = 0;
++	out[q++] = e[p + 1];                    /* address type */
++	memcpy(out + q, e + p + 2, 6);
++	q += 6;
++	out[q++] = 1;                           /* primary PHY: LE 1M */
++	out[q++] = 0;                           /* no secondary PHY */
++	out[q++] = 0xff;                        /* no SID */
++	out[q++] = 0x7f;                        /* TX power: not known */
++	out[q++] = e[p + 9 + e[p + 8]];         /* RSSI */
++	q += 2;                                 /* no periodic interval */
++	q += 7;                                 /* no direct address */
++	out[q++] = e[p + 8];
++	memcpy(out + q, e + p + 9, e[p + 8]);
++	q += e[p + 8];
++	return q;
++}
++
+ /* Write LE Host Support: Simultaneous_LE_Host must be 0x00 since Core 4.1 (negroni 0337) */
+ int
+ lbt_fix_command(uint8_t *c, size_t n)
+--- a/bsd/dev/laurel_bt_ios.c
++++ b/bsd/dev/laurel_bt_ios.c
+@@ -136,7 +136,19 @@
+ 	switch (lbt_h4_push(&t.rx, c)) {
+ 	case 1:
+ 		if (t.rx.bytes[0] == 4) {
++			uint8_t ext[LBT_SCAN_EVENT_MAX];
++			unsigned len;
++
+ 			(void)lbt_fix_event(&t.shim, t.rx.bytes, t.rx.used);
++			len = lbt_scan_report(&t.shim, t.rx.bytes, t.rx.used, 0, ext);
++			if (len != 0) {
++				for (unsigned i = 0; len != 0; i++) {
++					t.n_rx++;
++					deliver(ext, len);
++					len = lbt_scan_report(&t.shim, t.rx.bytes, t.rx.used, i + 1, ext);
++				}
++				break;
++			}
+ 		}
+ 		t.n_rx++;
+ 		deliver(t.rx.bytes, t.rx.used);
+@@ -205,6 +217,7 @@
+ 
+ 	if (p[0] == 1) {
+ 		(void)lbt_fix_command(p, n);
++		(void)lbt_scan_command(&t.shim, p, &n);
+ 		if ((len = lbt_local_answer(&t.shim, p, n, ev)) != 0) {
+ 			t.n_local++;
+ 			t.last_act = lbt_us();
