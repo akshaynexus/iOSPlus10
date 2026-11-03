@@ -1,8 +1,8 @@
 laurel 2992: LAUREL GPU SMMU: the GPU's SMMU takes no broadcast TLB maintenance (sCR0.PTM | VMIDPNE), as the stock driver; both kernels. docs/laurel_sprout/watchdog.md section 11.
 
 [V 2026-11-03, logs/usblog-20261103-071332.txt] Boot line: IDR0 0x4c017e04 (BTM, bit 13: a DVM slave), sCR0 0x00240406 (PTM, bit 12, clear). LineageOS
-arm-smmu.c arm_smmu_device_reset: "Disable TLB broadcasting": reg |= sCR0_VMIDPNE | sCR0_PTM; the kgsl_smmu node has no qcom,skip-init, so stock
-runs it. With PTM clear every `tlbi ...is` of a CPU goes to the GPU's SMMU and the CPU's `dsb ish` waits for its answer. Four catches of 2986-2991
+arm-smmu.c arm_smmu_device_reset: "Disable TLB broadcasting": reg |= sCR0_VMIDPNE | sCR0_PTM; qcom,skip-init on the node skips only the stream-map and
+context-bank reset, the sCR0 write runs at every probe. With PTM clear every `tlbi ...is` of a CPU goes to the GPU's SMMU and the CPU's `dsb ish` waits for its answer. Four catches of 2986-2991
 on one silver core: each in a VM system call (madvise 18:47, mmap through vm_map_enter 18:51) where the pmap invalidates TLB entries, the core
 answering no interrupt for 19 s: a dsb that never ends fits all of it [I: the frames of 2989 are the proof]. The driver's own TLB upkeep is
 tlb_flush() (TLBIALL + TLBSYNC) after each table change: nothing of ours needs the broadcast. Self-check: the bits must read back (single security
