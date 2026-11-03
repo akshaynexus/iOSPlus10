@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /* See nmn_pm4.h. Register values and their order: Mesa Turnip tu_cmd_buffer.cc, tu_pipeline.cc, tu_shader.cc, tu_clear_blit.cc (Copyright Google, Valve, Red Hat, Igalia and others; MIT). */
+#include <inttypes.h>
 #include "nmn_pm4.h"
 #include <assert.h>
 #include <math.h>
@@ -57,8 +58,9 @@ struct nmn_gpu {
 	struct fd_dev_id id;
 	struct fd_dev_info info;
 	struct nw_slice border;         /* builtin border colors */
-	struct nw_slice pvt;            /* one private memory area for all programs, grown once */
-	uint32_t pvt_fiber, pvt_sp;
+	/* tu_device's fiber_pvtmem_bo and wave_pvtmem_bo: programs share an area only with one layout: another layout in flight overwrites their spills. [0] per fiber, [1] per wave */
+	struct nw_slice pvt[2];
+	uint32_t pvt_fiber[2], pvt_sp[2];
 	uint32_t ccu_color_bypass, ccu_depth_bypass;
 };
 
@@ -180,7 +182,8 @@ void nmn_gpu_free(struct nmn_gpu *g)
 	if (g == NULL)
 		return;
 	nw_slice_free(g->dev, &g->border);
-	nw_slice_free(g->dev, &g->pvt);
+	nw_slice_free(g->dev, &g->pvt[0]);
+	nw_slice_free(g->dev, &g->pvt[1]);
 	free(g);
 }
 
@@ -802,26 +805,27 @@ static void emit_xs_config(struct nw_cs *cs, gl_shader_stage stage, const struct
 	emit_reg(cs, r->hlsq_ctrl, A6XX_HLSQ_VS_CNTL_CONSTLEN(xs->constlen) | A6XX_HLSQ_VS_CNTL_ENABLED);
 }
 
-/* tu_setup_pvtmem: one area, grown when a program needs more. Programs baked before keep their own area in the slice they got (the old slice stays). */
-static bool setup_pvtmem(struct nmn_gpu *g, uint32_t bytes, uint32_t *fiber, uint32_t *sp, uint64_t *iova)
+/* tu_setup_pvtmem: one area for each layout, grown when a program needs more. Programs baked before keep their own area in the slice they got (the old slice stays). */
+static bool setup_pvtmem(struct nmn_gpu *g, uint32_t bytes, bool per_wave, uint32_t *fiber, uint32_t *sp, uint64_t *iova)
 {
 	*fiber = *sp = 0;
 	*iova = 0;
 	if (bytes == 0)
 		return true;
-	if (g->pvt_fiber < bytes) {
+	const unsigned l = per_wave ? 1 : 0;
+	if (g->pvt_fiber[l] < bytes) {
 		uint32_t f = util_next_power_of_two(ALIGN(bytes, 512));
 		uint32_t s = ALIGN(f * g->info.fibers_per_sp, 1 << 12);
 		struct nw_slice n;
 		if (!nw_slice_new(g->dev, (uint64_t)g->info.num_sp_cores * s, 4096, &n))
 			return false;
-		g->pvt = n;     /* the old slice stays allocated: baked programs still name its address */
-		g->pvt_fiber = f;
-		g->pvt_sp = s;
+		g->pvt[l] = n;  /* the old slice stays allocated: baked programs still name its address */
+		g->pvt_fiber[l] = f;
+		g->pvt_sp[l] = s;
 	}
-	*fiber = g->pvt_fiber;
-	*sp = g->pvt_sp;
-	*iova = g->pvt.iova;
+	*fiber = g->pvt_fiber[l];
+	*sp = g->pvt_sp[l];
+	*iova = g->pvt[l].iova;
 	return true;
 }
 
@@ -844,7 +848,7 @@ static void emit_xs(struct nw_cs *cs, struct nmn_gpu *g, gl_shader_stage stage, 
 	emit_reg(cs, r->instrlen, xs->instrlen);
 	uint32_t fiber, sp;
 	uint64_t pvt;
-	setup_pvtmem(g, xs->pvtmem_size, &fiber, &sp, &pvt);
+	setup_pvtmem(g, xs->pvtmem_size, xs->pvtmem_per_wave, &fiber, &sp, &pvt);
 	pkt4(cs, r->first_exec, 7);
 	nw_cs_emit(cs, 0);
 	nw_cs_emit_qw(cs, binary_iova);
@@ -1380,6 +1384,24 @@ void nmn_baked_info(const struct nmn_baked *b, uint32_t *dwords, bool *reads)
 {
 	*dwords = b->dwords;
 	*reads = b->reads_framebuffer;
+}
+
+/* For the flight recorder: what the hardware gets of a program. Returns whether a stage uses private memory. */
+bool nmn_baked_describe(const struct nmn_baked *b, char *out, size_t size)
+{
+	size_t n = 0;
+	bool pvt = false;
+	const struct { const char *name; const struct ir3_shader_variant *v; } stages[] = {{"vs", b->vs}, {"fs", b->fs}, {"cs", b->cs}};
+	for (size_t i = 0; i < ARRAY_SIZE(stages); i++) {
+		const struct ir3_shader_variant *v = stages[i].v;
+		if (v == NULL || n >= size)
+			continue;
+		pvt |= v->pvtmem_size != 0;
+		n += snprintf(out + n, size - n, "%s %u instrs%s, %d full %d half, %u const, private %u%s, stack %u, %s, %s; ", stages[i].name, v->info.instrs_count, v->key.safe_constlen ? " safe" : "", v->info.max_reg + 1, v->info.max_half_reg + 1, v->constlen, v->pvtmem_size, v->pvtmem_per_wave ? " per wave" : "", v->branchstack, v->info.double_threadsize ? "thread128" : "thread64", v->mergedregs ? "merged" : "split");
+	}
+	if (n < size)
+		snprintf(out + n, size - n, "code at %#" PRIx64, b->code.iova);
+	return pvt;
 }
 
 /* The program's stream is called, so a pipeline costs 4 dwords per bind and no copy. */

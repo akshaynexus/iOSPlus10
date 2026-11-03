@@ -358,6 +358,7 @@ unsafe extern "C" {
     pub fn nmn_bake_render(g: *mut NmnGpu, vs: *const c_void, fs: *const c_void, f: *const NmnFixed, why: *mut c_char, why_size: usize) -> *mut NmnBaked;
     pub fn nmn_bake_compute(g: *mut NmnGpu, cs: *const c_void, why: *mut c_char, why_size: usize) -> *mut NmnBaked;
     pub fn nmn_baked_free(g: *mut NmnGpu, b: *mut NmnBaked);
+    pub fn nmn_baked_describe(b: *const NmnBaked, out: *mut c_char, size: usize) -> bool;
     pub fn nmn_cmd_program(cs: *mut NwCs, b: *const NmnBaked);
     pub fn nmn_cmd_raster(cs: *mut NwCs, r: *const NmnRaster);
     pub fn nmn_cmd_descriptor_sets(cs: *mut NwCs, set: *const u64, count: u32, graphics: bool);

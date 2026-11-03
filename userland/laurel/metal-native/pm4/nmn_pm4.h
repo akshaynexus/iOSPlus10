@@ -94,6 +94,7 @@ struct nmn_baked *nmn_bake_render(struct nmn_gpu *, const void *vs_variant, cons
 struct nmn_baked *nmn_bake_compute(struct nmn_gpu *, const void *cs_variant, char *why, size_t why_size);
 void nmn_baked_free(struct nmn_gpu *, struct nmn_baked *);
 void nmn_baked_info(const struct nmn_baked *, uint32_t *state_dwords, bool *reads_framebuffer);
+bool nmn_baked_describe(const struct nmn_baked *, char *out, size_t size);
 void nmn_cmd_program(struct nw_cs *, const struct nmn_baked *);
 
 struct nmn_raster {

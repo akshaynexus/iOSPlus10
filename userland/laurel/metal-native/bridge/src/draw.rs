@@ -1331,6 +1331,29 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
         for (i, s) in set_memory.iter().enumerate() {
             crate::flight::line(&crate::flight::set_words(i, s.0, s.1, entry.set_slots.get(i).copied().unwrap_or(0)));
         }
+        let mut facts = [0 as std::ffi::c_char; 400];
+        let private = unsafe { nmn_baked_describe(entry.baked.b as *const NmnBaked, facts.as_mut_ptr(), facts.len()) };
+        crate::flight::line(&format!("  program: {}", unsafe { std::ffi::CStr::from_ptr(facts.as_ptr()) }.to_string_lossy()));
+        if private {
+            // what such a large program reads: its uniform buffers, for a comparison of a draw that stops with one that ended
+            for (i, m) in set_memory.iter().enumerate() {
+                let slots = entry.set_slots.get(i).copied().unwrap_or(0) as usize;
+                for slot in 0..slots.min(64) {
+                    let w = unsafe { std::slice::from_raw_parts(m.1.add(slot * 16), 16) };
+                    // a UBO descriptor: address, size in vec4 from bit 17; the rest 0
+                    if w[1] >> 17 == 0 || w[1] & 0x1ffff != 0 || w[2..].iter().any(|x| *x != 0) {
+                        continue;
+                    }
+                    let (iova, bytes) = (w[0] as u64, ((w[1] >> 17) as u64 * 16).min(512));
+                    let bo = unsafe { nw_bo_of_address(cb.gpu.dev, iova, bytes) };
+                    if bo.is_null() || unsafe { (*bo).map.is_null() } {
+                        continue;
+                    }
+                    let data = unsafe { std::slice::from_raw_parts(((*bo).map as *const u8).add((iova - (*bo).iova) as usize), bytes as usize) };
+                    crate::flight::line(&format!("  ubo {slot} {iova:#x}: {}", crate::flight::hex(data)));
+                }
+            }
+        }
         for (k, b) in [("v", 1usize), ("f", 2)] {
             for (slot, t) in &e.stages[b].textures {
                 crate::flight::line(&format!("  {k} texture {slot}: format {} {}x{} at {:#x}{}", t.desc.format, t.desc.width, t.desc.height, unsafe { nmn_image_iova(t.image as *const NmnImage) }, if t.memoryless { " memoryless" } else { "" }));
