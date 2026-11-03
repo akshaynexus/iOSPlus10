@@ -123,6 +123,13 @@ __attribute__((constructor)) static void nmtl_error_mode(void)
 	setenv("CA_USE_CGTEXTUREDATA", "0", 0);
 	setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
 	setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+#if defined(NMTL_IOS26) && !defined(NMTL_NATIVE) && !defined(NMTL_HOT)
+	/*
+	 * laurel: no memoryless RGBA16F beside each screen pass on Turnip: 108 tiles -> 36, a pass 12 ms -> 3 ms, the same picture (scripts/laurel/ios26-png-compare.py:
+	 * Control Center 0.00 % off) [V phone, docs/laurel_sprout/ios26-default-speed.md]. Apple's own switch, read at the Metal context. CA_ENABLE_MEMORYLESS=1 in NMTL_DIR/env undoes it.
+	 */
+	setenv("CA_ENABLE_MEMORYLESS", "0", 0);
+#endif
 	/*
 	 * RB_COLOR_MODE=fixed (2026-10-27, blank/white widgets): RenderBox (SwiftUI's renderer: chronod's widget snapshots,
 	 * SpringBoard, SwiftUI apps) picks its RBLayer drawable format in RB::ColorMode::pixel_format from the colour mode and

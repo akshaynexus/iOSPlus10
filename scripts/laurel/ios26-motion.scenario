@@ -19,3 +19,11 @@ swipe 620 800 100 800 300
 settle 500 4000
 swipe 100 800 620 800 300
 settle 500 4000
+edge top 700 300 650
+settle 2500 15000
+edge bottom 700 300
+settle 1500 10000
+edge top 700 300 650
+settle 1500 15000
+edge bottom 700 300
+settle 1500 10000
