@@ -109,3 +109,26 @@ Run d1 (other steps, no sampler) had 471 gaps <20 ms and the 59.8 fps stretch, s
 **Next lead.** In s10a the gaps over 52 ms outnumber the 2-tick gaps, 247 to 65. Windows run at 11-15 frames/s for 4-6 s, and a short swipe reaches 64.7 frames/s for 247 ms. Which thread holds those long gaps: [U], s11 reads it.
 
 **Hang [V, cause U].** The phone stopped at 13:46:59, 67 s after a reboot that this bench did for a GPU that was off. The GPU hang before it (13:42:54) came with stack native [I: the last stack line]. See `watchdog.md`.
+
+
+## 7. Where a slow frame waits, read in the samples (branch `t3/ios26-frame-gap-root-cause`, 2026-11-03)
+
+Tool: `scripts/laurel/ios26-sample-bins.py SAMPLES [--thread N] [--bin MS] [--abs] [--from MS --to MS] [--callers] [--stacks N] [--dis DIR]`. Run s11 (`bench-s11.samples`, backboardd thread 6 only, 50 Hz; `bench-s11.sb.samples`, SpringBoard main thread), Home swipes, 13.1 fps.
+
+**The two threads do not alternate per frame [V].** On one clock (`--abs`, 100 ms bins): SpringBoard's main thread runs at 60-100 % for about 600 ms while the finger moves (UIKit, layout, commit), then idles; backboardd's render thread then runs 60-100 % for about 2 s while CoreAnimation animates the page by itself. The slow frames of the animation are the render thread's.
+
+**In the animation the render thread is 49 % busy [V, 205 samples of 4 s].** Where the other half is:
+
+| Wait | Share of the thread | What it is |
+|---|---|---|
+| `mach_msg2_trap` under `IOMFBServer::thread_body` | 33 % | the run loop waits for the next vsync message |
+| `__psynch_cvwait` under `nmb_command_buffer_wait_scheduled` | 8 % | CA's `waitUntilScheduled` in `MetalContext::flush` -> `finish_update`: a condvar until metal2vulkan's scheduler thread has submitted |
+| `mach_msg2_trap` under `io_connect_method` from Turnip | 8 % | kernel calls while recording: `tu_cs_reserve_space` -> `msm_bo_init` (`new`, 531 us each), `host_import_pages`, `redwood_drm_map` |
+
+Busy time by image: metal2vulkan 45 %, QuartzCore 24 %, Turnip 13 %, libsystem_malloc 5 %. Over the whole run (28 s) the thread is 28 % busy; SpringBoard's 25 %.
+
+**33 % in the vsync wait at 10-13 frames/s does not fit a thread that only finishes late [I].** A frame that ends inside a tick waits at most one tick (8 ms on average, 8 % of a 100 ms frame). The thread waits about 33 ms per frame. Either CoreAnimation skips ticks on purpose (its own pacing after a late frame), or the vsync message reaches it late, or a frame ends and the next commit is not there yet. The kernel's tick is not the cause: 1060 of 1162 windows have a mean tick of 16.6 ms and a worst tick under 20 ms; 32 windows hold one 33 ms tick, 7 one 50 ms tick, 15 one over 100 ms (`LAUREL FRAME: N ticks of U us, worst W`). Next: a sample of thread 6 at 500 Hz (`laurel-autotest sample PID 4 500 only=6`) through one animation, binned at 10 ms, gives the frame shape: encode, wait for the scheduler, vsync wait. Not run: the phone was down.
+
+**The kernel's GPU wait [V code].** `gpuWait` looks every 200 us (`delay_for_interval`, a timer with up to 1 ms of slop for a kernel thread) and drops `gGPULock` while it sleeps. `LAUREL GPU TIME: fence 693 us x 963 per 5 s` is u_trace's worker thread (Turnip patch 0105 turns tracing on; `tu_trace_read_ts` waits for the fence of each chunk), not the render thread; 14 waits per submission, one of them real. A/B of `NEGRONIMETAL_GPU_PASS=0`: not run.
+
+**What the CPU gives [NOT RUN].** `scripts/laurel/ios26-speed.sh` (`userland/laurel/speed/laurel_speed.c`, built, 0 words newer than ARMv8.0): the real clock of the core a thread lands on (dependent adds, 1 and 8 threads), L1/L2/DRAM load-to-use latency, memcpy, a syscall, `mach_absolute_time`, a semaphore and a mach_msg wake-up, how late a 1 ms and a 16.7 ms sleep ends, the cost of a first touch of a 4 KiB page. Reference on paper: A73 at 2016 MHz: 2.0 G adds/s, L1 2 ns, DRAM 100-140 ns, a wake-up 30-80 us. A result far from these is the constant factor behind "a draw costs 25-87 us here against 1.6 us on the host"; a result at these numbers puts the cost in the code (metal2vulkan's runtime first).

@@ -30,7 +30,7 @@ One line: `LAUREL WDOG: on: APSS WDT 0xf017000, bark 12 s (any CPU), bite 20 s, 
 | Pet | Only if no CPU in use has a signal open for 8 s, and no panic. A CPU that never came up (`SIGPdisabled`, the case `CPU 4 not alive`) is not in use | [V code, host test] |
 | Bark | IRQ to any CPU (1-of-N; if the GIC refuses, the boot CPU). Two lines per CPU, then `panic("LAUREL WDOG: bark: ...")`. So the panic hold sends the text over USB, and its timed reset follows | [V code] |
 | Bite | No pet for 20 s: the hardware resets with no CPU. This is what a hang of all CPUs gets | [V design], [U] on the phone |
-| Panic | `kPEPanicBegin`: no pets, bark = bite = 30 s, count from 0. If the panic hangs before its hold: a bite. Panic hold, `laurel_panic_final`: hardware off, so **a hold does not reset**. `laurel_restart`, `laurel_power_off`: off just before PSCI: ABL and Mu get no running count | [V code] |
+| Panic | `kPEPanicBegin`: no pets, bark = bite = 30 s, count from 0. If the panic hangs before its hold: a bite. Panic hold, `laurel_panic_final`: hardware off, so **a hold does not reset**, except after a bark (patch 2987): the count runs on and the bite resets the phone 30 s after the panic [V code], [U] on the phone. Reason: at 17:56:16 a bark on stuck CPU 5 printed `holding`, then the hold gave no pong and took no `ctl bootloader` [V]. `laurel_restart`, `laurel_power_off`: off just before PSCI: ABL and Mu get no running count | [V code] |
 | Lines | A CPU silent 2, 5, 10 s: 2 lines with its last interrupt, thread, signals, SGI state. `answers again` when it comes back. Each minute: `longest answer in 60 s, ms per CPU`, with the pc of the worst. The thread itself over 2 s late: one line per new worst. | [V code] |
 | Fallback | Self-check failed: no hardware, the same thread and lines. The USB thread (`ud_thread`) also checks: the pet thread 3 s late gives a line, and it does a round | [V code] |
 
@@ -142,3 +142,34 @@ LAUREL WDOG: bark: cpu N ...  then panic(...LAUREL WDOG: bark...)
 ```
 
 Host test [V]: `scripts/laurel/wdog-test.sh`: PASS: healthy 1 h no bark; a CPU off 5 s, a slow stackshot, the thread 10 s late, a CPU not in use: no bark. One stuck CPU at 60 s: bark 79.1 s, bite 87.1 s. All stop at 60 s: bite 79.1 s.
+
+## First catch, 2026-11-03 17:56:16, kernel 833d75cdc9 [V]
+
+CPU 5 (mpidr 0x1, silver) took its last interrupt in EL0 of `iconservicesagent`, pc 0x19dc52724 lr 0x19dbee774 (the pc of that interrupt, so it can be stale), then stayed silent 19562 ms with an SGI pending. The other 7 CPUs ran. `iconservicesagent` had started 6 s earlier and opened Metal. The hang of 13:46:59 also has `iconservicesagent` in its last lines (a link [I], two events). Cause [U].
+
+## 9. The first catch, read against the code (branch `t3/ios26-frame-gap-root-cause`; patch 2988 + post/9017, built, NOT BOOTED)
+
+What the two lines rule out and what they leave. `logs/hang-175616.txt`, extract of the usblog.
+
+| Candidate | Result | Mark |
+|---|---|---|
+| The EL0 emulator (`LAUREL EMU`) holds interrupts off | No. `sleh_synchronous` re-enables interrupts from the EL0 SPSR before `handle_uncategorized`; the exclusive loops of `laurel_a64emu_asm.h` stop after `A64EMU_SPINS` failed stores and return to EL0; `lse2_run` stops at 4096 tries. `retry=0` in the counts of that boot | [V code, V log] |
+| An interrupt taken and never ended (the CPU interface then delivers nothing of equal or lower priority) | No path found: every branch of `sleh_irq` writes `ICC_EOIR1_EL1`; the spurious 1020-1023 return needs none. The stamp says `in a handler now: pc 0x0` | [V code] |
+| Wrong MAIR encodings (xnu-12377 uses the FEAT_XS values 0x40, 0xA0, 0x0D, 0x01, reserved on a Cortex-A53/A73) | No. `HAS_FEAT_XS` is off for SWEET; the built kernel writes 0x44 (WC), 0xBB (WT), 0xFF (WB), 0x04, 0x08, 0x0C (`msr MAIR_EL1` at 0xfffffff007590540) | [V binary] |
+| A Secure (Group 0) interrupt looping as FIQ | FIQs are routed to EL3 on this firmware; `sleh_fiq` is not entered for them | [V code], [I] routing |
+| A fixed time after boot (both hangs at 67-68 s) | Common lines in the 7 s before both: `iconservicesagent` renders its first icons on Metal; `negronigl: IOSurface: no import by ID, its pages go through USERPTR`; `LAUREL BT: ios: client gone`; `LAUREL CELL: modem shutting down` (13:46:53, and 17:56:09 after the stall). The stuck CPU runs `iconservicesagent` in the 17:56 case, so an SCM call of a kernel thread (modem, audio, zap) is not it: it would show `kernel_task` | [V log] |
+| One instruction that never completes in EL0: an exclusive (LDXR/STXR, every atomic of ARMv8.0 code) to Normal Non-cacheable memory, which the memory system of a Snapdragon does not serve, or a load from an address that gives no answer | Fits every number: a user pc, no handler, no timer interrupt either (a running user thread gets one each 10 ms), the SGI pending at the redistributor. What this port maps Non-cacheable into a task: the GPU pool and the scattered write-combined pages (every BO map of Turnip, every pixel map of an IOSurface, 2977), nothing else: the IOSurface state page is cached and read-only in the task (`SweetSurface.cpp`), USERPTR and host imports wire the task's pages and change no attribute (`hostPages`). Which user code would do an atomic on BO or pixel memory: not found in Turnip's `p_atomic` uses (all on heap structs); metal2vulkan's Rust runtime: not read (its source is not in the tree) | [I], the strongest left |
+| A kernel path entered from EL0 that holds interrupts off (a spin lock under `splsched`, pmap, a `copyin` of Non-cacheable memory) | Nothing found in the code; a spin lock timeout would panic, not stay silent | [I] |
+
+**Why the user pc has no symbol.** The dyld shared cache slide is random per boot (`read_random` in `vm_shared_region.c`), and `slide 0x0` in the line is the kernel's slide. The `I` lines of a `laurel-autotest sample` of the same boot give it, and none exists for the 17:55 boot. Under the slide of the 17:25 boot (0x19448000) the pc would be CoreGraphics data, so that slide is not the one.
+
+**2988 (both kernels), post/9017 (iOS 26 sleh.c).** Each exception from EL0 stamps its CPU in `sleh_synchronous` (time, ESR, FAR, user pc, thread); `thread_exception_return` and the end of `sleh_synchronous` close the stamp. The report gets a third line:
+
+```
+LAUREL WDOG: on: silent 2000 ms: cpu 5 is in the kernel since an EL0 trap 2559 ms ago: class 0x15 (SVC: a system call) esr 0x.. far 0x.. user pc 0x.., 20482 traps in all; GICR pending 0x00000008 active 0x00000000; dyld slide 0x..
+LAUREL WDOG: on: silent 2000 ms: cpu 5 has no EL0 trap open (in EL0, or the trap ended): 20482 traps in all, the last 2600 ms ago at user pc 0x.. class 0x24; GICR pending 0x00000008 active 0x00000000; dyld slide 0x..
+```
+
+Reading: `in the kernel since an EL0 trap` with a time near the silence = the kernel path of that class holds the CPU (a data abort: `far` is the address; a system call: the user pc names the call). `no EL0 trap open` with the last trap long before the silence = the CPU is in EL0 on an instruction that does not complete: then the user pc of the last interrupt, with the dyld slide, names the code, and the memory it touches is the next question (an exclusive on a GPU buffer or a pixel map). `GICR active` with a bit set = an interrupt taken and never ended. The stamp is stale after the thread moved to another CPU; the report compares the thread with the CPU's current one and says `no EL0 trap open` then. Cost: five stores per EL0 exception. iOS 16: the functions exist, nothing calls them (its `sleh.c` hunk lives in 2986).
+
+**Not done, and why.** EDPCSR stays out (section 4). A reset at the bark (2987) gives the phone back without the owner; the report above is what a stalled core can still give.
