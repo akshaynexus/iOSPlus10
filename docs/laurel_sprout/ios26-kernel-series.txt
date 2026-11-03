@@ -343,6 +343,7 @@
 2980-laurel-gpu-submit-1024.patch                              applied
 2981-laurel-flip-not-before-drawn.patch                        applied
 2982-laurel-flip-fence-at-swap.patch                           applied
+2985-laurel-rpm-scale.patch                                    applied
 9000-series-12377-api.patch                                    post
 9001-laurel-release-only-initialized-pages.patch               post
 9002-laurel-no-panic-region.patch                              post
@@ -356,4 +357,4 @@
 9010-laurel-blastdoor-sandbox-check.patch                      post
 9011-laurel-arch-arm64e.patch                                  post
 9012-laurel-bt-legacy-le-scan.patch                            post
-== series: 228 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
+== series: 229 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
