@@ -1692,7 +1692,7 @@ def perf_self_test(d):
     jetsam_floors(t, [j])
     o = plistlib.loads(t.read(j))['Version4']
     dm = o['Daemon']['Override']
-    checks += [dm['com.apple.iconservices.iconservicesagent'] == {'InactiveHardMemoryLimit': 96, 'ActiveSoftMemoryLimit': 200, 'JetsamPriority': 140},
+    checks += [dm['com.apple.iconservices.iconservicesagent'] == {'InactiveHardMemoryLimit': 200, 'ActiveSoftMemoryLimit': 200, 'JetsamPriority': 140},
                dm['com.apple.linkd'] == {'ActiveSoftMemoryLimit': 64, 'InactiveHardMemoryLimit': 32}, dm['com.apple.logd'] == {'JetsamPriority': 1},
                dm['com.apple.nehelper'] == {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
                dm['com.apple.gamepolicyd'] == {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24}, dm['com.apple.deviceaccessd'] == {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
