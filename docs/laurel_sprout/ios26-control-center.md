@@ -68,6 +68,10 @@ Not proven: bluetoothd's next limit after the scan starts [U]. The owner's bluet
 
 **tccd** [V log, 53,355 lines]: most are `kTCCServiceBluetoothAlways` from sharingd, searchpartyd, rapportd, locationd, bluetoothd, each `Unable to construct an identity` (Code 2). Each new bluetoothd brings them again. [I] So the CPU follows the loop. At 05:17 tccd had 3.4 % and 12 s of time [V `ps`], so the 84 % was a burst. The identity error itself: [U], no fix. `healthd` and FitnessIntelligence: no cause was looked for [U].
 
+## Host results
+
+[V] `kernel-ios26-linux.sh`, both patches: `LAUREL BUILD: d035476edb 347 patches, series bdd4abcff8aaca74, ios26_4k`; series 226 applied, 86 applied+rules, 8 skipped, 11 base, 0 errors; printf-arg-check OK; armv80-check 0; 251 s. `test-bt-scan.sh` PASS. Not booted.
+
 ## What the phone needs
 
 | Change | Way |
