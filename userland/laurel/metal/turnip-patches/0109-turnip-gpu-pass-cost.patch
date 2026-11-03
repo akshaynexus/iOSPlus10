@@ -1,0 +1,55 @@
+laurel (Mi A3, iOS 26): the cost of LAUREL GPU PASS itself: a timestamp chunk used a new kernel buffer and map (kept now), each tile wrote 2 timestamps more (only with NEGRONIMETAL_GPU_PASS=2), and every Metal process took part (backboardd and SpringBoard now; =1: all). [V phone] 7 % of CoreAnimation's render thread. Docs: docs/laurel_sprout/ios26-default-speed.md.
+
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -1961,13 +1961,22 @@
+    return &device->trace_context;
+ }
+ 
++static simple_mtx_t trace_spare_lock = SIMPLE_MTX_INITIALIZER;
++static struct tu_bo *trace_spare[32];
++static unsigned trace_spare_count;
++
+ static void*
+ tu_trace_create_buffer(struct u_trace_context *utctx, uint64_t size_B)
+ {
+    struct tu_device *device =
+       container_of(utctx, struct tu_device, trace_context);
+ 
+-   struct tu_bo *bo;
++   /* laurel: a timestamp chunk per few passes made a kernel buffer and a map each time: 7 % of CoreAnimation's render thread [V phone] */
++   simple_mtx_lock(&trace_spare_lock);
++   struct tu_bo *bo = trace_spare_count ? trace_spare[--trace_spare_count] : NULL;
++   simple_mtx_unlock(&trace_spare_lock);
++   if (bo)
++      return bo;
+    tu_bo_init_new(device, NULL, &bo, size_B, TU_BO_ALLOC_INTERNAL_RESOURCE, "trace");
+    tu_bo_map(device, bo, NULL);
+ 
+@@ -1981,6 +1990,13 @@
+       container_of(utctx, struct tu_device, trace_context);
+    struct tu_bo *bo = (struct tu_bo *) timestamps;
+ 
++   simple_mtx_lock(&trace_spare_lock);
++   if (trace_spare_count < ARRAY_SIZE(trace_spare)) {
++      trace_spare[trace_spare_count++] = bo;
++      simple_mtx_unlock(&trace_spare_lock);
++      return;
++   }
++   simple_mtx_unlock(&trace_spare_lock);
+    tu_bo_finish(device, bo);
+ }
+ 
+--- a/src/freedreno/vulkan/tu_gpu_pass.cc
++++ b/src/freedreno/vulkan/tu_gpu_pass.cc
+@@ -241,6 +241,10 @@
+    if (off && off[0] == '0')
+       return;
+    snprintf(g.process, sizeof(g.process), "%s", getprogname());
++   /* the compositor and SpringBoard; NEGRONIMETAL_GPU_PASS=1: every Metal process. Passes and compute: 2 timestamps each; =2: also each tile's parts (bin, load, draw, store), 2 more per tile. */
++   if (!off && strcmp(g.process, "backboardd") && strcmp(g.process, "SpringBoard"))
++      return;
++   setenv("TU_GPU_TRACEPOINT", off && off[0] == '2' ? "render_pass,binning_ib,draw_ib_sysmem,draw_ib_gmem,gmem_load,gmem_store,gmem_clear,sysmem_clear,sysmem_clear_all,sysmem_resolve,blit,compute,compute_indirect,generic_clear" : "render_pass,blit,compute,compute_indirect,generic_clear", 0);
+    setenv("MESA_GPU_TRACES", "print", 0);
+    u_trace_event_sink = sink;
+    ngl_log("LAUREL GPU PASS: on: %s: GPU time per kind of render pass from Turnip's timestamps, one block in each 5 s of work (kill switch NEGRONIMETAL_GPU_PASS=0)", g.process);
