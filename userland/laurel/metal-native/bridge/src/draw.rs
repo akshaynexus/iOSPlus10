@@ -1636,7 +1636,26 @@ fn write_texture(e: &NmbEncoder, cb: &mut NmbCommandBuffer, stage: Stage, index:
     // the first level the view reaches, up to its last layer: a read past the buffer's end is a fault as a write is
     check_descriptor_address(e.gpu.dev, unsafe { nmn_image_iova(t.image as *const NmnImage) }, unsafe { nmn_image_extent(t.image as *const NmnImage, t.base_level, t.base_layer + t.layers.max(1) - 1) })?;
     unsafe { nmn_descriptor_image(t.image as *const NmnImage, t.pipe_format, t.view_type, t.base_level, t.levels, t.base_layer, t.layers, swizzle.as_ptr(), storage, slot) };
-    if t.must_name() {
+    if let Some(shadow) = t.shadow() {
+        // the rows as the CPU sees them now, once in a command buffer: the image lies in the copy (Shadow). Without this the GPU read old memory: blank icons, masks of sparse dots
+        if !cb.shadows_done.contains(&t.root_id()) {
+            let source = t.root_backing().ok_or("a shadow with no buffer")?;
+            let from = source.backing.map() as *const u8;
+            if from.is_null() {
+                return Err("a shadow over a buffer with no CPU mapping".into());
+            }
+            let fits = source.length.saturating_sub(shadow.offset);
+            let rows = if shadow.row == 0 { 0 } else { shadow.rows.min((fits + shadow.row - shadow.line.min(fits)) / shadow.row) };
+            for y in 0..rows {
+                let start = y * shadow.row;
+                unsafe { std::ptr::copy_nonoverlapping(from.add((shadow.offset + start) as usize), (shadow.copy.map as *mut u8).add((y * shadow.pitch) as usize), shadow.line.min(fits - start) as usize) };
+            }
+            cb.shadows_done.push(t.root_id());
+        }
+        if unsafe { (*shadow.copy.bo()).kind == NW_BO_SCATTERED } {
+            cb.names.push(shadow.copy.bo() as usize);
+        }
+    } else if t.must_name() {
         cb.names.push(t.bo() as usize);
     }
     cb.held_textures.push(t);

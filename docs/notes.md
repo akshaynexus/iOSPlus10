@@ -5437,3 +5437,14 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - `CA_ENABLE_MEMORYLESS=0` alone: 108 -> 36 tiles, pass 12 -> 3 ms [V].
 - `CASetDebugOption` is exported: the way to set the `CA_DISABLE_*` table after `init_debug` has read the environment.
 - m2v's notices have the exact reason for a shadow: `observe_message` in the bridge. Read them before you guess.
+
+## 2026-11-03: native stack, wrong pictures and their causes [V code; phone pictures in logs/round-*]
+
+- `SP_PS_2D_SRC_PITCH` and `RB_2D_DST_PITCH` hold 64-byte units, and a 2D base is 64-byte aligned: a row of 40 reads as 0. Such a copy goes line by line, as `tu_copy_buffer_to_image`.
+- A texture's base address has the same rule: low bits are lost, and the picture moves by some pixels with wraparound.
+- **`Shadow` in bridge/src/draw.rs was never filled until 12:45.** The earlier report "shadow done" was wrong: the fields were there and no code copied. A feature with no test on real data is not done.
+- In sysmem a draw that reads the target needs a CCU flush and a cache invalidate after the draws before it: `FLUSH_PER_OVERLAP_AND_OVERWRITE` is not enough between draws. Without it: wrong pixels in cache-line blocks.
+- Metal's A8 follows metal2vulkan's `AlphaInRed`: `R8_UNORM` with swizzle (0,0,0,R). `FMT6_A8_UNORM` with that swizzle reads 0 in alpha: no text.
+- `fdl6_layout` asks 16 pixels a row above 4 bytes a pixel, for tile memory only. A native row of 64-byte units is valid on the hardware.
+- Host pages: the kernel wants pages of 16 KiB here; errno 5 (kIOReturnVMError) means read-only pages: try again read-only, as `host_import_pages`.
+- Host compare: `pm4-rows.sh` does `cd` into the ref folder: PLAN must be an absolute path. With a relative path Turnip's row falls back to the default pipeline with no error line, and the compare means nothing.
