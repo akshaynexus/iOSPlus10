@@ -1,0 +1,21 @@
+# Home swipes only, many, for steady cadence. scripts/laurel/ios26-default-bench.sh NAME -- --scenario scripts/laurel/ios26-home-loop.scenario. Verbs: ios26-autotest.scenario.
+step swipes
+lock
+wake
+settle 700 8000
+edge bottom 800 300
+settle 1500 8000
+home
+settle 1000 8000
+swipe 620 800 100 800 300
+settle 400 3000
+swipe 100 800 620 800 300
+settle 400 3000
+swipe 620 800 100 800 1000
+settle 400 3000
+swipe 100 800 620 800 1000
+settle 400 3000
+swipe 620 800 100 800 1000
+settle 400 3000
+swipe 100 800 620 800 1000
+settle 400 3000

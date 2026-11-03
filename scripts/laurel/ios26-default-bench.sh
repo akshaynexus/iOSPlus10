@@ -78,9 +78,14 @@ t=$(mktemp)
 start=$(log_at)
 cpu() { phone 'for n in backboardd SpringBoard; do p=; for w in $(ps -ax -o pid=,comm= | grep "/$n\$"); do p=$w; break; done; echo "== $n $p"; ps -M -p $p | cut -c1-60; done'; }
 cpu0=$(cpu)
+# CORES_S=N: how the CPU time of the UI's processes splits over Gold and Silver, in the N seconds of the test
+if [ -n "${CORES_S:-}" ]; then
+  phone "/usr/local/bin/laurel-autotest cpus $CORES_S" > "$REPO/logs/bench-$name.cpus" 2>&1 &
+  phone 'L=; for n in backboardd SpringBoard; do for w in $(ps -ax -o pid=,comm= | grep "/$n\$"); do L="$L $w"; break; done; done; echo pids $L; /usr/local/bin/laurel-autotest cores '"$CORES_S"' $L' > "$REPO/logs/bench-$name.cores" 2>&1 &
+fi
 # SAMPLE_S=N: where backboardd's running threads spend their time, for N seconds (scripts/laurel/ios26-sample-sym.py logs/bench-NAME.samples)
 if [ -n "${SAMPLE_S:-}" ]; then
-  phone 'for w in $(ps -ax -o pid=,comm= | grep "/backboardd$"); do /usr/local/bin/laurel-autotest sample $w '"$SAMPLE_S"' 100; break; done' > "$REPO/logs/bench-$name.samples" 2>/dev/null &
+  phone 'for w in $(ps -ax -o pid=,comm= | grep "/backboardd$"); do /usr/local/bin/laurel-autotest sample $w '"$SAMPLE_S"' 100 '"${SAMPLE_ALL:-}"'; break; done' > "$REPO/logs/bench-$name.samples" 2>/dev/null &
   phone 'for w in $(ps -ax -o pid=,comm= | grep "/SpringBoard$"); do /usr/local/bin/laurel-autotest sample $w '"$SAMPLE_S"' 100; break; done' > "$REPO/logs/bench-$name.sb.samples" 2>/dev/null &
 fi
 "$REPO/scripts/laurel/ios26-autotest.sh" run "$@" 2>&1 | tee "$t" || rc=$?

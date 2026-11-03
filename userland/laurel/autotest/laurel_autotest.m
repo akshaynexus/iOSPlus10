@@ -560,7 +560,7 @@ num(const char *s, const char *what)
 	return (int)v;
 }
 
-/* laurel: where a process's running threads spend their time: for docs/laurel_sprout/ios26-default-speed.md. `sample PID SECONDS HZ` prints "I base path" per image, then "S thread pc lr frames...".
+/* laurel: where a process's running threads spend their time: for docs/laurel_sprout/ios26-default-speed.md. `sample PID SECONDS HZ [all]` prints "I base path" per image, then "S thread pc lr frames...": running threads, or all (where a thread waits).
  * Each sample stops one running thread for the time of its stack walk through frame pointers. */
 extern kern_return_t mach_vm_read_overwrite(vm_map_t, uint64_t, uint64_t, uint64_t, uint64_t *);
 extern kern_return_t task_for_pid(mach_port_t, int, mach_port_t *);
@@ -596,7 +596,7 @@ sample_images(task_t task)
 }
 
 static int
-cmd_sample(int pid, int seconds, int hz)
+cmd_sample(int pid, int seconds, int hz, bool all)
 {
 	task_t task;
 	kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
@@ -615,7 +615,7 @@ cmd_sample(int pid, int seconds, int hz)
 		for (mach_msg_type_number_t t = 0; t < count; t++) {
 			struct thread_basic_info basic;
 			mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
-			if (thread_info(threads[t], THREAD_BASIC_INFO, (thread_info_t)&basic, &n) == KERN_SUCCESS && basic.run_state == TH_STATE_RUNNING &&
+			if (thread_info(threads[t], THREAD_BASIC_INFO, (thread_info_t)&basic, &n) == KERN_SUCCESS && (all || basic.run_state == TH_STATE_RUNNING) &&
 			    thread_suspend(threads[t]) == KERN_SUCCESS) {
 				arm_thread_state64_t state;
 				n = ARM_THREAD_STATE64_COUNT;
@@ -641,6 +641,74 @@ cmd_sample(int pid, int seconds, int hz)
 		usleep(1000000 / hz);
 	}
 	fflush(stdout);
+	return 0;
+}
+
+/* laurel: how a process's CPU time splits over Gold (P) and Silver: `cores SECONDS PID...`: proc_pid_rusage, flavor 6: the kernel's recount per kind of core. */
+extern int proc_pid_rusage(int pid, int flavor, void *buffer);
+struct laurel_rusage6 {
+	uint8_t uuid[16];
+	uint64_t ri_user_time, ri_system_time, ri_pkg_idle_wkups, ri_interrupt_wkups, ri_pageins, ri_wired_size, ri_resident_size, ri_phys_footprint, ri_proc_start_abstime, ri_proc_exit_abstime;
+	uint64_t ri_child_user_time, ri_child_system_time, ri_child_pkg_idle_wkups, ri_child_interrupt_wkups, ri_child_pageins, ri_child_elapsed_abstime;
+	uint64_t ri_diskio_bytesread, ri_diskio_byteswritten;
+	uint64_t ri_cpu_time_qos[7];
+	uint64_t ri_billed_system_time, ri_serviced_system_time;
+	uint64_t ri_logical_writes, ri_lifetime_max_phys_footprint, ri_instructions, ri_cycles, ri_billed_energy, ri_serviced_energy, ri_interval_max_phys_footprint, ri_runnable_time;
+	uint64_t ri_flags, ri_user_ptime, ri_system_ptime, ri_pinstructions, ri_pcycles, ri_energy_nj, ri_penergy_nj, ri_secure_time_in_system, ri_secure_ptime_in_system;
+	uint64_t pad[32];
+};
+
+static int
+cmd_cores(int seconds, int argc, char **argv)
+{
+	struct laurel_rusage6 a[16], b[16];
+	if (argc > 16)
+		argc = 16;
+	for (int i = 0; i < argc; i++)
+		memset(&a[i], 0, sizeof(a[i])), proc_pid_rusage(atoi(argv[i]), 6, &a[i]);
+	sleep(seconds);
+	for (int i = 0; i < argc; i++) {
+		memset(&b[i], 0, sizeof(b[i]));
+		if (proc_pid_rusage(atoi(argv[i]), 6, &b[i]) != 0) {
+			printf("%s: gone\n", argv[i]);
+			continue;
+		}
+		struct mach_timebase_info tb;
+		mach_timebase_info(&tb);
+		uint64_t all = (b[i].ri_user_time + b[i].ri_system_time) - (a[i].ri_user_time + a[i].ri_system_time);
+		uint64_t gold = (b[i].ri_user_ptime + b[i].ri_system_ptime) - (a[i].ri_user_ptime + a[i].ri_system_ptime);
+		printf("%s: %llu ms CPU, %llu ms on P cores; runnable %llu ms\n", argv[i], all * tb.numer / tb.denom / 1000000, gold * tb.numer / tb.denom / 1000000, (b[i].ri_runnable_time - a[i].ri_runnable_time) * tb.numer / tb.denom / 1000000);
+	}
+	return 0;
+}
+
+/* laurel: how busy each CPU is, per second: `cpus SECONDS`: host_processor_info. CPU 0-3 Silver, 4-7 Gold is what the log says of this SoC; the line says what it reads. */
+static int
+cmd_cpus(int seconds)
+{
+	processor_info_array_t info;
+	mach_msg_type_number_t size;
+	natural_t n;
+	natural_t last[16][CPU_STATE_MAX] = {};
+	for (int t = 0; t <= seconds; t++) {
+		if (host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &n, &info, &size) != KERN_SUCCESS)
+			return 1;
+		processor_cpu_load_info_t load = (processor_cpu_load_info_t)info;
+		if (t > 0)
+			printf("T %d:", t);
+		for (natural_t c = 0; c < n && c < 16; c++) {
+			natural_t busy = load[c].cpu_ticks[CPU_STATE_USER] + load[c].cpu_ticks[CPU_STATE_SYSTEM] + load[c].cpu_ticks[CPU_STATE_NICE] - last[c][CPU_STATE_USER] - last[c][CPU_STATE_SYSTEM] - last[c][CPU_STATE_NICE];
+			natural_t idle = load[c].cpu_ticks[CPU_STATE_IDLE] - last[c][CPU_STATE_IDLE];
+			if (t > 0)
+				printf(" %3u", busy + idle ? 100 * busy / (busy + idle) : 0);
+			memcpy(last[c], load[c].cpu_ticks, sizeof(last[c]));
+		}
+		if (t > 0)
+			printf("\n");
+		fflush(stdout);
+		vm_deallocate(mach_task_self(), (vm_address_t)info, size * sizeof(integer_t));
+		sleep(1);
+	}
 	return 0;
 }
 
@@ -686,8 +754,12 @@ main(int argc, char **argv)
 		return cmd_shot(argc > 2 ? (uint32_t)num(argv[2], "ID") : 0);
 	if (strcmp(c, "seq") == 0 && argc >= 3)
 		return cmd_seq(num(argv[2], "N"), argc > 3 ? num(argv[3], "MAX_MS") : 10000);
+	if (strcmp(argv[1], "cpus") == 0 && argc >= 3)
+		return cmd_cpus(num(argv[2], "SECONDS"));
+	if (strcmp(argv[1], "cores") == 0 && argc >= 4)
+		return cmd_cores(num(argv[2], "SECONDS"), argc - 3, argv + 3);
 	if (strcmp(argv[1], "sample") == 0 && argc >= 5)
-		return cmd_sample(num(argv[2], "PID"), num(argv[3], "SECONDS"), num(argv[4], "HZ"));
+		return cmd_sample(num(argv[2], "PID"), num(argv[3], "SECONDS"), num(argv[4], "HZ"), argc > 5 && strcmp(argv[5], "all") == 0);
 	if (strcmp(c, "settle") == 0 && argc >= 4)
 		return cmd_settle(num(argv[2], "QUIET_MS"), num(argv[3], "MAX_MS"), argc > 4 && strcmp(argv[4], "change") == 0);
 	if (strcmp(c, "open") == 0 && argc == 3)
