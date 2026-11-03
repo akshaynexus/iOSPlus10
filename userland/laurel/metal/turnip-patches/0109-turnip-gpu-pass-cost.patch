@@ -2,7 +2,7 @@ laurel (Mi A3, iOS 26): the cost of LAUREL GPU PASS itself: a timestamp chunk us
 
 --- a/src/freedreno/vulkan/tu_device.cc
 +++ b/src/freedreno/vulkan/tu_device.cc
-@@ -1961,13 +1961,22 @@
+@@ -1961,13 +1961,24 @@
     return &device->trace_context;
  }
  
@@ -21,8 +21,10 @@ laurel (Mi A3, iOS 26): the cost of LAUREL GPU PASS itself: a timestamp chunk us
 +   simple_mtx_lock(&trace_spare_lock);
 +   struct tu_bo *bo = trace_spare_count ? trace_spare[--trace_spare_count] : NULL;
 +   simple_mtx_unlock(&trace_spare_lock);
-+   if (bo)
++   if (bo) {
++      memset(bo->map, 0, size_B); /* U_TRACE_NO_TIMESTAMP: an event that did not run reads no old time */
 +      return bo;
++   }
     tu_bo_init_new(device, NULL, &bo, size_B, TU_BO_ALLOC_INTERNAL_RESOURCE, "trace");
     tu_bo_map(device, bo, NULL);
  
