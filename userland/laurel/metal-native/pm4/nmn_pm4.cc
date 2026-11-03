@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "util/format/u_format.h"
 #include "util/format_srgb.h"
@@ -436,7 +437,11 @@ void nmn_cmd_init(struct nw_cs *cs, struct nmn_gpu *g)
 	emit_reg(cs, REG_A6XX_SP_UNKNOWN_B182, 0);
 	REGS(cs, A6XX_HLSQ_SHARED_CONSTS(.enable = false));
 	emit_reg(cs, REG_A6XX_UCHE_UNKNOWN_0E12, i->a6xx.magic.UCHE_UNKNOWN_0E12);
-	emit_reg(cs, REG_A6XX_UCHE_CLIENT_PF, i->a6xx.magic.UCHE_CLIENT_PF);
+	/* with the flight recorder on: the value that makes this register latch the client of a fault (kgsl 1, msm BIT(7) | 1), so that the kernel's line names the block; Mesa's magic value does not [V log 10:11:31: it read back 4] */
+	static int capture = -1;
+	if (capture < 0)
+		capture = access("/private/var/db/negronimetal/stack/flight-on", F_OK) == 0;
+	emit_reg(cs, REG_A6XX_UCHE_CLIENT_PF, capture ? (1u << 7) | 1u : i->a6xx.magic.UCHE_CLIENT_PF);
 	emit_reg(cs, REG_A6XX_RB_UNKNOWN_8E01, i->a6xx.magic.RB_UNKNOWN_8E01);
 	emit_reg(cs, REG_A6XX_SP_UNKNOWN_A9A8, 0);
 	REGS(cs, A6XX_SP_MODE_CONTROL(.constant_demotion_enable = true, .isammode = ISAMMODE_GL, .shared_consts_enable = false));

@@ -52,13 +52,17 @@ pub(crate) fn line(text: &str) {
     }
 }
 
-/// The words of a descriptor set that hold an address or a size: 0, 1, 2 (a buffer's or a UBO's) and 4, 5 (an image's).
+/// The words of a descriptor set, to the last that is not 0.
 pub(crate) fn set_words(set: usize, iova: u64, words: *const u32, slots: u32) -> String {
     let mut s = format!("  set {set} at {iova:#x}, {slots} slots:");
     for slot in 0..slots.min(64) as usize {
         let w = unsafe { std::slice::from_raw_parts(words.add(slot * 16), 16) };
         if w.iter().any(|x| *x != 0) {
-            s.push_str(&format!(" [{slot}] {:08x} {:08x} {:08x} {:08x} {:08x}", w[0], w[1], w[2], w[4], w[5]));
+            s.push_str(&format!(" [{slot}]"));
+            let last = w.iter().rposition(|x| *x != 0).unwrap_or(0);
+            for x in &w[..=last] {
+                s.push_str(&format!(" {x:08x}"));
+            }
         }
     }
     s
