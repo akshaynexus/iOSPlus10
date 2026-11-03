@@ -1,7 +1,8 @@
 #!/bin/bash
 # One test round of the native Metal stack on the running phone, for the agent that works on it. Takes the phone lock for the whole round.
 #   scripts/bg.sh round scripts/laurel/native/compositor-round.sh [--reboot] [--keep] [SECONDS]
-# --reboot first: `sync`, then op10tool ctl reboot, and wait for SSH (a GPU hang leaves the GPU off until a reboot). Then: install this tree's out/ios26/metal-all/stage with the setting native, wait SECONDS (default 240) or until a hang, take a screenshot, print the stack's lines, and write the setting `default` again (--keep: stay on native, for a test that follows).
+# Hold the lock for one install and one run: a few minutes (default 150 s of run): other agents wait for it.
+# --reboot first: `sync`, then op10tool ctl reboot, and wait for SSH (a GPU hang leaves the GPU off until a reboot). Then: install this tree's out/ios26/metal-all/stage with the setting native, wait SECONDS (default 150) or until a hang, take a screenshot, print the stack's lines, and write the setting `default` again (--keep: stay on native, for a test that follows).
 # The UI test tool: AUTOTEST_DIR (default: this tree). Output: logs/round-TIME/ (screenshot, lines).
 set -uo pipefail
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
@@ -10,7 +11,7 @@ if [ "${ROUND_LOCKED:-0}" != 1 ]; then
   export ROUND_LOCKED=1
   exec "$MAIN/scripts/laurel/phone-lock.sh" native "$0" "$@"
 fi
-REBOOT=0; KEEP=0; WAIT=240
+REBOOT=0; KEEP=0; WAIT=150
 for a in "$@"; do case "$a" in --reboot) REBOOT=1 ;; --keep) KEEP=1 ;; *) WAIT=$a ;; esac; done
 OP=$MAIN/out/bin/op10tool
 B=/System/Library/Extensions/NegroniMetal.bundle
@@ -23,7 +24,8 @@ if [ "$REBOOT" = 1 ]; then
   sh_phone sync 2>/dev/null || true
   "$OP" ctl reboot 2>&1 | tail -1
   sleep 15
-  wait_ssh 100 || { say "STOP: no SSH after the reboot"; exit 1; }
+  # at most 3 min: the lock is shared; a phone that does not come back is not a reason to hold it
+  wait_ssh 20 || { say "STOP: no SSH 3 min after the reboot"; exit 1; }
   say "SSH is back"
 fi
 L=$(usblog); FROM=$(wc -l < "$L")
