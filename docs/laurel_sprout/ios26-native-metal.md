@@ -558,3 +558,24 @@ A second defect found on this way [V code]: the kernel gives one handle per surf
 Also: `nw_bo_import_surface` asks with `kRedwoodAnyLayout` (laurel 2913): without it the kernel refuses any surface that is not 4 bytes an element.
 
 New scene part, `tests/scene.c` `scene_surfaces`: a real IOSurface (`scene_surface_ios.c`), 32 x 32, size 0, clear, no draw: the compositor's first frame; then 720 x 1560, size 0, the row's draw.
+
+## 13. Rounds of the compositor on the phone (2026-11-03)
+
+Tool: `scripts/laurel/native/compositor-round.sh`, under `phone-lock.sh`: reboot if the GPU is off, install this tree's stage, wait, screenshot, read the lines, write `default` again. Measure: `scripts/laurel/ios26-autotest.sh` (branch merged on laurel-sprout).
+
+| Time | Build's change | Result [V logs] |
+|---|---|---|
+| 07:22 | Pass size from the attachments; surface handle counted | No hang at the first frame. 3 min of compile, first submission, then 110 to 130 submissions per 5 s with **about 4 names each** (Turnip at that time: 7,300). Screenshot: the boot spinner on black, drawn by the native stack |
+| 07:25 | | A kernel panic in the stackshot path: not this stack: fixed in the kernel (post/9013) |
+| 07:38 | Disk cache | Check: `the screen surface stayed black for 30 s`: the samples miss the spinner in a cold start. Limit for native now 240 s |
+| 08:03 | Depth32Float_Stencil8; Turnip's format table | Hang after 73 s: `FAR 0x124404820902`, a read |
+| 08:24 | Tables and holes refused | First frame 5 s after the device opened. The same hang |
+| 08:39 | Flight recorder; host pages inside a page; rows of 64 | The same hang. The recorder: first failed submission has all 5 line draws of the ring |
+| 08:54 | `SP_FS_BINDLESS_PREFETCH_CMD` | The same hang: `FAR 0x126404820902`. That fix was real, and not the cause |
+| 09:05 | Lines as Turnip's | **Not read yet: the phone did not return to iOS after the reboot** |
+
+**Not proven: that the line register is the cause [I].** Its evidence: the mark in the flight data, and the register differs from Turnip's only for lines.
+
+Cold pipeline compile [V `pipelines.log`]: 100 to 560 ms per CA pipeline, 17.9 s for the generic one. With the disk cache: no compile.
+
+What the stack refuses now, each with a line: argument buffers, indirect draws, visibility results, a draw's descriptor tables, root tables and address holes, a pass before a draw, planar YUV taken whole, formats outside the table, a copy of a Depth32Float_Stencil8 texture.

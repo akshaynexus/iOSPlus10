@@ -5415,3 +5415,16 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - Agent's slip: a first SSH command `ps ... > /tmp/.a` wrote one small file in the phone's `/tmp` in spite of the read-only rule. Pipe to the host from the first command.
 - Worktree: `INCR=1 kernel-ios26-linux.sh` builds in 60 s after a tree. A `grep -c '^diff --git'` guard in `rpm-scale-patch.sh`.
 - `scripts/laurel/gpu-opp-patch.sh` diffs from 2961's parent to the work tree: after 2985 it also takes 2985's hunks in the same files. Use it only on a tree of 2961 alone, or move the hunks by hand.
+
+## 2026-11-03: native Metal, rounds on the phone (branch t3/native-metal-ca-features). Details: `ios26-native-metal.md` section 13
+- Keep a flight recorder for a GPU hang: a process is killed at the hang, so only memory-mapped text survives (`bridge/src/flight.rs`, `stack/flight-on`). It answered in one round what 3 rounds of reading code did not: **each failed submission holds all the `prim 1` draws of the ring.**
+- A wild FAR with one word the same across runs (`0x1244_04820902`, `0x1264_04820902`) is data taken as an address, not a buffer's address: a buffer's address moves between runs.
+- `MTLPrimitiveType` 1 = line list. CA's generic program draws paths as lines. Turnip at 1 sample: `GRAS_SU_CNTL` Bresenham, no polygon offset. Every earlier scene drew triangles, so no register comparison could show this.
+- `pm4-rows.sh`: compare many real keys against Turnip. It found nothing for the prefetch by itself: a missing register in both captures of a key that does not need it. Read Turnip's emit function for each register group when a new shape arrives.
+- `SP_FS_BINDLESS_PREFETCH_CMD` holds the slot of a bindless prefetch. No such write: the hardware reads a stale slot.
+- ir3 safe_constlen: native takes the safe variant alone, so its registers differ from Turnip's for a large program (FS length `0x623` against `0x8d1`, private memory 0 against 0x800). Not an error.
+- Do not export `NMN_SCENE_*` in a shell that also runs `ref-capture.sh`: the depth capture took the line draw.
+- `ref-capture.sh` empties `out/ios26/native/ref`, and `pm4-actions.py`'s table is by index into that older capture: use `REF_ONLY=depth-sysmem` to add one.
+- `/tmp` is another file system: `cp --reflink=always` to it fails, and the following `rm` loses the source. Keep scratch copies under `out/`.
+- `minimumLinearTextureAlignmentForPixelFormat`: the default stack's 16 is its own (it can copy behind the caller). An a6xx reads a pitch of 64 at least: the native stack answers 64.
+- A first native start now takes 5 s to its first frame (3 min with no disk cache): 17.9 s for one generic pipeline, cold.
