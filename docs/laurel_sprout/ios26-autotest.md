@@ -50,7 +50,7 @@ The tool never flashes, reboots, restarts a process, or changes a setting. A los
 
 A shared phone can have a UI restart or a GPU hang just before the lock comes free. So `run`, before step 1: panel on, a lit frame held for 10 s (else exit 3, no table). Metal must be on: the newest `LAUREL METAL26: on: Metal device` of this boot must come after any `LAUREL GPU: off` or `Metal device refused` (else exit 4, no table; `--allow-cpu`: run all the same). `--need-stack NAME`: exit 5 on another stack. `RENDERER:` and `STACK:` are in the head of each report.
 
-**A measure:** `scripts/bg.sh autotest scripts/laurel/phone-lock.sh ui scripts/laurel/ios26-autotest.sh baseline [STACK]`. Only this command reboots: with Metal off, since the kernel keeps the GPU off until a reboot. After a reboot it waits until 240 s of uptime: the first minutes hold the start's load.
+**A measure:** `scripts/bg.sh autotest scripts/laurel/phone-lock.sh ui scripts/laurel/ios26-autotest.sh baseline [STACK]`. Only this command reboots: with Metal off, since the kernel keeps the GPU off until a reboot. It waits until 420 s of uptime (`SETTLE_UP_S`): the first minutes hold the start's load.
 
 ## 3. Facts found on the phone [V]
 

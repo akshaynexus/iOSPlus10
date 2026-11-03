@@ -513,7 +513,9 @@ def main():
         return 0
     done = [run.run_step(n, c) for n, c in steps]
 
-    lines = [f"Mi A3 iOS 26 UI test {date}", text.strip(), render_line, input_line, f"USB log: {log.path or 'none: no kernel lines in this table. make usblog'}", f"Files: {out}", ""]
+    state_text = phone.ctl("state").splitlines()
+    kernel_line = "KERNEL: " + " ".join(x.strip() for x in state_text[:2])[:120]
+    lines = [f"Mi A3 iOS 26 UI test {date}", kernel_line, text.strip(), render_line, input_line, f"USB log: {log.path or 'none: no kernel lines in this table. make usblog'}", f"Files: {out}", ""]
     lines.append(table([step_row(s) for s in done]))
     lines.append("")
     lines.append("fps motion: frames / time of all LAUREL FRAME: motion ended lines of the step (lowest-highest, count). moving: best frames/s while moving. touch: finger event to the next flip (only on the kernel input). fence: mean GPU fence wait of a flip. gpu/sub: GPU busy time per submission in the step's RedwoodGPU windows. busy/MHz: the highest GPU busy share and clock of a RedwoodGPU window. "
@@ -526,7 +528,7 @@ def main():
     rc3, cfg = phone.run("echo env: $(grep -v '^#' /var/db/negronimetal/env | tr '\\n' ' '); echo clients: $(grep -v '^#' /var/db/negronimetal/clients | tr '\\n' ' ')", timeout=20)
     setting = next((x.split(":", 1)[1].strip() for x in stk.splitlines() if x.startswith("/var/db/negronimetal/option")), "?")
     active = next((x.split(":", 1)[1].strip() for x in stk.splitlines() if x.startswith("/var/db/negronimetal/stack/active")), "?")
-    lines.insert(2, f"STACK: {active.split()[0] if active.split() else '?'} (setting {setting}; selector: {active[:110]}); {' '.join(cfg.split())[:240]}")
+    lines.insert(3, f"STACK: {active.split()[0] if active.split() else '?'} (setting {setting}; selector: {active[:110]}); {' '.join(cfg.split())[:240]}")
     lines.append("Selector files (read only):")
     lines += ["  " + x for x in stk.strip().splitlines()] or ["  none"]
     lines.append("")

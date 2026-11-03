@@ -64,12 +64,17 @@ baseline)
     "$OP" ctl reboot
     sleep 30
     "$SSHP" wait 300
-    # the first minutes hold the start's load (widgets, first LaunchServices work): no measure
-    while up=$("$OP" ctl state 2>/dev/null | sed -n '1s/.*up=\([0-9]*\).*/\1/p'); [ "${up:-0}" -lt 240 ]; do sleep 10; done
-    rc=0
   elif [ "$rc" != 0 ]; then
     exit "$rc"
   fi
+  # the first minutes hold the start's load (widgets, first LaunchServices work): no measure, also after a reboot by another job
+  # (with a limit: this holds the phone's lock, and a phone that went away must not hold it for ever)
+  tries=0
+  while up=$("$OP" ctl state 2>/dev/null | sed -n '1s/.*up=\([0-9]*\).*/\1/p'); [ "${up:-0}" -lt "${SETTLE_UP_S:-420}" ]; do
+    tries=$((tries + 1))
+    [ "$tries" -le 60 ] || { echo "ios26-autotest: no settled phone in 600 s: last uptime ${up:-none}: no table"; exit 3; }
+    sleep 10
+  done
   exec python3 -I "$REPO/scripts/laurel/ios26-autotest.py" --need-stack "$stack"
   ;;
 test)
