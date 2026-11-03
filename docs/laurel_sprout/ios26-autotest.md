@@ -32,8 +32,8 @@ The tool never flashes, reboots, restarts a process, or changes a setting. A los
 | Frame | Finds the surfaces of 720x1560 with `IOSurfaceLookup` and reads the one on the panel. No lock (a lock can change a seed), no write, no display code | No |
 | Which surface | From the in-use marks: see below | No |
 | App start | `SBSLaunchApplicationWithIdentifier`, then `LSApplicationWorkspace` | No |
-| Kernel path for input | Patch 2983: USB command server words `touch F D X Y`, `key K D`, `synth`; `op10tool input ...`. The script takes it by itself when `op10tool input check` says `synth on`. `AUTOTEST_INPUT=ssh`: not this way; use it to compare with runs before the flash | **Yes. Built, not booted** |
-| Exact surface | Patch 2983: `kern.laurel_scan_surface`, written after the latch. The tool reads it first | **Yes. Built, not booted** |
+| Kernel path for input | Patch 2983: USB command server words `touch F D X Y`, `key K D`, `synth`; `op10tool input ...`. The script takes it by itself when `op10tool input check` says `synth on`. `AUTOTEST_INPUT=ssh`: not this way; use it to compare with runs before the flash | Yes. **On the phone since kernel f24b7056ba** [V `synth on`, `SWEET HID: touch 9 ... edge`] |
+| Exact surface | Patch 2983: `kern.laurel_scan_surface`, written after the latch. The tool reads it first | Yes. On the phone. 0 with the panel off and with no direct flip (the CPU renderer): then the marks of section 2 |
 
 ### Limits
 
@@ -46,6 +46,12 @@ The tool never flashes, reboots, restarts a process, or changes a setting. A los
 - A step fails on: `changed` with the same or a black picture, a `settle ... change` with no end, a crash of backboardd or SpringBoard, a panic line, a GPU line (`LAUREL GPU: off`, watchdog, SMMU fault, `LAUREL METAL NATIVE: off`). Other crashes only show in the column.
 - A sequence reads 1 row and 1 column in 4 (180x390). It cannot see a change that is only in the skipped pixels.
 
+### The gate before step 1
+
+A shared phone can have a UI restart or a GPU hang just before the lock comes free. So `run`, before step 1: panel on, a lit frame held for 10 s (else exit 3, no table). Metal must be on: the newest `LAUREL METAL26: on: Metal device` of this boot must come after any `LAUREL GPU: off` or `Metal device refused` (else exit 4, no table; `--allow-cpu`: run all the same). `--need-stack NAME`: exit 5 on another stack. `RENDERER:` and `STACK:` are in the head of each report.
+
+**A measure:** `scripts/bg.sh autotest scripts/laurel/phone-lock.sh ui scripts/laurel/ios26-autotest.sh baseline [STACK]`. Only this command reboots: with Metal off, since the kernel keeps the GPU off until a reboot. It waits until 420 s of uptime (`SETTLE_UP_S`): the first minutes hold the start's load.
+
 ## 3. Facts found on the phone [V]
 
 | Fact | Evidence |
@@ -56,6 +62,7 @@ The tool never flashes, reboots, restarts a process, or changes a setting. A los
 | `key power` wakes the panel | `SWEET FB: display on`, `brightness 255 of 255` |
 | The compositor uses surfaces 1 and 3 at first, and adds 197, 198 with an app in front | `surfaces` |
 | A boot can hang with `ps busy` on each try: `proc_list_mlock` held, no exec for 465 s, `usernotificationsd` 60 s of CPU a minute, SSH `Connection timed out during banner exchange`, `ctl ping` works. So the old note "dropbear stops answering" has this one cause in this case | 06:30-06:38, logs/usblog-20261103-000638.txt. Cause of the hold: [U] |
+| With Metal off (GPU hang before the run) the UI still works on the CPU renderer: no `LAUREL FRAME`, no `RedwoodGPU` lines, `kern.laurel_scan_surface` 0, surfaces both in use. A table from that time looks fine and measures nothing | `logs/autotest-20261103-080215.txt` of this work, hang 08:03:15. So the gate |
 | A fixed wait of 2 to 8 s gives frames of an animation: the first run's "settings-open" showed Home, "control-center-closed" showed Control Center, and the table said ok | So `settle`. **Look at the PNGs: `changed` only says that the picture moved** |
 
 | **backboardd crash, stack default, the first full run:** sig 11 at 07:07:45 during the Control Center close, with `far` in a gap of 0x20000 between two maps of tag 21, pc in a library at 0x11fc1e294; one second before: `native-metal: refused ...: no-copy buffer 0x124f84000 length 16384 options 0x0`. Then 22 black frames, and the Metal start again. That the two lines are linked: [I]. Not symbolized. The tool holds views of surfaces and only reads them: if that can matter [U] | `logs/autotest-20261103-070713.txt` of this work, USB log 07:07:44-07:07:51 |
@@ -67,7 +74,7 @@ scripts/laurel/ios26-autotest.sh test                             # self-test of
 python3 -I tools/op10tool/tests/input-test.py out/bin/op10tool    # op10tool input against a fake command server on 127.0.0.1:5141
 ```
 
-Kernel [V host]: `kernel-ios26-linux.sh` with 2983: 350 patches, 229 applied, 86 applied+rules, 8 skipped, 0 errors; LSE/RCpc 0; printf-arg-check OK; copyio table OK; armv80-check 0. **2983 has not run on the phone.**
+Kernel [V host]: `kernel-ios26-linux.sh` with 2983: 350 patches, 229 applied, 86 applied+rules, 8 skipped, 0 errors; LSE/RCpc 0; printf-arg-check OK; copyio table OK; armv80-check 0. 2983 runs on the phone since kernel f24b7056ba.
 
 ## 5. After a flash with 2983
 
