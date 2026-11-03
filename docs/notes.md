@@ -5345,3 +5345,6 @@ Full text: `docs/laurel_sprout/ios26-control-center.md`.
 - bluetoothd: 0x2041 (extended scan parameters) gets status 1 -> OI 701 -> `Bluetooth error - restarting`, each 10 s. `post/9012`: legacy commands to the chip. tccd's burst follows these restarts.
 - Tool: `scripts/laurel/ios26-unified-log.py` reads a copy of `/var/db/diagnostics` + `uuidtext`. Private text is in the file too (decompress, `strings`). Use it first: it had the exact reason, with bundle id.
 - Next: chronod's HEIC write fails (no HEVC encoder): `CMPhotoCompressionSessionAddImage` UnsupportedOperation. A control may lose its icon [I].
+
+## 2026-11-03: Control Center works after post/9011 (boot 20); test of Turnip sysmem
+[V owner] Control Center modules are back. [V log 06:12-06:14] motion 35 frames in 799 ms, 19 in 962, 37 in 967, 49 in 4841; `LAUREL FLIP` waits over 100 ms up to 322 ms, 2 surfaces not drawn after 900 ms, 0 surfaces shown again; one window 10 submissions of 265 ms GPU each; CPU 360 of 480 s with widgets starting first time; GPU at 320 MHz 37 s of a minute. Test: `TU_DEBUG=sysmem` + `CA_ENABLE_MEMORYLESS=0` in `/var/db/negronimetal/env` (no root change).
