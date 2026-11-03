@@ -344,6 +344,8 @@
 2981-laurel-flip-not-before-drawn.patch                        applied
 2982-laurel-flip-fence-at-swap.patch                           applied
 2983-laurel-synth-input.patch                                  applied
+2985-laurel-rpm-scale.patch                                    applied
+2986-laurel-wdog.patch                                         applied+rules(2): base 0003, glue
 9000-series-12377-api.patch                                    post
 9001-laurel-release-only-initialized-pages.patch               post
 9002-laurel-no-panic-region.patch                              post
@@ -357,4 +359,8 @@
 9010-laurel-blastdoor-sandbox-check.patch                      post
 9011-laurel-arch-arm64e.patch                                  post
 9012-laurel-bt-legacy-le-scan.patch                            post
-== series: 229 applied, 86 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
+9013-laurel-stackshot-single-thread.patch                      post
+9014-laurel-gpu-fault-client.patch                             post
+9015-laurel-wdog-sleh.patch                                    post
+9016-laurel-debug-ack-late-cpu.patch                           post
+== series: 230 applied, 87 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors

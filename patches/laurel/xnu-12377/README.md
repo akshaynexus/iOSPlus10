@@ -50,6 +50,8 @@ header or kernelcache is in git: they stay in `out/` and `~/op10-apple/`.
 
 `post/9006`: IOHIDFamily-2238.120.5 in place of the 1915.140.3 of topaz 0058: the HID wire format of 23F84 (`docs/laurel_sprout/ios26-touch.md`). Made by `scripts/laurel/ios26-hid-port.sh`; host test `scripts/laurel/test-ios26-hid.sh`.
 
+`post/9015`, `post/9016`: the sleh.c hunk of laurel 2986 (watchdog; a base-owned file, listed in `owned.txt`) and the stuck-CPU lines of `LAUREL DEBUG ACK`: `docs/laurel_sprout/watchdog.md`.
+
 `post/9007`: `LAUREL DEBUG ACK: on: stackshot given up`: a CPU late for a stackshot costs that stackshot (as in xnu-8796), not a panic; `debug-ack` 100 ms in place of 12.5 ms on this timer. Boot 11: panic 2 s after Preferences started, CPU 5 late. Why CPU 5 was late: [U].
 
 `post/9008`: `LAUREL FRAME: on: vsync gives CoreAnimation the refresh period`: the third number of the vsync message is the period on 23F84, not a counter (`docs/laurel_sprout/gpu.md` "The 24 fps windows"). Kill switch `sweetfb_period=0`.

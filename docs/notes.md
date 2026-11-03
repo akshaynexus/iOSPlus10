@@ -5448,3 +5448,16 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - `fdl6_layout` asks 16 pixels a row above 4 bytes a pixel, for tile memory only. A native row of 64-byte units is valid on the hardware.
 - Host pages: the kernel wants pages of 16 KiB here; errno 5 (kIOReturnVMError) means read-only pages: try again read-only, as `host_import_pages`.
 - Host compare: `pm4-rows.sh` does `cd` into the ref folder: PLAN must be an absolute path. With a relative path Turnip's row falls back to the default pipeline with no error line, and the compare means nothing.
+
+## 2026-11-03: Mi A3: APSS watchdog (2986), stuck-CPU report (post/9016), hang audit. NOT BOOTED (branch t3/mi-a3-watchdog-stuck-cpu-audit). Full text: `docs/laurel_sprout/watchdog.md`
+- [V] Hang at 13:46:59, 67 s after `LAUREL RPM SCALE: on`. A first `LAUREL CPU TOP` of `busy 376 s of 480` is 8 CPUs x 47 s, not a lost CPU: the first window is short. Do not read 376 as a limit.
+- [V] 12 of 12 stackshots given up name CPU 5 (logical 5 = Silver core 1: boot CPU Gold 0x100 is logical 0).
+- Times: pet 1 s, CPU silent 8 s stops the pet, bark 12 s, bite 20 s; one stuck CPU: bark 20 s, bite 28 s. Panic: 30 s until its hold, then off. Kill switch `laurelwdog=0`.
+- `SIGPast` for a heartbeat: no slot, no spin. `cpu_xcall` waits on a slot of the target with interrupts off. The answer is the stamp in `sleh_irq`.
+- Count silence from an open signal, not from the last interrupt: a late pet thread would otherwise blame all CPUs.
+- `sleh.c` is owned by 12377 base 0003: a series patch needs its name in `owned.txt`, and the 12377 hunk goes to `post/`.
+- `IGROUPR` reads 0 from NS whatever the group here (2016): test a Secure SPI by an enable that does not hold.
+- `ml_dbgwrap_*`: UNSUPPORTED on this SoC. EDPCSR needs QDSS clock and debug power: an access with these off can stop the bus [I]: not used. The pc of a late CPU comes when it takes the signal: `LAUREL DEBUG ACK: on: cpu N came`.
+- `delay()` with interrupts off is WFE: safe here only because `wfe_timeout_init` runs on every CPU [V].
+- IMEM restart word: `was 0x00000000` in 3 of 3 boots: [U] it survives a hard reset. Not a base for a boot-loop guard; 2985 also uses it.
+- Worktree build of iOS 16: `kernel-linux.sh` needs `external/ios-topaz` and `ios-sweet-linux` in the worktree (symlink to the main checkout, delete after), and `out/laurel-kernel/{theos,cache,dl,deps}` from the main checkout. Under 10 min with ccache.
