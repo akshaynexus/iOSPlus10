@@ -3,7 +3,7 @@
 #   scripts/laurel/ios26-autotest.sh install             build laurel-autotest, copy it to /usr/local/bin on the phone (no other file; a file in /var/tmp has no entitlements)
 #   scripts/laurel/ios26-autotest.sh check               LAUREL AUTOTEST: on|off: ...
 #   scripts/laurel/ios26-autotest.sh tap X Y [MS]        also: swipe X0 Y0 X1 Y1 [MS], edge bottom|top|left|right [LEN] [MS] [AT], key power|volup|voldown|home [MS]. Panel pixels 720x1560
-#   scripts/laurel/ios26-autotest.sh open BUNDLE_ID      start an app; home: go to the Home Screen
+#   scripts/laurel/ios26-autotest.sh open BUNDLE_ID      start an app; home: go to the Home Screen (an edge swipe); settle QUIET_MS MAX_MS [change]
 #   scripts/laurel/ios26-autotest.sh shot [NAME]         the frame on the panel: logs/autotest-shots/NAME.png
 #   scripts/laurel/ios26-autotest.sh seq N [MAX_MS]      N flips: logs/autotest-shots/seq-TIME/ and one line with frames that equal an older frame, and black frames
 #   scripts/bg.sh autotest scripts/laurel/ios26-autotest.sh run [--only a,b] [--scenario FILE]    the scenario; the table is in logs/autotest-DATE.txt
@@ -45,7 +45,8 @@ seq)
   echo "files: $SHOTS/$name/"
   ;;
 home)
-  "$SSHP" "$TOOL key home"
+  # an edge swipe from the bottom: the home key of this model changed nothing on the phone
+  "$0" edge bottom 700 250
   ;;
 run)
   need_op
@@ -56,7 +57,15 @@ test)
   OP10TOOL=$OP python3 -I "$REPO/scripts/laurel/ios26-autotest.py" --self-test
   cargo test --release --manifest-path "$REPO/tools/op10tool/Cargo.toml" --target-dir "$OUT/cargo" autotest
   ;;
-check|tap|swipe|edge|key|open|surfaces|awake)
+tap|swipe|edge|key)
+  # The kernel's own HID path if it has patch 2983 (also the CPU and GPU clock answer to touch, and it works with no SSH), else the tool. AUTOTEST_INPUT=ssh: the tool only.
+  if [ "${AUTOTEST_INPUT:-}" != ssh ] && [ -x "$OP" ] && "$OP" input check >/dev/null 2>&1; then
+    exec "$OP" input "$@"
+  fi
+  args=$*
+  exec "$SSHP" "$TOOL $args"
+  ;;
+check|open|surfaces|awake|settle)
   args=$*
   exec "$SSHP" "$TOOL $args"
   ;;

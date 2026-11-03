@@ -8,9 +8,10 @@
  *   laurel-autotest edge bottom|top|left|right [LEN_PX] [MS] [AT_PX]   from the screen edge, with the kernel's edge flag
  *   laurel-autotest key power|volup|voldown|home [HOLD_MS]
  *   laurel-autotest open BUNDLE_ID              SpringBoard's own service, then LaunchServices
- *   laurel-autotest awake                       exit 0 if a surface is on the panel, 1 if the panel is off
+ *   laurel-autotest awake                       exit 0 if the panel is on, 1 if off (SpringBoard's state), and the lock state
  *   laurel-autotest surfaces                    all screen-size surfaces: id, format, use count
  *   laurel-autotest shot                        one whole frame to stdout (LATF record, see frame_head)
+ *   laurel-autotest settle QUIET_MS MAX_MS [change]   waits until the picture holds still; change: it must first change
  *   laurel-autotest seq N [MAX_MS]              up to N flips to stdout: LATS head, then one record per frame, 1/4 size
  *
  * Input: the same events as SweetHIDTouch::touch and SweetHIDButtons::key of the kernel, with the sender id of
@@ -27,6 +28,7 @@
 #include <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
 #include <mach/mach_time.h>
+#include <notify.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -202,15 +204,18 @@ screens_release(void)
 static void
 screens_find(void)
 {
+	const uint32_t keep = g_current >= 0 && g_current < g_screens ? IOSurfaceGetID(g_screen[g_current]) : 0;
 	screens_release();
 	g_current = -1;
 	for (uint32_t id = 1; id < MAX_SURFACE_ID && g_screens < MAX_SCREENS; id++) {
 		IOSurfaceRef s = IOSurfaceLookup(id);
 		if (s == NULL)
 			continue;
-		if (IOSurfaceGetWidth(s) == PANEL_W && IOSurfaceGetHeight(s) == PANEL_H && IOSurfaceGetBytesPerElement(s) == 4 && IOSurfaceGetPlaneCount(s) <= 1)
+		if (IOSurfaceGetWidth(s) == PANEL_W && IOSurfaceGetHeight(s) == PANEL_H && IOSurfaceGetBytesPerElement(s) == 4 && IOSurfaceGetPlaneCount(s) <= 1) {
+			if (id == keep)
+				g_current = g_screens;
 			g_screen[g_screens++] = s;
-		else
+		} else
 			CFRelease(s);
 	}
 }
@@ -332,8 +337,23 @@ cmd_shot(uint32_t want_id)
 	return 0;
 }
 
+#define SEQ_RESCAN_US 300000 /* the compositor adds screen surfaces at times (an app in front): look for new ones when no frame came for this long */
+
+static void
+thumb_read(IOSurfaceRef s, uint8_t *thumb, uint32_t tw, uint32_t th)
+{
+	const uint8_t *base = IOSurfaceGetBaseAddress(s);
+	const size_t row = IOSurfaceGetBytesPerRow(s);
+	for (uint32_t y = 0; y < th; y++) {
+		const uint32_t *src = (const uint32_t *)(base + (size_t)y * THUMB_DIV * row);
+		uint32_t *dst = (uint32_t *)(thumb + (size_t)y * tw * 4);
+		for (uint32_t x = 0; x < tw; x++)
+			dst[x] = src[x * THUMB_DIV];
+	}
+}
+
 /*
- * One record per change of the surface, or of its picture. The host (op10tool autotest-frames) finds a frame that equals an older one.
+ * One record per change of the surface, or of its picture. The host (op10tool autotest-seq) finds a frame that equals an older one.
  * Rows are read 1 in 4, to keep to the flip rate.
  */
 static int
@@ -353,22 +373,14 @@ cmd_seq(int want, int max_ms)
 	uint32_t last_id = 0;
 	for (int got = 0; got < want && now_us() - t0 < (uint64_t)max_ms * 1000;) {
 		usleep(2000);
+		if (now_us() - t_find > SEQ_RESCAN_US) {
+			screens_find();
+			t_find = now_us();
+		}
 		IOSurfaceRef s = screen_current(&how);
-		const uint8_t *base = s != NULL ? IOSurfaceGetBaseAddress(s) : NULL;
-		if (base == NULL) {
-			if (now_us() - t_find > 500000) { /* a compositor restart makes new surfaces */
-				screens_find();
-				t_find = now_us();
-			}
+		if (s == NULL || IOSurfaceGetBaseAddress(s) == NULL)
 			continue;
-		}
-		const size_t row = IOSurfaceGetBytesPerRow(s);
-		for (uint32_t y = 0; y < th; y++) {
-			const uint32_t *src = (const uint32_t *)(base + (size_t)y * THUMB_DIV * row);
-			uint32_t *dst = (uint32_t *)(thumb + (size_t)y * tw * 4);
-			for (uint32_t x = 0; x < tw; x++)
-				dst[x] = src[x * THUMB_DIV];
-		}
+		thumb_read(s, thumb, tw, th);
 		const uint32_t id = IOSurfaceGetID(s);
 		if (id == last_id && memcmp(thumb, last, bytes) == 0)
 			continue;
@@ -377,11 +389,90 @@ cmd_seq(int want, int max_ms)
 		write_all(thumb, bytes);
 		memcpy(last, thumb, bytes);
 		last_id = id;
+		t_find = now_us();
 		got++;
 	}
 	free(thumb);
 	free(last);
 	return 0;
+}
+
+/*
+ * Waits until the picture holds still for QUIET_MS, at most MAX_MS. With change=1 the picture must first change (an app that takes seconds to come). Exit 0 if it settled.
+ * Two panel frames may differ by a little (a clock, noise): under 0.2 % of the samples moved counts as still, as the host's rule for one picture.
+ */
+static int
+cmd_settle(int quiet_ms, int max_ms, int must_change)
+{
+	screens_find();
+	const char *how = "";
+	const uint32_t tw = PANEL_W / THUMB_DIV, th = PANEL_H / THUMB_DIV;
+	const size_t bytes = (size_t)tw * 4 * th, pixels = (size_t)tw * th;
+	uint8_t *thumb = malloc(bytes), *last = malloc(bytes);
+	if (thumb == NULL || last == NULL)
+		return 1;
+	const uint64_t t0 = now_us();
+	uint64_t t_find = t0, still_since = t0;
+	bool have = false, changed = false;
+	while (now_us() - t0 < (uint64_t)max_ms * 1000) {
+		usleep(30000);
+		if (now_us() - t_find > SEQ_RESCAN_US) {
+			screens_find();
+			t_find = now_us();
+		}
+		IOSurfaceRef s = screen_current(&how);
+		if (s == NULL || IOSurfaceGetBaseAddress(s) == NULL)
+			continue;
+		thumb_read(s, thumb, tw, th);
+		if (have) {
+			size_t moved = 0;
+			for (size_t i = 0; i < pixels; i++) {
+				const uint8_t *a = thumb + i * 4, *b = last + i * 4;
+				if (abs((int)a[0] - b[0]) > 8 || abs((int)a[1] - b[1]) > 8 || abs((int)a[2] - b[2]) > 8)
+					moved++;
+			}
+			if (moved * 500 >= pixels) {
+				changed = true;
+				still_since = now_us();
+				memcpy(last, thumb, bytes);
+			}
+		} else {
+			memcpy(last, thumb, bytes);
+			have = true;
+			still_since = now_us();
+		}
+		if ((changed || !must_change) && now_us() - still_since >= (uint64_t)quiet_ms * 1000) {
+			printf("settled in %llu ms, %s\n", (now_us() - t0) / 1000, changed ? "changed" : "no change");
+			return 0;
+		}
+	}
+	printf("not settled in %d ms, %s\n", max_ms, changed ? "changed" : "no change");
+	return 1;
+}
+
+/*
+ * SpringBoard's own state. The surfaces cannot tell: with the panel off the last one keeps its mark, drawn black [V phone].
+ * Exit 0: on. 1: off. 3: no answer (no state in notifyd, SpringBoard not up).
+ */
+static uint64_t
+springboard_state(const char *name, int *ok)
+{
+	int token = 0;
+	uint64_t v = 0;
+	*ok = notify_register_check(name, &token) == NOTIFY_STATUS_OK && notify_get_state(token, &v) == NOTIFY_STATUS_OK;
+	if (token != 0)
+		notify_cancel(token);
+	return v;
+}
+
+static int
+cmd_awake(void)
+{
+	int ok_blank, ok_lock;
+	const uint64_t blank = springboard_state("com.apple.springboard.hasBlankedScreen", &ok_blank);
+	const uint64_t lock = springboard_state("com.apple.springboard.lockstate", &ok_lock);
+	printf("blanked %llu (%s), locked %llu (%s)\n", blank, ok_blank ? "read" : "no answer", lock, ok_lock ? "read" : "no answer");
+	return !ok_blank ? 3 : blank != 0 ? 1 : 0;
 }
 
 static int
@@ -457,7 +548,7 @@ num(const char *s, const char *what)
 static int
 usage(void)
 {
-	fprintf(stderr, "usage: laurel-autotest check | awake | tap X Y [MS] | swipe X0 Y0 X1 Y1 [MS] | edge bottom|top|left|right [LEN] [MS] [AT] | key power|volup|voldown|home [MS] | open BUNDLE | surfaces | shot | seq N [MAX_MS]\n");
+	fprintf(stderr, "usage: laurel-autotest check | awake | tap X Y [MS] | swipe X0 Y0 X1 Y1 [MS] | edge bottom|top|left|right [LEN] [MS] [AT] | key power|volup|voldown|home [MS] | open BUNDLE | surfaces | shot | settle QUIET_MS MAX_MS [change] | seq N [MAX_MS]\n");
 	return 2;
 }
 
@@ -488,17 +579,16 @@ main(int argc, char **argv)
 		printf("LAUREL AUTOTEST: on: touch service %#llx, buttons %#llx, %d screen surfaces, panel surface from %s\n", g_touch_id, g_buttons_id, g_screens, kernel_scan_id() ? "the kernel" : "in-use marks (inferred)");
 		return 0;
 	}
-	if (strcmp(c, "awake") == 0) {
-		screens_find();
-		const char *how = "";
-		return screen_current(&how) != NULL ? 0 : 1;
-	}
+	if (strcmp(c, "awake") == 0)
+		return cmd_awake();
 	if (strcmp(c, "surfaces") == 0)
 		return cmd_surfaces();
 	if (strcmp(c, "shot") == 0)
 		return cmd_shot(argc > 2 ? (uint32_t)num(argv[2], "ID") : 0);
 	if (strcmp(c, "seq") == 0 && argc >= 3)
 		return cmd_seq(num(argv[2], "N"), argc > 3 ? num(argv[3], "MAX_MS") : 10000);
+	if (strcmp(c, "settle") == 0 && argc >= 4)
+		return cmd_settle(num(argv[2], "QUIET_MS"), num(argv[3], "MAX_MS"), argc > 4 && strcmp(argv[4], "change") == 0);
 	if (strcmp(c, "open") == 0 && argc == 3)
 		return cmd_open(argv[2]);
 	if (need_input())

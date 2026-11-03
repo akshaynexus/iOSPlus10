@@ -15,6 +15,7 @@ mod gpt;
 mod fat;
 mod hfs;
 mod im4p;
+mod input;
 mod img2simg;
 mod ipsw;
 mod portpatch;
@@ -307,6 +308,14 @@ enum Cmd {
         #[arg(long, default_value = "192.168.7.2")]
         host: String,
     },
+    /// Touch and keys through the Mi A3 kernel's HID path over USB (kernel patch 2983). Panel pixels 720x1560
+    Input {
+        #[command(subcommand)]
+        action: input::Action,
+        /// the phone's address
+        #[arg(long, default_value = "192.168.7.2")]
+        host: String,
+    },
     /// A frame from laurel-autotest shot (LATF) to a PNG (scripts/laurel/ios26-autotest.sh)
     AutotestPng {
         input: PathBuf,
@@ -422,6 +431,7 @@ fn main() -> Result<()> {
         Cmd::A64Abi { cache, out } => abi::run(&cache, &out),
         Cmd::A64Dis { cache, image, symbol, xref, count } => abi::dis(&cache, &image, &symbol, xref, count, std::path::Path::new("out/ios26/tmp-dis")),
         Cmd::Ctl { command, host } => ctl::run(command, &host),
+        Cmd::Input { action, host } => input::run(action, &host),
         Cmd::AutotestPng { input, output, prev } => autotest::run_png(&input, &output, prev.as_deref()),
         Cmd::AutotestSeq { input, outdir, all } => autotest::run_seq(&input, &outdir, all),
         Cmd::Camframe { host, out, no_capture, raw, width, height, bayer } => {

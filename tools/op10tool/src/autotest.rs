@@ -16,6 +16,8 @@ const BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 const PIXEL_DIFF: u8 = 8;
 /// Two frames are the same picture if under this share of the pixels changed.
 const SAME_SHARE: f64 = 0.002;
+/// A return to an older picture counts only if the frame before it differs by at least this share: the last slow frames of an animation can differ by a little and come back.
+const FLASH_SHARE: f64 = 0.02;
 /// A pixel is dark at or below this value in all channels.
 const DARK: u8 = 8;
 /// A frame is mostly black from this share of dark pixels.
@@ -145,7 +147,7 @@ pub fn analyse(frames: &[Frame]) -> Report {
         if dark_share(f) >= BLACK_SHARE {
             r.black.push(i);
         }
-        if i < 2 || diff_share(f, &frames[i - 1]) < SAME_SHARE {
+        if i < 2 || diff_share(f, &frames[i - 1]) < FLASH_SHARE {
             continue;
         }
         for j in (i.saturating_sub(WINDOW)..i - 1).rev() {
@@ -319,6 +321,17 @@ mod tests {
         assert!(analyse(&fs).older.is_empty());
         let same = vec![frame(1, 0, [100, 0, 0, 255]), frame(2, 16, [100, 0, 0, 255]), frame(1, 33, [100, 0, 0, 255])];
         assert!(analyse(&same).older.is_empty());
+    }
+
+    #[test]
+    fn a_small_step_back_at_the_end_of_an_animation_is_not_a_flash() {
+        let base = frame(1, 0, [100, 100, 100, 255]);
+        let mut near = base.clone();
+        for p in near.pixels.chunks_exact_mut(4).take(4) {
+            p[0] = 200; // 1 % of the pixels
+        }
+        let fs = vec![base.clone(), near, base];
+        assert!(analyse(&fs).older.is_empty());
     }
 
     #[test]

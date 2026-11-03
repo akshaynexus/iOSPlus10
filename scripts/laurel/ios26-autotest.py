@@ -61,8 +61,8 @@ class Step:
 
 def parse_scenario(text):
     """A list of (name, [command words]). A scenario error stops before the phone is touched."""
-    known = {"wake": (0, 0), "key": (1, 2), "tap": (2, 3), "swipe": (4, 5), "edge": (1, 4), "open": (1, 1), "home": (0, 0), "wait": (1, 1), "shot": (1, 1),
-             "record": (2, 2), "stop": (0, 0), "changed": (0, 0)}
+    known = {"lock": (0, 0), "wake": (0, 0), "key": (1, 2), "tap": (2, 3), "swipe": (4, 5), "edge": (1, 4), "open": (1, 1), "home": (0, 0), "wait": (1, 1), "shot": (1, 1),
+             "record": (2, 2), "stop": (0, 0), "changed": (0, 0), "settle": (2, 3)}
     steps = []
     for no, line in enumerate(text.splitlines(), 1):
         words = line.split("#", 1)[0].split()
@@ -223,14 +223,20 @@ class LiveLog:
 
 
 class Run:
-    def __init__(self, phone, out, log):
+    def __init__(self, phone, out, log, kernel_input=False):
         self.phone, self.out, self.log = phone, out, log
+        self.kernel_input = kernel_input
         self.last_shots = []
         self.recording = None
         self.step = None
         self.nseq = 0
 
     def tool(self, *words, timeout=60):
+        if self.kernel_input and words[0] in ("tap", "swipe", "edge", "key"):
+            p = subprocess.run([self.phone.op10, "input"] + list(words), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+            if p.returncode != 0:
+                self.step.fail(f"{' '.join(words)}: {p.stdout.strip()[:120]}")
+            return p.returncode, p.stdout
         rc, text = self.phone.run(" ".join([TOOL] + list(words)), timeout=timeout)
         if rc == 255:
             self.step.notes.append(f"SSH lost at: {' '.join(words)}")
@@ -303,38 +309,42 @@ class Run:
         if p.returncode != 0:
             self.step.notes.append(f"{name}: autotest-seq rc {p.returncode}")
 
-    def home(self):
-        before = None
-        with tempfile.NamedTemporaryFile(dir=self.out, suffix=".bin", delete=False) as t:
-            before = t.name
-        rc, _ = self.phone.run(f"{TOOL} shot", stdout=open(before, "wb"))
-        self.tool("key", "home")
-        time.sleep(2)
-        after = before + ".2"
-        rc2, _ = self.phone.run(f"{TOOL} shot", stdout=open(after, "wb"))
-        same = None
-        if rc == 0 and rc2 == 0:
-            p = subprocess.run([self.phone.op10, "autotest-png", after, os.devnull, "--prev", before], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            m = re.search(r"([\d.]+) % changed", p.stdout)
-            same = m is not None and float(m.group(1)) < 0.2
-        if same:
-            self.step.notes.append("home: key home changed nothing, edge swipe")
-            self.tool("edge", "bottom", "700", "250")
-        for path in (before, after):
-            if os.path.exists(path):
-                os.unlink(path)
+    def settle(self, quiet, most, change):
+        cmd = f"{TOOL} settle {quiet} {most}" + (" change" if change else "")
+        rc, text = self.phone.run(cmd, timeout=int(most) / 1000 + 30)
+        self.step.notes.append(f"settle{' change' if change else ''}: {text.strip()[:100]}")
+        if rc != 0 and change:
+            self.step.fail(f"no new picture in {most} ms")
+
+    def panel_on(self):
+        """SpringBoard's own state; None: no answer."""
+        rc, _ = self.phone.run(f"{TOOL} awake")
+        return True if rc == 0 else False if rc == 1 else None
+
+    def panel_until(self, want, seconds=15):
+        # the state follows the key by more than 3 s on this phone; a second key in that time would undo the first
+        end = time.time() + seconds
+        while time.time() < end:
+            if self.panel_on() is want:
+                return True
+            time.sleep(0.5)
+        return False
 
     def do(self, words):
         c = words[0]
         if c in ("key", "tap", "swipe", "edge", "open"):
             self.tool(*words)
+        elif c == "lock":
+            if self.panel_on() is True:
+                self.tool("key", "power")
+                if not self.panel_until(False):
+                    self.step.fail("lock: the panel stayed on for 15 s")
         elif c == "wake":
-            rc, _ = self.phone.run(f"{TOOL} awake")
-            if rc == 1:
+            if self.panel_on() is False:
                 self.step.notes.append("wake: panel off, power key")
                 self.tool("key", "power")
-            elif rc != 0:
-                self.step.notes.append(f"wake: rc {rc}")
+                if not self.panel_until(True):
+                    self.step.fail("wake: the panel stayed off for 15 s")
         elif c == "wait":
             time.sleep(float(words[1]))
         elif c == "shot":
@@ -346,7 +356,9 @@ class Run:
         elif c == "stop":
             self.stop()
         elif c == "home":
-            self.home()
+            self.tool("edge", "bottom", "700", "250")
+        elif c == "settle":
+            self.settle(words[1], words[2], len(words) > 3)
 
     def run_step(self, name, commands):
         self.step = Step(name)
@@ -392,10 +404,14 @@ def main():
         print("ios26-autotest: the tool is off or absent: scripts/laurel/ios26-autotest.sh install")
         return 2
     log = LiveLog(REPO)
-    run = Run(phone, out, log)
+    # patch 2983: the real HID path, so the CPU and GPU clock answer to touch as for a finger. AUTOTEST_INPUT=ssh: the tool, no kernel path.
+    kernel_input = os.environ.get("AUTOTEST_INPUT") != "ssh" and subprocess.run([phone.op10, "input", "check"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    input_line = "Input: kernel HID path (patch 2983)" if kernel_input else "Input: laurel-autotest, event system in backboardd; no kernel clock answer to touch (CPU, GPU), so frame rates can be under those of a finger"
+    print(input_line, flush=True)
+    run = Run(phone, out, log, kernel_input)
     done = [run.run_step(n, c) for n, c in steps]
 
-    lines = [f"Mi A3 iOS 26 UI test {date}", text.strip(), f"USB log: {log.path or 'none: no kernel lines in this table. make usblog'}", f"Files: {out}", ""]
+    lines = [f"Mi A3 iOS 26 UI test {date}", text.strip(), input_line, f"USB log: {log.path or 'none: no kernel lines in this table. make usblog'}", f"Files: {out}", ""]
     lines.append(table([step_row(s) for s in done]))
     lines.append("")
     lines.append("motion: LAUREL FRAME: motion ended, one line per finished motion. moving: best frames/s while moving. fence: mean GPU fence wait of a flip. busy/MHz: the highest GPU busy share and clock of a RedwoodGPU window. "
