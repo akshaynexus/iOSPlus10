@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Mi A3 iOS 26: reads `laurel-autotest sample` output: where the running threads of a process spend their time. Docs: docs/laurel_sprout/ios26-default-speed.md.
+  scripts/laurel/ios26-sample-sym.py SAMPLES --bins MS [--thread N]    how busy the threads are per bin of time, from the T lines: one row per bin
   scripts/laurel/ios26-sample-sym.py SAMPLES [--thread N] [--top N] [--under TEXT]   --under: only the callees of the first frame whose symbol holds TEXT, one level
 Symbols: NegroniMetal (dSYM of out/ios26/metal-impl), Turnip (out/ios26/gpu/turnip/build-ios), the dyld cache (scripts/laurel/dsc-image.py, kept in out/ios26/dis). Self = the pc; inclusive = anywhere on the walked stack."""
 import bisect
@@ -74,7 +75,7 @@ class Image:
         return (self.table[i][1] if i >= 0 else "?") + " [" + self.leaf + "]"
 
 
-KEEP = {"QuartzCore", "libsystem_kernel.dylib", "libsystem_platform.dylib", "libsystem_malloc.dylib", "libsystem_pthread.dylib", "Metal", "IOKit", "IOSurface", "libobjc.A.dylib", "libdispatch.dylib", "CoreFoundation"}
+KEEP = {"libdyld.dylib", "libsystem_c.dylib", "dyld", "libc++.1.dylib", "libc++abi.dylib", "QuartzCore", "libsystem_kernel.dylib", "libsystem_platform.dylib", "libsystem_malloc.dylib", "libsystem_pthread.dylib", "Metal", "IOKit", "IOSurface", "libobjc.A.dylib", "libdispatch.dylib", "CoreFoundation"}
 
 
 def cache_images():
@@ -96,6 +97,30 @@ def main():
     want = None
     top = 45
     under = None
+    callers = False
+    if "--callers" in args:
+        i = args.index("--callers"); under = args[i + 1]; callers = True; del args[i:i + 2]
+    if "--bins" in args:
+        i = args.index("--bins"); ms = int(args[i + 1]); del args[i:i + 2]
+        rows = collections.defaultdict(collections.Counter)
+        ticks = collections.Counter()
+        now = None
+        for line in open(args[0], errors="replace"):
+            if line.startswith("T "):
+                now = int(line.split()[1]) // ms
+                ticks[now] += 1
+            elif line.startswith("S ") and now is not None:
+                rows[now][line.split()[1]] += 1
+        tops = collections.Counter()
+        for r in rows.values():
+            tops.update(r)
+        names = [t for t, _ in tops.most_common(4)]
+        print("bin(ms)  ticks  " + " ".join(f"th{n:>3}" for n in names) + "   others")
+        first = min(ticks) if ticks else 0
+        for b in sorted(ticks):
+            r = rows[b]
+            print(f"{(b - first) * ms:7d} {ticks[b]:5d}  " + " ".join(f"{100 * r[n] // max(ticks[b], 1):4d}%" for n in names) + f"   {sum(r.values()) - sum(r[n] for n in names)}")
+        return
     if "--under" in args:
         i = args.index("--under"); under = args[i + 1]; del args[i:i + 2]
     if "--thread" in args:
@@ -137,7 +162,10 @@ def main():
             if at is None:
                 continue
             hits += 1
-            kids[names[at - 1] if at > 0 else "(self)"] += 1
+            if callers:
+                kids[names[at + 1] if at + 1 < len(names) else "(top)"] += 1
+            else:
+                kids[names[at - 1] if at > 0 else "(self)"] += 1
         print(f"under {under}: {hits} samples, {100 * hits / len(use):.1f} % of the thread")
         for k, v in kids.most_common(top):
             print(f"{100 * v / hits:5.1f}  {k[:120]}")

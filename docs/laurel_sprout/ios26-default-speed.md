@@ -66,6 +66,51 @@ Baseline `b2-base`, same test, same kernel. "Pass" is the mean of `gmem 720x1560
 - ssh in a `while read` loop eats the rest of the list: `</dev/null`.
 - `git -C DIR` in a build tree that a rebuild removed reaches the repo above. Do not `git init` in `out/ios26/gpu/turnip/mesa-*`: `make_tree` removes it at each new patch, and an edit there goes with it.
 - A bench with Metal off gives an empty table: read `gpu/sub`.
+- Do not edit a shell script that runs: bash reads it as it goes (`unexpected EOF` at the end of run s9). Write a new file and `mv` it over.
+- A first run after a boot measures the boot: s9 had 377 s busy of 480 (`chronod`, `dasd`, `iconservicesagent`), Gold 79 % mean. The bench now waits for 420 s of uptime (`SETTLE_UP_S`).
+- The lock is not for waiting: a bench looped on `uptime none` under the lock while the phone was in a panic hold, and the owner's flash waited behind it (18:50-18:59). Now `scripts/laurel/ios26-bench-round.sh` waits for SSH and uptime with no lock; under the lock the bench never waits for a phone; `uptime none` for over 60 s ends the round (exit 7), in the settle time and in the test too; a reboot by the bench ends the round (exit 8). A restore with no SSH costs one timeout.
+- A restore with no SSH left `option default` on the shared phone, and the old log said `restored`. The bench now keeps `option.bench-saved` on the phone, and says `NOT restored`.
+
+## 6. Where the time is in a slow frame, and the CPU map
+
+**CPU map [V].** Logical CPU 0-3 are Gold and 4-7 are Silver: `uefi-image.sh` calls `mkadt.py --boot gold`, and the boot log gives cpu 5, 6, 7 = MPIDR 0x1, 0x2, 0x3.
+
+**`silver busy 100 %` [V code, V times, I link].** `cl_busy` in `laurel_gov_loop.h` is the busiest single core of a cluster, not the mean. Silver reads 100 % in the period that contextstored takes 60.5 s of each minute (11:53 to the reboot at 13:04), and 6-24 % after it. Run s8, after that reboot: Gold 50-53 %, Silver 9-17 %. There is no per-CPU sample from inside the period, so for 12:50 "the UI is not stuck on Silver" is [I].
+
+**`0 ms on P cores` [U].** `laurel-autotest cores` reads 0 on all runs, while `cpus` shows the work on Gold. The struct offsets match `resource.h`. Use `cpus`.
+
+**CPU 5 [V, cause U].** It reads 0 % busy, peak 0, in run s9, and 12 % in s8. See `watchdog.md` section 5, candidate 3: 12 of 12 stackshots given up name CPU 5 first.
+
+**contextstored [V, cause U].** 1 of 11 boots. pid 63, one thread, STIME 69:16, UTIME 0:00.08: all in the kernel. `thread_suspend` hangs on it, and `kill -SEGV` gives no CRASH line. `laurel-autotest kstack PID` reads kernel stacks through a stackshot, and `scripts/laurel/ios26-kstack-sym.py` adds symbols: [NOT RUN on the phone yet]. Run it when `LAUREL CPU TOP` shows a process with 60 s of each minute.
+
+**Render thread in busy bins [V s7: 100 Hz, all threads, Home loop, 24 bins of 500 ms at >= 40 % busy, 737 samples; a mix, not only 2-tick frames].**
+
+| Where | Share | Of 33 ms |
+|---|---|---|
+| `draw_elements` | 36.2 % | 12 ms |
+| idle in `mach_msg` | 20.8 % | 6.9 ms |
+| `stop_encoders` | 11.1 % | 3.7 ms |
+| blocked in `finish_update` | 8.1 % | 2.7 ms |
+| `render_update` other, `add_context`, `start_render_encoder`, `create_surface` | 10.5 % | 3.5 ms |
+
+Inside `draw_elements`: 71.6 % `NBRenderEncoder` (m2v and Turnip), 15.0 % `set_surface`. `ios26-sample-lines.py`: no hot line; the top inlined function has 1.0 % of the thread. [I] The 2-tick cadence comes from CoreAnimation's own work: about 26 ms of 33 ms is not idle.
+
+**SpringBoard main: no clean number.** s9 (wall samples, 58 bins, just after a boot): 74.2 % idle. s11 (`only=` sampler) has not run.
+
+**Sampler effect [V: not the main one].** Home loop, windows of at least 300 ms:
+
+| Run | Sampler | fps | Gaps <20 ms | <36 | <52 | Longer |
+|---|---|---|---|---|---|---|
+| s10a | none | 15.6 | 69 | 65 | 40 | 247 |
+| s7 | all threads, 100 Hz | 16.9 | 54 | 57 | 25 | 129 |
+| s9 | all threads, 100 Hz, just after a boot | 12.2 | 37 | 48 | 38 | 245 |
+
+Run d1 (other steps, no sampler) had 471 gaps <20 ms and the 59.8 fps stretch, so that stretch does not prove Home swipe speed. Which motion it was: [U].
+
+**Next lead.** In s10a the gaps over 52 ms outnumber the 2-tick gaps, 247 to 65. Windows run at 11-15 frames/s for 4-6 s, and a short swipe reaches 64.7 frames/s for 247 ms. Which thread holds those long gaps: [U], s11 reads it.
+
+**Hang [V, cause U].** The phone stopped at 13:46:59, 67 s after a reboot that this bench did for a GPU that was off. The GPU hang before it (13:42:54) came with stack native [I: the last stack line]. See `watchdog.md`.
+
 
 ## 7. Where a slow frame waits, read in the samples (branch `t3/ios26-frame-gap-root-cause`, 2026-11-03)
 
