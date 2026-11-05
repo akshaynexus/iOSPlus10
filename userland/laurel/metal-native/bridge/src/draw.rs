@@ -1330,7 +1330,9 @@ fn emit_draw(e: &mut NmbEncoder, draw: DrawCall, index: Option<(Arc<BufferObj>, 
     if crate::flight::on() {
         let at = unsafe { e.draws.start_iova + (e.draws.cur as u64).wrapping_sub(e.draws.start as u64) };
         crate::flight::line(&format!("draw {} prim {primitive} counts {counts:?} at {at:#x} id {}", device_pipeline.names, mark.map_or(0, |m| m.1)));
-        if !crate::flight::lite() {
+        // lite: a program with no private memory stays one line: most draws
+        let mut facts_lite = [0 as std::ffi::c_char; 8];
+        if !crate::flight::lite() || unsafe { nmn_baked_describe(entry.baked.b as *const NmnBaked, facts_lite.as_mut_ptr(), facts_lite.len()) } {
         for (i, s) in set_memory.iter().enumerate() {
             crate::flight::line(&crate::flight::set_words(i, s.0, s.1, entry.set_slots.get(i).copied().unwrap_or(0)));
         }
