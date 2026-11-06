@@ -355,11 +355,17 @@
 2993-laurel-apps-smmu-private-tlb.patch                        applied
 2994-laurel-lock-timeout.patch                                 applied
 2995-laurel-wdog-frame-scan.patch                              applied
+2996-laurel-timer-coalescing-off.patch                         applied
+2997-laurel-touch-fast.patch                                   applied
+2998-laurel-ucache.patch                                       applied+rules(3): base 0003, glue
 3000-laurel-audio-lead.patch                                   applied
 3001-laurel-haptic-first-contact.patch                         applied
+3002-laurel-haptic-node-early.patch                            applied
 3020-laurel-cpu-motion.patch                                   applied
 3021-laurel-gpu-motion.patch                                   applied
 3022-laurel-ram-top-line.patch                                 applied
+3040-laurel-ucache-line-after-boot-thread.patch                applied
+3041-laurel-lock-timeout-line-at-early-boot.patch              applied
 9000-series-12377-api.patch                                    post
 9001-laurel-release-only-initialized-pages.patch               post
 9002-laurel-no-panic-region.patch                              post
@@ -382,4 +388,5 @@
 9019-laurel-wdog-el0-trap-flag.patch                           post
 9020-laurel-focaltech-empty-report.patch                       post
 9021-laurel-pmap-free-backtrace.patch                          post
-== series: 244 applied, 87 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
+9022-laurel-ucache-sleh-init.patch                             post
+== series: 249 applied, 88 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
