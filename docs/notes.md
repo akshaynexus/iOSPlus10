@@ -5481,3 +5481,5 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - [I] Strongest hang candidate left: an exclusive (atomic) on Normal Non-cacheable memory in EL0 (a Turnip BO map or an IOSurface pixel map): the Snapdragon memory system does not serve it and the core never completes the instruction. 2988 tells EL0 from EL1 at the next catch.
 - Worktree build of iOS 26: symlink `out/laurel-kernel-ios26/{dl,cache,deps,kdk,theos}` to the main checkout's (read only); `linux/` is remade each run.
 - Bench on the shared phone: `scripts/laurel/ios26-bench-round.sh NAME ...` holds the lock only for the run; `uptime none` over 60 s ends the round. `LAUREL GPU TIME: new 531/26` is 531 calls and 26 ms in 5 s (`calls/ms`, `laurel_gpu_time_core.h`), so about 49 us a call, not 531 us.
+- [V host, 2026-11-07] `scripts/laurel/ios26-encode-bench.sh`: one draw with no state change costs 5.16 us on the x86 host (real runtime, fat LTO, Turnip on drm-shim); with CA-like binds before it 7.70 us. Flat profile. `m2v-ios26/0005` (QoS on iOS, kill switch `NEGRONIMETAL_QOS=0`): built as `out/ios26/snap/plugin11`, not run on the phone.
+

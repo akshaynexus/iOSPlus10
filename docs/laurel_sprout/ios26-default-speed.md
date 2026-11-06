@@ -133,3 +133,17 @@ Busy time by image: metal2vulkan 45 %, QuartzCore 24 %, Turnip 13 %, libsystem_m
 **The kernel's GPU wait [V code].** `gpuWait` looks every 200 us (`delay_for_interval`, a timer with up to 1 ms of slop for a kernel thread) and drops `gGPULock` while it sleeps. `LAUREL GPU TIME: fence 693 us x 963 per 5 s` is u_trace's worker thread (Turnip patch 0105 turns tracing on; `tu_trace_read_ts` waits for the fence of each chunk), not the render thread; 14 waits per submission, one of them real. A/B of `NEGRONIMETAL_GPU_PASS=0`: not run.
 
 **What the CPU gives [NOT RUN].** `scripts/laurel/ios26-speed.sh` (`userland/laurel/speed/laurel_speed.c`, built, 0 words newer than ARMv8.0): the real clock of the core a thread lands on (dependent adds, 1 and 8 threads), L1/L2/DRAM load-to-use latency, memcpy, a syscall, `mach_absolute_time`, a semaphore and a mach_msg wake-up, how late a 1 ms and a 16.7 ms sleep ends, the cost of a first touch of a 4 KiB page. Reference on paper: A73 at 2016 MHz: 2.0 G adds/s, L1 2 ns, DRAM 100-140 ns, a wake-up 30-80 us. A result far from these is the constant factor behind "a draw costs 25-87 us here against 1.6 us on the host"; a result at these numbers puts the cost in the code (metal2vulkan's runtime first).
+
+## 8. Encode cost on the host, no phone (2026-11-07)
+
+Tool: `scripts/laurel/ios26-encode-bench.sh [build|run|all] [DRAWS,FRAMES]`: the real metal2vulkan runtime + bridge (fat LTO, one codegen unit, as on the phone) and real Turnip for FD610 on Mesa's drm-shim, on this x86 host. It drives `userland/laurel/metal-native/tests/scene.c` with `NMN_SCENE_BENCH=DRAWS,FRAMES`, and samples the main thread at 1 kHz (`ios26-encode-bench.py`: self time by real function and by inlined function). A host number is for a compare before/after only.
+
+| Run (200 draws, 1800 frames) | us a draw | of it the binds | end of pass | commit |
+|---|---|---|---|---|
+| binds before each draw (2 byte blocks, 8 textures, 8 samplers) | 7.70 | 1.65 | 31.1 | 8.0 |
+| binds once a pass (`NMN_SCENE_BENCH_BIND=0`) | 5.16 | 0.04 | 31.8 | 8.3 |
+| binds each draw, `NEGRONIMETAL_QOS=0` | 7.99 | 1.73 | 32.7 | 8.5 |
+
+[V host] **A draw with no state change costs 5.16 us**: the draw path does its work again each time. Self time in that run: `draw_resident` 20.2 % (with what is inlined in it), `Residency::textures` 4.7 %, `settle_draw` 4.4 %, `Recording::record` 4.3 %, `bind::graphics::instantiate` 3.6 %, `command_uses_into` 2.1 %, mutex lock and unlock 6.9 % (leaf), Turnip 2.6 %. No single function holds the cost. [I] The way down is a draw that reuses the work of the draw before when nothing changed (IOS-26-Hot 0011 and 0012 aimed at this on an older pin), not one hot spot.
+[V host] QoS is not a CPU cost: 7.70 against 7.99 us is noise. Its effect is the scheduler wait on the phone: [NOT RUN].
+
