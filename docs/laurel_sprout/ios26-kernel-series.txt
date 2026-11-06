@@ -358,7 +358,7 @@
 2996-laurel-timer-coalescing-off.patch                         applied
 2997-laurel-touch-fast.patch                                   applied
 2998-laurel-ucache.patch                                       applied+rules(3): base 0003, glue
-2999-laurel-ucache-word.patch                                  applied+rules(1): base 0003
+2999-laurel-ucache-word.patch                                  applied+rules(2): base 0003
 3000-laurel-audio-lead.patch                                   applied
 3001-laurel-haptic-first-contact.patch                         applied
 3002-laurel-haptic-node-early.patch                            applied

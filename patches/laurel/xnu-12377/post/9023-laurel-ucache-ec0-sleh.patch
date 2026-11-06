@@ -1,5 +1,17 @@
 laurel 9023 (iOS 26): the sleh.c hook of 2999: handle_uncategorized (EC 0, how the Kryo 260 reports the UCI trap) gives the word to laurel_ucache_word(); the base owns sleh.c.
 
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 390af94..33e4da4 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -389,7 +389,6 @@ arm_init(
+ 	configure_timer_apple_regs();
+ 	wfe_timeout_configure();
+ 	wfe_timeout_init();
+-	{ extern void laurel_ucache_apply(void); laurel_ucache_apply(); }   /* laurel 2998 */
+ 
+ 	configure_misc_apple_boot_args();
+ 	configure_misc_apple_regs(true);
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 index b6decfc..5f4692f 100644
 --- a/osfmk/arm64/sleh.c
