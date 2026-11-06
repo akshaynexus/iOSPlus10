@@ -1,5 +1,5 @@
 #!/bin/bash
-# GPU levels of the Mi A3 (patch 2961), host only, quick:
+# GPU levels of the Mi A3 (patches 2961 and 3021), host only, quick:
 #  1. the table in laurel_gpu_opp.h against the stock source and the phone's stock DTB: rate, bus level, CX corner, PLL, L, alpha, VCO, iPeak.
 #  2. tools/gpu-opp-test: the real text of the header, with a fake clock block: the order of the votes, each failure, the governor, the thermal rule.
 #  3. controls: with no CX vote or with the CX vote after the clock, step 2 must fail.
@@ -17,6 +17,9 @@ for l in open(sys.argv[1]):
 assert out, 'no laurel_gpu_opp.h in the patch'
 open(sys.argv[2],'w').writelines(out)
 PY
+# laurel 3021 changes opp_decide (the level the UI holds): its hunk of the header goes on top
+M=$REPO/patches/laurel/xnu/3021-laurel-gpu-motion.patch
+(cd "$W" && awk '/^diff --git a\/iokit\/Kernel\/arm\/laurel_gpu_opp\.h/ {p=1} p && /^diff / && !/laurel_gpu_opp/ {exit} p {print}' "$M" | sed -e 's#^--- a/iokit/Kernel/arm/#--- #' -e 's#^+++ b/iokit/Kernel/arm/#+++ #' | patch -s laurel_gpu_opp.h)
 MAIN=$(git -C "$REPO" worktree list --porcelain | sed -n '1s/^worktree //p')
 K=$REPO/external/laurel-kernel-los; [ -e "$K/drivers/clk/qcom/gpucc-trinket.c" ] || K=$MAIN/external/laurel-kernel-los
 python3 -I "$REPO/tools/gpu-opp-test/check-table.py" "$W/laurel_gpu_opp.h" "$K" "$HOME/laurel-backup/stock/images/boot.img" "$HOME/laurel-backup/stock/images/dtbo.img"
