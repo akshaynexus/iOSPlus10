@@ -170,7 +170,9 @@ need_fastboot_mi_a3() {
   done
   die "the phone in fastboot does not say it is the Mi A3 (product '${_p:-no answer}'): nothing was written"
 }
-fb_var() { fastboot -s "$FB_S" getvar "$1" 2>&1 | sed -n "s/^$1: *//p" | tr -d '\r'; }
+# [V phone 2026-11-07] ABL fails every second command of a session ("GetVar Variable Not found"), so a fixed order of two
+# getvars can land one of them on the failing turn every time: ask each variable up to 4 times, until it answers.
+fb_var() { for _fv in 1 2 3 4; do _fvv=$(fastboot -s "$FB_S" getvar "$1" 2>&1 | sed -n "s/^$1: *//p" | tr -d '\r'); [ -z "$_fvv" ] || { echo "$_fvv"; return 0; }; done; return 0; }
 need_fastboot_layout() {
   # ABL can answer one getvar wrongly after a longer command (docs/notes.md): ask again before calling it a real absence.
   _try=0; _u=; _i=

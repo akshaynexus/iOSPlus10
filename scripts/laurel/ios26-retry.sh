@@ -84,7 +84,7 @@ CONFIRM=flash-slot-b; export CONFIRM
 _fs=1
 until $DB flash-slot-b $M > /tmp/ios26-retry-fs.$$ 2>&1; do
   tail -n 2 /tmp/ios26-retry-fs.$$
-  grep -q 'not numbers' /tmp/ios26-retry-fs.$$ && [ "$_fs" -lt 3 ] || { rm -f /tmp/ios26-retry-fs.$$; die "failed: $DB flash-slot-b $M"; }
+  grep -qE "not numbers|current slot is ''" /tmp/ios26-retry-fs.$$ && [ "$_fs" -lt 3 ] || { rm -f /tmp/ios26-retry-fs.$$; die "failed: $DB flash-slot-b $M"; }
   say "fastboot answered wrongly: a new session ($_fs of 2)"
   timeout 15 fastboot reboot bootloader >/dev/null 2>&1 || true
   sleep 8; wait_fb 40 || die "no fastboot after reboot bootloader"
