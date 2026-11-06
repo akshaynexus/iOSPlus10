@@ -81,6 +81,36 @@ main(void)
 	assert(lgov_next(50, 50, 3, 0, cap, 0, &low) == 3);
 	assert(lgov_next(70, 70, 3, 0, cap, 0, &low) == 5);
 	assert(lgov_next(0, 0, 0, 0, cap, 0, &low) == 0);
+	/*
+	 * laurel 3020: the rows a UI event holds. Tables as the Mi A3 logs them (LAUREL CPUFREQ rows_line):
+	 * silver 300 614 864 1017 1305 1420 1612 1804, gold 300 652 902 1056 1401 1536 1804 2016.
+	 */
+	{
+		static const unsigned silver[8] = { 300000, 614400, 864000, 1017600, 1305600, 1420800, 1612800, 1804800 };
+		static const unsigned gold[8] = { 300000, 652800, 902400, 1056000, 1401600, 1536000, 1804800, 2016000 };
+		static const unsigned low_table[3] = { 300000, 614400, 864000 };
+
+		assert(lgov_hold(1, 1, 0, gold, 8, 7) == 7);            /* touch: gold cap */
+		assert(lgov_hold(0, 1, 0, silver, 8, 7) == 7);          /* touch: silver cap */
+		assert(lgov_hold(1, 0, 1, gold, 8, 7) == 7);            /* motion: gold cap */
+		assert(lgov_hold(0, 0, 1, silver, 8, 7) == 5);          /* motion: silver 1420 MHz, the lowest row >= 1400 */
+		assert(silver[lgov_hold(0, 0, 1, silver, 8, 7)] >= LGOV_SILVER_MOTION_KHZ);
+		assert(lgov_hold(0, 0, 1, silver, 8, 3) == 3);          /* a thermal cap under it wins */
+		assert(lgov_hold(1, 0, 1, gold, 8, 2) == 2);
+		assert(lgov_hold(0, 0, 1, low_table, 3, 2) == 2);       /* no row that high: the cap */
+		assert(lgov_hold(0, 0, 0, silver, 8, 7) == 0);          /* still screen: nothing held */
+		assert(lgov_hold(1, 0, 0, gold, 8, 7) == 0);
+		/* the hold goes through lgov_next unchanged: an idle core takes the hold row at once, the cap still wins */
+		low = 0;
+		assert(lgov_next(0, 0, 0, 0, 7, lgov_hold(0, 0, 1, silver, 8, 7), &low) == 5);
+		assert(lgov_next(0, 0, 0, 0, 4, lgov_hold(0, 0, 1, silver, 8, 4), &low) == 4);
+		/* after the hold: the down rule, LGOV_DOWN_TICKS of a quiet core per row */
+		row = 7;
+		for (unsigned i = 0; i < LGOV_DOWN_TICKS; i++) { row = lgov_next(0, 0, row, 0, 7, 0, &low); }
+		assert(row == 6);
+		printf("gov-test (host only): motion hold: gold cap, silver %u MHz (row %u), %u ms after the last frame; touch: both caps %u ms\n",
+		    silver[5] / 1000, 5u, LGOV_MOTION_MS, LGOV_TOUCH_MS);
+	}
 	printf("gov-test: all checks passed\n");
 	return 0;
 }

@@ -1,0 +1,159 @@
+laurel 3021: LAUREL GPU MOTION: the GPU governor (2961) waits on an event, not IOSleep: a touch or the first frame after a pause (laurel 3020 laurel_frame_event) wakes it, and it goes to the top usable level at once (950 MHz, DDR 1804 MHz by opp_go's bus vote), not 320 -> 745 -> 950 over two 50 ms ticks; held 300 ms after a touch and 150 ms after the last frame, then by load (lower after 500 ms under the aim). opp_decide takes the level the UI holds (OPP_HOLD_TOP, OPP_TOUCH with gpumotion=0, OPP_NONE) in place of the bool; host test scripts/laurel/test-gpu-opp.sh. The thermal rule (95 C step, 100 C lowest) and the hot refusal count are unchanged. Kill switch gpumotion=0 (2961: a touch holds 745 MHz, read at the tick). Both kernels. docs/laurel_sprout/clocks-on-motion.md.
+
+diff --git a/iokit/Kernel/arm/LaurelGpuDcvs.cpp b/iokit/Kernel/arm/LaurelGpuDcvs.cpp
+--- a/iokit/Kernel/arm/LaurelGpuDcvs.cpp
++++ b/iokit/Kernel/arm/LaurelGpuDcvs.cpp
+@@ -33,6 +33,8 @@ bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uin
+ int laurel_thermal_gpu_dC(void);
+ unsigned laurel_cpufreq_gold_mhz(void);
+ extern uint64_t laurel_touch_at;
++extern uint64_t laurel_frame_at;        /* laurel 3020: the last GPU submission or swap (bsd/dev/laurel_thermal.c) */
++void laurel_gpu_dcvs_poke(void);
+ void laurel_gpu_dcvs_start(void);
+ bool laurel_gpu_dcvs_stall(void);
+ /* TopazAdreno.cpp */
+@@ -50,6 +52,7 @@ bool redwood_gpu_ready(void);
+ #define RPM_MEMC        0x326b6c63u     /* "clk2" */
+ #define RPM_KHZ         0x007a484bu     /* "KHz" */
+ #define TOUCH_MS        300u
++#define MOTION_MS       150u            /* laurel 3021: a frame on its way holds the top this long after the last one (LGOV_MOTION_MS) */
+ #define DDR_GOLD_MHZ    1017u           /* gpupll=0: the top level of the 2892 path */
+ #define DDR_TOP_MHZ     1804u           /* stock bus level 11 */
+ 
+@@ -84,6 +87,9 @@ bool redwood_gpu_ready(void);
+ static volatile uint8_t *gcc, *gpucc, *mccc, *tcsr;
+ static volatile uint32_t level;         /* index in opp_table: the clock now */
+ static volatile bool stalled;
++static volatile bool running;           /* laurel 3021: the thread is in its loop: a poke wakes it */
++static bool motion_on = true;           /* laurel 3021: LAUREL GPU MOTION; gpumotion=0: the 2961 rule (a touch holds 745 MHz, read at the tick) */
++static uint32_t wake_word;              /* laurel 3021: the event the thread waits on */
+ static uint32_t stall_mhz;
+ static uint32_t usable;                 /* bit per level: not taken out */
+ static bool ipeak_used, pll_allowed;
+@@ -417,13 +423,24 @@ dcvs_thread(void *arg __unused, wait_result_t wr __unused)
+ 	ddr_start();
+ 	if (!self_check()) {
+ 		ddr_mark_clear();
++		IOLog("LAUREL GPU MOTION: off: no GPU clock governor\n");
+ 		return;
+ 	}
+ 	(void)laurel_gpu_counters(&b0, &t0, &c);
+ 	lm_b0 = b0;
+ 	lm_t0 = t0;
++	if (motion_on) {
++		IOLog("LAUREL GPU MOTION: on: a touch or a frame (GPU submission or swap) wakes the governor: the top level (%u MHz, DDR %u MHz) at once, "
++		    "held %u ms after the last frame, %u ms after a touch; then by load; hot %d C refuses\n",
++		    opp_table[opp_top(usable, OPP_N - 1)].mhz, opp_table[opp_top(usable, OPP_N - 1)].bus_mhz, MOTION_MS, TOUCH_MS, OPP_HOT_DC / 10);
++	} else {
++		IOLog("LAUREL GPU MOTION: off: gpumotion=0 (2961: a touch holds %u MHz, read at the %u ms tick)\n", opp_table[OPP_TOUCH].mhz, OPP_TICK_MS);
++	}
++	running = true;
+ 	while (redwood_gpu_ready()) {
+-		IOSleep(OPP_TICK_MS);
++		/* laurel 3021: the tick, or earlier by laurel_gpu_dcvs_poke (a touch, the first frame after a pause) */
++		assert_wait_timeout((event_t)&wake_word, THREAD_UNINT, OPP_TICK_MS, NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
+ 		if (ddr_mark_until != 0 && mach_absolute_time() >= ddr_mark_until) {
+ 			ddr_mark_clear();
+ 		}
+@@ -452,7 +469,12 @@ dcvs_thread(void *arg __unused, wait_result_t wr __unused)
+ 
+ 		absolutetime_to_nanoseconds(now - laurel_touch_at, &ns);
+ 		bool touch = laurel_touch_at != 0 && ns < touch_ns;
+-		uint32_t to = opp_decide(cur, pct, touch, usable, th.cap, &low_ms);
++		absolutetime_to_nanoseconds(now - laurel_frame_at, &ns);
++		bool motion = motion_on && laurel_frame_at != 0 && ns < (uint64_t)MOTION_MS * NSEC_PER_MSEC;
++		/* laurel 3021: a touch or a frame holds the top; without the feature a touch holds OPP_TOUCH (2961) */
++		uint32_t hold = (touch || motion) ? (motion_on ? OPP_HOLD_TOP : OPP_TOUCH) : OPP_NONE;
++		uint32_t to = opp_decide(cur, pct, hold, usable, th.cap, &low_ms);
++		touch = touch || motion;
+ 
+ 		if (hot && to <= cur && (pct >= OPP_RAISE_PCT || touch)) {
+ 			blocks++;
+@@ -519,15 +541,27 @@ laurel_gpu_dcvs_stall(void)
+ 	return true;
+ }
+ 
++/* laurel 3021: from laurel_thermal.c on a touch or the first frame after a pause: the governor decides now, not at its next tick */
++void
++laurel_gpu_dcvs_poke(void)
++{
++	if (running && motion_on) {
++		thread_wakeup((event_t)&wake_word);
++	}
++}
++
+ void
+ laurel_gpu_dcvs_start(void)
+ {
+-	uint32_t on = 1;
++	uint32_t on = 1, motion = 1;
+ 	thread_t thread;
+ 
+ 	(void)PE_parse_boot_argn("gpudcvs", &on, sizeof(on));
++	(void)PE_parse_boot_argn("gpumotion", &motion, sizeof(motion));
++	motion_on = motion != 0;
+ 	if (on == 0) {
+ 		IOLog("LAUREL GPU CLOCK: off: boot-arg gpudcvs=0; 300 MHz stays\n");
++		IOLog("LAUREL GPU MOTION: off: no GPU clock governor\n");
+ 		return;
+ 	}
+ 	gcc = (volatile uint8_t *)ml_io_map(0x01400000u, 0x80000);
+@@ -555,5 +589,6 @@ laurel_gpu_dcvs_stats(char *s, size_t n)
+ #else
+ extern "C" int laurel_gpu_dcvs_stats(char *s, size_t n) { (void)s; (void)n; return 0; }
+ extern "C" void laurel_gpu_dcvs_start(void) {}
++extern "C" void laurel_gpu_dcvs_poke(void) {}
+ extern "C" bool laurel_gpu_dcvs_stall(void) { return false; }
+ #endif
+diff --git a/iokit/Kernel/arm/laurel_gpu_opp.h b/iokit/Kernel/arm/laurel_gpu_opp.h
+--- a/iokit/Kernel/arm/laurel_gpu_opp.h
++++ b/iokit/Kernel/arm/laurel_gpu_opp.h
+@@ -148,7 +148,8 @@ opp_thermal_tick(struct opp_thermal *t, int dc, uint32_t cur, uint32_t usable)
+ 
+ /*
+  * The governor. Raise at once: busy >= OPP_RAISE_PCT over a tick goes to the level where this work takes OPP_AIM_PCT, one level at least;
+- * busy >= OPP_FULL_PCT says nothing about the real demand and goes to the top; a touch goes to OPP_TOUCH at least, the highest rate that needs no
++ * busy >= OPP_FULL_PCT says nothing about the real demand and goes to the top; the UI holds a level: `hold` (laurel 3021: a touch or a frame on its way
++ * holds the top, OPP_HOLD_TOP; with gpumotion=0 a touch holds OPP_TOUCH as in 2961, OPP_NONE: nothing held). 2961: a touch went to OPP_TOUCH at least, the highest rate that needs no
+  * rail above what is held [V 2892]. Lower only when the work would take OPP_AIM_PCT or less on the lower level (below the raise mark, so no
+  * ping-pong), for OPP_LOWER_MS without a break, and during a touch not below OPP_TOUCH. Above the thermal cap: down at once.
+  */
+@@ -158,6 +159,8 @@ opp_thermal_tick(struct opp_thermal *t, int dc, uint32_t cur, uint32_t usable)
+ #define OPP_AIM_PCT     45u
+ #define OPP_LOWER_MS    500u
+ #define OPP_TOUCH       4u
++#define OPP_HOLD_TOP    ((uint32_t)OPP_N - 1u)  /* laurel 3021: the UI holds the top level */
++#define OPP_NONE        ((uint32_t)OPP_N)       /* laurel 3021: the UI holds nothing */
+ 
+ static inline uint32_t
+ opp_for_load(uint32_t mhz, uint32_t pct, uint32_t usable)
+@@ -173,9 +176,10 @@ opp_for_load(uint32_t mhz, uint32_t pct, uint32_t usable)
+ }
+ 
+ static inline uint32_t
+-opp_decide(uint32_t cur, uint32_t pct, bool touch, uint32_t usable, uint32_t cap, uint32_t *low_ms)
++opp_decide(uint32_t cur, uint32_t pct, uint32_t hold, uint32_t usable, uint32_t cap, uint32_t *low_ms)
+ {
+ 	uint32_t top = opp_top(usable, cap), want = cur;
++	bool touch = hold < OPP_N;
+ 
+ 	if (cur > top || !(usable & (1u << cur))) {
+ 		*low_ms = 0;
+@@ -201,7 +205,7 @@ opp_decide(uint32_t cur, uint32_t pct, bool touch, uint32_t usable, uint32_t cap
+ 		}
+ 	}
+ 	if (touch) {
+-		uint32_t t = opp_top(usable, OPP_TOUCH);
++		uint32_t t = opp_top(usable, hold);
+ 
+ 		want = want > t ? want : t;
+ 	}
+@@ -397,6 +401,6 @@ opp_on_line(char *s, size_t n, uint32_t usable, const uint16_t *gcc, const uint1
+ 		}
+ 		at += scnprintf(s + at, n - at, ": %s", why);
+ 	}
+-	at += scnprintf(s + at, n - at, "; raise %u %% or touch; hot %d C", OPP_RAISE_PCT, OPP_HOT_DC / 10);
++	at += scnprintf(s + at, n - at, "; raise %u %% or UI; hot %d C", OPP_RAISE_PCT, OPP_HOT_DC / 10);
+ 	return at;
+ }

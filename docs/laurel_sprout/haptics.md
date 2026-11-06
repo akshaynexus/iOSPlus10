@@ -130,3 +130,45 @@ LAUREL HAPTIC: off: <reason>                                                   (
 5. Endless-vibration check: repeat the 05:29 steps (boot, wake with the power key, three presses). Expect the `request kind`
    lines (the stop shape `N0` and the start shape `{hertz_millisecs=[...],repeat=B:true}` with the caller). A repeat must end
    with `repeat stopped by the ... key` at the next key press, or with `repeat stopped: 60 s` at the latest.
+
+## iOS 26 (23F84): "haptics isn't working" (2026-11-07, no phone; patch 3001)
+
+Owner, 2026-11-03 19:37, iOS 26.5.2 on kernel 48e56e9: no haptics felt. Log `logs/usblog-20261103-071332.txt` from 19:31:51.
+
+What the log shows [V]:
+- `LAUREL HAPTIC: /dev/redwood-haptic ready`, `LAUREL HAPTIC UI: on: /product/haptics closed-loop = 1`, `LAUREL SPMI ... haptic 0` errors.
+- No `LAUREL HAPTIC: /dev/redwood-haptic: iOS plays` line in 6 minutes of use (Settings, Home). On iOS 16 the same node logged peaks
+  267..2355 at the first taps (`logs/laurel-boot-20261101-*.log`, `usblog-20261101-165828.txt`).
+- No `LAUREL VIBRATOR: request` line: the legacy "vibrator" IOService got nothing either. `hertz_millisecs` is still in the 23F84 cache
+  (MediaExperience), so that path exists on 26; with closed-loop = 1 iOS does not take it (as on 16).
+- Nothing in the log says whether audiomxd opened the node or wrote silence: the old write line came only for a loud 2 ms block.
+
+What is the same on 16 and 26 [V host, 2026-11-07]:
+- `com.apple.audio.hapticd` is a MachService of `audiomxd` on 23F84 (of `mediaserverd` on 20H392): the haptic server runs in the
+  process that hosts the HAL and our plug-in, on both.
+- `VirtualAudio.plugin` 23F84 (7,356,608 B) and 20H392 (6,657,136 B) have the same actuator code: `Device_Actuator_Aspen.cpp`, ports
+  "Actuator" and "ActuatorIV" (the IV port is made by VirtualAudio itself, not looked up), `VAD_Actuator`, "No master haptic device is
+  specified", "CPMS for Haptics is %s" (decided by `MGGetBoolAnswer(cBy4BcYs5YWtFHbBpt4C6A)` = **DeviceSupportsHaptics**, then the
+  `CPMSAgent` class). The CPMS "-PowerManager-" haptic budget strings are in both caches (16: `.07`, 26: `.17`, `.19`).
+- Our ADT: `/product` carries the donor's properties only (topaz `d22ap_product()` copies no child node), so `/product/haptics` is the
+  kernel's own {closed-loop 1, supports-3rd-party-haptics 1} on both; the N104AP-only keys `power-control-features = 2`,
+  `controller-coeff-cal = syscfg/CLCL`, `/product/audio actuator-cpms-bgd_*` never reach the phone (checked: a trim of them changed nothing
+  in `mkadt.py --dump`; not committed).
+- The root (`ios26-root.img.manifest`, `report.txt`): RedwoodAudio.driver with the Actuator device, VirtualAudio.plugin in place,
+  BTAudioHALPlugin in HAL.disabled, no haptic-related job dropped. The speaker plays through the same plug-in (`stream: playing` x3).
+- Every iOS 26 boot since 2026-11-02 logged `LAUREL HAPTIC UI: on` (no `off` boot: the MobileGestalt cache cannot hold an old false).
+
+Candidates left [I], in the order the next boot sorts them (patch 3001 lines, once per boot):
+1. `LAUREL HAPTIC: /dev/redwood-haptic opened by audiomxd` missing: VirtualAudio built no actuator device, or audiomxd's sandbox refuses
+   the node (the speaker node opens, so a profile that names `/dev/redwood-audio` only would be new), or the plug-in's one-shot open
+   (`haptic = -2` after one failure) ran before the node existed (made after the root mount at 19:31:51, audiomxd exec at 19:32:05: not in
+   this boot).
+2. Opened, no `first write`: the actuator device exists, the haptic server never started I/O on it: CoreHaptics/UIKit clients did not reach
+   `com.apple.audio.hapticd`, or System Haptics / keyboard haptics are off in Settings (check Settings > Sounds & Haptics > System Haptics,
+   Keyboard Feedback > Haptic).
+3. `first write ... silent so far` and no `iOS plays`: the waveform is attenuated to zero (a CPMS power budget of 0, "HapticsExternalPowerAttenuation"):
+   then the fix is on the power side (MobileGestalt override of DeviceSupportsHaptics' CPMS branch, or a CPMS stub).
+4. `iOS plays` with peaks, no `play N` line: the motor side (SPMI, duty, `laurel_haptic=0`).
+
+Test when the phone is back (owner's standing order covers boot_b and reboots): flash the image of `scripts/laurel/ios26-image.sh` (kernel with
+3000 + 3001) with `scripts/laurel/ios26-fast-flash.sh`; tap the keyboard and a toggle in Settings; grep the USB log for `LAUREL HAPTIC`.

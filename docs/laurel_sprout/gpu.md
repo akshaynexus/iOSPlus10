@@ -951,10 +951,12 @@ Temperature, read at 300, MX + CX NOM, 600 (read, CP fence), back to 300 (read):
 
 Read tolerance 3 %, not 10 %: 900 and 950 are 5.5 % apart. Boot 11 reads: 298/300, 598/600.
 
-### Governor (50 ms tick)
+### Governor (50 ms tick, or earlier by an event since laurel 3021)
 
 - Busy >= 90 %: the top level. Busy >= 50 %: the level where the same work takes 45 %, one level at least.
-- Touch in the last 300 ms: 745 MHz at least (no rail above what is held, no iPeak; not the top, so a tap does not vote DDR and TURBO).
+- **laurel 3021 (`LAUREL GPU MOTION`, `docs/laurel_sprout/clocks-on-motion.md`):** a touch in the last 300 ms or a frame (GPU submission, swap) in the
+  last 150 ms holds the top usable level under the thermal cap (950 MHz, DDR 1804), and the event wakes the thread: no 320 -> 745 -> 950 over two ticks.
+  Kill switch `gpumotion=0` gives the 2961 rule: touch in the last 300 ms: 745 MHz at least (no rail above what is held, no iPeak; not the top).
 - Lower: when the same work takes 45 % or less on a lower level, for 500 ms without a break. 45 < 50: no ping-pong (host test: each steady load settles).
 
 ### Thermal [V trinket-thermal.dtsi, phone's DTB]

@@ -3,14 +3,14 @@ laurel 2991: the stuck-CPU report decides "inside a system call" by the thread's
 [V 2026-11-03 18:51:35, kernel c68eeb19c9] CPU 5 silent 19.5 s, its last interrupt in vm_map_zap_dispose from vm_map_enter+0x1184, and the
 2988 line said "no EL0 trap open": the stamp is per CPU and belongs to the CPU where the trap entered; a thread preempted inside a system call
 that goes on here brought none. XNU keeps the flag in the thread (machine.el0_synchronous_trap: set in sleh_synchronous, cleared in
-thread_exception_return). The report now reads that flag by a copy that cannot fault; the CPU's stamp gives the class, ESR, FAR and user pc only
+thread_exception_return). The report now reads that flag by a copy that cannot fault (iOS 26 only: post/9019 defines LAUREL_EL0_TRAP_FLAG; xnu-8796 has no such flag and keeps the CPU stamp); the CPU's stamp gives the class, ESR, FAR and user pc only
 when the trap entered here, else the line says so. The path lines of 2989 (frames, stack text, user registers) follow the flag too.
 
 diff --git a/osfmk/arm64/laurel_wdog.c b/osfmk/arm64/laurel_wdog.c
 index f1c44ba..ae3e6f9 100644
 --- a/osfmk/arm64/laurel_wdog.c
 +++ b/osfmk/arm64/laurel_wdog.c
-@@ -393,7 +393,19 @@ laurel_wdog_report_cpu(int cpu, const char *prefix)
+@@ -393,7 +393,21 @@ laurel_wdog_report_cpu(int cpu, const char *prefix)
  	    c->worst / ticks, c->worst_pc, vm_kernel_slide);
  	/* laurel 2988: inside the kernel on an EL0 trap, or not; the redistributor's words; the dyld cache slide of the task that runs there */
  	uint64_t trap_t = c->trap_t, esr = c->trap_esr;
@@ -24,14 +24,16 @@ index f1c44ba..ae3e6f9 100644
 +	bool in_trap = false;
 +	thread_t th0 = (thread_t)cd->cpu_active_thread;
 +
++#if LAUREL_EL0_TRAP_FLAG                /* xnu-12377: machine.el0_synchronous_trap (post/9019 sets it); xnu-8796 has no such flag: the CPU stamp alone */
 +	if (th0 != NULL) {
 +		(void)ml_nofault_copy((vm_offset_t)&th0->machine.el0_synchronous_trap, (vm_offset_t)&in_trap, sizeof(in_trap));
 +	}
++#endif
 +	bool open = in_trap || here;
  	uint32_t pend = 0, act = 0;
  	bool have_words = lwd_gicr_words((uint32_t)cd->cpu_phys_id, &pend, &act);
  	uint32_t dyld_slide = 0;
-@@ -408,10 +420,14 @@ laurel_wdog_report_cpu(int cpu, const char *prefix)
+@@ -408,10 +422,14 @@ laurel_wdog_report_cpu(int cpu, const char *prefix)
  	if (open && th != NULL) {
  		lwd_thread_path(prefix, cpu, th, c);
  	}

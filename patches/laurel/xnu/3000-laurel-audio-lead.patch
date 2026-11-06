@@ -1,0 +1,209 @@
+laurel 3000: LAUREL AUDIO lead: the speaker stream queues 3 periods of 20 ms at the DSP (was 8) and takes frames from the ring only once it holds 30 ms; the amp goes off 2 s after the last sound, the DSP path 12 s after it (was 2 s, with a full bring-up at the next sound); both kernels. docs/laurel_sprout/audio.md "Lead".
+
+[V 2026-11-03, logs/usblog-20261103-071332.txt, kernel 48e56e9] Three speaker streams: 24 underruns of 164 periods, 51 of 319, 83 of 670 (a partial period
+= zeros for the rest of it, and the sound moves later by that much). [I from the code] With 8 periods queued from the first write, the ring was drained at the
+start: period 0 held the sound's first frames and periods 1..7 silence, so the second chunk of every sound came 140 ms after the first; in steady state the
+ring held about one HAL I/O buffer and the refill raced the HAL's write. The HAL's clock is mach_absolute_time (audio_plugin.c get_zero_time_stamp), the DSP's
+is the I2S bit clock: nothing tied the ring level to a lead. Now: IN_FLIGHT 3, LEAD_FRAMES 1440, LEAD_MAX_MS 100 (a thin writer), a dry ring waits for the lead
+again (one gap, counted as "lead waits"), QUIET_MS 12000, AMP_QUIET_MS 2000. The "stream: playing" line now says how long path_start() took and how long
+after the first sound frames it was. Kill switch laurel_audio_lead=0 (8 periods, no lead, path off after 2 s). The self-check (path_check) is unchanged in
+what it proves: 2 periods back in 500 ms.
+
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1702,13 +1702,31 @@
+ /*
+  * /dev/topaz-audio (= /dev/redwood-audio): whole 48 kHz S16 stereo frames, never waits. The frames
+  * go to a 0.34 s ring; the audio thread fills each period the DSP gives back from it (silence when
+- * it is empty). Path + amp start on the first frames that are not silence and stop after 2 s of
+- * silence or no writes. ioctl _IOW('r', 1, {below, muted}): volume in eighths of a dB, applied to
+- * the samples (Q15).
++ * it is empty). Path + amp start on the first frames that are not silence; the amp goes off after
++ * AMP_QUIET_MS of silence, the path after QUIET_MS (so a sound burst after a short pause pays no
++ * bring-up). ioctl _IOW('r', 1, {below, muted}): volume in eighths of a dB, applied to the samples (Q15).
++ *
++ * Lead (laurel 3000): the HAL writes in real time (its clock is mach_absolute_time, the DSP's is the
++ * I2S bit clock), one I/O buffer at a time, and a period is 960 frames. With every period queued at
++ * the DSP from the first write, the ring is drained at the start: the first period holds the sound's
++ * first frames, the next 7 are silence, so the second chunk of every sound played 140 ms after the
++ * first, and in steady state the ring held about one I/O buffer, so a period was often partial
++ * [V phone 2026-11-03: 24, 51 and 83 underruns in streams of 164, 319 and 670 periods]: each one a
++ * gap of zeros that also moved the sound later. Now only IN_FLIGHT periods are queued (the other
++ * PERIODS - IN_FLIGHT pages stay mapped, unused), and a period takes frames from the ring only once
++ * it holds LEAD_FRAMES (or LEAD_MAX_MS after the first frames came: a writer that stays thin). A dry
++ * ring (the writer stopped: the end of a sound, or it is late by more than the lead) waits for the
++ * lead again: one gap of at most LEAD_FRAMES instead of many small ones. Latency from the write to
++ * the I2S: the lead (30 ms) + IN_FLIGHT periods (60 ms) + the DSP's own; before: 160 ms + the gaps.
++ * Kill switch laurel_audio_lead=0: the old numbers (8 periods queued, no lead, path off after 2 s).
+  */
+ #define RING_FRAMES         16384u              /* power of two */
+ #define SILENCE             8                   /* |sample| <= this: silence */
+-#define QUIET_MS            2000
++#define QUIET_MS            12000               /* path (AFE, ADM, ASM) kept up this long after the last sound */
++#define AMP_QUIET_MS        2000                /* amp off this long after the last sound */
++#define IN_FLIGHT           3                   /* periods queued at the DSP: 60 ms (PERIODS are allocated) */
++#define LEAD_FRAMES         1440u               /* 30 ms in the ring before a period takes from it */
++#define LEAD_MAX_MS         100                 /* ... or this long after the first frames of a lead wait */
+ 
+ static int16_t *ring;
+ static volatile uint32_t ring_w, ring_r;        /* frame counters, wrap at 2^32 */
+@@ -1717,8 +1735,11 @@
+ static volatile uint64_t last_sound;            /* mach_absolute_time() of the last frames that are not silence */
+ static volatile uint32_t vol_below, vol_muted, vol_gen;
+ static uint32_t vol_applied = ~0u, gain_q15 = 32767;
+-static uint64_t frames_in, frames_dropped, underruns, starts;
++static uint64_t frames_in, frames_dropped, underruns, starts, lead_waits;
+ static bool stream_wake_flag;
++static uint32_t in_flight = IN_FLIGHT, lead_frames = LEAD_FRAMES, quiet_ms = QUIET_MS;      /* laurel_audio_lead=0: 8, 0, 2000 */
++static bool lead_wait;                          /* periods take silence until the ring holds lead_frames (or LEAD_MAX_MS passed) */
++static uint64_t lead_since;                     /* mach_absolute_time() when the wait began */
+ 
+ static const uint16_t db_q15[97] = {
+ 	32767, 29205, 26029, 23198, 20675, 18427, 16423, 14637, 13045, 11627, 10362, 9235, 8231, 7336, 6538, 5827, 5193,
+@@ -1740,15 +1761,27 @@
+ 	gain_q15 = (db_q15[db] * (8 - f) + db_q15[db + 1] * f) / 8;
+ }
+ 
+-/* one period from the ring (gain applied), silence for what is missing */
++/* one period from the ring (gain applied), silence for what is missing; silence while the lead builds up */
+ static void
+ period_fill(uint32_t i)
+ {
+ 	int16_t *dst = (int16_t *)(periods + 4096ull * i);
+ 	uint32_t got = 0;
++	uint64_t now = mach_absolute_time(), lead_max;
+ 
++	nanoseconds_to_absolutetime((uint64_t)LEAD_MAX_MS * 1000000, &lead_max);
+ 	IOSimpleLockLock(ring_lock);
+ 	uint32_t avail = ring_w - ring_r;
++	if (lead_wait && (avail >= lead_frames || (avail > 0 && now - lead_since >= lead_max))) {
++		lead_wait = false;
++	}
++	if (lead_wait) {
++		avail = 0;
++	} else if (avail == 0 && lead_frames != 0) {
++		lead_wait = true;                               /* dry: the writer stopped or is late; build the lead again */
++		lead_since = now;
++		lead_waits++;
++	}
+ 	if (avail > 0) {
+ 		got = MIN(avail, (uint32_t)PERIOD_FRAMES);
+ 		for (uint32_t k = 0; k < got; k++) {
+@@ -1774,12 +1807,14 @@
+ 	wgen = (wgen + 1) & 0xFFFF;
+ 	returned = 0;
+ 	inflight = 0;
++	lead_wait = lead_frames != 0;
++	lead_since = mach_absolute_time();
+ 	if (!afe_on() || !stream_on()) {
+ 		stream_off();
+ 		afe_off();
+ 		return false;
+ 	}
+-	for (uint32_t i = 0; i < PERIODS; i++) {
++	for (uint32_t i = 0; i < in_flight; i++) {
+ 		period_fill(i);
+ 		if (!period_send(i)) {
+ 			snprintf(why, sizeof(why), "ASM write: GLINK queue full");
+@@ -1801,6 +1836,9 @@
+ static void
+ stream_start(void)
+ {
++	uint64_t ls = last_sound, t0 = mach_absolute_time(), ns;
++	uint32_t up_ms, since_ms;
++
+ 	if (vol_applied != vol_gen) {
+ 		apply_volume();
+ 	}
+@@ -1815,7 +1853,12 @@
+ 	amp_power(gain_q15 != 0);
+ 	playing = true;
+ 	starts++;
+-	LOG("t=%u.%03u stream: playing (start %llu)", T, starts);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	up_ms = (uint32_t)(ns / 1000000);
++	absolutetime_to_nanoseconds(ls != 0 && t0 > ls ? t0 - ls : 0, &ns);
++	since_ms = (uint32_t)(ns / 1000000);
++	LOG("t=%u.%03u stream: playing (start %llu: path up in %u ms, %u ms after the first sound; %u periods queued, lead %u ms)",
++	    T, starts, up_ms, since_ms, in_flight, lead_frames / (RATE / 1000));
+ }
+ 
+ static void
+@@ -1828,20 +1871,22 @@
+ 	IOSimpleLockLock(ring_lock);
+ 	ring_r = ring_w;
+ 	IOSimpleLockUnlock(ring_lock);
+-	LOG("t=%u.%03u stream: stopped (%llu frames in, %llu dropped, %llu underruns, %u done, %u errors, %u DSP underflows, "
+-	    "%u stale)", T, frames_in, frames_dropped, underruns, writes_done, write_errors, underflows, stale_events);
++	LOG("t=%u.%03u stream: stopped (%llu frames in, %llu dropped, %llu underruns, %llu lead waits, %u done, %u errors, "
++	    "%u DSP underflows, %u stale)", T, frames_in, frames_dropped, underruns, lead_waits, writes_done, write_errors,
++	    underflows, stale_events);
+ }
+ 
+ /* the audio thread, between GLINK polls */
+ static void
+ stream_poll(void)
+ {
+-	uint64_t ls = last_sound, now = mach_absolute_time(), quiet;   /* ls first: now >= ls */
++	uint64_t ls = last_sound, now = mach_absolute_time(), quiet, amp_quiet;   /* ls first: now >= ls */
+ 
+ 	if (!stream_ready) {
+ 		return;
+ 	}
+-	nanoseconds_to_absolutetime((uint64_t)QUIET_MS * 1000000, &quiet);
++	nanoseconds_to_absolutetime((uint64_t)quiet_ms * 1000000, &quiet);
++	nanoseconds_to_absolutetime((uint64_t)AMP_QUIET_MS * 1000000, &amp_quiet);
+ 	if (!playing && ls != 0 && now - ls < quiet) {
+ 		stream_start();
+ 		return;
+@@ -1851,11 +1896,11 @@
+ 	}
+ 	if (vol_applied != vol_gen) {
+ 		apply_volume();
+-		amp_power(gain_q15 != 0);
+ 	}
++	amp_power(gain_q15 != 0 && now - ls < amp_quiet);      /* amp_power() does nothing when nothing changes */
+ 	uint32_t back = returned;
+ 	returned = 0;
+-	for (uint32_t i = 0; i < PERIODS; i++) {
++	for (uint32_t i = 0; i < in_flight; i++) {
+ 		if ((back & (1u << i)) != 0) {
+ 			period_fill(i);
+ 			if (!period_send(i)) {
+@@ -1864,7 +1909,7 @@
+ 		}
+ 	}
+ 	if (now - ls >= quiet) {
+-		stream_stop();                                  /* 2 s without sound: what the ring holds is silence */
++		stream_stop();                                  /* quiet_ms without sound: what the ring holds is silence */
+ 	}
+ }
+ 
+@@ -2138,8 +2183,10 @@
+ 				say_off(why);
+ 			} else {
+ 				stream_ready = true;
+-				IOLog("LAUREL AUDIO: on: ADSP up (APR), MAX989%s7 rev 0x%02x, SEC_MI2S 48 kHz (2 periods back in %u ms)\n",
+-				    amp == &amp27 ? "2" : "3", amp_rev, done_ms);
++				IOLog("LAUREL AUDIO: on: ADSP up (APR), MAX989%s7 rev 0x%02x, SEC_MI2S 48 kHz (2 periods back in %u ms; "
++				    "%u periods of 20 ms queued, lead %u ms, path kept %u s after a sound%s)\n",
++				    amp == &amp27 ? "2" : "3", amp_rev, done_ms, in_flight, lead_frames / (RATE / 1000), quiet_ms / 1000,
++				    lead_frames == 0 ? ": laurel_audio_lead=0" : "");
+ 			}
+ 			/* its own line, whatever the speaker's result: it needs only the ADSP */
+ 			if (core_state == 1) {
+@@ -2204,6 +2251,13 @@
+ 	started = true;
+ 	(void)PE_parse_boot_argn("adsp", &on, sizeof(on));
+ 	(void)PE_parse_boot_argn("laurelaudio", &on2, sizeof(on2));
++	uint32_t lead = 1;
++	(void)PE_parse_boot_argn("laurel_audio_lead", &lead, sizeof(lead));
++	if (lead == 0) {
++		in_flight = PERIODS;
++		lead_frames = 0;
++		quiet_ms = 2000;
++	}
+ 	killed = on == 0 || on2 == 0;
+ 	(void)PE_parse_boot_argn("mic", &on3, sizeof(on3));
+ 	mic_killed = on3 == 0;

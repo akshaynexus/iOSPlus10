@@ -1,0 +1,13 @@
+laurel 9019 (iOS 26): xnu-12377 keeps a per-thread flag machine.el0_synchronous_trap; 2991's report reads it under LAUREL_EL0_TRAP_FLAG. xnu-8796 has no such flag (its build broke on 2991): there the CPU stamp alone decides.
+
+diff --git a/osfmk/arm64/laurel_wdog_core.h b/osfmk/arm64/laurel_wdog_core.h
+--- a/osfmk/arm64/laurel_wdog_core.h
++++ b/osfmk/arm64/laurel_wdog_core.h
+@@ -4,6 +4,7 @@
+  */
+ #ifndef LAUREL_WDOG_CORE_H
+ #define LAUREL_WDOG_CORE_H
++#define LAUREL_EL0_TRAP_FLAG 1  /* laurel 9019: xnu-12377 has thread->machine.el0_synchronous_trap */
+ 
+ #define LWD_HZ          32765u
+ #define LWD_COUNT_MAX   0xFFFFFu
