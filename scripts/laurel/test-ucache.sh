@@ -35,3 +35,32 @@ for w, crm, n in zip(words, crms, names):
 print("test-ucache:", "PASS" if bad == 0 else f"FAIL ({bad})")
 sys.exit(1 if bad else 0)
 PY
+
+# laurel 3040: no printf in laurel_ucache_apply() before the guard `startup_phase >= STARTUP_SUB_TUNABLES` (the first call runs in
+# arm_init() before the boot thread exists; a printf there hung the phone on 2026-11-07). The file as the series makes it: the new file
+# of 2998, then 3040 on it. Every printf of the function must come after the guard, and the guard must be there.
+U=$T/ucache; mkdir -p "$U/osfmk/arm64"
+python3 -I - "$REPO/patches/laurel/xnu/2998-laurel-ucache.patch" "$U/osfmk/arm64/laurel_ucache.c" <<'PY'
+import sys
+out, take = [], False
+for line in open(sys.argv[1]):
+    if line.startswith('+++ b/osfmk/arm64/laurel_ucache.c'): take = True; continue
+    if take and line.startswith('diff --git'): break
+    if take and line.startswith('+') and not line.startswith('+++'): out.append(line[1:])
+open(sys.argv[2], 'w').write(''.join(out))
+PY
+(cd "$U" && patch -p1 -s < "$REPO/patches/laurel/xnu/3040-laurel-ucache-line-after-boot-thread.patch") || { echo "test-ucache: FAIL: 3040 does not apply on the file of 2998"; exit 1; }
+python3 -I - "$U/osfmk/arm64/laurel_ucache.c" <<'PY'
+import re, sys
+s = open(sys.argv[1]).read()
+m = re.search(r'\nlaurel_ucache_apply\(void\)\n\{(.*?)\n\}\n', s, re.S)
+assert m, 'no laurel_ucache_apply'
+body = m.group(1)
+guard = body.find('startup_phase >= STARTUP_SUB_TUNABLES')
+prints = [p.start() for p in re.finditer(r'\bprintf\(', body)]
+early = [p for p in prints if guard < 0 or p < guard]
+print(f"laurel_ucache_apply: {len(prints)} printf, guard at {guard}, {len(early)} before the guard")
+if guard < 0 or early:
+    print("test-ucache: FAIL (3040: a printf before the boot thread exists)"); sys.exit(1)
+print("test-ucache (3040 guard): PASS")
+PY

@@ -1,0 +1,72 @@
+laurel 3040: LAUREL UCACHE (2998) prints its line only after the boot thread and the console exist; both kernels. docs/laurel_sprout/ios26-userland.md "JIT code".
+
+[V phone 2026-11-07 03:42] The first laurel_ucache_apply() call of 2998 is in arm_init() right after PE_init_platform(FALSE), and its
+printf was the first printf of the kernel: start.s leaves TPIDR_EL1 = 0 and arm_init sets the boot thread only after
+ml_parse_cpu_topology(); printf -> os_log_with_args -> counter_inc -> current_thread()->machine faults at a small address, the
+exception vector reads TPIDR_EL1 again and faults again: a silent hang. The early framebuffer console showed "SWEET EARLY 1: arm_init
+entered (MMU on)" and "SWEET EARLY 2: PE_init_platform done" and never "3: ml_parse_cpu_topology done"; no panic text, no USB
+(logs/usblog-20261107-034407.txt stays empty). In the diff from the last kernel that booted (72a5244) that call is the only new code
+between the two marks. The kill switch laurelucache=0 printed its "off" line from the same place, so it hung the same way.
+Fix: the decision and the SCTLR_EL1.UCI clear stay at every call; the one line waits for the first call with startup_phase >=
+STARTUP_SUB_TUNABLES (after kernel_startup_bootstrap(): the second call of arm_init, right before PE_init_platform(TRUE), whose
+"iBoot version" line is the first printf of a good boot). Host test: scripts/laurel/test-ucache.sh (the guard is in front of every printf).
+
+diff --git a/osfmk/arm64/laurel_ucache.c b/osfmk/arm64/laurel_ucache.c
+--- a/osfmk/arm64/laurel_ucache.c
++++ b/osfmk/arm64/laurel_ucache.c
+@@ -20,6 +20,7 @@
+ #include <arm/pmap/pmap.h>
+ #include <kern/misc_protos.h>
+ #include <kern/thread.h>
++#include <kern/startup.h>            /* laurel 3040: startup_phase */
+ #include <mach/arm/thread_status.h>
+ #if __has_include(<vm/vm_map_xnu.h>)
+ #include <vm/vm_map_xnu.h>              /* xnu-12377: current_map(), vm_map_pmap() */
+@@ -31,6 +32,9 @@
+ uint32_t laurel_ucache_on;              /* EL0 cache maintenance by VA traps on this kernel */
+ static int laurel_ucache_mode = -1;     /* -1 undecided, 0 off, 1 on */
+ static uint64_t laurel_ucache_ops;      /* instructions done here */
++static const char *laurel_ucache_why;   /* why it is off, for the line */
++static uint64_t laurel_ucache_ctr, laurel_ucache_clidr;
++static int laurel_ucache_said;          /* the line is out */
+ 
+ /* each CPU as it starts and as it wakes (start.s writes SCTLR_EL1_DEFAULT, UCI set, each time) */
+ void laurel_ucache_apply(void);
+@@ -43,6 +47,7 @@
+ 		uint32_t on = 1;
+ 		const char *why = NULL;
+ 
++		/* PE_parse_boot_argn is good this early: wfe_timeout_configure(), right before the first call, reads the boot line the same way */
+ 		(void)PE_parse_boot_argn("laurelucache", &on, sizeof(on));
+ 		if (!on) {
+ 			why = "kill switch laurelucache=0";
+@@ -51,11 +56,26 @@
+ 		}
+ 		laurel_ucache_mode = why == NULL ? 1 : 0;
+ 		laurel_ucache_on = laurel_ucache_mode;
+-		if (why != NULL) {
+-			printf("LAUREL UCACHE: off: %s (CTR_EL0 0x%llx, CLIDR_EL1 0x%llx)\n", why, ctr, clidr);
++		laurel_ucache_why = why;
++		laurel_ucache_ctr = ctr;
++		laurel_ucache_clidr = clidr;
++	}
++	/*
++	 * laurel 3040: no printf before the boot thread exists. The first call is in arm_init() right after PE_init_platform(FALSE):
++	 * TPIDR_EL1 is still 0 there (start.s clears it; arm_init sets the boot thread after ml_parse_cpu_topology), the console is not
++	 * up, and printf -> os_log -> counter_inc -> current_thread()->machine faults; the exception vector reads TPIDR_EL1 again and
++	 * faults again: a silent hang with no panic text ([V phone 2026-11-07 03:42: "SWEET EARLY 2: PE_init_platform done" was the
++	 * last line; the kill switch did not help, its line printed from the same place). The line waits for the first call after
++	 * kernel_startup_bootstrap() (startup_phase >= STARTUP_SUB_TUNABLES): the second call of arm_init(), right before
++	 * PE_init_platform(TRUE), whose "iBoot version" line is the first printf of a good boot. The SCTLR write below runs at every call.
++	 */
++	if (!laurel_ucache_said && startup_phase >= STARTUP_SUB_TUNABLES) {
++		laurel_ucache_said = 1;
++		if (laurel_ucache_why != NULL) {
++			printf("LAUREL UCACHE: off: %s (CTR_EL0 0x%llx, CLIDR_EL1 0x%llx)\n", laurel_ucache_why, laurel_ucache_ctr, laurel_ucache_clidr);
+ 		} else {
+ 			printf("LAUREL UCACHE: on: EL0 cache maintenance by VA is trapped and done with a clean first, so a JIT's new code is what the core fetches: CTR_EL0 0x%llx (IDC 0, DIC %llu), CLIDR_EL1 LoUU %llu LoUIS %llu (kill switch laurelucache=0)\n",
+-			    ctr, (ctr >> 29) & 1, (clidr >> 27) & 7, (clidr >> 21) & 7);
++			    laurel_ucache_ctr, (laurel_ucache_ctr >> 29) & 1, (laurel_ucache_clidr >> 27) & 7, (laurel_ucache_clidr >> 21) & 7);
+ 		}
+ 	}
+ 	if (laurel_ucache_on) {
