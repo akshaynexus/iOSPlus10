@@ -374,4 +374,5 @@
 9016-laurel-debug-ack-late-cpu.patch                           post
 9017-laurel-wdog-trap-stamp-sleh.patch                         post
 9018-laurel-wdog-irq-frame-sleh.patch                          post
+9019-laurel-wdog-el0-trap-flag.patch                           post
 == series: 239 applied, 87 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
