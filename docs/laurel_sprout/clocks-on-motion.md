@@ -107,7 +107,16 @@ as corruption early in the boot, not later. Then `laurelramtop=0`.
 Not proven until a boot: everything above the "After" column. The autotest's synthetic touch (2983) goes through `laurel_input_touch` [V code], so
 `ios26-autotest.sh run` exercises both holds without a finger.
 
-## 6. Patches and tests
+## 6. Images, ready to flash (worktree `~/.t3/worktrees/iOSPlus10/t3-cadd7d7f`, 2026-11-07 02:54) [V built]
+
+| File | What |
+| --- | --- |
+| `out/laurel-ios26/uefi/laurel-uefi-boot.img` | iOS 26 boot image: Mu FD `4a067d60` (mu 0001-0103 + 0104), kernel `kernel.ios26.development.sweet.4k` series `6508fab70dd0dee5` (368 patches, 3020-3022 in), ADT window 3904 MiB (DarwinBoot adds the top) |
+| `out/laurel/mu/SILICIUM_UEFI-DEBUG.fd` | the FD alone |
+
+It carries the `pmap_assert_free` panic of the current series (notes.md 2026-11-06): it boots no further than `exec launchd` until that fix lands; rebuild the image on top of it (`ios26-image.sh`, `mu-build.sh` with this branch's patches). Flash: `BOOT=reboot scripts/laurel/flash-boot.sh IMG` to `boot_b` (owner's standing order), through `scripts/laurel/phone-lock.sh`.
+
+## 7. Patches and tests
 
 | Patch | Files | Host test |
 | --- | --- | --- |
