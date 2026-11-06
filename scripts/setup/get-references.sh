@@ -28,6 +28,7 @@ UniXNU-pong        https://github.com/Chengdong-Yu/UniXNU-pong.git    ab74f07532
 ios-sailfish       https://github.com/joranv1/ios-sailfish.git        6f27e41ff249f2680540ebe8ee5ab982c5e641c9
 bergamota          https://github.com/ry-diffusion/bergamota.git      0826e48c3d3f4bd9b0ab7d5af82ed92dfaeec425 develop
 hackios-xnu-kernel https://github.com/oosexgang/hackios-xnu-kernel.git d82c64a3a31cd27a0a0afbf6e213e467e44b1b4c main
+hakios-main        https://github.com/oosexgang/hakios-xnu-kernel.git  63fc2b4633bac3af8e57dadab9f5a8d4cb940438 main
 ios-apollo         https://github.com/aTechGeekDev/ios-apollo.git     1f75f381e31da96de537653fbac2252d2eb80418 main
 ios-s9             https://github.com/syncmodz/ios-s9.git             7b72f7c0db34fc396498d71bb7e1af90d6f899f3
 Chlorophyll        https://github.com/ry-diffusion/Chlorophyll.git    787338fc7c297f54e2000bca02f4fa36f1154c5a
@@ -43,7 +44,7 @@ sm6125-common-los  https://github.com/LineageOS/android_device_xiaomi_sm6125-com
 ios-sweet-linux    https://github.com/myh120405/ios-sweet-linux.git   8d09cf0d6748e40845dd413e9157e465024252ab main
 xnu-linux-toolchain https://github.com/Allenwdk/xnu-linux-toolchain.git 909990e4ec2c6cda30c20cdb23219946918c7fd6 main
 hackios-umi        https://github.com/ls9875/hackios-umi.git          6ac5eee39b076faf5c33ee14a9b17558779ee0b4 main
-hackios-scion      https://github.com/Scion-Project/hackios-xnu-kernel.git e407d1e75a8d79b1cf5975e9abe52f23a71106f2 main
+hackios-scion      https://github.com/Scion-Project/scion-kernel.git b269b4f606239769d8a2b7e46ca2e54a7bc81f3f main
 ios-sweet-umi      https://github.com/myh982516/ios-sweet-umi.git     952cf3329e24c99adbb08f13fb78afe57f72ffc4 main
 ios-topaz-evergo   https://github.com/wlw333554/ios-topaz.git         f6440778080cee3b1b5fef9f4260693c0a8ce86f evergo
 ios-redfin         https://github.com/DenialOfGravity/ios-redfin.git  0c4433cf0060e5f0cd8947e558841c113bbad4db main
