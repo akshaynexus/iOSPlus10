@@ -6,6 +6,7 @@
 # docs/laurel_sprout/dual-boot.md with its own guard. A session entered with the buttons can answer wrongly, so it is
 # checked first. It never writes without a phone that answers laurel_sprout, and it stops at the first failure.
 # Build the kernel first if the patches changed: scripts/laurel/kernel-ios26-linux.sh.
+#   FAST_SWITCH=1 ...   after boot_b + dtbo_b, switch to slot b from fastboot, with no Android boot in between (owner, 2026-11-07)
 set -eu
 cd "$(dirname "$0")/../.."
 M=${1:-}
@@ -69,6 +70,21 @@ timeout 20 adb reboot bootloader
 wait_fb 40 || die "no fastboot after adb reboot bootloader"
 sleep 2
 CONFIRM=flash-slot-b; export CONFIRM; run $DB flash-slot-b $M
+if [ "${FAST_SWITCH:-0}" = 1 ]; then
+  # Owner, 2026-11-07: skip the Android boot that only rechecks. Android was up a moment ago and passed android-check
+  # (data opened, updater off), so slot a is the way back; the switch goes to slot b from this fastboot session.
+  # [V phone 2026-11-02] set_active can fail a few times in a session: retry with pauses, as dual-boot.sh to-android.
+  _try=0
+  until timeout 15 fastboot set_active b >/dev/null 2>&1 && [ "$(fb_get current-slot)" = b ]; do
+    _try=$((_try + 1))
+    [ "$_try" -lt 10 ] || die "set_active b failed 10 times: boot_b is written, slot a stays active; run this again without FAST_SWITCH=1"
+    sleep 3
+  done
+  say "slot b active from fastboot at $(date +%H:%M:%S) (FAST_SWITCH=1: no Android recheck)"
+  timeout 15 fastboot reboot >/dev/null 2>&1 || say "ABL did not take reboot: hold Power"
+  say "done: iOS 26 is booting. Read the panel; USB log: logs/usblog-*.txt"
+  exit 0
+fi
 timeout 15 fastboot reboot >/dev/null 2>&1 || say "ABL did not take reboot: hold Power"
 wait_android || die "Android did not start after flash-slot-b"
 say "switching to iOS at $(date +%H:%M:%S)"
