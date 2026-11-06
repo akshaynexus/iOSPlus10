@@ -1,0 +1,199 @@
+laurel 2999: LAUREL UCACHE (2998) decodes the trapped word, handles the EC 0 form of the trap, and faults like the instruction would; both kernels. docs/laurel_sprout/ios26-userland.md "JIT code".
+
+[V phone 2026-11-07 04:33, kernel series bedf0f69ec0eef1e] `CRASH SpringBoard[302] sig 4 code 0x200000001 sub 0xd50b7e28` (dc civac, x8), 32
+times in the boot, and `LAUREL EMU: unknown word 0xd50b7e28`: the trap of a clear SCTLR_EL1.UCI reached handle_uncategorized, so this
+Cortex-A53/A73 reports it as EC 0 with no ISS, not EC 0x18. 2998 matched the ISS in handle_msr_trap only. Now a pure decoder of the word
+(osfmk/arm64/laurel_ucache_core.h, host-tested) serves both handlers: op1 3, CRn 7, op2 1, CRm 5 (IC IVAU) or 10-14 (DC CVAC, CVAU, CVAP,
+CVADP, CIVAC), Rt 31 = xzr (address 0). An address that is not resident is faulted in first (vm_fault, read), a signal pending returns to
+EL0 at the same pc, an address that cannot be faulted ends in EXC_BAD_ACCESS at that address (a SIGSEGV, as the data abort the instruction
+would take; never SIGILL); a page that is not RAM is passed over. The pc moves by 4 after a done op. iOS 26: the sleh.c hooks are in post/9023.
+Host test scripts/laurel/test-ucache.sh: the decoder on the six assembled words, their xzr forms, and eleven words that must not match.
+
+diff --git a/osfmk/arm64/laurel_ucache.c b/osfmk/arm64/laurel_ucache.c
+index bbf62a6..0b0cf5f 100644
+--- a/osfmk/arm64/laurel_ucache.c
++++ b/osfmk/arm64/laurel_ucache.c
+@@ -28,6 +28,10 @@
+ #include <vm/vm_map.h>
+ #endif
+ #include <vm/pmap.h>
++#include <vm/vm_fault.h>
++#include <kern/restartable.h>
++#include <mach/exception.h>
++#include <mach/exception_types.h>
+ 
+ uint32_t laurel_ucache_on;              /* EL0 cache maintenance by VA traps on this kernel */
+ static int laurel_ucache_mode = -1;     /* -1 undecided, 0 off, 1 on */
+@@ -84,47 +88,67 @@ laurel_ucache_apply(void)
+ 	}
+ }
+ 
+-/* the ISS of a trapped SYS instruction: Op0 [21:20], Op2 [19:17], Op1 [16:14], CRn [13:10], Rt [9:5], CRm [4:1], direction [0] */
+-#define LUC_SYS_ISS_MASK        0x003ffc1fu                     /* everything but Rt */
+-#define LUC_SYS_CACHE(crm)      ((1u << 20) | (1u << 17) | (3u << 14) | (7u << 10) | ((uint32_t)(crm) << 1))
++#include <arm64/laurel_ucache_core.h>  /* laurel 2999: the word decoder, host-tested */
+ 
+-/* handle_msr_trap: true when this was EL0 cache maintenance by VA and it is done; the pc has moved on */
+-bool laurel_ucache_trap(arm_saved_state_t *state, uint64_t esr);
++static uint64_t laurel_ucache_faults;   /* traps that ended in a signal */
++
++/*
++ * laurel 2999: handle_uncategorized (EC 0: how a Cortex-A53 or A73 reports the trap) and handle_msr_trap (EC 0x18: other cores) give the
++ * word. True: it was EL0 cache maintenance by VA, it is done, and the pc has moved on, or the thread goes back to EL0 for a signal.
++ * The address: the line's page is made resident first (a JIT touches a page it has just mapped); a page that cannot be made resident
++ * ends in EXC_BAD_ACCESS at that address, as the data abort the instruction would have taken; a page that is not RAM is passed over.
++ */
++bool laurel_ucache_word(arm_saved_state_t *state, uint32_t instr);
+ bool
+-laurel_ucache_trap(arm_saved_state_t *state, uint64_t esr)
++laurel_ucache_word(arm_saved_state_t *state, uint32_t instr)
+ {
+-	uint32_t iss = (uint32_t)(esr & 0x1ffffff), op = iss & LUC_SYS_ISS_MASK, rt = (iss >> 5) & 0x1f;
+-	bool icache = false;
++	unsigned int rt = 31;
++	int crm;
+ 
+ 	if (!laurel_ucache_on || !is_saved_state64(state) || PSR64_IS_KERNEL(get_saved_state_cpsr(state))) {
+ 		return false;
+ 	}
+-	switch (op) {
+-	case LUC_SYS_CACHE(5):          /* IC IVAU */
+-		icache = true;
+-		break;
+-	case LUC_SYS_CACHE(10):         /* DC CVAC */
+-	case LUC_SYS_CACHE(11):         /* DC CVAU */
+-	case LUC_SYS_CACHE(12):         /* DC CVAP */
+-	case LUC_SYS_CACHE(13):         /* DC CVADP */
+-	case LUC_SYS_CACHE(14):         /* DC CIVAC */
+-		break;
+-	default:
++	crm = luc_cache_word(instr, &rt);
++	if (crm < 0) {
+ 		return false;
+ 	}
+ 	uint64_t va = (rt == 31 ? 0 : get_saved_state_reg(state, rt)) & ~63ULL;
+-	pmap_paddr_t pa = pmap_find_pa_nofault(vm_map_pmap(current_map()), va);
++	vm_map_t map = current_map();
++	pmap_paddr_t pa = 0;
++	kern_return_t kr = KERN_INVALID_ADDRESS;
+ 
+-	if (pa != 0 && pmap_valid_address(pa)) {
++	if (va < vm_map_max(map) && !(va & (1ULL << 55))) {
++		pa = pmap_find_pa_nofault(vm_map_pmap(map), va);
++		if (pa == 0) {
++			/* not resident yet: fault it in, as the instruction's own access would */
++			kr = vm_fault(map, vm_map_trunc_page(va, PAGE_MASK), VM_PROT_READ, FALSE, VM_KERN_MEMORY_NONE, THREAD_ABORTSAFE, NULL, 0);
++			if (kr == KERN_ABORTED) {
++				return true;                    /* a signal is pending: back to EL0 at the same pc, the word runs again after it */
++			}
++			if (kr == KERN_SUCCESS) {
++				pa = pmap_find_pa_nofault(vm_map_pmap(map), va);
++			}
++		}
++	}
++	if (pa == 0) {
++		mach_exception_data_type_t codes[2] = { kr == KERN_SUCCESS ? KERN_INVALID_ADDRESS : kr, (mach_exception_data_type_t)va };
++
++		laurel_ucache_faults++;
++		thread_reset_pcs_will_fault(current_thread());
++		set_saved_state_far(state, va);
++		exception_triage(EXC_BAD_ACCESS, codes, 2);
++		__builtin_unreachable();
++	}
++	if (pmap_valid_address(pa)) {
+ 		vm_offset_t kva = phystokv(pa) & ~63UL;
+ 
+-		if (op == LUC_SYS_CACHE(14)) {
++		if (crm == LUC_DC_CIVAC) {
+ 			__asm__ volatile ("dc civac, %0" : : "r"(kva) : "memory");
+ 		} else {
+ 			__asm__ volatile ("dc cvac, %0" : : "r"(kva) : "memory");
+ 		}
+ 		__builtin_arm_dsb(DSB_ISH);
+-		if (icache) {
++		if (crm == LUC_IC_IVAU) {
+ 			__asm__ volatile ("ic ivau, %0" : : "r"(kva) : "memory");
+ 			__builtin_arm_dsb(DSB_ISH);
+ 		}
+@@ -133,3 +157,20 @@ laurel_ucache_trap(arm_saved_state_t *state, uint64_t esr)
+ 	add_saved_state_pc(state, 4);
+ 	return true;
+ }
++
++/* handle_msr_trap (EC 0x18): the word is what the pc holds; the same decode */
++bool laurel_ucache_trap(arm_saved_state_t *state, uint64_t esr);
++bool
++laurel_ucache_trap(arm_saved_state_t *state, uint64_t esr)
++{
++	uint32_t instr = 0;
++
++	(void)esr;
++	if (!laurel_ucache_on || !is_saved_state64(state) || PSR64_IS_KERNEL(get_saved_state_cpsr(state))) {
++		return false;
++	}
++	if (copyin(get_saved_state_pc(state), &instr, sizeof(instr)) != 0) {
++		return false;
++	}
++	return laurel_ucache_word(state, instr);
++}
+diff --git a/osfmk/arm64/laurel_ucache_core.h b/osfmk/arm64/laurel_ucache_core.h
+new file mode 100644
+index 0000000..59d6320
+--- /dev/null
++++ b/osfmk/arm64/laurel_ucache_core.h
+@@ -0,0 +1,39 @@
++/*
++ * laurel 2999: the EL0 cache maintenance instructions that a clear SCTLR_EL1.UCI traps, read from the instruction word itself. No kernel
++ * types: the host test scripts/laurel/test-ucache.sh runs exactly this code. A Cortex-A53 or A73 reports the trap as EC 0 (unknown reason,
++ * no ISS), not EC 0x18 as the ESR_EL1 description says for other cores [V phone 2026-11-07: `dc civac, x8` 0xd50b7e28 reached the
++ * undefined-word path and SpringBoard died of SIGILL]; so the word, which both handlers have, is what is decoded.
++ *   SYS Xt: 1101 0101 0000 1 op1(3) CRn(4) CRm(4) op2(3) Rt(5). The six: op1 3, CRn 7, op2 1, CRm 5 (IC IVAU), 10 (DC CVAC), 11 (DC CVAU),
++ *   12 (DC CVAP), 13 (DC CVADP), 14 (DC CIVAC). DC ZVA (CRm 4) is SCTLR_EL1.DZE's, not UCI's: not here.
++ */
++#ifndef LAUREL_UCACHE_CORE_H
++#define LAUREL_UCACHE_CORE_H
++
++#define LUC_SYS_BASE            0xd5080000u
++#define LUC_SYS_MASK            0xfff80000u
++#define LUC_CACHE_FIXED         (LUC_SYS_BASE | (3u << 16) | (7u << 12) | (1u << 5))    /* op1 3, CRn 7, op2 1 */
++#define LUC_CACHE_FIXED_MASK    0xfffff0e0u                                             /* all but CRm and Rt */
++#define LUC_IC_IVAU             5
++#define LUC_DC_CVAC             10
++#define LUC_DC_CVAU             11
++#define LUC_DC_CVAP             12
++#define LUC_DC_CVADP            13
++#define LUC_DC_CIVAC            14
++
++/* the CRm (5, 10-14) of an EL0 cache maintenance word and its Rt (31 = xzr), or -1 for any other word */
++static inline int
++luc_cache_word(unsigned int instr, unsigned int *rt)
++{
++	unsigned int crm = (instr >> 8) & 0xf;
++
++	if ((instr & LUC_CACHE_FIXED_MASK) != LUC_CACHE_FIXED) {
++		return -1;
++	}
++	if (crm != LUC_IC_IVAU && (crm < LUC_DC_CVAC || crm > LUC_DC_CIVAC)) {
++		return -1;
++	}
++	*rt = instr & 0x1f;
++	return (int)crm;
++}
++
++#endif /* LAUREL_UCACHE_CORE_H */
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 20e6489..163f439 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -998,6 +998,11 @@ handle_uncategorized(arm_saved_state_t *state)
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 
+ #if defined(SWEET)
++	/* laurel 2999: a Cortex-A53 or A73 reports an EL0 cache maintenance trap (SCTLR_EL1.UCI clear, 2998) as EC 0: the word says which */
++	extern bool laurel_ucache_word(arm_saved_state_t *state, uint32_t instr);
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && laurel_ucache_word(state, instr)) {
++		return;
++	}
+ 	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && sweet_emulate_lse(state, instr)) {
+ 		return;
+ 	}

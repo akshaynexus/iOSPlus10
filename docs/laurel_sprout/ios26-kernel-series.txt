@@ -358,12 +358,15 @@
 2996-laurel-timer-coalescing-off.patch                         applied
 2997-laurel-touch-fast.patch                                   applied
 2998-laurel-ucache.patch                                       applied+rules(3): base 0003, glue
+2999-laurel-ucache-word.patch                                  applied+rules(1): base 0003
 3000-laurel-audio-lead.patch                                   applied
 3001-laurel-haptic-first-contact.patch                         applied
 3002-laurel-haptic-node-early.patch                            applied
 3020-laurel-cpu-motion.patch                                   applied
 3021-laurel-gpu-motion.patch                                   applied
 3022-laurel-ram-top-line.patch                                 applied
+3030-laurel-pmic-wdog.patch                                    applied+rules(1): glue
+3031-laurel-usb-hold-rearm.patch                               applied
 3040-laurel-ucache-line-after-boot-thread.patch                applied
 3041-laurel-lock-timeout-line-at-early-boot.patch              applied
 9000-series-12377-api.patch                                    post
@@ -389,4 +392,5 @@
 9020-laurel-focaltech-empty-report.patch                       post
 9021-laurel-pmap-free-backtrace.patch                          post
 9022-laurel-ucache-sleh-init.patch                             post
-== series: 249 applied, 88 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
+9023-laurel-ucache-ec0-sleh.patch                              post
+== series: 250 applied, 90 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors

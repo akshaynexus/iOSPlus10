@@ -1,9 +1,9 @@
 # The inputs of the Mu FD of the Mi A3, in one place. mu-build.sh writes this hash beside the FD (.fd.patches), uefi-image.sh compares it before a menu image: an FD of other inputs has older slot code,
 # and its menu can say "unknown action". Sourced with REPO set (scripts/lib/env.sh).
-# Inputs: all patches, also patches/laurel/mu/late/ (MU_RAM_LAYOUT=late), the three slot files that mu-build.sh copies in (tools/laurel-slot), and the commits of the Mu fork, UniXNU and its DarwinBoot.
+# Inputs: all patches, also patches/laurel/mu/late/ (MU_RAM_LAYOUT=late), the four slot files that mu-build.sh copies in (tools/laurel-slot, with LaurelPmicWdog.c of mu 0202), and the commits of the Mu fork, UniXNU and its DarwinBoot.
 _laurel_mu_sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1; }
 laurel_mu_files() {
-  for _f in "$REPO"/patches/laurel/mu/*.patch "$REPO"/patches/laurel/mu/late/*.patch "$REPO/tools/laurel-slot/laurel_slot.c" "$REPO/tools/laurel-slot/laurel_slot.h" "$REPO/tools/laurel-slot/uefi/LaurelSlot.c"; do
+  for _f in "$REPO"/patches/laurel/mu/*.patch "$REPO"/patches/laurel/mu/late/*.patch "$REPO/tools/laurel-slot/laurel_slot.c" "$REPO/tools/laurel-slot/laurel_slot.h" "$REPO/tools/laurel-slot/uefi/LaurelSlot.c" "$REPO/tools/laurel-slot/uefi/LaurelPmicWdog.c"; do
     # a pattern with no match stays as the text: it counts as absent, in both places
     if [ -f "$_f" ]; then printf '%s %s\n' "${_f#"$REPO"/}" "$(_laurel_mu_sha < "$_f")"; else printf '%s absent\n' "${_f#"$REPO"/}"; fi
   done
