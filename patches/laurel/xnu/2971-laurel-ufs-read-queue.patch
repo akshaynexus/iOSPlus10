@@ -99,7 +99,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +	if (count == 0) {
 +		goto done;
 +	}
-+	if (rd && (buf_flags(bp) & B_ASYNC) && luq_async_put(bp)) {
++	if (rd && luq_async_eligible(buf_flags(bp), buf_upl(bp) != NULL) && luq_async_put(bp)) {
 +		return;
 +	}
 +	ufs_bp_io(bp);
@@ -127,7 +127,7 @@ diff --git a/bsd/dev/laurel_ufs_queue.h b/bsd/dev/laurel_ufs_queue.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/laurel_ufs_queue.h
-@@ -0,0 +1,481 @@
+@@ -0,0 +1,493 @@
 +/*
 + * laurel 2971: reads of the root go to the UFS device in parallel (a piece of sweet_ufs.c; the host test
 + * scripts/laurel/test-ufs-queue.sh runs this code against a fake host with threads).
@@ -136,8 +136,9 @@ new file mode 100644
 + * all of it: 16 KiB reads: 40 MB/s with 1 reader, 44 MB/s in all with 4. Every program that waits for a page waits for all others.
 + *
 + * Now: slot 0 stays what it was (writes, cache sync, other LUNs, GPT watch, reads this queue gave up on), under its mutex. Reads of the
-+ * root take one of up to 7 slots of their own, with their own descriptor and bounce buffer. The mutex is not held. B_ASYNC reads
-+ * (read-ahead, async page-in) go to as many threads as slots, so the caller goes on, as with any real disk driver.
++ * root take one of up to 7 slots of their own, with their own descriptor and bounce buffer. The mutex is not held. Ordinary cache
++ * B_ASYNC reads may go to as many threads as slots. UPL/cluster/page-I/O buffers stay on the strategy caller through completion,
++ * because cluster_iodone_finish can abort pages whose mapping ownership must not cross to luq_worker.
 + *
 + * Even hardware slots only: a request descriptor has 32 bytes and a cache line 64, and this host is not cache coherent. A clean of one
 + * descriptor must not touch another that the host writes. So: 2, 4, ... 14; the odd neighbours are never rung. Slot 0's line holds
@@ -159,6 +160,17 @@ new file mode 100644
 +#define LUQ_ASYNC_MAX   128u
 +#define LUQ_CHECK_BLOCKS 3u
 +#define LUQ_LINE_NS     (60ull * NSEC_PER_SEC)
++
++/*
++ * Keep UPL-backed completion on the strategy caller. Cluster callbacks may abort/free
++ * the UPL pages; handing those buffers to luq_worker can race their mapping owner.
++ */
++static bool
++luq_async_eligible(uint32_t flags, bool has_upl)
++{
++	return (flags & (B_READ | B_ASYNC)) == (B_READ | B_ASYNC) &&
++	    !(flags & (B_CLUSTER | B_PAGEIO)) && !has_upl;
++}
 +
 +#define REG_UICCMD      0x90
 +#define REG_UICARG1     0x94

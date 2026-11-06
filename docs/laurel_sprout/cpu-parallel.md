@@ -9,7 +9,7 @@ Marks: [V] read in a log, code, or measured on the phone. [I] inference. [U] unk
 | # | Cause | Numbers | Fix | Needs | Mark |
 |---|---|---|---|---|---|
 | 1 | Jetsam kill loops: daemons die at 6-10 MB and restart | At rest ended tasks take 32-35 s of 61-66 s a minute: **53 % of all CPU**. In the storm 197 and 285 s of 461. 52 min: deviceaccessd 278 kills, gamepolicyd 271, liveactivitiesd 204, linkd 34, intents_helper 29. Memory is there: 715 MiB free | Floors in `JETSAM_FLOORS`, commit f3cb706 | New root, or copy the plist + reboot | [V] numbers; [I] that the ended tasks are these loops |
-| 2 | Root disk: one UFS slot, one mutex over command and copy; each wait spins a CPU; read-ahead stops its caller | dd on `/dev/rufsroot0`: 16 KiB: 1 reader 40 MB/s, 4 readers 44 MB/s in all. 4 KiB: 13 and 17 MB/s. 1 MiB: 144 MB/s. Pageins 787 MB | 2970, 2971 | New kernel | [V] numbers; gain on the phone [U]: the host test gives 3.4-4.1 times with 4 readers on a fake device |
+| 2 | Root disk: one UFS slot, one mutex over command and copy; each wait spins a CPU; ordinary-buffer read-ahead stops its caller | dd on `/dev/rufsroot0`: 16 KiB: 1 reader 40 MB/s, 4 readers 44 MB/s in all. 4 KiB: 13 and 17 MB/s. 1 MiB: 144 MB/s. Pageins 787 MB. Patch 2971 now keeps UPL/cluster/page-I/O completion on the strategy caller; only ordinary async cache buffers may transfer to a worker | 2970, 2971 | New kernel | [V] numbers; gain on the phone [U]: the host test gives 3.4-4.1 times with 4 readers on a fake device; the new eligibility cases pass on the host |
 | 3 | backboardd: the frame waits for the GPU on the CPU (`NEGRONIMETAL_SYNC=1`), though the presenter waits for the same fence | A frame = CPU 9 ms + GPU 25-40 ms. Without the wait: the larger of the two: 34-49 ms -> 25-40 ms, about 20-25 % more frames | commit 8a25c38 | Plug-in file copy, restart backboardd | [V] the wait; [I] the gain; [U] half-drawn frames |
 | 4 | Governor: edges only, no cap on a loaded core. 120 ms from idle to the top; 80 ms of it at 300-650 MHz. Gold 14 s a minute at 1401-1804 MHz while the UI moves. Touch held Silver at 1305 MHz | Under load 2016:60, 1804:60 [V] | 2972: 40 ms; touch holds both caps; GPU work holds Gold's | New kernel | [V] rows; [I] gain. Cost: power |
 | 5 | SPMI: a waiter for the lock spins with interrupts off, up to 5 ms | Bound from the code | 2973 | New kernel | [V] code; not shown to be the cause of the late CPU |
@@ -64,6 +64,7 @@ So a daemon that maps the store is at 5-11 MB before it does any work. Why the r
 
 ```
 scripts/laurel/test-ufs-queue.sh   16 KiB reads on a fake host: 3.4-4.1 times the rate with 4 readers; off on error, timeout, wrong data; PASS, 3 of 3 runs
+                                   read-ahead eligibility: ordinary async only; UPL/cluster/page-I/O rejected (PASS)
 real sweet_ufs.c over a RAM disk   42809 checks passed, 0 failed
 scripts/laurel/gov-test.sh         top row 40 ms from idle, was 120 ms
 ios26-root-spec.py --self-test     passed; floors applied to the phone's plist by hand: every limit raised, none lowered

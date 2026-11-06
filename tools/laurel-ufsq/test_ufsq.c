@@ -28,6 +28,10 @@
 #define THREAD_UNINT 0
 #define THREAD_WAITING 1
 #define THREAD_CONTINUE_NULL NULL
+#define B_READ         0x00000001u
+#define B_ASYNC        0x00000002u
+#define B_CLUSTER      0x00000040u
+#define B_PAGEIO       0x00000080u
 #define TIMEOUT_URGENCY_SYS_CRITICAL 0
 #define KMA_DATA 0
 #define KMA_ZERO 0
@@ -342,6 +346,13 @@ main(void)
 	uint32_t fell;
 
 	/* layout */
+	CHECK(luq_async_eligible(B_READ | B_ASYNC, false), "ordinary async read may transfer to worker");
+	CHECK(!luq_async_eligible(B_READ, false), "synchronous read stays with caller");
+	CHECK(!luq_async_eligible(B_ASYNC, false), "async write stays with caller");
+	CHECK(!luq_async_eligible(B_READ | B_ASYNC | B_CLUSTER, false), "clustered UPL read stays with caller");
+	CHECK(!luq_async_eligible(B_READ | B_ASYNC | B_PAGEIO, false), "page-I/O read stays with caller");
+	CHECK(!luq_async_eligible(B_READ | B_ASYNC, true), "any UPL-backed read stays with caller");
+
 	CHECK(LUQ_DMA_SIZE < (8u << 20), "memory %u", LUQ_DMA_SIZE);
 	CHECK(sizeof(struct utrd) == 32 && sizeof(struct ucd) == 1088, "descriptors %zu %zu", sizeof(struct utrd), sizeof(struct ucd));
 	for (unsigned i = 0; i < LUQ_READ_SLOTS; i++) {

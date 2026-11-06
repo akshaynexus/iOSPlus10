@@ -1,0 +1,45 @@
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -45,6 +45,7 @@
+ #include <kern/kalloc.h>
+ #include <kern/spl.h>
+ #include <kern/startup.h>
++#include <kern/backtrace.h>
+ #include <kern/trustcache.h>
+ 
+ #include <os/overflow.h>
+@@ -2885,10 +2886,14 @@
+ {
+ 	const pmap_paddr_t pa = ptoa(ppnum);
+ 
+ 	/* Only mappings to kernel-managed physical memory are tracked. */
+ 	if (__probable(!pa_valid(pa) || pmap_verify_free(ppnum))) {
+ 		return;
+ 	}
++	/* laurel 9002: preserve the current kernel call chain in this fatal VM invariant. */
++	uintptr_t recycle_bt[16] = { 0 };
++	backtrace_info_t recycle_bt_info = BTI_NONE;
++	const unsigned int recycle_bt_count = backtrace(recycle_bt, ARRAY_LEN(recycle_bt), NULL, &recycle_bt_info);
+ 
+ 	const unsigned int pai = pa_index(pa);
+ 	pv_entry_t **pvh = pai_to_pvh(pai);
+@@ -2943,11 +2948,17 @@
+ 	/* Panic with a unique string identifying the first bad mapping and owner. */
+ 	{
+ 		/* First PTE is mapped by the main CPUs. */
+ 		pmap_t pmap = ptep_get_pmap(first_ptep);
+ 		const char *type = (pmap == kernel_pmap) ? "Kernel" : "User";
++		char stack[384];
++		int used = snprintf(stack, sizeof(stack), "%u%s", recycle_bt_count,
++		    (recycle_bt_info & BTI_TRUNCATED) ? " truncated" : "");
++		for (unsigned int i = 0; i < recycle_bt_count && used > 0 && (size_t)used < sizeof(stack); i++) {
++			used += snprintf(stack + used, sizeof(stack) - (size_t)used, " %p", (void *)recycle_bt[i]);
++		}
+ 
+ 		panic("%s: Found at least one mapping to %#llx. First PTEP (%p) is a "
+-		    "%s CPU mapping (pmap: %p)",
+-		    __func__, (uint64_t)pa, first_ptep, type, pmap);
++		    "%s CPU mapping (pmap: %p); kernel backtrace n=%s",
++		    __func__, (uint64_t)pa, first_ptep, type, pmap, stack);
+ 	}
+ }

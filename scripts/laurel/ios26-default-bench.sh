@@ -58,8 +58,9 @@ up=$(uptime_s)
 [ "${up:-0}" -ge "${SETTLE_UP_S:-120}" ] || { say "uptime ${up:-none} s, under ${SETTLE_UP_S:-120}: the round ends"; trap - EXIT; exit 7; }
 # A run that a reboot ended left its settings: they go first (we hold the lock, so no run is under way).
 phone "[ -f $DB/option.bench-saved ] && mv -f $DB/option.bench-saved $DB/option; [ -f $DB/env.bench-saved ] && mv -f $DB/env.bench-saved $DB/env; for f in $B/libvulkan_freedreno.dylib $B/options/default/NegroniMetal; do [ -f \$f.bench-saved ] && mv -f \$f.bench-saved \$f; done; true" || { say "no SSH"; exit 2; }
-old_option=$(phone "cat $DB/option 2>/dev/null")
-phone "cp $DB/env $DB/env.bench-saved; cp $DB/option $DB/option.bench-saved" || { say "no SSH"; exit 2; }
+old_option_exists=$(phone "[ -f $DB/option ] && echo yes || echo no")
+old_option=$(phone "cat $DB/option 2>/dev/null || true")
+phone "cp $DB/env $DB/env.bench-saved; if [ -f $DB/option ]; then cp $DB/option $DB/option.bench-saved; else rm -f $DB/option.bench-saved; fi" || { say "no SSH"; exit 2; }
 restore() {
   [ "${NO_RESTORE:-0}" = 1 ] && { say "stays: option default, env and files of this run"; return; }
   # A phone that is gone costs one SSH timeout here, not one for each step: others wait for the lock. The copies stay on the phone; the next run puts them back first.
@@ -67,7 +68,11 @@ restore() {
   back "$B/libvulkan_freedreno.dylib"; back "$B/options/default/NegroniMetal"
   phone "tail -c +${meta_at:-1} $DB/metal.log; rm -f $DB/telemetry" > "$REPO/logs/bench-$name.metal.log" 2>/dev/null
   # With no SSH here, the copies stay on the phone, and the next run puts them back first.
-  if phone "mv -f $DB/env.bench-saved $DB/env; mv -f $DB/option.bench-saved $DB/option"; then say "restored: option $old_option, env"; else say "NOT restored: no SSH: option and env stay until the next run"; fi
+  if [ "$old_option_exists" = yes ]; then
+    if phone "mv -f $DB/env.bench-saved $DB/env; mv -f $DB/option.bench-saved $DB/option"; then say "restored: option $old_option, env"; else say "NOT restored: no SSH: option and env stay until the next run"; fi
+  else
+    if phone "mv -f $DB/env.bench-saved $DB/env; rm -f $DB/option $DB/option.bench-saved"; then say "restored: option remains absent, env"; else say "NOT restored: no SSH: option and env stay until the next run"; fi
+  fi
   restart_ui
 }
 trap restore EXIT
@@ -92,7 +97,16 @@ if gpu_lost_since "$at"; then
   exit 8
 fi
 active=$(phone "head -c 100 $DB/stack/active 2>/dev/null")
-case "$active" in default*) ;; *) say "NOT stack default: $active"; exit 3 ;; esac
+case "$active" in
+  default*) ;;
+  "")
+    # A fresh root has no stack selector marker; the option file set above is authoritative.
+    selected=$(phone "cat $DB/option 2>/dev/null || true")
+    [ "$selected" = default ] || { say "NOT stack default: active marker absent, option $selected"; exit 3; }
+    say "stack selector has no active marker on this fresh root; option is default"
+    ;;
+  *) say "NOT stack default: $active"; exit 3 ;;
+esac
 # WARMUP=1: the test once before the measure: a new Turnip file means no pipeline cache, and pipelines compiled in the middle of a motion measure the compiler.
 if [ "${WARMUP:-1}" = 1 ]; then
   watched "$REPO/scripts/laurel/ios26-autotest.sh" run "$@" > /dev/null 2>&1 || true

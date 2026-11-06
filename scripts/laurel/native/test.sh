@@ -4,10 +4,10 @@
 set -euo pipefail
 . "$(cd "$(dirname "$0")/.." && pwd)/metal-env.sh"
 N=$REPO/userland/laurel/metal-native
-S=$OUT/ios26/turnip-host/mesa
+S=$OUT/gpu/turnip/mesa-25.0.7
 W=$OUT/ios26/native/test
 mkdir -p "$W"
-B=$OUT/ios26/native/mesa-host
+B=$OUT/gpu/turnip/build-ios
 CF="-O1 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -I$N/winsys -I$N/tests -I$S/include -I$S/src/freedreno/common -I$B/src/freedreno/registers/adreno -I$B/src/freedreno/registers"
 for t in ${*:-winsys option}; do
   case $t in

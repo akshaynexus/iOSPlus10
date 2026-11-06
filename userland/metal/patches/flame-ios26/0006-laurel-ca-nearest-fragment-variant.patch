@@ -1,0 +1,135 @@
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -12,6 +12,7 @@
+ #import <objc/runtime.h>
+ #import <objc/message.h>   // NegroniMetal (flame/0009): objc_msgSend for the MSL front end's private library accessors
+ #include <algorithm>
++#include <cstdlib>
+ #include <atomic>
+ #include <map>
+ #include <mutex>
+@@ -502,6 +503,7 @@
+  uint8_t _libraryHash[CC_SHA256_DIGEST_LENGTH];
+ }
+ @property(nonatomic) NmbLibrary *handle;
++@property(nonatomic,copy) NSArray<NSString *> *cachedFunctionNames;
+ - (void)hashBytes:(const void *)bytes length:(size_t)length;
+ @end
+ @class NBFunction;
+@@ -591,7 +593,52 @@
+  }
+ }
+ static std::string quartzCoreCallers();
++
++static NSString *nb_ca_part(NSTextCheckingResult *match, NSUInteger group, NSString *text) {
++  NSRange range=[match rangeAtIndex:group];
++  return range.location==NSNotFound?@"":[text substringWithRange:range];
++}
++
++static NSString *nb_ca_resolve_fragment(NSArray<NSString *> *names, NSString *requested) {
++  static NSString *const prefix=@"com.apple.coreanimation.frag.";
++  static NSMutableSet<NSString *> *told;
++  static NSRegularExpression *form;
++  static dispatch_once_t once;
++  if(!requested || ![requested hasPrefix:prefix] || [names containsObject:requested])return requested;
++  dispatch_once(&once, ^{
++    form=[[NSRegularExpression alloc] initWithPattern:@"^(T[a-z0-9]{3})?(B[a-z]{3})?(D[a-z]{2})?(A[0-9])(S[0-9])?(L[a-z]{2})?X([a-z]*)((?:_[A-Za-z0-9]+)*)$" options:0 error:NULL];
++    told=[[NSMutableSet alloc] init];
++  });
++  NSString *wanted=[requested substringFromIndex:prefix.length];
++  NSTextCheckingResult *want=[form firstMatchInString:wanted options:0 range:NSMakeRange(0,wanted.length)];
++  NSString *best=nil;
++  NSInteger bestCost=NSIntegerMax;
++  if(want)for(NSString *candidate in names) {
++    if(![candidate hasPrefix:prefix])continue;
++    NSString *haveText=[candidate substringFromIndex:prefix.length];
++    NSTextCheckingResult *have=[form firstMatchInString:haveText options:0 range:NSMakeRange(0,haveText.length)];
++    BOOL compatible=have!=nil;
++    for(NSUInteger i=1;compatible && i<=6;i++)compatible=[nb_ca_part(want,i,wanted) isEqualToString:nb_ca_part(have,i,haveText)];
++    if(!compatible)continue;
++    NSString *wantFlags=nb_ca_part(want,7,wanted),*haveFlags=nb_ca_part(have,7,haveText);
++    NSArray<NSString *> *wantInputs=[nb_ca_part(want,8,wanted) componentsSeparatedByString:@"_"],*haveInputs=[nb_ca_part(have,8,haveText) componentsSeparatedByString:@"_"];
++    if(wantInputs.count!=haveInputs.count)continue;
++    NSInteger cost=0;
++    for(NSUInteger i=0;i<wantInputs.count;i++)if(![wantInputs[i] isEqualToString:haveInputs[i]])cost+=100+std::labs((long)haveInputs[i].length-(long)wantInputs[i].length);
++    for(NSUInteger i=0;i<wantFlags.length;i++)if([haveFlags rangeOfString:[wantFlags substringWithRange:NSMakeRange(i,1)]].location==NSNotFound)cost+=3;
++    for(NSUInteger i=0;i<haveFlags.length;i++)if([wantFlags rangeOfString:[haveFlags substringWithRange:NSMakeRange(i,1)]].location==NSNotFound)cost+=10;
++    if(cost<bestCost || (cost==bestCost && (!best || [candidate compare:best]==NSOrderedAscending))){best=candidate;bestCost=cost;}
++  }
++  @synchronized(told) {
++    if(![told containsObject:requested]) {
++      [told addObject:requested];
++      NSString *message=[NSString stringWithFormat:@"CoreAnimation fragment %@ is absent: %@ stands in for it",wanted,best?[best substringFromIndex:prefix.length]:@"no compatible variant"];
++      sm2_logs(message.UTF8String);
++    }
++  }
++  return best?:requested;
++}
+ @implementation NBLibrary
+ - (void)hashBytes:(const void *)bytes length:(size_t)length {
+  if(bytes && length)CC_SHA256(bytes,(CC_LONG)MIN(length,(size_t)0x40000000u),_libraryHash);
+  else {const uintptr_t tag=(uintptr_t)self;CC_SHA256(&tag,(CC_LONG)sizeof tag,_libraryHash);}
+@@ -631,19 +678,20 @@
+   for(uint64_t i=0;i<c.length;i++){snprintf(head,sizeof head,"%02x",((const uint8_t *)c.bytes)[i]);text+=head;}
+  }
+  const uint64_t functionBegan=nowUs();
+- NmbFunction *handle=nmb_function_new_with_descriptor(_handle,name.UTF8String,linkName.UTF8String,constants.data(),(uint32_t)constants.size(),true);gTimeFunction.add(functionBegan);
++ NSString *resolvedName=nb_ca_resolve_fragment(self.functionNames,name);
++ NmbFunction *handle=nmb_function_new_with_descriptor(_handle,resolvedName.UTF8String,linkName.UTF8String,constants.data(),(uint32_t)constants.size(),true);gTimeFunction.add(functionBegan);
+  // One S line per specialization (int-155: every QuartzCore pipeline was made on its draw, and a refused generic function would leave its
+  // generic pipeline unmade without a word): the function, its constants, the time, the refusal and QuartzCore's callers.
+  if(!gJournalPath.empty()) {
+   char head[96];snprintf(head,sizeof head,"S t=%llu us=%llu ok=%d name=",(unsigned long long)((functionBegan-gJournalBegan)/1000),
+       (unsigned long long)(nowUs()-functionBegan),handle?1:0);
+-  journal(head+std::string(name.UTF8String?:"?")+" k="+text+(handle?std::string():" err="+std::string(lastError().UTF8String?:"?"))+" | "+quartzCoreCallers());
++  journal(head+std::string(resolvedName.UTF8String?:"?")+" k="+text+(handle?std::string():" err="+std::string(lastError().UTF8String?:"?"))+" | "+quartzCoreCallers());
+  }
+  if(!handle){
+   noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
+   if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
+  }
+- NBFunction *function=[NBFunction new];function.handle=handle;function.name=linkName.length?linkName:name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
++ NBFunction *function=[NBFunction new];function.handle=handle;function.name=linkName.length?linkName:resolvedName;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+  function.constantsText=text;[function hashWithLibrary:_libraryHash];if(error)*error=nil;return (id<MTLFunction>)function;
+ }
+ - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
+@@ -668,7 +716,8 @@
+  if(d.constantValues)return [self newFunctionWithName:d.name linkName:d.specializedName constantValues:d.constantValues error:error];
+  if(d.specializedName.length) {
+   const uint64_t functionBegan=nowUs();
+-  NmbFunction *handle=nmb_function_new_with_descriptor(_handle,d.name.UTF8String,d.specializedName.UTF8String,nullptr,0,false);gTimeFunction.add(functionBegan);
++ NSString *resolvedName=nb_ca_resolve_fragment(self.functionNames,d.name);
++ NmbFunction *handle=nmb_function_new_with_descriptor(_handle,resolvedName.UTF8String,d.specializedName.UTF8String,nullptr,0,false);gTimeFunction.add(functionBegan);
+   if(!handle){if(error)*error=nbError([NSString stringWithFormat:@"function %@ as %@: %@",d.name,d.specializedName,lastError()]);return nil;}
+   NBFunction *linked=[NBFunction new];linked.handle=handle;linked.name=d.specializedName;linked.functionType=(MTLFunctionType)nmb_function_type(handle);
+   [linked hashWithLibrary:_libraryHash];
+@@ -679,18 +728,23 @@
+  if(error)*error=nil;return function;
+ }
+ - (NSArray<NSString *> *)functionNames {
+- NSMutableArray *names=[NSMutableArray array];
+- for(uint32_t i=0,n=nmb_library_function_count(_handle);i<n;i++) {
+-  char name[256];nmb_library_function_name(_handle,i,name,sizeof name);[names addObject:[NSString stringWithUTF8String:name]];
++ @synchronized(self) {
++  if(_cachedFunctionNames)return _cachedFunctionNames;
++  NSMutableArray *names=[NSMutableArray array];
++  for(uint32_t i=0,n=nmb_library_function_count(_handle);i<n;i++) {
++   char name[256];nmb_library_function_name(_handle,i,name,sizeof name);[names addObject:[NSString stringWithUTF8String:name]];
++  }
++  _cachedFunctionNames=[names copy];
++  return _cachedFunctionNames;
+  }
+- return names;
+ }
+ - (id<MTLFunction>)newFunctionWithName:(NSString *)name {
+  const uint64_t functionBegan=nowUs();
+- NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
++ NSString *resolvedName=nb_ca_resolve_fragment(self.functionNames,name);
++ NmbFunction *handle=resolvedName?nmb_function_new(_handle,resolvedName.UTF8String):nullptr;gTimeFunction.add(functionBegan);
+  if(!handle)return nil;
+- NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
++ NBFunction *function=[NBFunction new];function.handle=handle;function.name=resolvedName;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+  [function hashWithLibrary:_libraryHash];
+  return (id<MTLFunction>)function;
+ }
+ @end

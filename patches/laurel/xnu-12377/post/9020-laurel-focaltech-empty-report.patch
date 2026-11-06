@@ -1,0 +1,12 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -638,5 +638,9 @@ touch_focaltech(void)
+ 	if (err) {
+ 		return err;
+ 	}
++	/* Upstream HakiOS 81b5dd2: FocalTech's 0xff sentinel means no report, not a lift. */
++	if (buf[1] == 0xffu && buf[2] == 0xffu && buf[3] == 0xffu) {
++		return 0;
++	}
+ 	unsigned n = buf[2] & 15u, active = 0;
+ 	if (n || !st.s_frames) {
