@@ -1,0 +1,18 @@
+laurel 9023 (iOS 26): the sleh.c hook of 2999: handle_uncategorized (EC 0, how the Kryo 260 reports the UCI trap) gives the word to laurel_ucache_word(); the base owns sleh.c.
+
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index b6decfc..5f4692f 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1275,6 +1275,11 @@ handle_uncategorized(arm_saved_state_t *state)
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 
+ #if defined(SWEET)
++	/* laurel 2999: a Cortex-A53 or A73 reports an EL0 cache maintenance trap (SCTLR_EL1.UCI clear, 2998) as EC 0: the word says which */
++	extern bool laurel_ucache_word(arm_saved_state_t *state, uint32_t instr);
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && laurel_ucache_word(state, instr)) {
++		return;
++	}
+ 	/* laurel iOS 26: words newer than ARMv8.0 (osfmk/arm64/laurel_abi.c, laurel_a64emu.c). With laurelemu=0 the older LSE path below still runs */
+ 	extern bool laurel_abi_trap(arm_saved_state_t *state, uint32_t instr);
+ 	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && laurel_abi_trap(state, instr)) {
