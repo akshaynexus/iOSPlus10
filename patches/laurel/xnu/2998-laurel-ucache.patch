@@ -4,7 +4,7 @@ laurel 2998: LAUREL UCACHE: EL0 cache maintenance by VA is trapped and done with
 reads IDC 0: a core can fetch the stale bytes under a line of new code still dirty in its L1 data cache (WebContent: SIGSEGV at pc 0 at its
 first style resolution, 218 times on the S9). SCTLR_EL1.UCI is cleared on every core as it starts and wakes; the trapped IC IVAU and DC ops
 are done on the kernel's alias of the page with DC CVAC first. Self-check: on only with CTR_EL0.IDC 0. Kill switch laurelucache=0. One line.
-iOS 26: the sleh.c and arm_init.c hunks are in post/9020 (the base owns those files; owned.txt lists 2998).
+iOS 26: the sleh.c and arm_init.c hunks are in post/9022 (the base owns those files; owned.txt lists 2998).
 
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
 index fa30ed9..b641192 100644
