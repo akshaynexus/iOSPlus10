@@ -44,20 +44,21 @@ watch_sleep() {
     if [ "$none" -gt "${NONE_S:-60}" ]; then say "uptime none for over ${NONE_S:-60} s: the round ends"; exit 7; fi
   done
 }
-# FILE PATH: a new file, read back by hash, moved over PATH; the old one stays in PATH.bench-saved until restore()
+# FILE PATH: a new file, read back by hash, moved over PATH; the old one stays in PATH.bench-saved until restore().
+# A root with no such file (a root of the native stack only has no options/default): PATH.bench-none, and restore() takes the file away again.
 put() {
   local want; want=$(sha256sum "$1" | cut -d' ' -f1)
-  phone "[ -f '$2.bench-saved' ] || cp -p '$2' '$2.bench-saved'; cat > '$2.new'" < "$1"
+  phone "mkdir -p \"\$(dirname '$2')\"; if [ -f '$2.bench-saved' ] || [ -f '$2.bench-none' ]; then :; elif [ -f '$2' ]; then cp -p '$2' '$2.bench-saved'; else : > '$2.bench-none'; fi; cat > '$2.new'" < "$1"
   [ "$(phone "shasum -a 256 '$2.new' 2>/dev/null || sha256sum '$2.new'" | cut -d' ' -f1)" = "$want" ] || { say "bad copy of $2"; exit 4; }
   phone "chown 0:0 '$2.new'; chmod 755 '$2.new'; mv -f '$2.new' '$2'"
   say "this run: $2 = $1"
 }
-back() { phone "[ -f '$1.bench-saved' ] && mv -f '$1.bench-saved' '$1'; true"; }
+back() { phone "if [ -f '$1.bench-none' ]; then rm -f '$1' '$1.bench-none'; elif [ -f '$1.bench-saved' ]; then mv -f '$1.bench-saved' '$1'; fi; true"; }
 # Too young, or gone: no wait under the lock, the round script waits with no lock.
 up=$(uptime_s)
 [ "${up:-0}" -ge "${SETTLE_UP_S:-120}" ] || { say "uptime ${up:-none} s, under ${SETTLE_UP_S:-120}: the round ends"; trap - EXIT; exit 7; }
 # A run that a reboot ended left its settings: they go first (we hold the lock, so no run is under way).
-phone "[ -f $DB/option.bench-saved ] && mv -f $DB/option.bench-saved $DB/option; [ -f $DB/env.bench-saved ] && mv -f $DB/env.bench-saved $DB/env; for f in $B/libvulkan_freedreno.dylib $B/options/default/NegroniMetal; do [ -f \$f.bench-saved ] && mv -f \$f.bench-saved \$f; done; true" || { say "no SSH"; exit 2; }
+phone "[ -f $DB/option.bench-saved ] && mv -f $DB/option.bench-saved $DB/option; [ -f $DB/env.bench-saved ] && mv -f $DB/env.bench-saved $DB/env; for f in $B/libvulkan_freedreno.dylib $B/options/default/NegroniMetal; do if [ -f \$f.bench-none ]; then rm -f \$f \$f.bench-none; elif [ -f \$f.bench-saved ]; then mv -f \$f.bench-saved \$f; fi; done; true" || { say "no SSH"; exit 2; }
 old_option_exists=$(phone "[ -f $DB/option ] && echo yes || echo no")
 old_option=$(phone "cat $DB/option 2>/dev/null || true")
 phone "cp $DB/env $DB/env.bench-saved; if [ -f $DB/option ]; then cp $DB/option $DB/option.bench-saved; else rm -f $DB/option.bench-saved; fi" || { say "no SSH"; exit 2; }
@@ -137,4 +138,11 @@ python3 -I "$REPO/scripts/laurel/ios26-thread-cpu.py" <(printf '%s\n' "$cpu0") <
 tail -c +"$start" "$LOG" | grep -aE 'LAUREL GPU PASS|LAUREL FRAME|RedwoodGPU: [0-9]+ submissions|LAUREL FLIP' > "$REPO/logs/bench-$name.kernel.txt"
 python3 -I "$REPO/scripts/laurel/ios26-gpu-pass-sum.py" "$REPO/logs/bench-$name.kernel.txt" | tee -a "$REPO/logs/bench-$name.txt"
 say "table: logs/bench-$name.txt (test exit $rc)"
+# A crash of the compositor or SpringBoard from the UI restart on makes the run's numbers invalid (05:09-05:10 on 11-07: SpringBoard sig 4 at `dc civac`, a kernel bug).
+crash=$(tail -c +"$at" "$LOG" | grep -aE 'CRASH (SpringBoard|backboardd)' | head -1 | cut -c1-200)
+if [ -n "$crash" ]; then
+  say "INVALID: a crash in this run: $crash"
+  echo "INVALID: $crash" >> "$REPO/logs/bench-$name.txt"
+  exit 10
+fi
 exit "$rc"
