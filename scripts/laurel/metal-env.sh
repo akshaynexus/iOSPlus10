@@ -26,7 +26,7 @@ LAUREL_CHIP_ID=0x06010000
 # 0101 caps maxMemoryAllocationSize/maxBufferSize at the kernel's RedwoodMaxBuffer (pass-through SMMU: < 64 MiB)
 # 0102 reports Vulkan 1.3 for the A610 (no HW multiview: upstream says 1.0, and metal2vulkan needs 1.2)
 # 0103 host pointers aligned to the page size of the process (4 KiB on the laurel kernel, not 16 KiB)
-export TU_EXTRA_PATCHES="$LMSRC/turnip-patches"
+export TU_EXTRA_PATCHES="$LMSRC/turnip-patches${TU_PATCHES_ADD:+ $TU_PATCHES_ADD}"   # TU_PATCHES_ADD: one more directory, for an A/B of a pending patch
 # Compiled target (Kryo 260, ARMv8.0; measured choice: docs/laurel_sprout/metal.md "Compiled target"):
 #   C/C++/ObjC (Turnip, plug-in, probes): -mcpu=cortex-a53 (ISA floor and tuning) + the A53 erratum 835769 fix
 #   Turnip: -O3 (meson release) + ThinLTO through ld64.lld, debug info kept as a dSYM (out/gpu/turnip/*.dSYM)
