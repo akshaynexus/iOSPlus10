@@ -138,4 +138,11 @@ python3 -I "$REPO/scripts/laurel/ios26-thread-cpu.py" <(printf '%s\n' "$cpu0") <
 tail -c +"$start" "$LOG" | grep -aE 'LAUREL GPU PASS|LAUREL FRAME|RedwoodGPU: [0-9]+ submissions|LAUREL FLIP' > "$REPO/logs/bench-$name.kernel.txt"
 python3 -I "$REPO/scripts/laurel/ios26-gpu-pass-sum.py" "$REPO/logs/bench-$name.kernel.txt" | tee -a "$REPO/logs/bench-$name.txt"
 say "table: logs/bench-$name.txt (test exit $rc)"
+# A crash of the compositor or SpringBoard from the UI restart on makes the run's numbers invalid (05:09-05:10 on 11-07: SpringBoard sig 4 at `dc civac`, a kernel bug).
+crash=$(tail -c +"$at" "$LOG" | grep -aE 'CRASH (SpringBoard|backboardd)' | head -1 | cut -c1-200)
+if [ -n "$crash" ]; then
+  say "INVALID: a crash in this run: $crash"
+  echo "INVALID: $crash" >> "$REPO/logs/bench-$name.txt"
+  exit 10
+fi
 exit "$rc"
