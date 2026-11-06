@@ -1,0 +1,169 @@
+laurel mu 0104 (DarwinBoot, external/UniXNU/drivers/DarwinBoot): the kernel also owns UEFI's own boot-time memory right above the window.
+UEFI allocates top-down from the end of "Kernel RAM" (mu 0101), so its loaded images, pool pages, page tables and DarwinBoot's own image sit
+in the 176 MiB above the 3904 MiB window the ADT asks for (mkadt.py --dram auto leaves that room). After ExitBootServices every page of type
+EfiLoaderCode/Data, EfiBootServicesCode/Data and EfiConventionalMemory is free (UEFI 2.10, 7.2), and DarwinEnter turns the MMU off before the
+branch, so nothing of the firmware runs or is read after it. New DarwinBootPkg/Driver/WindowTop.h: DarwinWindowTop walks the final memory map
+(the one ExitBootServices takes) from the window end over such descriptors contiguous with it, stops at runtime-services, reserved, ACPI, MMIO,
+persistent or EFI_MEMORY_RUNTIME memory, and returns a 2 MiB multiple, at most DARWINBOOT_MAX_WINDOW - window. boot_args memSize =
+memSizeActual = window + top; the owned range of DarwinEnter's cache clean grows by it. Screen line "WINDOW +<bytes> UEFI TOP" (row 1), log
+line "DARWINBOOT: window top: +0x.. bytes ...". XNU (laurel 3022) says "LAUREL RAM: on: 4078 MiB ...; +174 MiB above the 3904 MiB the ADT
+asks: UEFI's boot memory, given by DarwinBoot" and runs its 2100/2974 checks on the whole size. Kill switch: "laurelramtop=0" in the command
+line (DarwinBoot reads it; no rebuild). Host test: scripts/laurel/test-darwinboot-top.sh (tools/darwinboot-top-test on the header of this patch).
+Not taken, by design: 0x65E00000-0x7CC00000 (366 MiB free in bank A) and the UEFI heap/FD at 0x5FC00000-0x65D00000: not contiguous with the
+window, and XNU manages one physical range. docs/laurel_sprout/clocks-on-motion.md "RAM".
+diff --git a/DarwinBootPkg/Driver/DarwinBoot.c b/DarwinBootPkg/Driver/DarwinBoot.c
+--- a/DarwinBootPkg/Driver/DarwinBoot.c
++++ b/DarwinBootPkg/Driver/DarwinBoot.c
+@@ -16,6 +16,7 @@
+ #include "BootVideo.h"
+ #include "PackedRamdisk.h"
+ #include "WindowSize.h"
++#include "WindowTop.h"
+ 
+ #define WINDOW_SIZE  SIZE_256MB
+ #define BLOCK_SIZE   SIZE_2MB
+@@ -552,6 +553,8 @@
+   UINTN                           Attempt;
+   CHAR8                           CommandLine[1024];
+   UINT64                          Video[6];
++  UINT64                          Top;
++  UINT64                          TopMax;
+ 
+   (VOID)This;
+   if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
+@@ -706,8 +709,26 @@
+   Root->Close (Root); Root = NULL;
+   Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
+   if (EFI_ERROR (Status)) { goto Fail; }
++  //
++  // iOSPlus10 laurel mu 0104: the kernel also owns UEFI's own boot-time memory right above the window (WindowTop.h),
++  // free once boot services end. The number is read again from the final map before ExitBootServices; this one is
++  // for the screen and the log. Kill switch: "laurelramtop=0" in the command line.
++  //
++  TopMax = MAX_UINT64 - WindowSize;
++#ifdef DARWINBOOT_MAX_WINDOW
++  TopMax = (WindowSize < DARWINBOOT_MAX_WINDOW) ? DARWINBOOT_MAX_WINDOW - WindowSize : 0;
++#endif
++  if (AsciiStrStr (CommandLine, "laurelramtop=0") != NULL) { TopMax = 0; }
++  Top = DarwinWindowTop ((CONST UINT8 *)Map, MapSize, Stride, Address + WindowSize, TopMax);
++  if (Top != 0) {
++    CHAR16 Line[96];
++    UnicodeSPrint (Line, sizeof (Line), L"WINDOW +%lx UEFI TOP", Top);
++    DiagDraw (Line, 1);
++  }
+   Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
+          Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
++  Print (L"DARWINBOOT: window top: +0x%lx bytes of UEFI boot-time memory above 0x%lx go to the kernel%a\n",
++         Top, Address + WindowSize, (TopMax == 0) ? " (off: laurelramtop=0 or the window cap)" : "");
+   Print (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
+          Video[0], Video[1], Video[2], Video[3], Video[4], Video[5]);
+   Print (L"DARWINBOOT: command line: %a\n", CommandLine);
+@@ -721,7 +742,7 @@
+   DEBUG ((DEBUG_ERROR, "\fDARWINBOOT: hand-off to the kernel\n\n"));
+   DEBUG ((DEBUG_ERROR, "kernel   va 0x%lx  pa 0x%lx\n", Kernel.Base, Address));
+   DEBUG ((DEBUG_ERROR, "entry    pa 0x%lx\n", Address + Kernel.Entry - Kernel.Base));
+-  DEBUG ((DEBUG_ERROR, "args     pa 0x%lx  window 0x%lx bytes\n", ArgsAddress, (UINT64)WindowSize));
++  DEBUG ((DEBUG_ERROR, "args     pa 0x%lx  window 0x%lx bytes  + 0x%lx UEFI top\n", ArgsAddress, (UINT64)WindowSize, Top));
+   DEBUG ((DEBUG_ERROR, "video    base 0x%lx  %lux%lu  row %lu bytes  %lu bpp\n", Video[0], Video[3], Video[4], Video[2], Video[5]));
+   DEBUG ((DEBUG_ERROR, "entry words %08x %08x %08x %08x\n",
+           ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base)),
+@@ -740,9 +761,16 @@
+       if (Attempt == 0) { goto Fail; }
+       CpuDeadLoop ();
+     }
++    //
++    // laurel mu 0104: the final map decides; boot_args and the owned range for the cache clean of DarwinEnter grow by it.
++    // A store into boot_args changes no allocation, so the map key stays valid.
++    //
++    Top = DarwinWindowTop ((CONST UINT8 *)Map, MapSize, Stride, Address + WindowSize, TopMax);
++    Args->MemorySize = WindowSize + Top;
++    Args->MemorySizeActual = WindowSize + Top;
+     Status = gBS->ExitBootServices (mImage, Key);
+     if (!EFI_ERROR (Status)) {
+-      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4]);
++      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize + Top, Video[0], Video[2] * Video[4]);
+       CpuDeadLoop ();
+     }
+     if (Status != EFI_INVALID_PARAMETER) { CpuDeadLoop (); }
+diff --git a/DarwinBootPkg/Driver/DarwinBoot.inf b/DarwinBootPkg/Driver/DarwinBoot.inf
+--- a/DarwinBootPkg/Driver/DarwinBoot.inf
++++ b/DarwinBootPkg/Driver/DarwinBoot.inf
+@@ -10,6 +10,7 @@
+ [Sources]
+   DarwinBoot.c
+   PackedRamdisk.h
++  WindowTop.h
+   BootArgs.h
+   BootVideo.h
+   DiagFont.h
+diff --git a/DarwinBootPkg/Driver/WindowTop.h b/DarwinBootPkg/Driver/WindowTop.h
+--- a/DarwinBootPkg/Driver/WindowTop.h
++++ b/DarwinBootPkg/Driver/WindowTop.h
+@@ -0,0 +1,67 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++// iOSPlus10 laurel mu 0104: the RAM right above the window that UEFI itself holds when boot services end.
++//
++// UEFI allocates top-down from the end of "Kernel RAM" (Mu laurel 0101): its loaded images, the DXE pool pages, the
++// page tables and DarwinBoot's own image sit above the window the ADT asks for (176 MiB on the Mi A3), and the ADT
++// planner left that room on purpose. After ExitBootServices every page of type EfiLoaderCode/Data,
++// EfiBootServicesCode/Data and EfiConventionalMemory is free (UEFI 2.10, 7.2 "Memory Allocation Services"): the kernel
++// may own it. DarwinEnter (Entry.S) turns the MMU off before the branch, so the firmware's page tables are not used
++// after it; the kernel builds its own. Runtime-services pages, reserved, ACPI, MMIO, persistent or unaccepted memory
++// and any descriptor with EFI_MEMORY_RUNTIME end the run: they are not taken.
++//
++// DarwinWindowTop walks the final memory map (the one ExitBootServices takes) from the window end and returns the
++// bytes of such memory contiguous with it, a 2 MiB multiple (the window is one), at most Max. No hardware access: the
++// host test (iOSPlus10 tools/darwinboot-top-test) runs this same text on fake maps.
++#ifndef DARWINBOOT_WINDOW_TOP_H
++#define DARWINBOOT_WINDOW_TOP_H
++
++#define DARWINBOOT_TOP_PAGE   0x1000ULL
++#define DARWINBOOT_TOP_BLOCK  0x200000ULL
++#define DARWINBOOT_TOP_RUNTIME (1ULL << 63)   /* EFI_MEMORY_RUNTIME */
++
++// EFI_MEMORY_DESCRIPTOR, read by offset: Type +0 (UINT32), PhysicalStart +8, VirtualStart +16, NumberOfPages +24, Attribute +32.
++static inline unsigned long long
++DarwinTopRead64 (const unsigned char *P)
++{
++  unsigned long long V = 0;
++  for (unsigned I = 0; I < 8; I++) { V |= (unsigned long long)P[I] << (8 * I); }
++  return V;
++}
++
++static inline int
++DarwinTopTypeFree (unsigned long long Type)
++{
++  // EfiLoaderCode 1, EfiLoaderData 2, EfiBootServicesCode 3, EfiBootServicesData 4, EfiConventionalMemory 7
++  return Type == 1 || Type == 2 || Type == 3 || Type == 4 || Type == 7;
++}
++
++static inline unsigned long long
++DarwinWindowTop (const unsigned char *Map, unsigned long long Size, unsigned long long Stride, unsigned long long End, unsigned long long Max)
++{
++  unsigned long long Start = End;
++  unsigned long long Count = (Stride >= 40 && Stride <= 4096 && Map != 0) ? Size / Stride : 0;
++  unsigned long long Steps;
++
++  if ((End & (DARWINBOOT_TOP_PAGE - 1)) != 0) { return 0; }
++  for (Steps = 0; Steps <= Count; Steps++) {
++    unsigned long long I;
++    int Grew = 0;
++    for (I = 0; I < Count; I++) {
++      const unsigned char *D = Map + I * Stride;
++      unsigned long long Type = DarwinTopRead64 (D) & 0xffffffffULL;
++      unsigned long long Phys = DarwinTopRead64 (D + 8);
++      unsigned long long Pages = DarwinTopRead64 (D + 24);
++      unsigned long long Attr = DarwinTopRead64 (D + 32);
++      if ((Phys != End) || (Pages == 0) || (Pages >= (~0ULL - End) / DARWINBOOT_TOP_PAGE)) { continue; }
++      if (!DarwinTopTypeFree (Type) || ((Attr & DARWINBOOT_TOP_RUNTIME) != 0)) { break; }
++      End += Pages * DARWINBOOT_TOP_PAGE;
++      Grew = 1;
++      break;
++    }
++    if (!Grew) { break; }
++  }
++  End -= (End - Start) & (DARWINBOOT_TOP_BLOCK - 1);
++  if (End - Start > Max) { End = Start + (Max & ~(DARWINBOOT_TOP_BLOCK - 1)); }
++  return End - Start;
++}
++#endif

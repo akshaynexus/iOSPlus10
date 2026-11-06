@@ -1,0 +1,16 @@
+laurel 3022: LAUREL RAM: the line names the RAM above the ADT window that DarwinBoot gives (laurel mu 0104: UEFI's boot-time allocations at the top of "Kernel RAM", free after ExitBootServices): "; +N MiB above the M MiB the ADT asks: UEFI's boot memory, given by DarwinBoot". The checks of 2100/2974 (inside the banks, no pool, the 4608 MiB table budget) run on the whole size as before. Both kernels. docs/laurel_sprout/clocks-on-motion.md "RAM".
+
+diff --git a/osfmk/arm64/laurel_ram.c b/osfmk/arm64/laurel_ram.c
+--- a/osfmk/arm64/laurel_ram.c
++++ b/osfmk/arm64/laurel_ram.c
+@@ -228,6 +228,10 @@ laurel_ram_limit(const boot_args *args, uint64_t memory_size)
+ 	if (laurel_ram_dt_u64(chosen, "darwinboot-memory-size", 0, &asked) && asked > size && note[0] == '\0') {
+ 		snprintf(note, sizeof(note), "; DarwinBoot gave %llu of the %llu MiB the ADT asks", size >> 20, asked >> 20);
+ 	}
++	if (asked != 0 && size > asked && note[0] == '\0') {
++		/* laurel 3022 + mu 0104: UEFI's boot-time allocations above the window (free after ExitBootServices) are kernel RAM too */
++		snprintf(note, sizeof(note), "; +%llu MiB above the %llu MiB the ADT asks: UEFI's boot memory, given by DarwinBoot", (size - asked) >> 20, asked >> 20);
++	}
+ 	if (base < LAUREL_RAM_4G && base + managed > LAUREL_RAM_4G) {
+ 		vm_himemory_mode = FALSE;       /* pmap_startup fills the free queue from the top */
+ 	}

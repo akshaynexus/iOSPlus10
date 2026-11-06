@@ -148,6 +148,8 @@ bit 0 = power key, PS_HOLD_RST_CTL 0x85a (type: 1 warm, 4 shutdown, 7 hard), RST
 
 ## CPU response and what burns the CPU (2890, 2891, root-tweaks-perf.py; built, NOT BOOTED)
 
+Since laurel 3020 (`LAUREL CPU MOTION`, 2026-11-07): a touch or a frame wakes the governor and holds gold at its cap and silver at 1420 MHz (touch: both caps): `docs/laurel_sprout/clocks-on-motion.md`.
+
 ### Answers from the logs
 
 | Question | Answer | Evidence |

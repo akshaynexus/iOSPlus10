@@ -196,24 +196,39 @@ int main() {
 
 	// governor
 	uint32_t low = 0;
-	eq(opp_table[opp_decide(1, 100, false, STOCK, OPP_N - 1, &low)].mhz, 950, "100 % at 320");
-	eq(opp_table[opp_decide(1, 50, false, STOCK, OPP_N - 1, &low)].mhz, 465, "50 % at 320");
-	eq(opp_table[opp_decide(3, 50, false, STOCK, OPP_N - 1, &low)].mhz, 745, "50 % at 600");
-	eq(opp_table[opp_decide(6, 50, false, STOCK, OPP_N - 1, &low)].mhz, 950, "50 % at 900");
-	eq(opp_table[opp_decide(1, 0, true, STOCK, OPP_N - 1, &low)].mhz, 745, "touch at 320");
-	eq(opp_table[opp_decide(7, 0, true, STOCK, OPP_N - 1, &low)].mhz, 950, "touch at 950, 0 %: holds, first tick");
+	eq(opp_table[opp_decide(1, 100, OPP_NONE, STOCK, OPP_N - 1, &low)].mhz, 950, "100 % at 320");
+	eq(opp_table[opp_decide(1, 50, OPP_NONE, STOCK, OPP_N - 1, &low)].mhz, 465, "50 % at 320");
+	eq(opp_table[opp_decide(3, 50, OPP_NONE, STOCK, OPP_N - 1, &low)].mhz, 745, "50 % at 600");
+	eq(opp_table[opp_decide(6, 50, OPP_NONE, STOCK, OPP_N - 1, &low)].mhz, 950, "50 % at 900");
+	eq(opp_table[opp_decide(1, 0, OPP_TOUCH, STOCK, OPP_N - 1, &low)].mhz, 745, "touch at 320");
+	eq(opp_table[opp_decide(7, 0, OPP_TOUCH, STOCK, OPP_N - 1, &low)].mhz, 950, "touch at 950, 0 %: holds, first tick");
 	low = OPP_LOWER_MS;
-	eq(opp_table[opp_decide(7, 0, true, STOCK, OPP_N - 1, &low)].mhz, 745, "touch, 0 %, after 500 ms: not below 745");
+	eq(opp_table[opp_decide(7, 0, OPP_TOUCH, STOCK, OPP_N - 1, &low)].mhz, 745, "touch, 0 %, after 500 ms: not below 745");
 	low = OPP_LOWER_MS;
-	eq(opp_table[opp_decide(4, 0, true, STOCK, OPP_N - 1, &low)].mhz, 745, "touch at 745, 0 %: stays");
+	eq(opp_table[opp_decide(4, 0, OPP_TOUCH, STOCK, OPP_N - 1, &low)].mhz, 745, "touch at 745, 0 %: stays");
 	eq(low, 0, "touch at 745: no count");
+	// laurel 3021: a touch or a frame holds the top: 950 from 320 in one decision; the thermal cap still wins; nothing held: the old rule
+	low = 0;
+	eq(opp_table[opp_decide(1, 0, OPP_HOLD_TOP, STOCK, OPP_N - 1, &low)].mhz, 950, "UI hold at 320, 0 %: the top at once");
+	eq(opp_table[opp_decide(3, 0, OPP_HOLD_TOP, STOCK, OPP_N - 1, &low)].mhz, 950, "UI hold at 600: the top");
+	eq(opp_table[opp_decide(7, 0, OPP_HOLD_TOP, STOCK, OPP_N - 1, &low)].mhz, 950, "UI hold at 950, 0 %: stays");
+	eq(low, 0, "UI hold at 950: no lower count");
+	low = OPP_LOWER_MS;
+	eq(opp_table[opp_decide(7, 0, OPP_HOLD_TOP, STOCK, OPP_N - 1, &low)].mhz, 950, "UI hold, 0 %, after 500 ms: still the top");
+	eq(opp_table[opp_decide(1, 0, OPP_HOLD_TOP, STOCK, 5, &low)].mhz, 820, "UI hold under a thermal cap of 820: 820");
+	eq(opp_table[opp_decide(1, 0, OPP_HOLD_TOP, STOCK & ~(1u << 7), OPP_N - 1, &low)].mhz, 900, "950 out: the UI hold takes the highest left");
+	eq(opp_table[opp_decide(OPP_300, 0, OPP_HOLD_TOP, OPP_GPLL0_ONLY, OPP_N - 1, &low)].mhz, 600, "fallback: UI hold at 300 gives 600");
+	low = 0;
+	eq(opp_table[opp_decide(1, 0, OPP_NONE, STOCK, OPP_N - 1, &low)].mhz, 320, "no hold, 0 % at 320: stays");
+	eq(OPP_HOLD_TOP, OPP_N - 1, "OPP_HOLD_TOP is the last level");
+	eq(OPP_NONE, OPP_N, "OPP_NONE is past the table");
 	// lower only after 500 ms without a break
 	low = 0;
-	for (uint32_t t = 0; t + OPP_TICK_MS < OPP_LOWER_MS; t += OPP_TICK_MS) eq(opp_decide(7, 0, false, STOCK, OPP_N - 1, &low), 7, "no lower before 500 ms");
-	eq(opp_table[opp_decide(7, 0, false, STOCK, OPP_N - 1, &low)].mhz, 320, "after 500 ms at 0 %");
+	for (uint32_t t = 0; t + OPP_TICK_MS < OPP_LOWER_MS; t += OPP_TICK_MS) eq(opp_decide(7, 0, OPP_NONE, STOCK, OPP_N - 1, &low), 7, "no lower before 500 ms");
+	eq(opp_table[opp_decide(7, 0, OPP_NONE, STOCK, OPP_N - 1, &low)].mhz, 320, "after 500 ms at 0 %");
 	low = 0;
-	(void)opp_decide(7, 10, false, STOCK, OPP_N - 1, &low);
-	(void)opp_decide(7, 60, false, STOCK, OPP_N - 1, &low);
+	(void)opp_decide(7, 10, OPP_NONE, STOCK, OPP_N - 1, &low);
+	(void)opp_decide(7, 60, OPP_NONE, STOCK, OPP_N - 1, &low);
 	eq(low, 0, "a busy tick breaks the count");
 	// no ping-pong: a steady amount of work settles on one level from any start
 	for (uint32_t work = 1; work <= 950; work += 7) {
@@ -221,7 +236,7 @@ int main() {
 			uint32_t cur = start, changes = 0, l = 0;
 			for (int t = 0; t < 400; t++) {
 				uint32_t pct = work * 100 / opp_table[cur].mhz;
-				uint32_t n = opp_decide(cur, pct > 100 ? 100 : pct, false, STOCK, OPP_N - 1, &l);
+				uint32_t n = opp_decide(cur, pct > 100 ? 100 : pct, OPP_NONE, STOCK, OPP_N - 1, &l);
 				if (n != cur && t > 100) changes++;
 				cur = n;
 			}
@@ -230,10 +245,10 @@ int main() {
 	}
 	// the fallback path acts as 2892: 300 <-> 600
 	low = 0;
-	eq(opp_table[opp_decide(OPP_300, 50, false, OPP_GPLL0_ONLY, OPP_N - 1, &low)].mhz, 600, "fallback: 50 % at 300");
-	eq(opp_table[opp_decide(OPP_300, 0, true, OPP_GPLL0_ONLY, OPP_N - 1, &low)].mhz, 600, "fallback: touch at 300");
-	eq(opp_table[opp_decide(7, 100, false, OPP_GPLL0_ONLY, OPP_N - 1, &low)].mhz, 600, "a level taken out: down to the highest left");
-	eq(opp_table[opp_decide(5, 100, false, STOCK & ~(1u << 6) & ~(1u << 7), OPP_N - 1, &low)].mhz, 820, "900, 950 out: 820 is the top");
+	eq(opp_table[opp_decide(OPP_300, 50, OPP_NONE, OPP_GPLL0_ONLY, OPP_N - 1, &low)].mhz, 600, "fallback: 50 % at 300");
+	eq(opp_table[opp_decide(OPP_300, 0, OPP_TOUCH, OPP_GPLL0_ONLY, OPP_N - 1, &low)].mhz, 600, "fallback: touch at 300");
+	eq(opp_table[opp_decide(7, 100, OPP_NONE, OPP_GPLL0_ONLY, OPP_N - 1, &low)].mhz, 600, "a level taken out: down to the highest left");
+	eq(opp_table[opp_decide(5, 100, OPP_NONE, STOCK & ~(1u << 6) & ~(1u << 7), OPP_N - 1, &low)].mhz, 820, "900, 950 out: 820 is the top");
 
 	// thermal: Android's limits
 	struct opp_thermal th = { (uint32_t)OPP_N - 1, false };
@@ -256,10 +271,10 @@ int main() {
 	th = { (uint32_t)OPP_N - 1, false };
 	(void)opp_thermal_tick(&th, 960, 7, STOCK);
 	low = 0;
-	eq(opp_table[opp_decide(7, 100, false, STOCK, th.cap, &low)].mhz, 900, "hot: down at once");
+	eq(opp_table[opp_decide(7, 100, OPP_NONE, STOCK, th.cap, &low)].mhz, 900, "hot: down at once");
 	th = { 4, false };
 	(void)opp_thermal_tick(&th, 960, 4, STOCK);
-	eq(opp_table[opp_decide(1, 100, false, STOCK, th.cap, &low)].mhz, 600, "hot: a raise stays under the cap");
+	eq(opp_table[opp_decide(1, 100, OPP_NONE, STOCK, th.cap, &low)].mhz, 600, "hot: a raise stays under the cap");
 
 	// the DDR floor
 	eq(opp_ddr_snap(1355), 1353, "boot read 1355 is level 1353");

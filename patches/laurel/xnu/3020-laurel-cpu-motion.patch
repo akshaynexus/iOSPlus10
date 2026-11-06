@@ -1,0 +1,214 @@
+laurel 3020: LAUREL CPU MOTION: a touch or a frame on its way (GPU submission, swap) wakes the OSM governor and holds the rows at once: gold at its cap, silver at its cap (touch) or at the lowest row >= 1400 MHz (motion, 1420 MHz on the Mi A3); held 500 ms after a touch, 150 ms after the last frame; the floor comes back by load when the screen is still. Before (2972): a touch woke the governor, GPU work held only gold and only when the 40 ms tick saw it; a server-side animation (no finger) ran silver at 300 MHz. The thermal cap still wins (lgov_next). Rule in laurel_gov_core.h lgov_hold (host test scripts/laurel/gov-test.sh); the events also wake the GPU governor (laurel 3021). Kill switch laurelcpumotion=0. Both kernels. docs/laurel_sprout/clocks-on-motion.md.
+
+diff --git a/bsd/dev/laurel_gov_core.h b/bsd/dev/laurel_gov_core.h
+--- a/bsd/dev/laurel_gov_core.h
++++ b/bsd/dev/laurel_gov_core.h
+@@ -20,6 +20,32 @@
+ #define LGOV_HI         60u     /* +2 rows */
+ #define LGOV_LO         30u
+ #define LGOV_DOWN_TICKS 8u      /* 320 ms below LGOV_LO: -1 row (as before: about 300 ms) */
++#define LGOV_TOUCH_MS   500u    /* a touch holds this long after the last event */
++#define LGOV_MOTION_MS  150u    /* laurel 3020: a frame (GPU submission or swap) holds this long after the last one: 9 frames at 60 Hz, 1.5 at 10 */
++#define LGOV_SILVER_MOTION_KHZ 1400000u /* laurel 3020: silver's row while frames move: the lowest row at or above this (1420 MHz on the Mi A3) */
++
++/*
++ * laurel 3020 (owner 2026-11-03: full clock on touch and while frames move): the row a UI event holds, 0 = none. A touch: the cap on
++ * both clusters. Motion (a frame is on its way: a GPU submission or a swap in the last LGOV_MOTION_MS): gold at its cap, silver at the
++ * lowest row at or above LGOV_SILVER_MOTION_KHZ (the cap when no row is that high). The thermal cap is `cap` and wins. The event
++ * wakes the governor, so the hold is written at once, not at the next tick; the floor comes back by load when the screen is still.
++ */
++static inline unsigned
++lgov_hold(unsigned gold, unsigned touch, unsigned motion, const unsigned *khz, unsigned rows, unsigned cap)
++{
++	if (touch || (motion && gold)) {
++		return cap;
++	}
++	if (!motion) {
++		return 0;
++	}
++	for (unsigned r = 0; r < rows; r++) {
++		if (khz[r] >= LGOV_SILVER_MOTION_KHZ) {
++			return r > cap ? cap : r;
++		}
++	}
++	return cap;
++}
+ 
+ static inline unsigned
+ lgov_next(unsigned busy, unsigned tick, unsigned row, unsigned floor, unsigned cap, unsigned hold, unsigned *low)
+diff --git a/bsd/dev/laurel_gov_loop.h b/bsd/dev/laurel_gov_loop.h
+--- a/bsd/dev/laurel_gov_loop.h
++++ b/bsd/dev/laurel_gov_loop.h
+@@ -60,10 +60,15 @@ gov_step(void)
+ 	uint64_t now = mach_absolute_time();
+ 	bool touch = within_ms(laurel_touch_at, now, TOUCH_HOLD_MS);
+ 	bool gpu = within_ms(laurel_gpu_last_work, now, GPU_HOLD_MS);
++	bool motion = motion_on && within_ms(laurel_frame_at, now, MOTION_HOLD_MS);
+ 
+ 	for (unsigned c = 0; c < CL_N; c++) {
+-		/* laurel 2972: a touch: both clusters at their caps; GPU work: Gold at its cap. Before: Gold 1401 MHz with GPU work, Silver 1305 MHz with a touch */
+-		uint32_t hold = touch ? cl_cap[c] : (gpu && c == CL_GOLD ? cl_cap[c] : 0);
++		/*
++		 * laurel 2972: a touch: both clusters at their caps; GPU work: Gold at its cap. Before: Gold 1401 MHz with GPU work, Silver 1305 MHz with a touch.
++		 * laurel 3020: a frame on its way holds gold at the cap and silver at >= 1400 MHz (lgov_hold); the event woke this thread, so the hold is at once.
++		 */
++		uint32_t hold = motion_on ? lgov_hold(c == CL_GOLD, touch, motion, cl_khz[c], cl_rows[c], cl_cap[c])
++		    : (touch ? cl_cap[c] : (gpu && c == CL_GOLD ? cl_cap[c] : 0));
+ 		unsigned low = cl_low[c];
+ 
+ 		wr_row(c, lgov_next(cl_busy[c], cl_tick[c], cl_row[c], lo_row(c), cl_cap[c], hold, &low));
+diff --git a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
+--- a/bsd/dev/laurel_thermal.c
++++ b/bsd/dev/laurel_thermal.c
+@@ -12,6 +12,9 @@
+  *   load   processor_cpu_load_info() (the HOST_CPU_LOAD_INFO ticks): busy % of the busiest core of a
+  *          cluster over the last 120 ms; the decision is laurel_gov_core.h (laurel 2890). Floor = row 0; a
+  *          touch or GPU work holds a higher row; the thermal cap lowers the top row, down to row 0 (the cap wins).
++ *          laurel 3020: a touch or a frame (GPU submission, swap) wakes the governor and holds the rows of lgov_hold()
++ *          (laurel_gov_core.h) at once: gold at the cap, silver at the cap (touch) or >= 1400 MHz (motion). Kill switch
++ *          laurelcpumotion=0 (2972: touch 500 ms on both, GPU work 100 ms on gold, read at the tick).
+  *   TSENS  tsens0 (trinket.dtsi, "qcom,sm6150-tsens", TSENS v2): TM 0x4411000, SN_STATUS(n) = 0xa0 + 4n,
+  *          [11:0] signed 0.1 C, valid bit 21 (tsens2xxx.c), -40..125 C, a single sensor > 20 C above all
+  *          others ignored; sensors 6-8 cpuss (Silver), 9-12 Gold cores,
+@@ -53,8 +56,9 @@ extern void laurel_cpu_top_line(uint64_t busy_abs, uint32_t seconds, uint32_t co
+ #define GOV_TICK_MS     LGOV_TICK_MS
+ #define GOV_WINDOW      LGOV_WINDOW
+ #define GOV_MAX_CPUS    8u
+-#define TOUCH_HOLD_MS   500u
++#define TOUCH_HOLD_MS   LGOV_TOUCH_MS
+ #define GPU_HOLD_MS     100u
++#define MOTION_HOLD_MS  LGOV_MOTION_MS
+ #define TH_HOT_DC       950
+ #define TH_CRIT_DC      1050
+ #define TH_COOL_DC      850
+@@ -84,7 +88,10 @@ static uint64_t cl_row_ms[CL_N][OSM_ROWS];      /* time in each row since the la
+ static uint64_t busy_total_abs;                 /* all cores, for laurel 2891 */
+ uint64_t laurel_gpu_last_work;                  /* mach time of the last GPU submission (TopazAdreno.cpp) */
+ uint64_t laurel_touch_at;                       /* mach time of the last touch event (SweetHID.cpp) */
++uint64_t laurel_frame_at;                       /* laurel 3020: mach time of the last frame event: GPU submission (TopazAdreno.cpp) or swap (SweetFramebuffer.cpp) */
++static bool motion_on = true;                   /* laurel 3020: LAUREL CPU MOTION */
+ #define GOV_EVENT       ((event_t)&laurel_touch_at)
++extern void laurel_gpu_dcvs_poke(void);         /* laurel 3021: LaurelGpuDcvs.cpp: the GPU governor wakes on the same events */
+ 
+ /* the governor's lower bound: the ABL row, or the thermal cap when that is lower (the cap wins) */
+ static uint32_t
+@@ -198,6 +205,24 @@ laurel_input_touch(void)
+ 	laurel_touch_at = now;
+ 	if (!within_ms(then, now, GOV_TICK_MS)) {
+ 		thread_wakeup(GOV_EVENT);
++		laurel_gpu_dcvs_poke();
++	}
++}
++
++/*
++ * laurel 3020: from redwood_gpu_submit (TopazAdreno.cpp) and AppleCLCD::swap (SweetFramebuffer.cpp): a frame is on its way. The first
++ * event after a pause of one tick wakes both governors at once; while frames flow, the stamp alone keeps the hold at each tick.
++ */
++void laurel_frame_event(void);
++void
++laurel_frame_event(void)
++{
++	uint64_t now = mach_absolute_time(), then = laurel_frame_at;
++
++	laurel_frame_at = now;
++	if (motion_on && !within_ms(then, now, GOV_TICK_MS)) {
++		thread_wakeup(GOV_EVENT);
++		laurel_gpu_dcvs_poke();
+ 	}
+ }
+ 
+@@ -230,7 +255,8 @@ laurel_thermal_stats(char *s, size_t n)
+ 	           "cpu.gold_cap_mhz=%u\ncpu.hold=%s\ntemp.cpu_dC=%d\ntemp.gpu_dC=%d\ntemp.on=%d\n",
+ 	           cl_khz[CL_SILVER][cl_row[CL_SILVER]] / 1000, cl_busy[CL_SILVER], cl_khz[CL_SILVER][cl_cap[CL_SILVER]] / 1000,
+ 	           cl_khz[CL_GOLD][cl_row[CL_GOLD]] / 1000, cl_busy[CL_GOLD], cl_khz[CL_GOLD][cl_cap[CL_GOLD]] / 1000,
+-	           within_ms(laurel_touch_at, now, TOUCH_HOLD_MS) ? "touch" : within_ms(laurel_gpu_last_work, now, GPU_HOLD_MS) ? "gpu" : "none",
++	           within_ms(laurel_touch_at, now, TOUCH_HOLD_MS) ? "touch" : motion_on ? (within_ms(laurel_frame_at, now, MOTION_HOLD_MS) ? "motion" : "none")
++	           : within_ms(laurel_gpu_last_work, now, GPU_HOLD_MS) ? "gpu" : "none",
+ 	           th_cpu, th_gpu, th_on ? 1 : 0);
+ }
+ 
+@@ -242,20 +268,25 @@ laurel_cpufreq_start(void)
+ 		return started ? 0 : -1;
+ 	}
+ 	started = 0;
+-	int gov = 1, th = 1;
++	int gov = 1, th = 1, motion = 1;
+ 	(void)PE_parse_boot_argn("laurelcpugov", &gov, sizeof(gov));
+ 	(void)PE_parse_boot_argn("laurelthermal", &th, sizeof(th));
++	(void)PE_parse_boot_argn("laurelcpumotion", &motion, sizeof(motion));      /* laurel 3020 */
++	motion_on = motion != 0;
+ 	if (!gov) {
+ 		printf("LAUREL CPUFREQ: off: laurelcpugov=0 (topaz: Gold pinned at max)\n");
++		printf("LAUREL CPU MOTION: off: no CPU governor\n");
+ 		return -1;
+ 	}
+ 	if (read_table(CL_SILVER) != 0 || read_table(CL_GOLD) != 0) {
+ 		printf("LAUREL CPUFREQ: off: OSM LUT not readable (topaz: Gold pinned at max)\n");
++		printf("LAUREL CPU MOTION: off: no CPU governor\n");
+ 		return -1;
+ 	}
+ 	const ml_topology_info_t *topo = ml_get_topology_info();
+ 	if (!topo || topo->num_cpus == 0) {
+ 		printf("LAUREL CPUFREQ: off: no CPU topology\n");
++		printf("LAUREL CPU MOTION: off: no CPU governor\n");
+ 		return -1;
+ 	}
+ 	if (!th) {
+@@ -279,10 +310,21 @@ laurel_cpufreq_start(void)
+ 	thread_t thread;
+ 	if (kernel_thread_start(gov_thread, NULL, &thread) != KERN_SUCCESS) {
+ 		printf("LAUREL CPUFREQ: off: no governor thread (topaz: Gold pinned at max)\n");
++		printf("LAUREL CPU MOTION: off: no CPU governor\n");
+ 		return -1;
+ 	}
+ 	thread_deallocate(thread);
+ 	started = 1;
++	if (motion_on) {
++		unsigned sr = lgov_hold(0, 0, 1, cl_khz[CL_SILVER], cl_rows[CL_SILVER], cl_cap[CL_SILVER]);
++
++		printf("LAUREL CPU MOTION: on: a touch holds silver and gold at their caps for %u ms; a frame (GPU submission or swap) holds gold at its cap "
++		    "and silver at %u MHz for %u ms; the event wakes the governor (no ramp); the floor comes back by load when the screen is still\n",
++		    TOUCH_HOLD_MS, cl_khz[CL_SILVER][sr] / 1000, MOTION_HOLD_MS);
++	} else {
++		printf("LAUREL CPU MOTION: off: laurelcpumotion=0 (2972: touch holds both caps %u ms, GPU work holds gold %u ms, read at the tick)\n",
++		    TOUCH_HOLD_MS, GPU_HOLD_MS);
++	}
+ 	printf("LAUREL CPUFREQ: on: OSM governor %u ms tick, a core full for one tick goes to the cap, touch holds both caps, GPU work holds gold's; silver rows %u..%u (%u..%u MHz), gold rows %u..%u (%u..%u MHz), %u cpus\n",
+ 	    GOV_TICK_MS,
+ 	    cl_floor[CL_SILVER], cl_rows[CL_SILVER] - 1, cl_khz[CL_SILVER][cl_floor[CL_SILVER]] / 1000,
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1496,10 +1496,13 @@ sweet_fps_count(void)
+ 	}
+ }
+ 
++extern "C" void laurel_frame_event(void);       /* bsd/dev/laurel_thermal.c (laurel 3020) */
++
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	sweet_fps_count();
++	laurel_frame_event();                   /* laurel 3020: the screen changes: CPU and GPU clocks held up for the next frames */
+ 	SweetSurface *held[4] = {};
+ 	uint32_t mask = get32(rec, 0x104);
+ 	for (uint32_t i = 0; i < 4 && i < SWEET_FB_LAYERS; i++) {
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -2134,6 +2134,7 @@ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]
+ 
+ /* IBs then CACHE_FLUSH_TS writing the submission's number to mem+0 (TopazGpuW HwSubmit). 0: ring full. */
+ extern "C" uint64_t laurel_gpu_last_work;       /* bsd/dev/laurel_thermal.c */
++extern "C" void laurel_frame_event(void);       /* bsd/dev/laurel_thermal.c (laurel 3020) */
+ 
+ uint32_t
+ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+@@ -2144,6 +2145,7 @@ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
+ 		return 0;
+ 	}
+ 	laurel_gpu_last_work = mach_absolute_time();    /* laurel 2890: the governor holds Gold at speed while the GPU has work */
++	laurel_frame_event();                           /* laurel 3020: a frame is on its way: CPU and GPU clocks up at once */
+ 	IOLockLock(hw_lock);
+ 	ts_account();
+ 	for (int spin = 0; ring_free() < need && spin < 20000; spin++) {
