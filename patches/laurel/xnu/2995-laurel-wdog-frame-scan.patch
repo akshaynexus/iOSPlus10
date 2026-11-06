@@ -1,0 +1,53 @@
+laurel 2995: the stuck-CPU report's stack scan keeps __TEXT_EXEC only and adds a frame chain found by scanning; both kernels.
+
+[V 08:09:55] The 2989 lines held strings and tables of __TEXT (vm_kernel_stext covers __TEXT, __DATA_CONST and __TEXT_EXEC), and the fp of the
+last interrupt was the idle thread's. Now: only __TEXT_EXEC pointers, and one more line: from the lowest (fp', lr) record whose fp' points
+higher in the stack and whose lr is code, the chain upward, newest first. Stale frames below the live stack pointer can still start it; the
+chain that reaches the top of the stack is the live one.
+
+diff --git a/osfmk/arm64/laurel_wdog.c b/osfmk/arm64/laurel_wdog.c
+index ae3e6f9..bdb9330 100644
+--- a/osfmk/arm64/laurel_wdog.c
++++ b/osfmk/arm64/laurel_wdog.c
+@@ -297,8 +297,39 @@ lwd_thread_path(const char *prefix, int cpu, thread_t th, struct lwd_cpu *c)
+ 	}
+ 	kprintf("%s cpu %d callers at its last interrupt, fp 0x%llx%s%s\n", prefix, cpu, c->fp, n ? ":" : ": none in its kernel stack", n ? line : "");
+ 
+-	/* the text pointers on its kernel stack */
+-	uint64_t stext = vm_kernel_stext, etext = vm_kernel_etext;
++	/* laurel 2995: a frame chain found by scanning: the lowest record (fp', lr) with fp' above it in the stack and lr in code, followed up */
++	{
++		extern vm_offset_t segTEXTEXECB;
++		extern unsigned long segSizeTEXTEXEC;
++		uint64_t cs = segTEXTEXECB, ce = segTEXTEXECB + segSizeTEXTEXEC, at, rec[2] = { 0, 0 };
++		int m = 0;
++
++		n = 0;
++		for (at = lo; stack != 0 && at + 16 <= hi; at += 8) {
++			if (ml_nofault_copy((vm_offset_t)at, (vm_offset_t)rec, sizeof(rec)) != sizeof(rec)) {
++				break;
++			}
++			if (rec[0] > at && rec[0] + 16 <= hi && (rec[0] & 7) == 0 && rec[1] >= cs && rec[1] < ce) {
++				break;
++			}
++		}
++		for (; stack != 0 && at + 16 <= hi && m < 20 && n < (int)sizeof(line) - 20; m++) {
++			if (ml_nofault_copy((vm_offset_t)at, (vm_offset_t)rec, sizeof(rec)) != sizeof(rec) || rec[1] < cs || rec[1] >= ce) {
++				break;
++			}
++			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", rec[1]);
++			if (rec[0] <= at || rec[0] + 16 > hi || (rec[0] & 7) != 0) {
++				break;
++			}
++			at = rec[0];
++		}
++		kprintf("%s cpu %d frame chain by scan, newest first%s%s\n", prefix, cpu, n ? ":" : ": none", n ? line : "");
++	}
++
++	/* the code pointers on its kernel stack (laurel 2995: __TEXT_EXEC only; __TEXT holds strings and tables too) */
++	extern vm_offset_t segTEXTEXECB;
++	extern unsigned long segSizeTEXTEXEC;
++	uint64_t stext = segTEXTEXECB, etext = segTEXTEXECB + segSizeTEXTEXEC;
+ 	int found = 0, lines = 0;
+ 
+ 	n = 0;

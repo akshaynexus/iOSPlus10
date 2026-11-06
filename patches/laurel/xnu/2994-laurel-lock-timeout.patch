@@ -1,0 +1,57 @@
+laurel 2994: LAUREL LOCK TIMEOUT: the spin-lock and ticket-lock timeouts come back; wdt=-1 had set them to 0; both kernels. docs/laurel_sprout/watchdog.md section 13.
+
+[V code] machine_timeout_init_with_suffix(): `if (!always_enabled && (wdt == -1 || ...)) return;`: with the boot line's wdt=-1 every machine
+timeout stays 0: LockTimeOut, TLockTimeOut, lock-panic, interrupt-masked, sched-preemption, xcall... hw_spin_should_keep_spinning() returns
+true for a timeout of 0: a spin lock whose holder never lets go spins for ever with interrupts off. [V logs/usblog-20261106-043354.txt] 16 catches
+in 65 minutes on two cores (5 silver, 1 gold), the 08:09:55 stack of 2989 holds hw_lock_lock+0x34 and hw_lock_bit+0x20 under thread_setrun,
+thread_dispatch and thread_invoke, and the CPU's last interrupt came in machine_idle: the run-queue and pset spin locks of the scheduler.
+Upstream would have panicked after 0.25 s with "Spinlock[%p] timeout ... current owner: %p". ml_init_lock_timeout() runs after the timeouts
+are set and takes slto_us/tlto_us: the same place now restores the two defaults when they are 0. The other timeouts stay off: the port's
+console and SPMI paths hold interrupts longer than their thresholds. Kill switch laurellockto=0. One line at boot.
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index a1f2a91..8de6ed4 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -618,6 +618,41 @@ ml_init_lock_timeout(void)
+ 		os_atomic_store(&TLockTimeOut, lto_abstime >> 1, relaxed);
+ 	} // else take default from MACHINE_TIMEOUT.
+ 
++	/*
++	 * laurel 2994: LAUREL LOCK TIMEOUT. The boot line carries wdt=-1 (no Apple watchdog, no interrupt-masked panics on this port's slow
++	 * console and SPMI paths), and machine_timeout_init_with_suffix() disables EVERY machine timeout for wdt == -1: LockTimeOut and
++	 * TLockTimeOut stay 0, hw_spin_should_keep_spinning() then returns true for ever, and a spin lock whose holder never lets go becomes a
++	 * silent CPU (16 catches of 2986 on 2026-11-06, hw_lock_lock and hw_lock_bit on the stuck stack) in place of the panic that names the
++	 * lock and its holder. The two lock timeouts come back at their upstream defaults (0.25 s and 0.125 s); the other timeouts stay as wdt
++	 * left them. Kill switch laurellockto=0.
++	 */
++	{
++		uint32_t on = 1;
++		uint64_t lto_now = os_atomic_load(&LockTimeOut, relaxed), tlto_now = os_atomic_load(&TLockTimeOut, relaxed);
++
++		(void)PE_parse_boot_argn("laurellockto", &on, sizeof(on));
++		if (on && lto_now == 0) {
++			nanoseconds_to_absolutetime(250 * NSEC_PER_MSEC, &lto_abstime);
++			os_atomic_store(&LockTimeOut, lto_abstime, relaxed);
++			os_atomic_store(&LockTimeOutUsec, 250000ull, relaxed);
++			lto_now = lto_abstime;
++		}
++		if (on && tlto_now == 0 && lto_now != 0) {
++			os_atomic_store(&TLockTimeOut, lto_now >> 1, relaxed);
++			tlto_now = lto_now >> 1;
++		}
++		uint64_t lto_ns = 0, tlto_ns = 0;
++
++		absolutetime_to_nanoseconds(lto_now, &lto_ns);
++		absolutetime_to_nanoseconds(tlto_now, &tlto_ns);
++		if (!on) {
++			printf("LAUREL LOCK TIMEOUT: off: kill switch laurellockto=0: a spin lock waits for ever (spin %llu ms, ticket %llu ms)\n", lto_ns / NSEC_PER_MSEC, tlto_ns / NSEC_PER_MSEC);
++		} else {
++			printf("LAUREL LOCK TIMEOUT: on: a spin lock waits at most %llu ms, a ticket lock %llu ms, then a panic names the lock and its holder (wdt=-1 had left 0: a silent CPU); kill switch laurellockto=0\n",
++			    lto_ns / NSEC_PER_MSEC, tlto_ns / NSEC_PER_MSEC);
++		}
++	}
++
+ 	uint64_t mtxspin;
+ 	uint64_t mtx_abstime;
+ 	if (PE_parse_boot_argn("mtxspin", &mtxspin, sizeof(mtxspin))) {
