@@ -5529,3 +5529,9 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - [V] The iOS 16 kernel on laurel-sprout does not build since 2991: `laurel_wdog.c:406: no member named 'el0_synchronous_trap' in 'struct machine_thread'` (xnu-8796 has no such field). Not mine: the last iOS 16 builds in the main checkout's logs are 314-316 patches, before 2991. 3020-3022 apply on it (`apply-xnu: ok`).
 - Worktree: `git submodule update --init` of Mu-Silicium-negroni in a worktree gave an empty directory the first time; `--force --recursive` in tmux fetches it (many nested clones, long). The iOS 16 build in a worktree needs `external/ios-topaz`, `external/ios-sweet-linux` and `out/laurel-kernel/{theos,cache,dl,deps}` as links to the main checkout's.
 - Writing a Python heredoc from zsh: a line `PY` inside the Python text ends a `<<'PY'` heredoc early: use another delimiter.
+
+## 2026-11-07: HakiOS/Scion ports 2996-2998 (branch t3/scion-ports-2996 on t3/integ-1107; built, NOT BOOTED)
+- 2996 `LAUREL TIMER COALESCING`: `mach_timer_coalescing_enabled = FALSE` at the framebuffer's vsync start (Scion 8782070: 10 fps from timers 100 ms late); `laureltcoal=0`. gpu.md "Timer coalescing off".
+- 2997 `LAUREL TOUCH FAST`: touch poll 4 ms, thread priority 92 (HakiOS 66b8e63, Scion 357b437); `laureltouchfast=0`. ios26-touch.md.
+- 2998 `LAUREL UCACHE` + post/9020: SCTLR_EL1.UCI clear on every core, EL0 IC IVAU / DC ops done in the kernel with DC CVAC first, on only with CTR_EL0.IDC 0 (Scion 49759b2, patch 1511); `laurelucache=0`; host test `scripts/laurel/test-ucache.sh` PASS. New file `osfmk/arm64/laurel_ucache.c`; sleh.c and arm_init.c are base-owned: owned.txt lists 2998, post/9020 carries the iOS 26 hunks. ios26-userland.md "JIT code".
+- GIC review (HakiOS f7f7fab): our `sleh_irq` EOIs on every path, the IPI is SGI 1, no active-IAR state; no change. watchdog.md section 14.

@@ -1,0 +1,200 @@
+laurel 2998: LAUREL UCACHE: EL0 cache maintenance by VA is trapped and done with a clean first, so a JIT's new code is what the core fetches (Scion 49759b2, patch 1511); both kernels. docs/laurel_sprout/ios26-userland.md "JIT code".
+
+[V Scion S9] iOS's sys_icache_invalidate() is DSB, IC IVAU per line, DSB, ISB and no DC CVAU: Apple's cores have CTR_EL0.IDC. The Kryo 260
+reads IDC 0: a core can fetch the stale bytes under a line of new code still dirty in its L1 data cache (WebContent: SIGSEGV at pc 0 at its
+first style resolution, 218 times on the S9). SCTLR_EL1.UCI is cleared on every core as it starts and wakes; the trapped IC IVAU and DC ops
+are done on the kernel's alias of the page with DC CVAC first. Self-check: on only with CTR_EL0.IDC 0. Kill switch laurelucache=0. One line.
+iOS 26: the sleh.c and arm_init.c hunks are in post/9020 (the base owns those files; owned.txt lists 2998).
+
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index fa30ed9..b641192 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -375,6 +375,7 @@ arm_init(
+ 	configure_timer_apple_regs();
+ 	wfe_timeout_configure();
+ 	wfe_timeout_init();
++	{ extern void laurel_ucache_apply(void); laurel_ucache_apply(); }   /* laurel 2998 */
+ 
+ 	configure_misc_apple_boot_args();
+ 	configure_misc_apple_regs();
+@@ -604,6 +605,7 @@ arm_init(
+ #endif
+ 
+ 	cpu_machine_idle_init(TRUE);
++	{ extern void laurel_ucache_apply(void); laurel_ucache_apply(); }   /* laurel 2998 */
+ 
+ 	PE_init_platform(TRUE, &BootCpuData);
+ 
+@@ -728,11 +730,13 @@ arm_init_cpu(
+ 
+ #if __arm64__
+ 	wfe_timeout_init();
++	{ extern void laurel_ucache_apply(void); laurel_ucache_apply(); }   /* laurel 2998 */
+ 	pmap_clear_user_ttb();
+ 	flush_mmu_tlb();
+ #endif
+ 
+ 	cpu_machine_idle_init(FALSE);
++	{ extern void laurel_ucache_apply(void); laurel_ucache_apply(); }   /* laurel 2998 */
+ 
+ 	cpu_init();
+ 
+@@ -824,6 +828,7 @@ arm_init_idle_cpu(
+ 
+ #if __arm64__
+ 	wfe_timeout_init();
++	{ extern void laurel_ucache_apply(void); laurel_ucache_apply(); }   /* laurel 2998 */
+ 	pmap_clear_user_ttb();
+ 	flush_mmu_tlb();
+ 	/* Enable asynchronous exceptions */
+diff --git a/osfmk/arm64/laurel_ucache.c b/osfmk/arm64/laurel_ucache.c
+new file mode 100644
+index 0000000..b9d541d
+--- /dev/null
++++ b/osfmk/arm64/laurel_ucache.c
+@@ -0,0 +1,115 @@
++/*
++ * laurel 2998 (Scion 49759b2, their patch 1511, ucache_trap): code that user space writes and then runs (JavaScriptCore's JIT, WebCore's
++ * CSS selector compiler) made visible to instruction fetch on a core whose L1 does not unify data and instructions.
++ *
++ * iOS makes new code executable with sys_icache_invalidate(): DSB ISH, IC IVAU per 64-byte line, DSB ISH, ISB, and no DC CVAU: Apple's
++ * cores have CTR_EL0.IDC, so instruction fetch sees a store with no clean. The Kryo 260 (Cortex-A73 and A53) reads CTR_EL0.IDC = 0: a
++ * line of new code still dirty in the L1 data cache is not what the core fetches, and it runs the stale bytes under it ([V Scion S9]
++ * WebContent died at its first style resolution, SIGSEGV with pc 0, 218 times). So SCTLR_EL1.UCI is cleared on every core as it starts
++ * and as it wakes: EL0's cache maintenance by VA (IC IVAU, DC CVAU, DC CVAC, DC CVAP, DC CVADP, DC CIVAC) traps (ESR EC 0x18) and
++ * laurel_ucache_trap() does it for the process with the clean the core needs, DC CVAC (CIVAC for a CIVAC) of the line, then IC IVAU,
++ * on the kernel's alias of the page (the data caches are physically tagged, the instruction cache VIPT with no alias at these page sizes,
++ * so the alias reaches the same lines, and a page unmapped meanwhile cannot fault the kernel). A line that is not mapped or not RAM is
++ * passed over. Cost: one trap for each line a JIT makes executable. Self-check: on only when CTR_EL0.IDC is 0 (a core with IDC needs no
++ * clean, and the trap would be a cost for nothing). Kill switch laurelucache=0. One line at boot, from the boot CPU.
++ */
++#include <pexpert/pexpert.h>
++#include <arm64/proc_reg.h>
++#include <arm/cpu_data_internal.h>
++#include <arm/thread.h>
++#include <arm/pmap/pmap.h>
++#include <kern/misc_protos.h>
++#include <kern/thread.h>
++#include <mach/arm/thread_status.h>
++#if __has_include(<vm/vm_map_xnu.h>)
++#include <vm/vm_map_xnu.h>              /* xnu-12377: current_map(), vm_map_pmap() */
++#else
++#include <vm/vm_map.h>
++#endif
++#include <vm/pmap.h>
++
++uint32_t laurel_ucache_on;              /* EL0 cache maintenance by VA traps on this kernel */
++static int laurel_ucache_mode = -1;     /* -1 undecided, 0 off, 1 on */
++static uint64_t laurel_ucache_ops;      /* instructions done here */
++
++/* each CPU as it starts and as it wakes (start.s writes SCTLR_EL1_DEFAULT, UCI set, each time) */
++void laurel_ucache_apply(void);
++void
++laurel_ucache_apply(void)
++{
++	uint64_t ctr = __builtin_arm_rsr64("CTR_EL0"), clidr = __builtin_arm_rsr64("CLIDR_EL1");
++
++	if (laurel_ucache_mode < 0) {
++		uint32_t on = 1;
++		const char *why = NULL;
++
++		(void)PE_parse_boot_argn("laurelucache", &on, sizeof(on));
++		if (!on) {
++			why = "kill switch laurelucache=0";
++		} else if ((ctr >> 28) & 1) {
++			why = "CTR_EL0.IDC is 1: instruction fetch sees a store with no clean";
++		}
++		laurel_ucache_mode = why == NULL ? 1 : 0;
++		laurel_ucache_on = laurel_ucache_mode;
++		if (why != NULL) {
++			printf("LAUREL UCACHE: off: %s (CTR_EL0 0x%llx, CLIDR_EL1 0x%llx)\n", why, ctr, clidr);
++		} else {
++			printf("LAUREL UCACHE: on: EL0 cache maintenance by VA is trapped and done with a clean first, so a JIT's new code is what the core fetches: CTR_EL0 0x%llx (IDC 0, DIC %llu), CLIDR_EL1 LoUU %llu LoUIS %llu (kill switch laurelucache=0)\n",
++			    ctr, (ctr >> 29) & 1, (clidr >> 27) & 7, (clidr >> 21) & 7);
++		}
++	}
++	if (laurel_ucache_on) {
++		__builtin_arm_wsr64("SCTLR_EL1", __builtin_arm_rsr64("SCTLR_EL1") & ~(1ULL << 26));   /* UCI */
++		__builtin_arm_isb(ISB_SY);
++	}
++}
++
++/* the ISS of a trapped SYS instruction: Op0 [21:20], Op2 [19:17], Op1 [16:14], CRn [13:10], Rt [9:5], CRm [4:1], direction [0] */
++#define LUC_SYS_ISS_MASK        0x003ffc1fu                     /* everything but Rt */
++#define LUC_SYS_CACHE(crm)      ((1u << 20) | (1u << 17) | (3u << 14) | (7u << 10) | ((uint32_t)(crm) << 1))
++
++/* handle_msr_trap: true when this was EL0 cache maintenance by VA and it is done; the pc has moved on */
++bool laurel_ucache_trap(arm_saved_state_t *state, uint64_t esr);
++bool
++laurel_ucache_trap(arm_saved_state_t *state, uint64_t esr)
++{
++	uint32_t iss = (uint32_t)(esr & 0x1ffffff), op = iss & LUC_SYS_ISS_MASK, rt = (iss >> 5) & 0x1f;
++	bool icache = false;
++
++	if (!laurel_ucache_on || !is_saved_state64(state) || PSR64_IS_KERNEL(get_saved_state_cpsr(state))) {
++		return false;
++	}
++	switch (op) {
++	case LUC_SYS_CACHE(5):          /* IC IVAU */
++		icache = true;
++		break;
++	case LUC_SYS_CACHE(10):         /* DC CVAC */
++	case LUC_SYS_CACHE(11):         /* DC CVAU */
++	case LUC_SYS_CACHE(12):         /* DC CVAP */
++	case LUC_SYS_CACHE(13):         /* DC CVADP */
++	case LUC_SYS_CACHE(14):         /* DC CIVAC */
++		break;
++	default:
++		return false;
++	}
++	uint64_t va = (rt == 31 ? 0 : get_saved_state_reg(state, rt)) & ~63ULL;
++	pmap_paddr_t pa = pmap_find_pa_nofault(vm_map_pmap(current_map()), va);
++
++	if (pa != 0 && pmap_valid_address(pa)) {
++		vm_offset_t kva = phystokv(pa) & ~63UL;
++
++		if (op == LUC_SYS_CACHE(14)) {
++			__asm__ volatile ("dc civac, %0" : : "r"(kva) : "memory");
++		} else {
++			__asm__ volatile ("dc cvac, %0" : : "r"(kva) : "memory");
++		}
++		__builtin_arm_dsb(DSB_ISH);
++		if (icache) {
++			__asm__ volatile ("ic ivau, %0" : : "r"(kva) : "memory");
++			__builtin_arm_dsb(DSB_ISH);
++		}
++	}
++	laurel_ucache_ops++;
++	add_saved_state_pc(state, 4);
++	return true;
++}
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index ff9edce..20e6489 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1833,6 +1833,12 @@ handle_msr_trap(arm_saved_state_t *state, uint32_t esr)
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 	codes[1] = instr;
+ 
++	/* laurel 2998: EL0 cache maintenance by VA, trapped by a clear SCTLR_EL1.UCI, done with a clean first (osfmk/arm64/laurel_ucache.c) */
++	extern bool laurel_ucache_trap(arm_saved_state_t *state, uint64_t esr);
++	if (laurel_ucache_trap(state, esr)) {
++		return;
++	}
++
+ 	exception_triage(exception, codes, numcodes);
+ 	__builtin_unreachable();
+ }
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index c6d0d83..66dd031 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -43,6 +43,7 @@ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
+ osfmk/arm64/laurel_ram.c	standard
+ osfmk/arm64/laurel_wdog.c	standard
++osfmk/arm64/laurel_ucache.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard

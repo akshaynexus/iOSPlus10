@@ -5,11 +5,11 @@ config/Private.exports 0002 0009
 makedefs/MakeInc.def 0002 0001 0004 0081 0140
 pexpert/pexpert/arm64/Makefile 0002 0004
 pexpert/pexpert/arm64/board_config.h 0002 0004 0141
-osfmk/arm/arm_init.c 0003 0010 0012 2100
+osfmk/arm/arm_init.c 0003 0010 0012 2100 2998
 osfmk/arm64/arm_vm_init.c 0003 0010 0011 0012 0140 0142
 osfmk/arm64/caches_asm.s 0003 0008
 osfmk/arm64/cpu.c 0003 0065 2004 2006
-osfmk/arm64/sleh.c 0003 0004 0017 0081 2986
+osfmk/arm64/sleh.c 0003 0004 0017 0081 2986 2998
 osfmk/arm64/start.s 0003 0004 0008 0010 0065 0140 0142 2016
 pexpert/pexpert/arm/protos.h 0003 0003 0017
 pexpert/arm/pe_serial.c 0004 0003 0012 2870

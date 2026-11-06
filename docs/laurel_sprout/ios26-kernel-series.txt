@@ -355,6 +355,9 @@
 2993-laurel-apps-smmu-private-tlb.patch                        applied
 2994-laurel-lock-timeout.patch                                 applied
 2995-laurel-wdog-frame-scan.patch                              applied
+2996-laurel-timer-coalescing-off.patch                         applied
+2997-laurel-touch-fast.patch                                   applied
+2998-laurel-ucache.patch                                       applied+rules(3): base 0003, glue
 3000-laurel-audio-lead.patch                                   applied
 3001-laurel-haptic-first-contact.patch                         applied
 3020-laurel-cpu-motion.patch                                   applied
@@ -380,4 +383,5 @@
 9017-laurel-wdog-trap-stamp-sleh.patch                         post
 9018-laurel-wdog-irq-frame-sleh.patch                          post
 9019-laurel-wdog-el0-trap-flag.patch                           post
-== series: 244 applied, 87 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
+9020-laurel-ucache-sleh-init.patch                             post
+== series: 246 applied, 88 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors

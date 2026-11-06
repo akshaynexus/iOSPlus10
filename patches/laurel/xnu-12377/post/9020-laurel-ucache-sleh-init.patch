@@ -1,0 +1,61 @@
+laurel 9020 (iOS 26): the sleh.c and arm_init.c calls of 2998 (the base owns those files): handle_msr_trap gives EL0's cache maintenance to laurel_ucache_trap(); each CPU start and wake runs laurel_ucache_apply().
+
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 78ca4db..390af94 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -389,6 +389,7 @@ arm_init(
+ 	configure_timer_apple_regs();
+ 	wfe_timeout_configure();
+ 	wfe_timeout_init();
++	{ extern void laurel_ucache_apply(void); laurel_ucache_apply(); }   /* laurel 2998 */
+ 
+ 	configure_misc_apple_boot_args();
+ 	configure_misc_apple_regs(true);
+@@ -660,6 +661,7 @@ arm_init(
+ #endif
+ 
+ 	cpu_machine_idle_init(TRUE);
++	{ extern void laurel_ucache_apply(void); laurel_ucache_apply(); }   /* laurel 2998 */
+ 
+ 	PE_init_platform(TRUE, &BootCpuData);
+ 
+@@ -774,11 +776,13 @@ arm_init_cpu(
+ 
+ #if __arm64__
+ 	wfe_timeout_init();
++	{ extern void laurel_ucache_apply(void); laurel_ucache_apply(); }   /* laurel 2998 */
+ 	pmap_clear_user_ttb();
+ 	flush_mmu_tlb();
+ #endif
+ 
+ 	cpu_machine_idle_init(FALSE);
++	{ extern void laurel_ucache_apply(void); laurel_ucache_apply(); }   /* laurel 2998 */
+ 
+ 	cpu_init();
+ 
+@@ -877,6 +881,7 @@ arm_init_idle_cpu(
+ 
+ #if __arm64__
+ 	wfe_timeout_init();
++	{ extern void laurel_ucache_apply(void); laurel_ucache_apply(); }   /* laurel 2998 */
+ 	pmap_clear_user_ttb();
+ 	flush_mmu_tlb();
+ #endif
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index cf55b14..b6decfc 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -2915,6 +2915,12 @@ handle_msr_trap(arm_saved_state_t *state, uint64_t esr)
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 	codes[1] = instr;
+ 
++	/* laurel 2998: EL0 cache maintenance by VA, trapped by a clear SCTLR_EL1.UCI, done with a clean first (osfmk/arm64/laurel_ucache.c) */
++	extern bool laurel_ucache_trap(arm_saved_state_t *state, uint64_t esr);
++	if (laurel_ucache_trap(state, esr)) {
++		return;
++	}
++
+ #if defined(SWEET)
+ 	/* a read of an Apple register or DIT can arrive here instead of as undefined; the same emulator */
+ 	extern bool laurel_abi_trap(arm_saved_state_t *state, uint32_t instr);
