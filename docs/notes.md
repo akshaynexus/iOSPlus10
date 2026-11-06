@@ -5541,3 +5541,5 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - 2997 `LAUREL TOUCH FAST`: touch poll 4 ms, thread priority 92 (HakiOS 66b8e63, Scion 357b437); `laureltouchfast=0`. ios26-touch.md.
 - 2998 `LAUREL UCACHE` + post/9022: SCTLR_EL1.UCI clear on every core, EL0 IC IVAU / DC ops done in the kernel with DC CVAC first, on only with CTR_EL0.IDC 0 (Scion 49759b2, patch 1511); `laurelucache=0`; host test `scripts/laurel/test-ucache.sh` PASS. New file `osfmk/arm64/laurel_ucache.c`; sleh.c and arm_init.c are base-owned: owned.txt lists 2998, post/9022 carries the iOS 26 hunks. ios26-userland.md "JIT code".
 - GIC review (HakiOS f7f7fab): our `sleh_irq` EOIs on every path, the IPI is SGI 1, no active-IAR state; no change. watchdog.md section 14.
+- [V host, 2026-11-07] `scripts/laurel/ios26-encode-bench.sh`: one draw with no state change costs 5.16 us on the x86 host (real runtime, fat LTO, Turnip on drm-shim); with CA-like binds before it 7.70 us. Flat profile. `m2v-ios26/0005` (QoS on iOS, kill switch `NEGRONIMETAL_QOS=0`): built as `out/ios26/snap/plugin11`, not run on the phone.
+

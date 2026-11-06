@@ -199,6 +199,123 @@ static void *read_file(const char *path, size_t *length)
 	return p;
 }
 
+/*
+ * NMN_SCENE_BENCH=DRAWS,FRAMES (default stack, host): the encode cost of the runtime, with no GPU: frames of DRAWS draws, each with its bytes and textures as CA binds them.
+ * Prints us per draw, per pass end, per commit. Samples the main thread with SIGPROF at 1 kHz into NMN_SCENE_BENCH_PCS: "pc" lines after a "base" line. Tool: scripts/laurel/ios26-encode-bench.sh.
+ */
+#include <signal.h>
+#include <sys/time.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <ucontext.h>
+#include <unistd.h>
+static uint64_t bench_pcs[1 << 20];
+static volatile uint32_t bench_npcs;
+static pid_t bench_tid;
+static void bench_prof(int sig, siginfo_t *info, void *uc)
+{
+	(void)sig;
+	(void)info;
+	if ((pid_t)syscall(SYS_gettid) != bench_tid)
+		return;
+#if defined(__x86_64__)
+	const uint64_t pc = (uint64_t)((ucontext_t *)uc)->uc_mcontext.gregs[16]; /* REG_RIP: the name needs _GNU_SOURCE before the first include */
+#else
+	const uint64_t pc = (uint64_t)((ucontext_t *)uc)->uc_mcontext.pc;
+#endif
+	if (bench_npcs < sizeof(bench_pcs) / sizeof(bench_pcs[0]))
+		bench_pcs[bench_npcs++] = pc;
+}
+static double bench_now(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec * 1e6 + t.tv_nsec / 1e3;
+}
+static int scene_bench(const char *spec, NmbQueue *queue, const struct NmbRenderPassDescriptor *rp, NmbRenderPipeline *pipe, NmbTexture *image, NmbSampler *sampler, NmbBuffer *ib)
+{
+	int draws = 200, frames = 300;
+	sscanf(spec, "%d,%d", &draws, &frames);
+	const int warm = frames / 10;
+	double draw_us = 0, end_us = 0, commit_us = 0, wait_us = 0, begin_us = 0, bind_us = 0;
+	/* NMN_SCENE_BENCH_BIND=0: bind once a pass, not before each draw: the cost of the draw call alone */
+	const bool bind_each = getenv("NMN_SCENE_BENCH_BIND") == NULL || strcmp(getenv("NMN_SCENE_BENCH_BIND"), "0") != 0;
+	const double viewport[6] = {0, 0, 720, 1560, 0, 1};
+	const uint64_t scissor[4] = {0, 0, 720, 1560};
+	bench_tid = (pid_t)syscall(SYS_gettid);
+	const char *pcs = getenv("NMN_SCENE_BENCH_PCS");
+	if (pcs != NULL) {
+		struct sigaction sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_sigaction = bench_prof;
+		sa.sa_flags = SA_SIGINFO | SA_RESTART;
+		sigaction(SIGPROF, &sa, NULL);
+	}
+	for (int f = 0; f < frames; f++) {
+		if (f == warm && pcs != NULL) {
+			const struct itimerval on = {{0, 1000}, {0, 1000}};
+			setitimer(ITIMER_PROF, &on, NULL);
+		}
+		const double t0 = bench_now();
+		NmbCommandBuffer *cb = nmb_command_buffer_new(queue);
+		NmbEncoder *en = cb ? nmb_render_encoder_new(cb, rp) : NULL;
+		if (en == NULL)
+			FAIL("bench encoder");
+		if (!nmb_render_set_pipeline(en, pipe))
+			FAIL("bench pipeline");
+		nmb_render_set_viewport(en, viewport);
+		nmb_render_set_scissor(en, scissor);
+		if (!bind_each && !scene_bind(en, image, sampler))
+			FAIL("bench bind");
+		const double t1 = bench_now();
+		double binding = 0;
+		for (int d = 0; d < draws; d++) {
+			const double b0 = bench_now();
+			if (bind_each && !scene_bind(en, image, sampler))
+				FAIL("bench bind");
+			binding += bench_now() - b0;
+			if (!nmb_render_draw_indexed(en, 3, 6, 0, ib, 0, 1, 0, 0))
+				FAIL("bench draw");
+		}
+		const double t2 = bench_now();
+		if (!nmb_encoder_end(en))
+			FAIL("bench end");
+		const double t3 = bench_now();
+		if (!nmb_command_buffer_commit(cb))
+			FAIL("bench commit");
+		const double t4 = bench_now();
+		if (nmb_command_buffer_wait(cb, 20000) != 0 || nmb_command_buffer_status(cb) != 4)
+			FAIL("bench wait");
+		const double t5 = bench_now();
+		nmb_command_buffer_release(cb);
+		if (f >= warm) {
+			begin_us += t1 - t0;
+			draw_us += t2 - t1;
+			bind_us += binding;
+			end_us += t3 - t2;
+			commit_us += t4 - t3;
+			wait_us += t5 - t4;
+		}
+	}
+	const struct itimerval off = {{0, 0}, {0, 0}};
+	setitimer(ITIMER_PROF, &off, NULL);
+	const int n = frames - warm;
+	printf("bench: %d draws, %d frames, bind %s: begin %.1f us, draw %.2f us each (%.0f us a frame; of it the binds %.2f us each), end %.1f us, commit %.1f us, wait %.1f us\n", draws, n, bind_each ? "each draw" : "once a pass", begin_us / n, draw_us / n / draws, draw_us / n, bind_us / n / draws, end_us / n, commit_us / n, wait_us / n);
+	if (pcs != NULL) {
+		FILE *o = fopen(pcs, "w");
+		if (o == NULL)
+			FAIL("bench pcs");
+		FILE *m = fopen("/proc/self/maps", "r");
+		char row[512];
+		while (m != NULL && fgets(row, sizeof(row), m))
+			fprintf(o, "M %s", row);
+		for (uint32_t i = 0; i < bench_npcs; i++)
+			fprintf(o, "P %llx\n", (unsigned long long)bench_pcs[i]);
+		fclose(o);
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	size_t length;
@@ -371,6 +488,11 @@ int main(int argc, char **argv)
 	NmbBuffer *ib = nmb_buffer_new(dev, sizeof(ib_data), 0, ib_data);
 	if (ib == NULL)
 		FAIL("index buffer");
+	if (getenv("NMN_SCENE_BENCH") != NULL) {
+		if (!nmb_encoder_end(en))
+			FAIL("end before the bench");
+		return scene_bench(getenv("NMN_SCENE_BENCH"), queue, &rp, pipe, image, sampler, ib);
+	}
 	/* NMN_SCENE_PRIM=1: line lists, as CA's generic program draws paths: the mark of the hangs of 08:39 and 08:54. A row of 6 indices is 3 lines */
 	const uint64_t prim = getenv("NMN_SCENE_PRIM") ? strtoull(getenv("NMN_SCENE_PRIM"), NULL, 10) : 3;
 	if (getenv("NMN_SCENE_INDIRECT") != NULL) {
