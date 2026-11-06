@@ -197,3 +197,38 @@ Reusable: rails, reset, SoundWire helpers, codec init. New work: the RX macro 0x
   6. Play music while recording: the speaker must not stop. A click at the path's start is expected ([I] the bring-up holds the audio thread for about 100 ms).
   7. Camera video: which of the two camera hook lines comes.
   8. Boot with `mic=0`: `LAUREL MIC: off: kill switch (boot-arg mic=0)`, the speaker works, Voice Memos records silence.
+
+## Lead (patch 3000, 2026-11-07): "audio is laggy"
+
+Owner, 2026-11-03 19:37, iOS 26: audio lags. Log `logs/usblog-20261103-071332.txt`, kernel 48e56e9.
+
+[V] Three speaker streams in that boot: `stream: stopped (113664 frames in, 0 dropped, 24 underruns, 164 done ...)`, then 51 of 319, 83 of 670
+periods. An underrun here is a period that got some frames but not 960: the rest is zeros, and every later frame plays that much later. 0 dropped,
+0 DSP underflows, 0 errors: the DSP never starved and the ring never overflowed; the writer and the reader were not aligned.
+
+[I from the code, 2500] Why:
+1. The start drained the ring: `path_start()` filled all 8 periods at once from a ring that held one HAL I/O buffer, so period 0 carried the sound's
+   first frames and periods 1..7 silence. The second chunk of every sound came 140 ms after the first: a stutter at each start, then 160 ms of latency.
+2. Steady state: the ring level stayed at what was left after that drain (about one I/O buffer), so a refill (every 20 ms, when a period came back)
+   raced the HAL's next write. The HAL paces itself on `mach_absolute_time()` (`get_zero_time_stamp`, 16384-frame periods), the DSP on the I2S bit
+   clock; nothing held a lead between them.
+3. Every pause longer than 2 s tore the path down (AFE, ADM, ASM, amp) and the next sound paid the bring-up before its first frame. How long that is
+   was never logged (the self-check's "2 periods back in 14 ms" starts after `path_start()`).
+
+What 3000 does (`TopazAudio.cpp`, both kernels):
+- `IN_FLIGHT 3`: 3 periods (60 ms) queued at the DSP; the other 5 pages stay mapped, unused.
+- `LEAD_FRAMES 1440`: a period takes frames from the ring only once it holds 30 ms, or `LEAD_MAX_MS 100` after the first frames (a thin writer).
+  A dry ring (the sound ended, or the writer is late by more than the lead) waits for the lead again: one gap, counted as "lead waits" in the stop
+  line, instead of many partial periods.
+- `AMP_QUIET_MS 2000`: amp off 2 s after the last sound; `QUIET_MS 12000`: the DSP path stays up 12 s (the thread polls at 2 ms meanwhile).
+- Lines: `LAUREL AUDIO: on: ... (2 periods back in N ms; 3 periods of 20 ms queued, lead 30 ms, path kept 12 s after a sound)`,
+  `stream: playing (start N: path up in X ms, Y ms after the first sound; 3 periods queued, lead 30 ms)`,
+  `stream: stopped (... underruns, L lead waits, ...)`.
+- Kill switch `laurel_audio_lead=0`: 8 periods, no lead, path off after 2 s (the old numbers), said in the `on` line.
+
+Expected on the phone [I]: underruns near 0, lead waits = the number of sound ends, `path up in` tens of ms at most, and the first start of a
+burst within 40 ms of the first sound frame; latency about 90 ms + the DSP's. Not proven until it runs. The latency the HAL reports
+(`kAudioDevicePropertyLatency` = 0 in audio_plugin.c) is unchanged: AV sync, not the felt delay, would need it.
+
+Not the cause [V]: CPU 5 stuck in audiomxd (19:31:11 watchdog): a user-mode stall of a whole core (docs/laurel_sprout/watchdog.md, fixed by 2992);
+the three streams above ran after that reboot with 0 DSP underflows.

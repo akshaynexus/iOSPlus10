@@ -5504,3 +5504,18 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - **Who should map a kernel-RAM page and free it without unmap?** First suspect: exec/load of launchd (dyld, an IOBufferMemoryDescriptor wired for DMA, or the wired-guard/surface pool 2101/2906/2916) getting a kernel_pmap mapping that is never `pmap_remove`d. The custom launchd panic handler prints only the single line and the USB console had "0 frames queued" at panic time, so **no backtrace** is streamed; `op10tool ctl logall` replays the ring but the stack walk there comes only after USB configures.
 - **To fix:** add a caller log in `pmap_recycle_page` (or trap the specific page `0x1b27d4000` / `pmap_verify_free`) at build, reboot once, read the caller, then remove/`pmap_remove` the stale mapping (or the driver leaks it) and rebuild. This kernel series has **never booted** (`ios26-kernel.md` "This kernel has never run"; last working iOS 26 kernels were the older series `8c6e2af`/294 patches). The phone was left on slot `a` (Android), safe.
 - [V 2026-11-07] iOS 16 build fix: `machine.el0_synchronous_trap` exists in xnu-12377 only; 2991 reads it under `LAUREL_EL0_TRAP_FLAG`, which post/9019 defines in `laurel_wdog_core.h`; xnu-8796 keeps the CPU stamp. Both kernels build (iOS 26: 368 patches, 0 errors; iOS 16: 343 patches). Worktree iOS 16 build: symlink `external/{ios-topaz,ios-sweet-linux}` and `out/laurel-kernel/{theos,cache,dl,deps}` to the main checkout's.
+
+## Haptics silent and audio lag on iOS 26 (2026-11-07, patches 3000, 3001; no phone)
+
+- [V] Audio: 24/164, 51/319, 83/670 underruns per stream, 0 dropped, 0 DSP underflows (`usblog-20261103-071332.txt`). [I] 2500 queued all 8
+  periods from a ring holding one HAL buffer (first chunk, then 140 ms of silence, then the rest) and kept no lead; every 2 s pause cost a full
+  path bring-up. 3000: 3 periods queued, 30 ms lead, dry ring waits for the lead again, amp off at 2 s, path kept 12 s, `path up in N ms` in the
+  playing line. Kill switch `laurel_audio_lead=0`. docs/laurel_sprout/audio.md "Lead".
+- [V] Haptics on 26: the node was ready, closed-loop on, SPMI errors 0, and no write line and no legacy "vibrator" request in 6 minutes; on 16
+  the same node logged peaks 267..2355. [V] Same on 16 and 26: hapticd lives in the HAL host (mediaserverd / audiomxd), VirtualAudio's actuator
+  code and strings, our ADT /product (donor props only, no child nodes: the N104 CPMS keys never reach the phone). [U] which link is missing;
+  3001 logs the first open (process) and the first write (frames, peak, silent or not). docs/laurel_sprout/haptics.md "iOS 26".
+- Gotchas: the old write line came only for a loud block, so "no line" could not tell silence from no open. `hertz_millisecs` is still in the
+  23F84 cache (`.17`): the legacy path exists on 26. VirtualAudio's "CPMS for Haptics" branch is gated by MobileGestalt `DeviceSupportsHaptics`
+  (`cBy4BcYs5YWtFHbBpt4C6A`; names: `_MobileGestalt_get_*` symbols in the cache linkedit, key = base64(md5("MGCopyAnswer"+Name))[:22]).
+  `scripts/ios26/dis-xref.py` finds the code that references a string in an `llvm-objdump -d --macho` listing (adrp+add pairs).

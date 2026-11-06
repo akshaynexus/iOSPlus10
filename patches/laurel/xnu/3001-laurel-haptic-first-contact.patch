@@ -1,0 +1,54 @@
+laurel 3001: LAUREL HAPTIC: /dev/redwood-haptic logs its first open (process name) and its first write (frames, peak), loud or silent; both kernels. docs/laurel_sprout/haptics.md "iOS 26".
+
+[V 2026-11-03, logs/usblog-20261103-071332.txt, iOS 26.5.2] The owner felt no haptics. The log has "LAUREL HAPTIC UI: on" and no "iOS plays" line and no
+"LAUREL VIBRATOR: request" line; the old write log came only for a loud block (peak > 256), so "no line" could not tell a silent waveform (a power
+budget of zero) from no write and no open at all. On iOS 16 the same node logged peaks 267..2355 [V logs of 2026-11-01]. These two lines, once per boot,
+tell which link is missing: open (VirtualAudio built the Actuator device and audiomxd started its I/O), first write (the haptic server plays), peak
+(the waveform is not attenuated to zero).
+
+diff --git a/bsd/dev/laurel_haptic.c b/bsd/dev/laurel_haptic.c
+--- a/bsd/dev/laurel_haptic.c
++++ b/bsd/dev/laurel_haptic.c
+@@ -62,6 +62,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <sys/proc.h>
+ #include "sweet_spmi.h"
+ 
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -136,6 +137,8 @@
+ static uint64_t lh_run_s, lh_run_e;             /* open loud run */
+ static uint64_t lh_frames, lh_loud_blocks;
+ static uint32_t lh_said;
++static uint32_t lh_opens;                       /* the first open and the first write are logged (laurel 3001): */
++static bool lh_wrote;                           /* on iOS 26 nothing was heard from the HAL at all, loud or silent */
+ 
+ static uint64_t
+ lh_abs(uint64_t ms)
+@@ -527,6 +530,13 @@
+ 		lh_frames += (uint64_t)n / 2u;
+ 	}
+ 	lh_flush_run_locked();
++	if (!lh_wrote) {
++		char name[MAXCOMLEN + 1] = "";
++		lh_wrote = true;
++		proc_selfname(name, sizeof(name));
++		printf("LAUREL HAPTIC: /dev/redwood-haptic: first write from %s: %llu frames, peak %u of 32768 (the HAL's Actuator "
++		    "device runs%s)\n", name, lh_frames, peak_all, peak_all > LH_SILENT ? "" : "; silent so far");
++	}
+ 	if (peak_all > 0 && lh_said < LH_LOG) {
+ 		lh_said++;
+ 		printf("LAUREL HAPTIC: /dev/redwood-haptic: iOS plays (peak %u of 32768; %llu frames, %llu loud 2 ms blocks so far)%s\n",
+@@ -539,6 +549,11 @@
+ static int
+ lh_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+ {
++	if (lh_opens++ == 0) {
++		char name[MAXCOMLEN + 1] = "";
++		proc_selfname(name, sizeof(name));
++		printf("LAUREL HAPTIC: /dev/redwood-haptic opened by %s (the HAL plug-in's Actuator output)\n", name);
++	}
+ 	return 0;
+ }
+ 
