@@ -5438,6 +5438,13 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - `CASetDebugOption` is exported: the way to set the `CA_DISABLE_*` table after `init_debug` has read the environment.
 - m2v's notices have the exact reason for a shadow: `observe_message` in the bridge. Read them before you guess.
 
+## 2026-11-03: Mi A3 default stack: slow frames, CPU map (branch t3/default-stack-glass-60fps). Full: docs/laurel_sprout/ios26-default-speed.md section 6
+- [V] Logical CPU 0-3 are Gold, 4-7 Silver. `cl_busy` is the busiest single core: `silver busy 100 %` matches contextstored's 60.5 s a minute in time ([I] link). After that reboot: Gold 50-53 %, Silver 9-17 %.
+- [V] Home loop with no sampler (s10a): 15.6 fps; gaps 69 <20 ms, 65 <36, 40 <52, 247 longer. So the long gaps, not the 2-tick gaps, are the larger part. The all-threads sampler at 100 Hz is not the main effect. Thread that holds them: [U].
+- [V] Render thread in busy bins (s7, a mix): `draw_elements` 12 ms of 33, flat, no hot line.
+- Not run on the phone yet: `laurel-autotest kstack PID`, `sample ... only=N`. The phone has had no SSH since 13:46:59.
+- Bench: uptime gate 420 s; option copy on the phone. Do not edit a running shell script: `mv` a new file over it.
+
 ## 2026-11-03: native stack, wrong pictures and their causes [V code; phone pictures in logs/round-*]
 
 - `SP_PS_2D_SRC_PITCH` and `RB_2D_DST_PITCH` hold 64-byte units, and a 2D base is 64-byte aligned: a row of 40 reads as 0. Such a copy goes line by line, as `tu_copy_buffer_to_image`.
@@ -5481,3 +5488,18 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - [V 2026-11-06 log] 2992 + 2993 on: still 16 barks in 65 min, on CPU 5 and CPU 1 (4-CPU boots): not the SMMUs, not one core. The 08:09:55 stack (symbolised with the unstripped kernel of that build; `llvm-nm -n` lists the kernel's functions as `s`/`S`) holds `hw_lock_lock+0x34`, `hw_lock_bit+0x20` under `thread_setrun`/`thread_dispatch`/`thread_invoke`; last interrupt in `machine_idle`.
 - [V code] **`wdt=-1` in the boot line disables every machine timeout** (`machine_timeout_init_with_suffix`): `LockTimeOut` 0 → `hw_spin_should_keep_spinning` spins for ever → a held spin lock = a silent CPU, no "Spinlock timeout" panic. 2994 restores the spin (250 ms) and ticket (125 ms) timeouts in `ml_init_lock_timeout`, kill switch `laurellockto=0`. 2995: stack scan `__TEXT_EXEC` only + a frame chain by scan. `watchdog.md` section 13. NOT BOOTED.
 - The stir-the-pot LL/SC loops (base 0005) are clean in the machine code: 4-9 instructions, branches only.
+- Bench on the shared phone: `scripts/laurel/ios26-bench-round.sh NAME ...` holds the lock only for the run; `uptime none` over 60 s ends the round. `LAUREL GPU TIME: new 531/26` is 531 calls and 26 ms in 5 s (`calls/ms`, `laurel_gpu_time_core.h`), so about 49 us a call, not 531 us.
+
+## 2026-11-06: Mi A3 iOS 26 (series 80b6fe) panics at exec launchd: `pmap_assert_free` (the current bring-up blocker)
+- **Panic, every boot** of kernel series `80b6fe729a6aff39`, commit `72a5244`, 365 patches `ios26_4k` (the image at the time; the root rebuilt 2026-11-06 with the merged userland):
+  ```
+  exec launchd
+  LAUREL STATE: on: launchd is pid 1
+  pmap_assert_free: Found at least one mapping to 0x1b27d4000. First PTEP (0xfffffff107bab1e0)
+    is a Kernel CPU mapping (pmap: 0xfffffff007dfed80) @pmap.c:2951
+  LAUREL PANIC: USB not configured (waiting for the host): console ring 346813 bytes ...
+  ```
+- Same physical page `0x1b27d4000` and same PTEP every boot with the current root (verified 5 boots: 04:34, 04:35, 04:39, 04:40, 04:43). So it is a **fixed leaked kernel_pmap mapping**, not a random race. With an earlier root the page was `0x1b2cbc000`. The page is a kernel-RAM page: `0x1b27d4000` is inside the 2974 kernel window `0xc1004000..0x1b5004000` at offset ~3863.8 MiB (DRAM ~5928 MiB), not the GPU pool or modem pool. Note the DSI high DMA buffer was separately seen at `0x1b4664000` in the same window (patch 2979).
+- **Mechanism:** in `vm_page_release` / `vm_page_free_prepare_object` (osfmk/vm/vm_resident.c) a "canonical" page is returned to the free list but `pmap_verify_free` still finds a recorded mapping, so `pmap_recycle_page` -> `pmap_assert_free` panics (MACH_ASSERT); the non-assert path also panics `"page referenced"` (pmap.c:2970) because the mapping is real. The page is still mapped into kernel_pmap when the VM frees it.
+- **Who should map a kernel-RAM page and free it without unmap?** First suspect: exec/load of launchd (dyld, an IOBufferMemoryDescriptor wired for DMA, or the wired-guard/surface pool 2101/2906/2916) getting a kernel_pmap mapping that is never `pmap_remove`d. The custom launchd panic handler prints only the single line and the USB console had "0 frames queued" at panic time, so **no backtrace** is streamed; `op10tool ctl logall` replays the ring but the stack walk there comes only after USB configures.
+- **To fix:** add a caller log in `pmap_recycle_page` (or trap the specific page `0x1b27d4000` / `pmap_verify_free`) at build, reboot once, read the caller, then remove/`pmap_remove` the stale mapping (or the driver leaks it) and rebuild. This kernel series has **never booted** (`ios26-kernel.md` "This kernel has never run"; last working iOS 26 kernels were the older series `8c6e2af`/294 patches). The phone was left on slot `a` (Android), safe.

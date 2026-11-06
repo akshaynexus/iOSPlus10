@@ -406,6 +406,9 @@ msm_fence_wait(uint32_t seq, int64_t deadline_ns)
 	struct drm_msm_wait_fence w = {.fence = seq};
 	int64_t left = deadline_ns > 0 ? deadline_ns - mono_ns() : 0;
 	if (left > 0) {
+		/* laurel: the kernel's wait counts whole milliseconds: under 1 ms it answers at once, and fence_wait_until asks again: metal2vulkan's completion thread, whose
+		 * slices are short, made 5000 system calls a second [V phone 2026-11-03: fence 24541 calls in 5 s, 4.6 s of CPU a run]. Up to the next millisecond. */
+		left = (left + 999999) / 1000000 * 1000000;
 		struct timespec now;
 		clock_gettime(CLOCK_MONOTONIC_RAW, &now);
 		int64_t at = (int64_t)now.tv_sec * 1000000000ll + now.tv_nsec + left;
