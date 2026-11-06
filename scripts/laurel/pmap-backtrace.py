@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Symbolize the kernel frames printed by post/9019 on pmap_assert_free.
+"""Symbolize the kernel frames printed by post/9021 on pmap_assert_free.
 
 Usage: scripts/laurel/pmap-backtrace.py [USB_LOG [UNSTRIPPED_KERNEL]]
 Use '-' as USB_LOG to read stdin. This tool reads logs and symbols only.
