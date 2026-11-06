@@ -36,7 +36,13 @@ sleep 2
 _cs=$(fb_get current-slot)
 [ "$_cs" = b ] || die "current slot is '$_cs', not b: use scripts/laurel/ios26-retry.sh, which switches from Android"
 say "writing boot_b"
-fastboot flash boot_b "$IMG"
+# [V phone 2026-11-07] ABL fails every second command; the flash asks max-download-size and the partition size first,
+# so one of them can fail ("Requested download size is more than max allowed"): up to 4 tries, nothing is written by a failed one.
+_w=1
+until fastboot flash boot_b "$IMG"; do
+  [ "$_w" -lt 4 ] || die "fastboot flash boot_b failed 4 times"
+  say "fastboot flash failed, try $((_w + 1)) of 4"; _w=$((_w + 1)); sleep 2
+done
 say "reboot into iOS"
 timeout 15 fastboot reboot >/dev/null 2>&1 || say "ABL did not take reboot: hold Power"
 say "done: slot b, iOS is booting"
