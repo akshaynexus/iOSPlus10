@@ -172,3 +172,19 @@ Candidates left [I], in the order the next boot sorts them (patch 3001 lines, on
 
 Test when the phone is back (owner's standing order covers boot_b and reboots): flash the image of `scripts/laurel/ios26-image.sh` (kernel with
 3000 + 3001) with `scripts/laurel/ios26-fast-flash.sh`; tap the keyboard and a toggle in Settings; grep the USB log for `LAUREL HAPTIC`.
+
+### The node's timing (patch 3002, plug-in actuator-retry.patch, 2026-11-07)
+
+Lead from Scion 027dd2b (max77705, Galaxy S9): the audio server's plug-in opens the haptic node **once**, at its first haptic, and never again
+when that open failed; made in a later thread, iOS never felt a thing; made at driver start, the vibration works. Our plug-in is the same code
+(ios-topaz `audio_plugin.c actuator_write`: one `open`, then `haptic = -2` for good) [V].
+
+[V 2026-11-03 boot] `/dev/redwood-haptic ready` at 19:31:51, `exec audiomxd` at 19:32:05: that boot did not lose the open to timing. Any boot
+where the root mount is slow, or audiomxd's first haptic comes before the root thread's 20 ms poll, does. Both ends are closed now:
+- Kernel 3002: `laurel_haptic_make_node()` is called by TopazAudio's thread right after `/dev/topaz-audio` (after vfsinit and sweet_ufs, before
+  the root mount and launchd; `devfs_make_node()` before vfsinit panics, so this is the earliest point), and by the haptic root thread after the
+  root mount when audio is off or late. Whoever comes first makes it. The ready line says `made before|after the root mount`.
+- Plug-in `userland/laurel/audio/actuator-retry.patch` (both builds, `build.sh` applies it after `mic-input.patch`): a failed open is tried again at
+  every actuator write for the first 512, then once in 256; one stderr line `opened after N failed tries` when it opens late. The iOS 26 root
+  needs a rebuild (`ios26-root.sh`) to carry it; the kernel change alone covers the next boot.
+- 3001's `opened by NAME` and `first write` lines stay: they prove it on the phone.

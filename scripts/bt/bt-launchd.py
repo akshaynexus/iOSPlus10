@@ -27,6 +27,7 @@ BT_KEY = '/System/Library/LaunchDaemons/com.apple.BlueTool.plist'
 ENV = {'BT_HCI_TRANSPORT': 'H4BC:POSIX:com.apple.uart.bluetooth,3000000', 'BT_BAUDRATE': '3000000'}
 STOCK_BLUETOOL = ['/usr/sbin/BlueTool', '-R']
 STUB = '/usr/libexec/negroni-bluetool'
+WRAP = '/usr/local/libexec/laurel-bluetoothd'   # BTD_WRAP=path (or BTD_WRAP= for none): execs /usr/sbin/bluetoothd with liblaurel-btpty.dylib
 
 
 def main():
@@ -48,11 +49,17 @@ def main():
         stub = sys.argv[4] if len(sys.argv) > 4 else STUB
         job = jobs.get(BTD_KEY) or plistlib.load(open(sys.argv[3], 'rb'))
         job.setdefault('EnvironmentVariables', {}).update(ENV)
+        wrap = os.environ.get('BTD_WRAP', WRAP)
+        args = job.get('ProgramArguments') or [job.get('Program', '/usr/sbin/bluetoothd')]
+        if args and args[0] in (WRAP, '/usr/sbin/bluetoothd'):
+            args = args[1:]
+        job['ProgramArguments'] = ([wrap] if wrap else ['/usr/sbin/bluetoothd']) + args
+        job.pop('Program', None)
         jobs[BTD_KEY] = job
         if bt is not None:
             bt['ProgramArguments'] = [stub]
             bt.pop('Program', None)
-        print('bt-launchd: bluetoothd job on with', ENV, '; BlueTool job ->', stub if bt is not None else '(no job!)')
+        print('bt-launchd: bluetoothd job on with', ENV, 'program', job['ProgramArguments'], '; BlueTool job ->', stub if bt is not None else '(no job!)')
     elif op == 'off':
         jobs.pop(BTD_KEY, None)
         if bt is not None:

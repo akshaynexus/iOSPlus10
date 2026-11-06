@@ -1107,13 +1107,24 @@ def audio(t):
     for f, m in (('RedwoodAudio', 0o755), ('Info.plist', 0o644)):
         with open(os.path.join(src, f), 'rb') as g:
             t.write(os.path.join(hal, b'RedwoodAudio.driver', f.encode()), g.read(), m, 0, 0)
-    # BTAudioHALPlugin: its factory's XPC trapped the host on negroni; no port ran it with bluetoothd. A trap stops all audio. BTAUDIO=1 keeps it (the test of system-features.md)
-    bt = 'kept (BTAUDIO=1)'
-    if os.environ.get('BTAUDIO', '0') != '1' and t.exists(os.path.join(hal, b'BTAudioHALPlugin.driver')):
-        move(t, os.path.join(hal, b'BTAudioHALPlugin.driver'), b'System/Library/Audio/Plug-Ins/HAL.disabled/BTAudioHALPlugin.driver')
-        bt = 'moved to HAL.disabled'
     left = [x for x in ('Library/Audio/Tunings/N104', 'System/Library/Audio/UISounds', 'Library/Ringtones') if not t.exists(x)]
-    return f'RedwoodAudio.driver: Speaker, Hawking, Actuator, Codec (4 channels, the one microphone in each: /dev/redwood-mic, kernel 2920), Baseband Voice (no call path); VirtualAudio.plugin stays; BTAudioHALPlugin {bt}; missing of tunings and sounds: {left or "none"}'
+    return f'RedwoodAudio.driver: Speaker, Hawking, Actuator (its open of /dev/redwood-haptic is tried again: actuator-retry.patch), Codec (4 channels, the one microphone in each: /dev/redwood-mic, kernel 2920), Baseband Voice (no call path); VirtualAudio.plugin stays; BTAudioHALPlugin: decided after the bluetooth hook (bt_audio); missing of tunings and sounds: {left or "none"}'
+
+
+def bt_audio(t, bt_on):
+    """BTAudioHALPlugin.driver: in HAL when the bluetoothd job is in this root (the bluetooth hook applied), else to HAL.disabled. The plug-in is how
+    bluetoothd's A2DP/HFP devices reach CoreAudio (Scion 84b0b1a: with it and bluetoothd, headphones play); without bluetoothd it waits for a mach
+    service that never comes, and its factory's XPC trapped the host on negroni (a trap stops all audio). BTAUDIO=1|0 overrides."""
+    hal = b'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver'
+    off = b'System/Library/Audio/Plug-Ins/HAL.disabled/BTAudioHALPlugin.driver'
+    keep = os.environ.get('BTAUDIO', '1' if bt_on else '0') == '1'
+    if keep and t.exists(off) and not t.exists(hal):
+        move(t, off, hal)
+    if keep:
+        t.audit('audio', 'applied', 'BTAudioHALPlugin.driver in HAL: the bluetoothd job is in this root (A2DP/HFP devices reach CoreAudio through it; Scion 84b0b1a). Not proven until a headset plays')
+    elif t.exists(hal):
+        move(t, hal, off)
+        t.audit('audio', 'applied', 'BTAudioHALPlugin.driver moved to HAL.disabled: no bluetoothd job in this root (BT=0 or its hook failed): its XPC trapped the host on negroni without one')
 
 
 def move(t, src, dst):
@@ -1363,9 +1374,12 @@ def parity(t, work):
     else:
         t.audit('cell', 'off', 'needs the notch hook: laurel-springboard inserts it, as iOS 16')
         t.audit('ringer', 'off', 'needs the notch hook: laurel-springboard inserts it')
-    if not feature(t, 'audio', 'AUDIO', audio):
+    audio_on = feature(t, 'audio', 'AUDIO', audio)
+    if not audio_on:
         virtual_audio_off(t)
-    feature(t, 'bluetooth', 'BT', bluetooth, work)
+    bt_on = feature(t, 'bluetooth', 'BT', bluetooth, work)
+    if audio_on:
+        bt_audio(t, bt_on)
     feature(t, 'camera-tables', 'CAMERA', camera_tables)
     t.audit('camera-plugin', 'off', CAMERA_REASON)
     if os.environ.get('TORCH', '1') == '0':
@@ -1450,7 +1464,9 @@ def _parity_real_checks(t, work, ok, jobs_of, line, tree, d, said):
     real('real: cell job', lambda: jobs[J + 'com.laurel.celld.plist']['KeepAlive'] is False and t.exists('usr/local/libexec/laurel-celld') and t.exists('usr/local/lib/liblaurel-cellbar.dylib'))
     real('real: ringer file', lambda: t.exists('usr/local/lib/liblaurel-ringer.dylib'))
     real('real: audio plug-in', lambda: t.n[B + b'RedwoodAudio.driver/RedwoodAudio'].mode == 0o755 and t.n[B + b'RedwoodAudio.driver/Info.plist'].mode == 0o644)
-    real('real: VirtualAudio stays, BTAudio moved', lambda: t.exists('Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio') and not t.exists(B + b'BTAudioHALPlugin.driver') and t.exists(b'System/Library/Audio/Plug-Ins/HAL.disabled/BTAudioHALPlugin.driver/BTAudioHALPlugin'))
+    real('real: VirtualAudio stays, BTAudio follows the bluetooth hook', lambda: t.exists('Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio') and
+         ((line(t, 'bluetooth').startswith('applied') and t.exists(B + b'BTAudioHALPlugin.driver/BTAudioHALPlugin')) or
+          (not line(t, 'bluetooth').startswith('applied') and not t.exists(B + b'BTAudioHALPlugin.driver') and t.exists(b'System/Library/Audio/Plug-Ins/HAL.disabled/BTAudioHALPlugin.driver/BTAudioHALPlugin'))))
     j = jobs.get(J + 'com.apple.bluetoothd.plist', {})
     real('real: bluetoothd job', lambda: j['EnvironmentVariables']['BT_HCI_TRANSPORT'] == 'H4BC:POSIX:com.apple.uart.bluetooth,3000000' and '_PanicOnCrash' not in j and '_PanicOnCrasX' in j)
     real('real: BlueTool stand-in', lambda: jobs[J + 'com.apple.BlueTool.plist']['ProgramArguments'] == ['/usr/libexec/negroni-bluetool'] and t.n[b'usr/libexec/negroni-bluetool'].mode == 0o755)

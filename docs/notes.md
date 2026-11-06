@@ -5543,3 +5543,9 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - GIC review (HakiOS f7f7fab): our `sleh_irq` EOIs on every path, the IPI is SGI 1, no active-IAR state; no change. watchdog.md section 14.
 - [V host, 2026-11-07] `scripts/laurel/ios26-encode-bench.sh`: one draw with no state change costs 5.16 us on the x86 host (real runtime, fat LTO, Turnip on drm-shim); with CA-like binds before it 7.70 us. Flat profile. `m2v-ios26/0005` (QoS on iOS, kill switch `NEGRONIMETAL_QOS=0`): built as `out/ios26/snap/plugin11`, not run on the phone.
 
+- 2026-11-07, patches 3002 + userland (branch t3/laurel-haptics-audio-lag on t3/integ-1107): Scion leads. (1) Haptic node timing: the plug-in opens
+  `/dev/redwood-haptic` once and keeps "not there" (Scion 027dd2b); 3002 makes the node with `/dev/topaz-audio` on the audio thread (before launchd),
+  `actuator-retry.patch` makes the plug-in's open retry; [V] the 11-03 boot had the node 14 s before audiomxd, so timing was not that boot's cause.
+  (2) BTAudioHALPlugin stays in HAL when the bluetoothd job is in the root (Scion 84b0b1a: A2DP plays through it); `bt_audio()` in the 26 spec,
+  `BTAUDIO` default follows `BT` in root-audio.sh. (3) bluetoothd's iAP PTY non-blocking through `laurel-bluetoothd` + `liblaurel-btpty.dylib`
+  (Scion 2e0c90a: a full PTY written under the stack mutex got bluetoothd aborted 20 s after pairing). docs/laurel_sprout/bluetooth.md "iAP PTY".
