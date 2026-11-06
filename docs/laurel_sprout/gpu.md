@@ -1351,3 +1351,7 @@ Reading, for Maps:
   msm DRM ABI that redwood-drm already maps; needs per-process GPU VA or the identity map kept); (3) metal2vulkan
   bundle as in ios-redfin/negroni; (4) CX (and MX for PLL rates) vote through RPM before clocks above 300 MHz. [I] A610 is a low-end gen1
   part: Vulkan 1.1 class, enough for CoreAnimation; heavy apps will be slow.
+
+## Timer coalescing off (2996, from Scion 8782070; built, NOT BOOTED)
+
+[V Scion S9] CoreAnimation ran at exactly 10 frames a second from mk_timers that fired up to 100 ms late: with `mach_timer_coalescing_enabled` the kernel slides a timer of a thread that is not real time by its class (`timer_coalesce_bg_ns_max` 100 ms for the background tier, 75 ms and more for the low latency tiers, `arm_timer.c`). The window server's frame timer and every client's display link are such timers. [V this port] the switch exists in xnu-12377 and xnu-8796 (`timer_call.c`, sysctl `kern.timer_coalescing_enabled`). 2996 turns it off as the framebuffer's vsync timer starts: `LAUREL TIMER COALESCING: on: the kernel's timer coalescing is off: ...`; kill switch `laureltcoal=0`. Expected: the "10.0 frames a second" windows of this doc and the 2-tick cadence of `ios26-default-speed.md` section 7 (33 % of the render thread in the vsync wait) shrink; measure with `LAUREL FRAME: motion ended` before and after.

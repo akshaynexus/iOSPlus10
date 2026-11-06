@@ -1,0 +1,42 @@
+laurel 2996: LAUREL TIMER COALESCING: the kernel's timer coalescing is off from the first frame (Scion 8782070); both kernels. docs/laurel_sprout/gpu.md "Timer coalescing".
+
+[V Scion S9] CoreAnimation ran at exactly 10 frames a second from mk_timers that fired up to 100 ms late: with mach_timer_coalescing_enabled
+a timer of a thread that is not real time is slid by its class (timer_coalesce_bg_ns_max 100 ms for the background tier, 75 ms and more for
+the low latency tiers; arm_timer.c). The window server's frame timer and every client's display link are such timers. The switch is the one of
+sysctl kern.timer_coalescing_enabled; the framebuffer turns it off as its vsync timer starts. Kill switch laureltcoal=0. One line.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 54f270b..5afe6be 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -51,6 +51,7 @@ extern "C" int laurel_fbcon_take_dirty(void);
+ extern "C" void laurel_fbcon_mute(void);
+ extern "C" void (*laurel_fbcon_show_hook)(void);
+ extern "C" unsigned panic_active(void);
++extern "C" boolean_t mach_timer_coalescing_enabled;     /* laurel 2996: osfmk/kern/timer_call.c, the switch of sysctl kern.timer_coalescing_enabled */
+ #define LAUREL_FBCON_REGISTERED 1
+ #define LAUREL_FBCON_SHADOW     2
+ #define LAUREL_FBCON_MUTED      4
+@@ -936,6 +937,22 @@ AppleCLCD::start(IOService *provider)
+ 	fPanelUS = SWEET_FB_VSYNC_US;
+ 	IOLog("SWEET FB: vsync %s the panel (%u lines a frame)\n", fVLock ? "follows" : "does not follow", fVTotal);
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	/*
++	 * laurel 2996 (Scion 8782070, their S9): the kernel's timer coalescing is off from the first frame. CoreAnimation draws a frame when a
++	 * timer of its own fires (mk_timer, the display link of each client too); with coalescing on, a timer of a thread that is not real time
++	 * may fire late by its class: up to 100 ms in the background tier (timer_coalesce_bg_ns_max), 75 ms and more in the low latency tiers.
++	 * [V Scion S9] the window server ran at exactly 10 frames a second from such late timers. Kill switch laureltcoal=0 leaves it on.
++	 */
++	{
++		uint32_t on = 1;
++
++		(void)PE_parse_boot_argn("laureltcoal", &on, sizeof(on));
++		if (on && mach_timer_coalescing_enabled) {
++			mach_timer_coalescing_enabled = FALSE;
++		}
++		IOLog("LAUREL TIMER COALESCING: %s: the kernel's timer coalescing is %s: a timer of the window server or a display link fires when it is due%s (kill switch laureltcoal=0)\n",
++		    on ? "on" : "off", mach_timer_coalescing_enabled ? "ON" : "off", mach_timer_coalescing_enabled ? ", or up to 100 ms late by its class" : "");
++	}
+ 	uint32_t sync = 0;
+ 	if (!(PE_parse_boot_argn("sweetfb_sync", &sync, sizeof(sync)) && sync != 0) && (fQLock = IOLockAlloc()) != NULL) {
+ 		thread_t thread;
