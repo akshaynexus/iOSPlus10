@@ -35,13 +35,20 @@ sleep 2
 [ "$(fb_get slot-count)" = 2 ] || die "fastboot: no two slots"
 _cs=$(fb_get current-slot)
 [ "$_cs" = b ] || die "current slot is '$_cs', not b: use scripts/laurel/ios26-retry.sh, which switches from Android"
-say "writing boot_b"
-# [V phone 2026-11-07] ABL fails every second command; the flash asks max-download-size and the partition size first,
-# so one of them can fail ("Requested download size is more than max allowed"): up to 4 tries, nothing is written by a failed one.
+# [V phone 2026-11-07 04:11 and 04:16] The getvars above use up the good turns of the session (ABL fails every second command, and the
+# flash itself asks max-download-size and the partition size first): a write after them failed 4 of 4 ("Requested download size is
+# more than max allowed"), and a write as the FIRST command of a fresh session (reboot bootloader, then flash) worked at 03:47, 04:16.
+# So: the checks keep their session; the write gets a fresh one. The slot stays b across `reboot bootloader`. Up to 4 fresh sessions.
 _w=1
-until fastboot flash boot_b "$IMG"; do
+while :; do
+  say "fresh fastboot session for the write (try $_w of 4)"
+  timeout 15 fastboot reboot bootloader >/dev/null 2>&1 || say "ABL did not take reboot bootloader"
+  sleep 2; wait_fb 40 || die "no fastboot after reboot bootloader: hold Power + Vol Down"
+  sleep 2
+  say "writing boot_b"
+  fastboot flash boot_b "$IMG" && break
   [ "$_w" -lt 4 ] || die "fastboot flash boot_b failed 4 times"
-  say "fastboot flash failed, try $((_w + 1)) of 4"; _w=$((_w + 1)); sleep 2
+  say "fastboot flash failed"; _w=$((_w + 1)); sleep 2
 done
 say "reboot into iOS"
 timeout 15 fastboot reboot >/dev/null 2>&1 || say "ABL did not take reboot: hold Power"

@@ -1,0 +1,83 @@
+laurel 3041: LAUREL LOCK TIMEOUT (2994) prints its line at EARLY_BOOT, not inside kernel_startup_bootstrap(); both kernels. docs/laurel_sprout/watchdog.md section 13.
+
+[V phone 2026-11-07 04:2x, image 9ebe4fa + laurelramtop=0] With 3040 in, the boot passed "SWEET EARLY 4: cpu_bootstrap done" and stopped
+before mark 5 ("kernel_startup_bootstrap done"): a blank row and two rows of dense text on the early console (sweet_early_panic: a
+newline, then the panic text), no USB. Between the two marks runs kernel_startup_bootstrap(): the TUNABLES, TIMEOUTS and LOCKS phases.
+2994's printf sits in ml_init_lock_timeout(), STARTUP(TIMEOUTS): printf -> os_log_with_args -> _os_log_to_msgbuf_internal ->
+bsd_log_lock -> lck_ticket_lock(&log_lock); log_lock (LCK_TICKET_DECLARE in osfmk/kern/printf.c) gets its type word at STARTUP(LOCKS,
+rank 4), later; the DEVELOPMENT kernel's LCK_TICKET_VERIFY sees lck_ticket_type 0, not LCK_TYPE_TICKET (0x44), and panics "Invalid
+ticket lock" [I: read in the code; the photo shows the panic rows, not the words]. The kill switch laurellockto=0 printed its "off"
+line from the same place. A good boot's first printf is "iBoot version" (PE_init_platform(TRUE), after kernel_startup_bootstrap()).
+Fix: the decision and the timeouts stay at TIMEOUTS (they must hold from the first contended lock); the line prints from
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, laurel_lock_timeout_line), where LAUREL RAM prints too. Host test: scripts/laurel/test-early-lines.sh.
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -676,6 +676,10 @@
+ 	return Shutdown_context(doshutdown, processor);
+ }
+ 
++/* laurel 3041: what ml_init_lock_timeout() decided; laurel_lock_timeout_line() prints it at EARLY_BOOT */
++static uint32_t laurel_lockto_on;
++static uint64_t laurel_lockto_lto, laurel_lockto_tlto;
++
+ /*
+  *      Routine:        ml_init_lock_timeout
+  *      Function:
+@@ -736,16 +740,10 @@
+ 			os_atomic_store(&TLockTimeOut, lto_now >> 1, relaxed);
+ 			tlto_now = lto_now >> 1;
+ 		}
+-		uint64_t lto_ns = 0, tlto_ns = 0;
+-
+-		absolutetime_to_nanoseconds(lto_now, &lto_ns);
+-		absolutetime_to_nanoseconds(tlto_now, &tlto_ns);
+-		if (!on) {
+-			printf("LAUREL LOCK TIMEOUT: off: kill switch laurellockto=0: a spin lock waits for ever (spin %llu ms, ticket %llu ms)\n", lto_ns / NSEC_PER_MSEC, tlto_ns / NSEC_PER_MSEC);
+-		} else {
+-			printf("LAUREL LOCK TIMEOUT: on: a spin lock waits at most %llu ms, a ticket lock %llu ms, then a panic names the lock and its holder (wdt=-1 had left 0: a silent CPU); kill switch laurellockto=0\n",
+-			    lto_ns / NSEC_PER_MSEC, tlto_ns / NSEC_PER_MSEC);
+-		}
++		/* laurel 3041: the line prints at EARLY_BOOT (laurel_lock_timeout_line), not here: see there */
++		laurel_lockto_on = on;
++		laurel_lockto_lto = lto_now;
++		laurel_lockto_tlto = tlto_now;
+ 	}
+ 
+ 	uint64_t mtxspin;
+@@ -776,6 +774,34 @@
+ }
+ STARTUP(TIMEOUTS, STARTUP_RANK_MIDDLE, ml_init_lock_timeout);
+ 
++/*
++ * laurel 3041: the line of 2994 printed from ml_init_lock_timeout(), a STARTUP(TIMEOUTS) function, inside kernel_startup_bootstrap():
++ * before the LOCKS phase. printf -> os_log_with_args -> _os_log_to_msgbuf_internal -> bsd_log_lock -> lck_ticket_lock(&log_lock), and
++ * log_lock (LCK_TICKET_DECLARE, osfmk/kern/printf.c) gets its type word only at STARTUP(LOCKS, rank 4): the DEVELOPMENT kernel's
++ * LCK_TICKET_VERIFY sees lck_ticket_type 0, not LCK_TYPE_TICKET, and panics "Invalid ticket lock" [V phone 2026-11-07 04:2x: after
++ * "SWEET EARLY 4: cpu_bootstrap done" the early console showed a blank row and two rows of dense text (sweet_early_panic prints a
++ * newline, then the panic text) and never mark 5; no USB]. The kill switch printed its "off" line from the same place. A good boot's
++ * first printf is "iBoot version" from PE_init_platform(TRUE), after kernel_startup_bootstrap(). The values stay set at TIMEOUTS (the
++ * lock timeouts must hold from the first contended lock); the line prints at EARLY_BOOT, where LAUREL RAM prints too.
++ */
++
++__startup_func
++static void
++laurel_lock_timeout_line(void)
++{
++	uint64_t lto_ns = 0, tlto_ns = 0;
++
++	absolutetime_to_nanoseconds(laurel_lockto_lto, &lto_ns);
++	absolutetime_to_nanoseconds(laurel_lockto_tlto, &tlto_ns);
++	if (!laurel_lockto_on) {
++		printf("LAUREL LOCK TIMEOUT: off: kill switch laurellockto=0: a spin lock waits for ever (spin %llu ms, ticket %llu ms)\n", lto_ns / NSEC_PER_MSEC, tlto_ns / NSEC_PER_MSEC);
++	} else {
++		printf("LAUREL LOCK TIMEOUT: on: a spin lock waits at most %llu ms, a ticket lock %llu ms, then a panic names the lock and its holder (wdt=-1 had left 0: a silent CPU); kill switch laurellockto=0\n",
++		    lto_ns / NSEC_PER_MSEC, tlto_ns / NSEC_PER_MSEC);
++	}
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, laurel_lock_timeout_line);
++
+ 
+ /*
+  * This is called when all of the ml_processor_info_t structures have been
