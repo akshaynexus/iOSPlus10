@@ -228,3 +228,63 @@ Expected at the next catch: `panic(... Spinlock[0x...] timeout ... current owner
 ## 14. GIC review against HakiOS f7f7fab (GIC_IAR_TAKEN): the IPI's end-of-interrupt on this port [V code]
 
 HakiOS's fault: its IPI is SGI 0, `ICC_IAR1_EL1` reads 0 for it, and a "0 = none" mark lost the EOI when a core was switched off inside that interrupt (every core but one, in a panic); the next kernel on that core then took no interrupt (an active priority left in the CPU interface). This port: the IPI is SGI 1 (`SWEET_IPI_SGI`), `sleh_irq` keeps the raw `iar` in a local and writes `ICC_EOIR1_EL1` on every path: the timer (after `rtclock_intr`), SGIs (before `cpu_signal_handler`, so a signal raised meanwhile is not lost), the bark (SPI 3) and every other interrupt (after the IOKit handler). Only 1020-1023 return with no EOI, which is right for a spurious read. No `gic_active_iar` state exists, so no mark can be lost. A core never goes off while in an interrupt here (no CPU_OFF: `haltCPU` panics), and `laurel_gicr_setup` of each core at boot deactivates and clears its SGIs and PPIs and writes `ICC_AP1R0_EL1 = 0` (laurel 2013), so a core left in an interrupt by a panic hold and a reset starts the next kernel clean. No change made.
+
+## 15. 2026-11-07: USB control through every panic and hang: patches 3030, 3031, mu 0202 (branch t3/usb-hold-pmic-wdog; built, NOT BOOTED)
+
+Owner's order: "make it so that kernel panic don't stop usb control". Three cases, one cause each, and one backstop that needs no CPU.
+
+### Case 1: the hold of 17:56:16 sent "holding" and then took nothing for 44 minutes
+
+[V `logs/usblog-20261103-071332.txt` 222993-222994] The bark report went out, `LAUREL PANIC: holding; reset with: op10tool ctl bootloader` went out, and the next line in the log is the owner's reset at 18:40:17. The two other bark holds of that day (18:41:57, 18:48:00) and the stackshot panic of 07:25:51 answered `ping` and `bootloader`. So the hold loop ran at least long enough to send; what died was the way in.
+
+[V code] The hold receives through one TRB (`UD_TRB_RX`): `ud_rx_done` reads the frame, hands it to `ud_panic_rx`, then `ud_rx_arm` queues the TRB again. In normal running the same code runs in `ud_thread` (or the timer call of 2013) from `ud_service_events`, which reads an event, advances `evt_pos`, acks it in `GEVNTCOUNT`, then handles it. A panic on another CPU stops `ud_thread` with the debugger IPI wherever it is. The hold then inherits that state: a frame read but the TRB not queued again (no receive, ever), an event acked but not handled (the RX completion is lost: no receive, ever), `evt_pos` advanced but the ack not written (the hold reads one stale slot: a stale "bus reset" turns the data endpoints off), or an endpoint command half done. The TX side does not care: the hold starts its own transfers and ends a stuck one after 2 s. That is the asymmetry of 17:56: sending worked, receiving did not. At 17:56 CPU 0 ran `dropbearmulti` (an SSH session) with 94 frames queued: the USB thread was busy when the IPI came. Mark [I]: the log cannot show where the thread stood; this is the only path found in the code that gives exactly "sends, never receives", and the fix removes every such path.
+
+Also found [V code]: `laurel_wdog_hold` (2987) printed with `kprintf`, which spins on `kprintf_lock` with no way out; a CPU the panic stopped inside a `kprintf` (the panel console at 300 MHz takes 700 us a line) holds that lock for ever, and the hold would never start. And a nested panic inside the hold (a fault in the loop) went to `panic_spin_forever` with the text on the panel only: silence on USB, only the Power key.
+
+**3031** (both kernels, `sweet_usb.c`, `laurel_wdog.c`, `laurel_reboot.c`):
+
+| Change | What |
+|---|---|
+| `ud.evt_stage`, `ud.evt_cur` | `ud_service_events` leaves a mark at each step (1 read, 2 position advanced, 3 acked, 4 inside `ud_event`). `ud_panic_resync` at the hold start reads it: stage 2 steps the position back one slot (the count still holds the event), stage 3 handles the event now, stage 4 says so and re-arms. A hold then never reads a stale slot and never loses the acked event |
+| `ud_panic_rearm` | At the hold start, always: ENDTRANSFER + FORCERM on the RX endpoint when it has a transfer, then a fresh RX TRB; a consumed SETUP with no TRB behind it gets one. And again after 15 s with no frame from the host (a silent host costs one command, a lost TRB comes back). Line `LAUREL PANIC: USB hold: RX re-armed (why), N in all` |
+| `ud_rx_done` | a completion for a TRB the controller still owns (`HWO` set) is not a frame: counted, not re-armed twice |
+| nested panic in the hold | `LAUREL PANIC: nested panic in the USB hold: reset in 5 s`, then `laurel_restart` (mode normal: the boot menu); a third entry resets by PSCI alone (`laurel_reset_raw`) |
+| `laurel_wdog_hold` | `kdb_printf`, no lock |
+
+What the hold cannot fix: a hold CPU that dies (a fault, a stuck register read): that is case 2's backstop.
+
+### Case 2: a hang with no bark, and the bite that does not reset
+
+[V 2026-11-03 18:48] The APSS bite gave no reset in 90 s. [V downstream `msm-poweroff.c`] Android calls `SCM_SVC_BOOT 0x9` ("WDOG_DEBUG_BOOT_PART", "Needed to bypass debug image on some chips") before its own resets: a bite on this firmware goes to TrustZone's debug image path, and whether that path resets a retail phone with no dload cookie is [U]; the phone stayed in the hold, so the APSS was not reset at all. Not resolved here; not needed any more.
+
+[V downstream `qpnp-power-on.c`, mainline `drivers/watchdog/pm8916_wdt.c`] The PM6125 PON has its own watchdog: S1 timer 0x854 and S2 timer 0x855 in seconds (7 bits), S2 control 0x856 (reset type: 1 warm, 4 shutdown, 7 hard), S2 control 2 0x857 bit 7 enable, pet 0x858 bit 0. No pet for S1 s: a bark (an SPMI interrupt, unused here); S2 s more: the PMIC resets the SoC through the PON, the same path as a long press of the Power key (2955), with no CPU and no TrustZone. Android never pets it [V: the only user is `qpnp_pon_wd_config(0)` before download mode]; the PON lane of our SPMI core reaches these registers (2018/2710, the lane every `ctl bootloader` uses [V]).
+
+**3030** (both kernels, new `bsd/dev/laurel_pmic_wdog.c` + `laurel_pmic_wdog_core.h`): `LAUREL PMIC WDOG: on: PM6125 PON watchdog, no pet for 60 s + 2 s: hard reset by the PMIC ...; found off|armed ...; laurelpmicwdog=0`, or `off: REASON` (no PON lane; the PMIC does not hold the setting; `laurelwdog=0`: no pet thread, so nothing may stay armed). Pets, each at most once a second: the APSS watchdog thread (2986) when every CPU in use answered its signal in the last 8 s (the same rule as the hardware pet, also when the APSS hardware is off), the USB panic hold loop at each turn, the timed reset of `laurel_panic_final` while it waits. Disarmed before every reset and power off of ours (`laurel_restart`, `laurel_power_off`: ABL's fastboot and the menu wait for the owner; a power-off with an armed count would turn the phone on again). Reset type hard: the PMIC power-cycles the SoC and its configuration starts clean [I], so a phone that ABL's retries send to Android does not carry an armed count into Android.
+
+| Case | Before | Now |
+|---|---|---|
+| One CPU stuck, interrupts off | bark 20 s, hold, reset 20 s later (2990) [V 11-06: 16 of 16 came back] | the same; the PMIC count stays petted by the hold |
+| All CPUs stop, or interrupts off everywhere | nothing: Power key | the PMIC resets 62 s after the last pet |
+| A panic that stops before its hold (a fault in the panic path, the console) | nothing | the same 62 s |
+| The hold loop dies | nothing (17:56) | 62 s |
+| A pet thread that cannot run for 60 s (every CPU busy with interrupts on) | a bark at 12 s (2986) | the same bark first |
+
+Host test [V]: `scripts/laurel/pmic-wdog-test.sh`: 18 checks of the rules header, and every `LPW_` number of the UEFI side equals the kernel's.
+
+### Case 3: a hang before the gadget starts, and the boot menu's own count
+
+[V 2026-11-07 03:45] Two boots stopped at `SWEET EARLY ... PE_init` with no USB device. Nothing of the kernel runs yet: no thread, no gadget, no pet. The way back must be armed before the kernel.
+
+**mu 0202** (`tools/laurel-slot/uefi/LaurelPmicWdog.c`, copied into UniXNULib by `mu-build.sh`; patch `0202-unixnu-laurel-pmic-wdog`): the menu reaches the PON through the SPMI arbiter's own registers (core 0x1C40000: version, APID count, the PPID map; config 0x1C0A000: the owner EE of each APID; observer channel for reads, rw channel for writes), the same recipe as `sweet_spmi.c` [V on this phone: `PON APID 112 rw lane mapped`], at `TPL_HIGH_LEVEL` so no firmware callback interleaves. At the menu start: `LAUREL PMIC WDOG: on: arbiter .., PON APID ..; found off|armed ..` and a count found armed goes off (the menu may wait for minutes; a warm reset keeps the PMIC's registers). Right before `Loader->Boot` in `RunXnu`: armed with S1 100 s, S2 2 s, hard reset, one pet: `LAUREL PMIC WDOG: on: armed: no pet for 100 s + 2 s from here`. The kernel's 3030 finds it (`found armed, hard reset (the boot loader)`), writes its own 60 s and pets. `laurelpmicwdog=0` in the entry's command line: the menu arms nothing and the kernel disarms what it finds. The Android entry disarms before its reset. A loader that returns: disarmed.
+
+So a kernel that hangs at `PE_init` now ends in a hard reset 102 s after the jump, ABL takes one more retry of slot b, the menu shows again, and after at most 7 such boots ABL boots Android (boot-menu.md section 4), with no key and no computer.
+
+**The menu's count of failed starts** (boot-menu.md section 10): ABL takes one retry before it loads boot_b, so a menu on a slot b that is not successful sees 6 - N where N boots in a row did not reach a refill. The menu now says `iOS failed N boot(s) in a row. Android after R more boots: press a key to stay` from the first one. With a kernel marked good (`scripts/laurel/mark-kernel-good.sh`, entry `ios-lastgood` in the payload) and N >= 2, that entry is the default: `iOS failed N boots in a row: the last good kernel boots. Android after R more`. No write by Mu: the count is ABL's. Rule in `ls_fallback_plan` (`tools/laurel-slot/laurel_slot.c`), host test in `test_slot.c` [V 688 checks].
+
+### What needs the phone
+
+1. The kernel line `LAUREL PMIC WDOG: on: ... found armed, hard reset (the boot loader)` after the menu's `LAUREL PMIC WDOG: on: armed`: both lanes reach the PMIC.
+2. `op10tool ctl panic`, then `ctl ping` in the hold: `LAUREL PANIC: USB hold: RX re-armed (hold start), 1 in all` in the log, `pong (panic)`; after 15 s of silence one more `RX re-armed (no frame for 15 s)`; `ctl bootloader` still lands in fastboot (so the disarm before the reset works: `LAUREL PMIC WDOG: off: reset: disarmed`).
+3. The reset itself, once, on purpose: `EXTRA_ARGS=laurelwdog=0` makes 3030 disarm (no pet thread)... so instead: a boot with `laurelpmicwdog=1` and a hang. The first real hang of the phone shows it: the log stops, the phone is in the menu about 62 s later (kernel count) or 102 s after the jump (menu count). **Then, before anything else, read the PMIC WD state in Android after a WD reset**: `adb shell su -c 'cat /sys/kernel/debug/regmap/spmi0-00/registers | grep ^857'` must say `857: 00` (the hard reset cleared the enable). If it says `80`, the count survives a hard reset: then Android would reset 102 s into every boot that follows a WD reset, and the menu's arming must go (`laurelpmicwdog=0` in `uefi-image.sh` until a disarm path for ABL's fallback exists). [I] it clears; [U] on this PMIC.
+4. ABL after a PMIC hard reset: the menu again, retries one less (the notice line counts), no fastboot, no EDL.
+5. iOS 16: the same patches apply (both kernels build); not booted.

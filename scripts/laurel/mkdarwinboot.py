@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """UniXNU payload volume (FAT) for the Mi A3 (laurel_sprout) XNU kernel, booted by DarwinBoot.
 
-usage: mkdarwinboot.py KERNEL ADT OUT.img --cmdline "..." [--size-mib 48] [--timeout 3] [--entry-title TEXT] [--android-entry]
+usage: mkdarwinboot.py KERNEL ADT OUT.img --cmdline "..." [--size-mib 48] [--timeout 3] [--entry-title TEXT] [--android-entry] [--last-good KERNEL]
 
 Port of external/slop/negroni-ios/tools/mkdarwinboot.py to the topaz tool chain (external/ios-topaz/tools/mkpayload.py
 gives parse_macho/apply_chained_fixups). DarwinBoot copies the kernel's segments as they are in the file, so the
@@ -49,6 +49,16 @@ action = "laurel-android"
 confirm = "Restart into Android?"
 '''
 
+# mu 0202: a kernel the owner marked good (scripts/laurel/mark-kernel-good.sh). The menu boots it by default after LS_LASTGOOD_AT failed boots in a row (boot-menu.md section 10).
+LASTGOOD_ENTRY = '''
+[[entry]]
+id = "ios-lastgood"
+title = "iOS: last good kernel ({stamp})"
+type = "xnu"
+path = '\\Payloads\\kernel-lastgood.macho'
+args = "{cmdline}"
+'''
+
 
 def main():
     a = sys.argv[1:]
@@ -64,6 +74,7 @@ def main():
     android = '--android-entry' in a
     if android:
         a.remove('--android-entry')
+    last_good = opt('--last-good')
     if len(a) != 3:
         sys.exit(__doc__)
     kernel, adt, out = a
@@ -80,7 +91,15 @@ def main():
         os.makedirs(f'{d}/EFI/UniXNU'); os.makedirs(f'{d}/Payloads')
         open(f'{d}/Payloads/kernel.macho', 'wb').write(buf)
         shutil.copy(adt, f'{d}/Payloads/kernel.macho.adt')
-        open(f'{d}/EFI/UniXNU/unixnu.toml', 'w').write(TOML.format(timeout=timeout, title=title, cmdline=cmdline.replace('"', '\\"')) + (ANDROID_ENTRY if android else ''))
+        toml = TOML.format(timeout=timeout, title=title, cmdline=cmdline.replace('"', '\\"')) + (ANDROID_ENTRY if android else '')
+        if last_good:
+            lg = bytearray(open(last_good, 'rb').read())
+            apply_chained_fixups(lg, parse_macho(lg))
+            open(f'{d}/Payloads/kernel-lastgood.macho', 'wb').write(lg)
+            shutil.copy(adt, f'{d}/Payloads/kernel-lastgood.macho.adt')
+            stamp = open(last_good + '.stamp').read().split('\n')[0].replace('stamp=', '')[:40] if os.path.exists(last_good + '.stamp') else 'marked good'
+            toml += LASTGOOD_ENTRY.format(stamp=stamp.replace('"', ''), cmdline=cmdline.replace('"', '\\"'))
+        open(f'{d}/EFI/UniXNU/unixnu.toml', 'w').write(toml)
         if os.path.exists(out):
             os.remove(out)
         with open(out, 'wb') as f:

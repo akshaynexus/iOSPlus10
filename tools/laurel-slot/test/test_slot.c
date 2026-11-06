@@ -418,6 +418,20 @@ static void test_plans(void)
   CHECK(ls_plan_refill(0x77, 0x7B, &a, &b, &why) != 0, "refill: b not active");
   CHECK(ls_plan_refill(0x33, 0x0F, &a, &b, &why) != 0, "refill: a not successful");
   CHECK(ls_plan_refill(0x73, 0x8F, &a, &b, &why) != 0, "refill: b unbootable");
+  /* mu 0202: the fallback plan reads the retries; ABL took one before the menu, so 6 = no failed boot */
+  { unsigned r, failed = 99;
+    for (r = 0; r <= 7; r++) {
+      ls_u8 in = (ls_u8)(0x07 | (r << LS_RETRY_SHIFT));
+      unsigned want = r < 6 ? 6 - r : 0;
+      int plan = ls_fallback_plan(in, 1, &failed);
+      CHECK(failed == want, "fallback r=%u: failed %u, want %u", r, failed, want);
+      CHECK(plan == ((want >= LS_LASTGOOD_AT && r > 0) ? 1 : 0), "fallback r=%u: plan %d", r, plan);
+      CHECK(ls_fallback_plan(in, 0, &failed) == 0, "fallback r=%u: no last good entry, no plan", r);
+    }
+    CHECK(ls_fallback_plan(0x7F, 1, &failed) == 0 && failed == 0, "fallback: successful b says nothing");
+    CHECK(ls_fallback_plan(0x8B, 1, &failed) == 0 && failed == 0, "fallback: unbootable b says nothing");
+    CHECK(ls_fallback_plan(0x0B, 1, &failed) == 0 && failed == 0, "fallback: inactive b says nothing");
+  }
 }
 
 /* the whole cycle on the model */

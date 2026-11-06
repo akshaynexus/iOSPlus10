@@ -1,0 +1,70 @@
+laurel boot menu (mu 0202): the PM6125 PON watchdog armed right before DarwinBoot (tools/laurel-slot/uefi/LaurelPmicWdog.c, copied in by mu-build.sh), disarmed at the menu start and before the Android reset; a hang before the kernel watchdog thread hard-resets in 102 s with no key. docs/laurel_sprout/watchdog.md section 15, boot-menu.md section 10.
+
+--- a/package/UniXNUPkg/Library/UniXNULib/Boot.c	2026-11-07 04:22:36.902766301 +0530
++++ b/package/UniXNUPkg/Library/UniXNULib/Boot.c	2026-11-07 04:22:36.938021012 +0530
+@@ -39,6 +39,7 @@
+           return Status;
+         }
+ 
++        LaurelPmicWdogDisarm ();   // iOSPlus10 laurel (mu 0202)
+         UniXNULog ("action: reset for Android");
+         gRT->ResetSystem (EfiResetCold, EFI_SUCCESS, 0, NULL);
+         break;
+@@ -110,7 +111,12 @@
+   Request.Kexts          = Kexts;
+   Request.KextCount      = KextCount;
+   UniXNULog ("xnu: handing off %u staged kext(s) to loader", (UINT32)KextCount);
++  //
++  // iOSPlus10 laurel (mu 0202): the PMIC counts from here. A kernel that hangs before its own watchdog thread resets in LPW_S1_BOOT_S + 2 s, with no key.
++  //
++  LaurelPmicWdogArm (Entry->Args);
+   Status = Loader->Boot (Loader, &Request);
++  LaurelPmicWdogDisarm ();   // the loader returned: no boot, no count
+   UniXNUFreeKexts (Kexts, KextCount);
+   return Status;
+ }
+--- a/package/UniXNUPkg/Library/UniXNULib/Internal.h	2026-11-07 04:22:36.886766122 +0530
++++ b/package/UniXNUPkg/Library/UniXNULib/Internal.h	2026-11-07 04:22:36.936399150 +0530
+@@ -621,4 +621,22 @@
+ 
+ extern BOOLEAN  gLaurelKeyHeard;
+ 
++//
++// iOSPlus10 laurel (mu 0202): LaurelPmicWdog.c, the PM6125 PON watchdog armed before DarwinBoot
++//
++VOID
++LaurelPmicWdogSelfCheck (
++  VOID
++  );
++
++VOID
++LaurelPmicWdogArm (
++  IN CONST CHAR16  *Args
++  );
++
++VOID
++LaurelPmicWdogDisarm (
++  VOID
++  );
++
+ #endif
+--- a/package/UniXNUPkg/Library/UniXNULib/Main.c	2026-11-07 04:22:36.894766211 +0530
++++ b/package/UniXNUPkg/Library/UniXNULib/Main.c	2026-11-07 04:22:36.937235938 +0530
+@@ -106,6 +106,7 @@
+ 
+   UniXNUUiInit (&Config, &Ui);
+   LaurelSlotSelfCheck (&Config, Ui.Notice, sizeof (Ui.Notice));
++  LaurelPmicWdogSelfCheck ();   // iOSPlus10 laurel (mu 0202): a count left armed goes off; the menu may wait for minutes
+   UnicodeSPrint (
+     Ui.Info,
+     sizeof (Ui.Info),
+--- a/package/UniXNUPkg/Library/UniXNULib/UniXNULib.inf	2026-11-07 04:22:36.911766401 +0530
++++ b/package/UniXNUPkg/Library/UniXNULib/UniXNULib.inf	2026-11-07 04:22:36.938352448 +0530
+@@ -21,6 +21,7 @@
+   Inject.c
+   Kext.c
+   LaurelSlot.c
++  LaurelPmicWdog.c
+   laurel_slot.c
+   laurel_slot.h
+   Logo.c

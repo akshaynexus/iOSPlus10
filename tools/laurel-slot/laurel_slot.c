@@ -152,6 +152,15 @@ int ls_plan_android(ls_u8 a, ls_u8 b, ls_u8 *new_a, ls_u8 *new_b, const char **w
   return 0;
 }
 
+int ls_fallback_plan(ls_u8 b, int has_lastgood, unsigned *failed)
+{
+  unsigned r = LS_RETRIES(b);
+  *failed = 0;
+  if (!(b & LS_ACTIVE) || (b & LS_SUCCESSFUL) || (b & LS_UNBOOTABLE)) return 0;
+  if (r < LS_RETRY_MAX - 1) *failed = LS_RETRY_MAX - 1 - r;
+  return (has_lastgood && *failed >= LS_LASTGOOD_AT && r > 0) ? 1 : 0;
+}
+
 int ls_refill_gate(int key_heard, ls_u32 imem_word, const char **why)
 {
   if (imem_word == LS_PANIC_WORD) { *why = "the last iOS boot panicked"; return -1; }

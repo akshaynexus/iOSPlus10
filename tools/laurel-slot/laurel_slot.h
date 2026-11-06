@@ -26,6 +26,7 @@ typedef UINT8 ls_u8; typedef UINT16 ls_u16; typedef UINT32 ls_u32; typedef UINT6
 
 #define LS_RETRY_MAX     7u  /* what the HAL and ABL write */
 #define LS_REFILL_AT     3u  /* the menu writes again only at or below this: one GPT write per 4 boots, and a broken Mu still has at least 3 boots to fall */
+#define LS_LASTGOOD_AT   2u  /* mu 0202: this many iOS boots in a row did not end well (ABL counted them): the "last good kernel" entry becomes the default */
 
 /* IMEM restart_reason (0x0C125000 + 0x65C, the word the kernel writes anyway, laurel_reboot.c). Kernel patch 2956 writes this value at a panic */
 #define LS_IMEM_RESTART_PA  0x0C12565Cu
@@ -86,6 +87,13 @@ ls_status ls_load(const ls_disk *d, ls_table *t);
  * ls_refill_gate: may this boot refill at all? Only after a real key event in this menu (a handle count proves nothing: ButtonsDxe can install and give no event, a GOP can
  * exist on a dark panel), and not when the last iOS boot left the panic word. No: ABL's count goes on, and it returns to Android with no computer.
  */
+/*
+ * ls_fallback_plan (mu 0202): what the retries say about the boots before this one, with no store of our own. ABL takes one retry before it loads boot_b,
+ * so a menu on a slot b that is not successful sees at most 6: failed = 6 - retries boots of iOS in a row did not reach a refill (a kernel that hangs, panics or
+ * resets by a watchdog; a key in the menu refills and ends the count). *failed gets that number (0 when the flags say nothing). Returns 1 when the menu
+ * should boot the last good kernel by default: has_lastgood, failed >= LS_LASTGOOD_AT and retries left; else 0. Reads only.
+ */
+int ls_fallback_plan(ls_u8 b, int has_lastgood, unsigned *failed);
 int ls_refill_gate(int key_heard, ls_u32 imem_word, const char **why);
 int ls_plan_android(ls_u8 a, ls_u8 b, ls_u8 *new_a, ls_u8 *new_b, const char **why);
 int ls_plan_refill(ls_u8 a, ls_u8 b, ls_u8 *new_a, ls_u8 *new_b, const char **why);

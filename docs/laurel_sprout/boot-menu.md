@@ -260,3 +260,19 @@ Time [I]: if each step passes, about 1 hour with the owner at the phone. A failu
 - Kernel: 2950 is not touched. 2955 changes only `laurel_reboot.c`. 2956 adds a panic path in `laurel_reboot.c`, `SweetPlatformExpert.cpp`, `osfmk/kern/debug.c`.
 - `FW_B` moved from `dual-boot.sh` to `laurel-layout.sh`: one list for `check_fw_b` and the app's mark.
 - iOS and Android keep apart: the menu reads and writes only the sde table, mounts nothing, and opens neither `userdata` nor `iosroot`. The fence is in 2950. O1 is about LUN 4; the approved GPT write of `dual-boot.md` D8 is about LUN 0 only, so it does not cover this.
+
+## 10. No host for a kernel that fails N times: the PMIC watchdog and the last good kernel (2026-11-07, mu 0202, kernel 3030/3031; built, NOT BOOTED)
+
+Owner's order: "make the boot menu or DarwinBoot not depend on the host for recovery when a kernel fails N times in a row (fall back to the last good boot image or Android), with one line on the screen". Full text: `watchdog.md` section 15.
+
+| What | How | Mark |
+|---|---|---|
+| A kernel that hangs before its own watchdog (`SWEET EARLY ... PE_init`, 2026-11-07 03:45) | the menu arms the PM6125 PON watchdog right before DarwinBoot (`LaurelPmicWdog.c`): 100 s + 2 s, then a hard reset by the PMIC, no CPU. The kernel takes it over at `LAUREL PMIC WDOG` (3030), 60 s, petted every second. ABL counts the boot as one retry | [V code, host test], [U] phone |
+| The count of failed starts | ABL's retries: the menu reads them (no store of our own, no write). `iOS failed N boot(s) in a row. Android after R more boots: press a key to stay` from the first failed boot | [V code, `test_slot`] |
+| The last good kernel | `scripts/laurel/mark-kernel-good.sh [KERNEL]` keeps a copy in `out/laurel/uefi/last-good/`; `uefi-image.sh` adds it as the entry `ios-lastgood` (`LAST_GOOD_KERNEL=none` leaves it out). At 2 failed boots in a row (`LS_LASTGOOD_AT`) the menu makes it the default: `iOS failed N boots in a row: the last good kernel boots. Android after R more`. It gets the retries left; then Android | [V code, `test_slot`] |
+| Android | unchanged: ABL at retries 0 (section 4). The Android entry disarms the PMIC count before its reset | [V code] |
+| The menu itself | a count found armed at the menu start is disarmed: the menu may wait. `laurelpmicwdog=0` in the command line: nothing armed, the kernel disarms what it finds | [V code] |
+
+Payload: the second kernel costs its size (3.1 MB of the 48 MiB FAT). The same kernel as the main entry adds no second entry (`cmp`).
+
+Lines on the log: `LAUREL PMIC WDOG: on: arbiter 5000.., PON APID 112; found off ...; armed at the jump into DarwinBoot`, then `LAUREL PMIC WDOG: on: armed: no pet for 100 s + 2 s from here ...`; `LAUREL SLOT: N iOS boot(s) in a row did not end well (retries R)`.

@@ -1,0 +1,206 @@
+laurel 3031: the USB panic hold serves in every case the stopped USB thread can leave: the event ring is read against a mark of where ud_service_events was, the data path (the one RX TRB) is re-armed from a known state at the hold start and after 15 s with no frame, a completion for a TRB the controller still owns is not a frame, a nested panic inside the hold resets in 5 s instead of a silent spin, and the bark line of the hold uses kdb_printf (kprintf spins on a lock a stopped CPU can hold). Cause of 2026-11-03 17:56:16 (holding, then no pong for 44 min) [I]: the panic IPI stopped ud_thread between the frame read and ud_rx_arm, or between the ack and the handling of the RX completion: no TRB, no receive, while the TX side still sent "holding". Both kernels. docs/laurel_sprout/watchdog.md section 15.
+
+--- a/bsd/dev/laurel_reboot.c	2026-11-07 04:25:20.710994701 +0530
++++ b/bsd/dev/laurel_reboot.c	2026-11-07 04:26:50.186142225 +0530
+@@ -309,6 +309,14 @@
+ 	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_RESET returned %lld\n", (long long)rc);
+ }
+ 
++/* laurel 3031: the last way out of a panic hold that panicked again: PSCI alone, no SPMI, no IMEM, nothing that can fault. */
++void laurel_reset_raw(void);
++void
++laurel_reset_raw(void)
++{
++	(void)lr_psci(PSCI_SYSTEM_RESET);
++}
++
+ /* laurel 2956: from kPEPanicBegin on. Before laurel_reboot_prepare there is no mapping: no word, and the menu's gate still needs a key. */
+ void laurel_panic_mark(void);
+ void
+--- a/bsd/dev/sweet_usb.c	2026-11-07 04:25:20.714823962 +0530
++++ b/bsd/dev/sweet_usb.c	2026-11-07 04:29:52.271521794 +0530
+@@ -272,6 +272,9 @@
+ 	vm_offset_t dma;
+ 	uint64_t    dma_pa;
+ 	uint32_t    evt_pos;
++	/* laurel 3031: where ud_service_events is, for a panic that stops the CPU inside it (ud_panic_resync) */
++	volatile uint32_t evt_stage;    /* 0 idle; 1 event read, nothing else; 2 evt_pos advanced, not acked; 3 acked, not handled; 4 inside ud_event */
++	volatile uint32_t evt_cur;      /* the event of stages 1-4 */
+ 	int         sleep_chan;
+ 	enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS2, EP0_WAIT_STATUS3, EP0_STATUS } state;
+ 	bool        data_in;        /* data stage direction */
+@@ -319,6 +322,10 @@
+ static int  ud_reset_end = 1;
+ static int  ud_poll_chan;               /* ud_thread's poll sleep (ud_if_output wakes it) */
+ static bool ud_running;                 /* gadget set up (event buffer, ep0) */
++static uint32_t ud_rx_stale;            /* laurel 3031: RX completions for a TRB the controller still owns */
++static uint32_t ud_panic_rearms;        /* laurel 3031: data path re-armed in the hold */
++static uint64_t ud_panic_rx_at;         /* laurel 3031: the last received frame, or re-arm, in the hold */
++static uint64_t ud_panic_rx_wait;       /* 15 s */
+ 
+ static inline void
+ dwc_wr(uint32_t off, uint32_t v)
+@@ -904,11 +911,17 @@
+ {
+ 	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 	ud_sync(UD_TRB_RX, 16);
++	if (t[3] & TRB_HWO) {
++		/* laurel 3031: the controller still owns the TRB: a completion of an older transfer (the hold re-armed the endpoint). Not a frame. */
++		ud_rx_stale++;
++		return;
++	}
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
+ 	ud.last_active = mach_absolute_time();          /* laurel 2905 */
+ 	if (ud_in_panic || ud_early) {
+ 		/* no network stack in panic mode or before bsd_init: ARP and the command server by hand */
++		ud_panic_rx_at = ud.last_active;        /* laurel 3031 */
+ 		if (len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 			ud.rx_frames++;
+ 			ud_panic_rx((const uint8_t *)(ud.dma + UD_RX), len);
+@@ -1587,6 +1600,60 @@
+ 	}
+ }
+ 
++/*
++ * laurel 3031: the hold's data path from a known state. The thread (or the timer call) the panic stopped may have been anywhere: after reading the
++ * frame and before re-arming the one RX TRB (then the hold never receives: 17:56:16, "holding" went out, no pong for 44 min), inside an endpoint command,
++ * between the ack and the handling of an event. ENDTRANSFER with FORCERM on the RX endpoint when it has a transfer, then a fresh RX TRB. TX: the 2 s
++ * timeout of the hold sends again by itself. ep0: a SETUP that was consumed and not re-armed gets its TRB back.
++ */
++static void
++ud_panic_rearm(const char *why)
++{
++	if (!ud.configured) {
++		return;
++	}
++	if (ud.ep_busy[EP_RX]) {
++		(void)ud_epcmd(EP_RX, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | (ud.ep_rsc[EP_RX] << 16), 0, 0, 0);
++		ud.ep_busy[EP_RX] = false;
++		ud_udelay(1000);
++	}
++	ud_rx_arm();
++	ud_panic_rearms++;
++	ud_panic_rx_at = mach_absolute_time();
++	ud_panic_log("LAUREL PANIC: USB hold: RX re-armed (%s), %u in all\n", why, ud_panic_rearms);
++}
++
++/* laurel 3031: the event ring, read against the mark ud_service_events left (its comment has the stages). Returns true when the data path needs ud_panic_rearm. */
++static bool
++ud_panic_resync(void)
++{
++	uint32_t stage = ud.evt_stage;
++	ud.evt_stage = 0;
++	switch (stage) {
++	case 0:
++	case 1:
++		return false;                   /* evt_pos still names the event: the hold reads it */
++	case 2:
++		ud.evt_pos = (ud.evt_pos + UD_EVT_SIZE - 4) % UD_EVT_SIZE;     /* not acked: the count still holds it: read it again */
++		ud_panic_log("LAUREL PANIC: USB hold: event 0x%08x read again (stage 2)\n", ud.evt_cur);
++		return false;
++	case 3:
++		ud_panic_log("LAUREL PANIC: USB hold: event 0x%08x acked, not handled: handled now (stage 3)\n", ud.evt_cur);
++		ud_event(ud.evt_cur);
++		return false;
++	default:
++		ud_panic_log("LAUREL PANIC: USB hold: the CPU stopped inside the handling of event 0x%08x (stage %u)\n", ud.evt_cur, stage);
++		if (ud.state == EP0_SETUP) {
++			volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_OUT);
++			ud_sync(UD_TRB_OUT, 16);
++			if ((t[3] & TRB_HWO) == 0) {
++				ud_start_setup();       /* a consumed SETUP with no TRB behind it: the host could not enumerate again */
++			}
++		}
++		return true;
++	}
++}
++
+ /* Once per panic. false: no USB in this panic (not started, or laurelpanicusb=0). */
+ static bool
+ ud_panic_begin(void)
+@@ -1619,6 +1686,11 @@
+ 		ud_panic_tx_at = mach_absolute_time();
+ 	}
+ 	ud_panic_ok = true;
++	nanoseconds_to_absolutetime(15 * NSEC_PER_SEC, &ud_panic_rx_wait);
++	ud_panic_rx_at = mach_absolute_time();
++	/* laurel 3031: the state the stopped thread left, then the data path from a known state in every case: one RX TRB is all the hold has */
++	(void)ud_panic_resync();
++	ud_panic_rearm("hold start");
+ 	kdb_printf("LAUREL PANIC: USB %s: console ring %llu bytes to send, %u frames queued; "
+ 	    "commands on udp 192.168.7.2:%u %s\n", ud.configured ? "configured" : "not configured (waiting for the host)",
+ 	    end - from, ud.txq_count, UD_CTL_PORT, ud.ctl_enabled ? "on" : "off");
+@@ -1650,6 +1722,10 @@
+ 			ud_event(ev);
+ 		}
+ 	}
++	/* laurel 3031: no frame from the host for 15 s: the RX side gets a fresh TRB. A silent host costs nothing; a lost TRB state comes back. */
++	if (ud.configured && mach_absolute_time() - ud_panic_rx_at > ud_panic_rx_wait) {
++		ud_panic_rearm("no frame for 15 s");
++	}
+ 	return ud_raw_tx_service();
+ }
+ 
+@@ -1745,7 +1821,23 @@
+ 
+ 	laurel_wdog_hold();                     /* laurel 2987: the hold has its own timed reset; only after a bark the bite stays */
+ 	if (entries++ != 0) {
+-		return;                         /* nested panic: no USB */
++		/*
++		 * laurel 3031: a panic inside the hold: the loop is gone and the host hears nothing more. Before: a silent spin for ever (the
++		 * nested text goes to the panel only). Now: 5 s for a photo of the panel, then a reset into the boot menu. A third entry: PSCI alone.
++		 */
++		extern void laurel_reset_raw(void);
++		if (entries > 2) {
++			laurel_reset_raw();
++			return;
++		}
++		kdb_printf("LAUREL PANIC: nested panic in the USB hold: reset in 5 s (the panel has the text)\n");
++		uint64_t freq = __builtin_arm_rsr64("CNTFRQ_EL0"), start = __builtin_arm_rsr64("CNTVCT_EL0");
++		while (__builtin_arm_rsr64("CNTVCT_EL0") - start < 5 * freq) {
++		}
++		(void)laurel_reboot_set_mode("normal");
++		laurel_restart();
++		laurel_reset_raw();
++		return;
+ 	}
+ 	if (!ud_panic_begin()) {
+ 		return;
+@@ -2006,14 +2098,24 @@
+ 		ud_sync(UD_EVT, UD_EVT_SIZE);
+ 		for (uint32_t done = 0; done + 4 <= count; done += 4) {
+ 			uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++			/*
++			 * laurel 3031: each step leaves a mark. A panic on another CPU stops this one anywhere in here (the debugger IPI), and the hold
++			 * then reads the mark: a slot not yet acked is read again, an acked event is handled, a half-handled one gets a fresh data path.
++			 */
++			ud.evt_cur = ev;
++			ud.evt_stage = 1;
+ 			ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
++			ud.evt_stage = 2;
+ 			/* ack each event before it is handled: a panic inside ud_event()
+ 			 * leaves GEVNTCOUNT and evt_pos in step for the panic loop */
+ 			dwc_wr(GEVNTCOUNT, 4);
++			ud.evt_stage = 3;
+ 			if (ud.events++ < 200) {
+ 				printf("SWEET USB: event 0x%08x\n", ev);
+ 			}
++			ud.evt_stage = 4;
+ 			ud_event(ev);
++			ud.evt_stage = 0;
+ 		}
+ 	}
+ }
+--- a/osfmk/arm64/laurel_wdog.c	2026-11-07 04:25:20.712915618 +0530
++++ b/osfmk/arm64/laurel_wdog.c	2026-11-07 04:26:50.185269331 +0530
+@@ -531,7 +531,8 @@
+ laurel_wdog_hold(void)
+ {
+ 	if (lwd_barked != 0 && lwd_on != 0) {
+-		kprintf("LAUREL WDOG: on: bark: the phone resets in 30 s by the bite\n");
++		/* laurel 3031: kdb_printf: kprintf spins on its lock, and a CPU the panic stopped inside a kprintf holds it for ever */
++		kdb_printf("LAUREL WDOG: on: bark: the hold resets in 20 s (2990); the bite count runs on\n");
+ 		return;
+ 	}
+ 	laurel_wdog_stop();

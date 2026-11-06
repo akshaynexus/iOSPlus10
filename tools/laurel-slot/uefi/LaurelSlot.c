@@ -228,8 +228,34 @@ LaurelSlotSelfCheck (
     );
 
   //
-  // The owner must see what happens with no key: at most 7 boots, then Android.
+  // mu 0202: the boots before this one that did not end well, from ABL's count; from LS_LASTGOOD_AT of them the entry "ios-lastgood" (a kernel the owner marked good,
+  // scripts/laurel/mark-kernel-good.sh) boots by default. The owner must see what happens with no key: at most 7 boots, then Android.
   //
+  {
+    UINTN     Index;
+    UINTN     LastGood = Config->EntryCount;
+    unsigned  Failed  = 0;
+
+    for (Index = 0; Index < Config->EntryCount; Index++) {
+      if ((Config->Entries[Index].Id != NULL) && (AsciiStrCmp (Config->Entries[Index].Id, "ios-lastgood") == 0)) {
+        LastGood = Index;
+      }
+    }
+
+    if (ls_fallback_plan (Table.flags_b, LastGood < Config->EntryCount, &Failed) == 1) {
+      Config->DefaultIndex = LastGood;
+      UniXNULog ("LAUREL SLOT: %u iOS boots in a row did not end well: the default entry is the last good kernel (entry %u)", Failed, (UINT32)LastGood);
+      UnicodeSPrint (Notice, NoticeSize, L"iOS failed %u boots in a row: the last good kernel boots. Android after %u more", Failed, LS_RETRIES (Table.flags_b));
+      return;
+    }
+
+    if (Failed > 0) {
+      UniXNULog ("LAUREL SLOT: %u iOS boot(s) in a row did not end well (retries %u)", Failed, LS_RETRIES (Table.flags_b));
+      UnicodeSPrint (Notice, NoticeSize, L"iOS failed %u boot(s) in a row. Android after %u more boots: press a key to stay", Failed, LS_RETRIES (Table.flags_b));
+      return;
+    }
+  }
+
   if ((Table.flags_b & LS_ACTIVE) && !(Table.flags_b & LS_SUCCESSFUL) && (LS_RETRIES (Table.flags_b) <= LS_REFILL_AT)) {
     //
     // [V ABL] retries R: R more iOS boots, then Android. This boot is already counted.

@@ -233,7 +233,7 @@ mk_kernel() {
 printf 'pass\n' > "$R/scripts/laurel/mkadt.py"   # the real one needs external/ios-topaz; it takes no part in these checks
 # a menu image needs an FD of this tree's Mu inputs. The stamp comes from what mu-build.sh runs; a tree older than scripts/lib/laurel-mu-inputs.sh (dualboot-tests-detect.sh, the old-code runs): its formula.
 mkdir -p "$T/repo/patches/laurel/mu/late" "$T/repo/tools/laurel-slot/uefi"; echo fake > "$T/repo/patches/laurel/mu/0201.patch"; echo late > "$T/repo/patches/laurel/mu/late/0101.patch"
-for f in laurel_slot.c laurel_slot.h uefi/LaurelSlot.c; do echo "$f" > "$T/repo/tools/laurel-slot/$f"; done
+for f in laurel_slot.c laurel_slot.h uefi/LaurelSlot.c uefi/LaurelPmicWdog.c; do echo "$f" > "$T/repo/tools/laurel-slot/$f"; done
 fd_stamp() {
   if [ -f "$T/repo/scripts/lib/laurel-mu-inputs.sh" ]; then ( REPO=$T/repo; . "$T/repo/scripts/lib/laurel-mu-inputs.sh"; laurel_mu_inputs_built "$T/nomu" "$T/nounixnu" )
   else cat "$T"/repo/patches/laurel/mu/*.patch | sha256sum | cut -d' ' -f1; fi
