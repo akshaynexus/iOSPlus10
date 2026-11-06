@@ -9,11 +9,30 @@ EL0 at the same pc, an address that cannot be faulted ends in EXC_BAD_ACCESS at 
 would take; never SIGILL); a page that is not RAM is passed over. The pc moves by 4 after a done op. iOS 26: the sleh.c hooks are in post/9023.
 Host test scripts/laurel/test-ucache.sh: the decoder on the six assembled words, their xzr forms, and eleven words that must not match.
 
+Second round [V phone 05:15, kernel da6a24b881]: the hook ran first and the decoder was right (disassembly), but laurel_ucache_on read 0
+at the trap while the core's UCI was clear. The first apply() of 2998 ran in arm_init() before arm_vm_init(); the flag is a common symbol
+(zeroed with the BSS by the early boot after that point), the decision stayed in __data, so the second call made no new decision and set
+no flag; the boot core kept its clear UCI from the first call. Now the trap path gates on this core's SCTLR_EL1.UCI (a trap of this kind
+only comes from a core whose UCI is clear), and the early call in arm_init() is gone: the first decision is the one before
+PE_init_platform(TRUE), after arm_vm_init() and kernel_startup_bootstrap(). The host test also checks the final sleh.c and arm_init.c.
+
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index b641192..051b49f 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -375,7 +375,6 @@ arm_init(
+ 	configure_timer_apple_regs();
+ 	wfe_timeout_configure();
+ 	wfe_timeout_init();
+-	{ extern void laurel_ucache_apply(void); laurel_ucache_apply(); }   /* laurel 2998 */
+ 
+ 	configure_misc_apple_boot_args();
+ 	configure_misc_apple_regs();
 diff --git a/osfmk/arm64/laurel_ucache.c b/osfmk/arm64/laurel_ucache.c
-index bbf62a6..0b0cf5f 100644
+index bcb6f56..e5fc125 100644
 --- a/osfmk/arm64/laurel_ucache.c
 +++ b/osfmk/arm64/laurel_ucache.c
-@@ -28,6 +28,10 @@
+@@ -27,6 +27,10 @@
  #include <vm/vm_map.h>
  #endif
  #include <vm/pmap.h>
@@ -24,7 +43,7 @@ index bbf62a6..0b0cf5f 100644
  
  uint32_t laurel_ucache_on;              /* EL0 cache maintenance by VA traps on this kernel */
  static int laurel_ucache_mode = -1;     /* -1 undecided, 0 off, 1 on */
-@@ -84,47 +88,67 @@ laurel_ucache_apply(void)
+@@ -64,47 +68,76 @@ laurel_ucache_apply(void)
  	}
  }
  
@@ -53,7 +72,14 @@ index bbf62a6..0b0cf5f 100644
 +	unsigned int rt = 31;
 +	int crm;
  
- 	if (!laurel_ucache_on || !is_saved_state64(state) || PSR64_IS_KERNEL(get_saved_state_cpsr(state))) {
+-	if (!laurel_ucache_on || !is_saved_state64(state) || PSR64_IS_KERNEL(get_saved_state_cpsr(state))) {
++	/*
++	 * laurel 2999: the gate is this core's SCTLR_EL1.UCI, not the flag. [V phone 2026-11-07 05:15] the flag read 0 at the trap while the
++	 * core's UCI was clear: the first apply() ran before arm_vm_init() and the flag (a common symbol, zeroed with the BSS by the early
++	 * boot) was gone when the second one found the decision already made in __data; the boot core kept its clear UCI. A trap of this
++	 * kind can only come from a core whose UCI is clear, so the op is always right to do; the flag only tells whether the kernel meant it.
++	 */
++	if (!is_saved_state64(state) || PSR64_IS_KERNEL(get_saved_state_cpsr(state))) {
  		return false;
  	}
 -	switch (op) {
@@ -67,6 +93,9 @@ index bbf62a6..0b0cf5f 100644
 -	case LUC_SYS_CACHE(14):         /* DC CIVAC */
 -		break;
 -	default:
++	if ((__builtin_arm_rsr64("SCTLR_EL1") & (1ULL << 26)) != 0) {
++		return false;                   /* UCI set on this core: not our trap */
++	}
 +	crm = luc_cache_word(instr, &rt);
 +	if (crm < 0) {
  		return false;
@@ -115,7 +144,7 @@ index bbf62a6..0b0cf5f 100644
  			__asm__ volatile ("ic ivau, %0" : : "r"(kva) : "memory");
  			__builtin_arm_dsb(DSB_ISH);
  		}
-@@ -133,3 +157,20 @@ laurel_ucache_trap(arm_saved_state_t *state, uint64_t esr)
+@@ -113,3 +146,20 @@ laurel_ucache_trap(arm_saved_state_t *state, uint64_t esr)
  	add_saved_state_pc(state, 4);
  	return true;
  }
@@ -128,7 +157,7 @@ index bbf62a6..0b0cf5f 100644
 +	uint32_t instr = 0;
 +
 +	(void)esr;
-+	if (!laurel_ucache_on || !is_saved_state64(state) || PSR64_IS_KERNEL(get_saved_state_cpsr(state))) {
++	if (!is_saved_state64(state) || PSR64_IS_KERNEL(get_saved_state_cpsr(state))) {
 +		return false;
 +	}
 +	if (copyin(get_saved_state_pc(state), &instr, sizeof(instr)) != 0) {

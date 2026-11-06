@@ -63,3 +63,36 @@ int main(int argc, char **argv) {
 C
 cc -I"$T" -o "$T/t" "$T/t.c"
 "$T/t" "$T/t.bin"
+
+# The built trees, when they exist (scripts/laurel/kernel-ios26-linux.sh): in sleh.c the hook must come before the emulator and the LSE path
+# in handle_uncategorized and in handle_msr_trap, and in arm_init.c no laurel_ucache_apply() may run before arm_vm_init() (the common
+# symbols are zeroed after that point: [V phone 2026-11-07 05:15]).
+for tree in "$REPO/out/laurel-kernel-ios26/src/xnu" "$REPO/out/laurel-kernel-ios26/src/shadow" "$REPO/out/laurel-kernel/xnu-src/xnu-8796.141.3"; do
+  [ -f "$tree/osfmk/arm64/sleh.c" ] || continue
+  python3 -I - "$tree" <<'PY'
+import re, sys
+tree = sys.argv[1]
+sleh = open(tree + "/osfmk/arm64/sleh.c", errors="replace").read()
+init = open(tree + "/osfmk/arm/arm_init.c", errors="replace").read()
+bad = 0
+def body(src, name):
+    i = src.index("\n" + name + "(")
+    j = src.index("\n}\n", i)
+    return src[i:j]
+u = body(sleh, "handle_uncategorized")
+for later in ("laurel_abi_trap(", "sweet_emulate_lse("):
+    if later in u:
+        ok = u.index("laurel_ucache_word(") < u.index(later)
+        print(f"{tree.split('/')[-1]}: handle_uncategorized: laurel_ucache_word before {later[:-1]}: {'ok' if ok else 'WRONG'}"); bad += not ok
+m = body(sleh, "handle_msr_trap")
+if "laurel_abi_trap(" in m:
+    ok = m.index("laurel_ucache_trap(") < m.index("laurel_abi_trap(")
+    print(f"{tree.split('/')[-1]}: handle_msr_trap: laurel_ucache_trap before laurel_abi_trap: {'ok' if ok else 'WRONG'}"); bad += not ok
+a = body(init, "arm_init")
+first = a.find("laurel_ucache_apply()"); vmi = a.find("arm_vm_init(")
+ok = first > 0 and vmi > 0 and first > vmi
+print(f"{tree.split('/')[-1]}: arm_init: the first laurel_ucache_apply() comes after arm_vm_init(): {'ok' if ok else 'WRONG'} ({init.count('laurel_ucache_apply();')} calls in the file)"); bad += not ok
+print("test-ucache tree check:", "PASS" if not bad else f"FAIL ({bad})")
+sys.exit(1 if bad else 0)
+PY
+done
