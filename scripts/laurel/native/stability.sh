@@ -7,6 +7,7 @@ REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 N=${1:-5}
 O=$REPO/logs/stability-$(date +%H%M%S).txt
 A=${AUTOTEST_DIR:-$REPO}
+[ -x "$A/scripts/laurel/ios26-autotest.sh" ] || { echo "stability: no UI test tool in $A"; exit 2; }
 for i in $(seq 1 "$N"); do
   keep=--keep; [ "$i" = "$N" ] && keep=
   flight=--no-flight; [ "${FLIGHT:-0}" = 1 ] && flight=; [ "${FLIGHT:-0}" = lite ] && flight=--flight-lite
@@ -28,6 +29,7 @@ for i in $(seq 1 "$N"); do
   H=$(grep -ac 'TopazGPU: watchdog: GPU hang' "$D/usblog.txt")
   B=$(grep -ac 'LAUREL WDOG: bark: no pet' "$D/usblog.txt")
   echo "$(date +%H:%M:%S) round $i of $N: $(basename "$D"), GPU hangs $H, CPU watchdog barks $B, table $(basename "$T")" | tee -a "$O"
+  [ -n "$T" ] || { echo "$(date +%H:%M:%S) round $i: the UI test wrote no table: stopped" | tee -a "$O"; exit 4; }
   [ "$(stat -c %Y "$T")" -ge "$(stat -c %Y "$O.start" 2>/dev/null || echo 0)" ] && grep -E '^\| (unlock|home-swipe|control-center|settings-scroll)' "$T" | cut -c1-135 | tee -a "$O"
   if [ "$B" != 0 ]; then grep -a -m1 'LAUREL WDOG: bark: no pet' "$D/usblog.txt" | cut -c1-170 | tee -a "$O"; echo "a CPU watchdog bark: not this stack's GPU hang" | tee -a "$O"; fi
   if [ "${H:-0}" != 0 ]; then grep -a -m2 -E 'watchdog: GPU hang|SMMU gfsr' "$D/usblog.txt" | cut -c1-170 | tee -a "$O"; echo "stopped at a hang" | tee -a "$O"; exit 1; fi

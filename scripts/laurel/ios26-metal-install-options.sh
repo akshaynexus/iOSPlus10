@@ -31,6 +31,9 @@ put() {
 }
 # Stacks and what they load, then the Info.plist, then the selector.
 if [ "${ONLY_NATIVE:-0}" = 1 ]; then
+  # 2026-11-07: a root with the old one-stack layout has the default stack as the bundle's own NegroniMetal and no options/default: the selector
+  # written over it left no Metal at all after a native hang. ONLY_NATIVE needs a phone that already has the selector layout.
+  sh_phone "test -s $B/options/default/NegroniMetal" || die "the phone has no options/default (one-stack root): run this script without ONLY_NATIVE first"
   put options/native/NegroniMetal 755
 else
   for f in $(cd "$S" && find options -type f | sort); do

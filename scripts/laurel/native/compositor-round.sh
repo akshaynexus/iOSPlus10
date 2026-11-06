@@ -50,6 +50,7 @@ for _ in $(seq 1 $((WAIT / 5))); do
   if tail -n +"$FROM" "$L" | grep -aqE 'watchdog: GPU hang|LAUREL METAL NATIVE: off|LAUREL PANIC: holding'; then say "stopped early: a hang, a fallback or a panic"; sleep 5; break; fi
 done
 A=${AUTOTEST_DIR:-$REPO}
+[ -x "$A/scripts/laurel/ios26-autotest.sh" ] || { say "STOP: no UI test tool in $A"; exit 2; }
 if [ -n "$TEST" ] && ! tail -n +"$FROM" "$(usblog)" | grep -aqE 'watchdog: GPU hang|LAUREL METAL NATIVE: off|LAUREL PANIC: holding'; then
   (cd "$A" && timeout 40 scripts/laurel/ios26-autotest.sh key power 2>&1 | tail -1; timeout 50 scripts/laurel/ios26-autotest.sh shot "round-$(basename "$D")-awake" 2>&1 | tail -1 | cut -c1-160; timeout 400 scripts/laurel/ios26-autotest.sh run --only "$TEST" 2>&1 | tail -14 | cut -c1-220)
   (cd "$A" && timeout 50 scripts/laurel/ios26-autotest.sh shot "round-$(basename "$D")-after" 2>&1 | tail -1 | cut -c1-160)
