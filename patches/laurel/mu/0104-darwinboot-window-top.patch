@@ -97,7 +97,8 @@ diff --git a/DarwinBootPkg/Driver/DarwinBoot.inf b/DarwinBootPkg/Driver/DarwinBo
    BootVideo.h
    DiagFont.h
 diff --git a/DarwinBootPkg/Driver/WindowTop.h b/DarwinBootPkg/Driver/WindowTop.h
---- a/DarwinBootPkg/Driver/WindowTop.h
+new file mode 100644
+--- /dev/null
 +++ b/DarwinBootPkg/Driver/WindowTop.h
 @@ -0,0 +1,67 @@
 +// SPDX-License-Identifier: BSD-2-Clause-Patent
