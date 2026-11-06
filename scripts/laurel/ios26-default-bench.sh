@@ -132,6 +132,7 @@ cat "$t"
 { echo "bench $name: env + ${extra[*]:-nothing}"; sed -n '/^Mi A3 iOS 26 UI test/,$p' "$t"; } > "$REPO/logs/bench-$name.txt"
 rm -f "$t"
 cpu1=$(cpu)
+printf '%s\n' "$cpu1" > "$REPO/logs/bench-$name.threads"   # ps -M of both: priorities, for the render class A/B
 python3 -I "$REPO/scripts/laurel/ios26-thread-cpu.py" <(printf '%s\n' "$cpu0") <(printf '%s\n' "$cpu1") | tee -a "$REPO/logs/bench-$name.txt"
 tail -c +"$start" "$LOG" | grep -aE 'LAUREL GPU PASS|LAUREL FRAME|RedwoodGPU: [0-9]+ submissions|LAUREL FLIP' > "$REPO/logs/bench-$name.kernel.txt"
 python3 -I "$REPO/scripts/laurel/ios26-gpu-pass-sum.py" "$REPO/logs/bench-$name.kernel.txt" | tee -a "$REPO/logs/bench-$name.txt"
