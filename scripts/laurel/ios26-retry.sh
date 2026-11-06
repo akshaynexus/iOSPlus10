@@ -6,6 +6,7 @@
 # docs/laurel_sprout/dual-boot.md with its own guard. A session entered with the buttons can answer wrongly, so it is
 # checked first. It never writes without a phone that answers laurel_sprout, and it stops at the first failure.
 # Build the kernel first if the patches changed: scripts/laurel/kernel-ios26-linux.sh.
+#   RESUME_FASTBOOT=1   start at the flash, from fastboot on slot a, after a run that passed android-check
 #   FAST_SWITCH=1 ...   after boot_b + dtbo_b, switch to slot b from fastboot, with no Android boot in between (owner, 2026-11-07)
 set -eu
 cd "$(dirname "$0")/../.."
@@ -42,6 +43,13 @@ to_root() {
 
 say "building the image"
 run $DB image $M
+if [ "${RESUME_FASTBOOT:-0}" = 1 ]; then
+  # A run that passed android-check and then met a wrong fastboot answer: the phone waits in fastboot on slot a.
+  wait_fb 40 || die "RESUME_FASTBOOT=1: no fastboot"
+  [ "$(fb_get product)" = laurel_sprout ] || die "RESUME_FASTBOOT=1: fastboot is not the Mi A3"
+  [ "$(fb_get current-slot)" = a ] || die "RESUME_FASTBOOT=1: current slot is not a"
+  say "resume from fastboot: android-check passed in the run before"
+else
 _ser=$(mi_a3 || true)
 if [ -n "$_ser" ] && [ "$(timeout 5 adb -s "$_ser" shell getprop ro.boot.slot_suffix 2>/dev/null | tr -d '\r')" = _a ]; then
   ANDROID_SERIAL=$_ser; export ANDROID_SERIAL
@@ -69,7 +77,20 @@ run $DB android-check
 timeout 20 adb reboot bootloader
 wait_fb 40 || die "no fastboot after adb reboot bootloader"
 sleep 2
-CONFIRM=flash-slot-b; export CONFIRM; run $DB flash-slot-b $M
+fi
+CONFIRM=flash-slot-b; export CONFIRM
+# [V phone 2026-11-03, 2026-11-07] ABL can give an empty partition-size:userdata for a whole session; flash-slot-b then
+# stops before any write. A new session (fastboot reboot bootloader) answers again: up to 3 sessions.
+_fs=1
+until $DB flash-slot-b $M > /tmp/ios26-retry-fs.$$ 2>&1; do
+  tail -n 2 /tmp/ios26-retry-fs.$$
+  grep -q 'not numbers' /tmp/ios26-retry-fs.$$ && [ "$_fs" -lt 3 ] || { rm -f /tmp/ios26-retry-fs.$$; die "failed: $DB flash-slot-b $M"; }
+  say "fastboot answered wrongly: a new session ($_fs of 2)"
+  timeout 15 fastboot reboot bootloader >/dev/null 2>&1 || true
+  sleep 8; wait_fb 40 || die "no fastboot after reboot bootloader"
+  sleep 2; _fs=$((_fs + 1))
+done
+tail -n 1 /tmp/ios26-retry-fs.$$; rm -f /tmp/ios26-retry-fs.$$
 if [ "${FAST_SWITCH:-0}" = 1 ]; then
   # Owner, 2026-11-07: skip the Android boot that only rechecks. Android was up a moment ago and passed android-check
   # (data opened, updater off), so slot a is the way back; the switch goes to slot b from this fastboot session.
