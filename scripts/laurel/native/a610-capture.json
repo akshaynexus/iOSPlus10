@@ -1,0 +1,22 @@
+{
+ "VkPhysicalDeviceVulkan12Properties": {
+  "denormBehaviorIndependence": "VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL",
+  "roundingModeIndependence": "VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL",
+  "shaderDenormFlushToZeroFloat16": true,
+  "shaderDenormFlushToZeroFloat32": true,
+  "shaderDenormFlushToZeroFloat64": false,
+  "shaderDenormPreserveFloat16": false,
+  "shaderDenormPreserveFloat32": false,
+  "shaderDenormPreserveFloat64": false,
+  "shaderRoundingModeRTEFloat16": true,
+  "shaderRoundingModeRTEFloat32": true,
+  "shaderRoundingModeRTEFloat64": false,
+  "shaderRoundingModeRTZFloat16": false,
+  "shaderRoundingModeRTZFloat32": false,
+  "shaderRoundingModeRTZFloat64": false,
+  "shaderSignedZeroInfNanPreserveFloat16": true,
+  "shaderSignedZeroInfNanPreserveFloat32": true,
+  "shaderSignedZeroInfNanPreserveFloat64": false
+ },
+ "_source": "vulkaninfo -j of Turnip (Mesa 25.0.7 + our patches) for FD610 on drm-shim, scripts/laurel/native/profile-capture.sh, 2026-11-03"
+}
