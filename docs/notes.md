@@ -5476,3 +5476,18 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - [V 18:47:43, 2988 on] The stuck CPU 5 is in the kernel on a Unix system call: `madvise` (user pc with the task's dyld slide = `_madvise+0x8`). Third process, same core. The madvise path masks no interrupts and its spin locks panic on timeout: the core is stalled on one instruction in the pmap path [I]: `dsb ish` after a broadcast `tlbi` (the GPU SMMU is a DVM slave: `gcc_gpu_snoc_dvm_gfx`), or an exclusive on a page table page. 2989 + post/9018 print the frame chain, the stack's text pointers and the user registers. `watchdog.md` section 10.
 - [V] Fifth catch 18:51:35: last interrupt in `vm_map_zap_dispose` (mmap), stamp closed: the 2988 stamp is per CPU and a thread preempted mid-syscall carries none; 2991 reads XNU's `machine.el0_synchronous_trap` instead.
 - [V] **Cause found: the GPU SMMU is a DVM slave (IDR0.BTM) with sCR0.PTM clear, so every CPU `tlbi ...is` waits for it in `dsb ish`.** Stock arm-smmu sets `sCR0_VMIDPNE | sCR0_PTM` at reset ("Disable TLB broadcasting"); our smmu_setup never wrote sCR0. 2992 sets them with a read-back self-check, kill switch `gpusmmuptm=0`. `watchdog.md` section 11. NOT BOOTED.
+
+## Haptics silent and audio lag on iOS 26 (2026-11-07, patches 3000, 3001; no phone)
+
+- [V] Audio: 24/164, 51/319, 83/670 underruns per stream, 0 dropped, 0 DSP underflows (`usblog-20261103-071332.txt`). [I] 2500 queued all 8
+  periods from a ring holding one HAL buffer (first chunk, then 140 ms of silence, then the rest) and kept no lead; every 2 s pause cost a full
+  path bring-up. 3000: 3 periods queued, 30 ms lead, dry ring waits for the lead again, amp off at 2 s, path kept 12 s, `path up in N ms` in the
+  playing line. Kill switch `laurel_audio_lead=0`. docs/laurel_sprout/audio.md "Lead".
+- [V] Haptics on 26: the node was ready, closed-loop on, SPMI errors 0, and no write line and no legacy "vibrator" request in 6 minutes; on 16
+  the same node logged peaks 267..2355. [V] Same on 16 and 26: hapticd lives in the HAL host (mediaserverd / audiomxd), VirtualAudio's actuator
+  code and strings, our ADT /product (donor props only, no child nodes: the N104 CPMS keys never reach the phone). [U] which link is missing;
+  3001 logs the first open (process) and the first write (frames, peak, silent or not). docs/laurel_sprout/haptics.md "iOS 26".
+- Gotchas: the old write line came only for a loud block, so "no line" could not tell silence from no open. `hertz_millisecs` is still in the
+  23F84 cache (`.17`): the legacy path exists on 26. VirtualAudio's "CPMS for Haptics" branch is gated by MobileGestalt `DeviceSupportsHaptics`
+  (`cBy4BcYs5YWtFHbBpt4C6A`; names: `_MobileGestalt_get_*` symbols in the cache linkedit, key = base64(md5("MGCopyAnswer"+Name))[:22]).
+  `scripts/ios26/dis-xref.py` finds the code that references a string in an `llvm-objdump -d --macho` listing (adrp+add pairs).

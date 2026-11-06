@@ -352,6 +352,8 @@
 2990-laurel-wdog-bark-hold-reset.patch                         applied
 2991-laurel-wdog-thread-flag.patch                             applied
 2992-laurel-gpu-smmu-private-tlb.patch                         applied
+3000-laurel-audio-lead.patch                                   applied
+3001-laurel-haptic-first-contact.patch                         applied
 9000-series-12377-api.patch                                    post
 9001-laurel-release-only-initialized-pages.patch               post
 9002-laurel-no-panic-region.patch                              post
@@ -371,4 +373,4 @@
 9016-laurel-debug-ack-late-cpu.patch                           post
 9017-laurel-wdog-trap-stamp-sleh.patch                         post
 9018-laurel-wdog-irq-frame-sleh.patch                          post
-== series: 236 applied, 87 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
+== series: 238 applied, 87 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
