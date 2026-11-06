@@ -1,0 +1,361 @@
+laurel 3030: the PM6125 PON watchdog ("PMIC WD") armed for the whole run: no pet for 60 s + 2 s = a hard reset by the PMIC, with no CPU and no TrustZone (the APSS bite gave no reset here, 2026-11-03 18:48). Petted by the APSS watchdog thread on its rule (every CPU answered), by the USB panic hold loop while it runs (17:56:16: a hold that went silent for 44 min now ends in a reset), and by the timed reset. Disarmed before every reset and power off of ours. Takes over the count the boot loader arms (mu 0202). Line LAUREL PMIC WDOG: on|off: REASON; kill switch laurelpmicwdog=0. Both kernels. docs/laurel_sprout/watchdog.md section 15.
+
+--- a/bsd/conf/files	2026-11-07 04:24:04.684745922 +0530
++++ b/bsd/conf/files	2026-11-07 04:25:20.710363070 +0530
+@@ -123,6 +123,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/laurel_reboot.c			standard
++bsd/dev/laurel_pmic_wdog.c		standard
+ bsd/dev/laurel_rtc.c			standard
+ bsd/dev/laurel_build.c			standard
+ bsd/dev/laurel_wired.c			standard
+--- a/bsd/dev/laurel_pmic_wdog.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_pmic_wdog.c	2026-11-07 04:25:20.692280077 +0530
+@@ -0,0 +1,176 @@
++/*
++ * laurel 3030: the PM6125 PON watchdog, armed for the whole run of this kernel. One line LAUREL PMIC WDOG: on|off: REASON. Kill switch laurelpmicwdog=0.
++ *
++ * What it covers that the APSS watchdog (2986) does not: a hang with every CPU's interrupts off, a panic that stops before its hold, a USB panic hold whose loop
++ * died (17:56:16: "holding" went out, then nothing for 44 minutes), and the boot loader's own arming (mu 0202) covers the kernel before this file runs.
++ * Who pets: the APSS watchdog thread (laurel_wdog.c), on the same rule as the hardware pet (every CPU in use answered its signal in the last 8 s); the panic
++ * hold loop (sweet_usb.c), while it runs; the timed reset of laurel_panic_final while it waits. A reset or power off of ours disarms it first
++ * (laurel_restart, laurel_power_off): ABL's fastboot and the boot menu wait for the owner, and Android never pets it.
++ * Rules and registers: laurel_pmic_wdog_core.h (host test scripts/laurel/pmic-wdog-test.sh). docs/laurel_sprout/watchdog.md section 15.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
++#include "laurel_pmic_wdog_core.h"
++
++extern int kdb_printf(const char *format, ...) __printflike(1, 2);
++extern void delay(int usec);
++
++static int lpw_on;                      /* armed by this kernel: pets go */
++static int lpw_checked;                 /* laurel_pmic_wdog_start ran with a PON lane */
++static volatile uint64_t lpw_last_pet;
++static uint64_t lpw_ms;
++static volatile uint32_t lpw_pets, lpw_pet_failed;
++
++int laurel_pmic_wdog_on(void);
++int
++laurel_pmic_wdog_on(void)
++{
++	return lpw_on;
++}
++
++static int
++lpw_read4(uint8_t *s1, uint8_t *s2, uint8_t *ctl, uint8_t *ctl2)
++{
++	if (sweet_spmi_pon_read(LPW_S1_TIMER, s1) != 0 || sweet_spmi_pon_read(LPW_S2_TIMER, s2) != 0 ||
++	    sweet_spmi_pon_read(LPW_S2_CTL, ctl) != 0 || sweet_spmi_pon_read(LPW_S2_CTL2, ctl2) != 0) {
++		return -1;
++	}
++	return 0;
++}
++
++/* enable off, read back. 0 = off now (or was off), -1 = the PMIC did not take it */
++static int
++lpw_disarm(void)
++{
++	uint8_t ctl2 = 0;
++
++	if (sweet_spmi_pon_read(LPW_S2_CTL2, &ctl2) != 0) {
++		return -1;
++	}
++	if ((ctl2 & LPW_EN) == 0) {
++		return 0;
++	}
++	if (sweet_spmi_pon_write(LPW_S2_CTL2, (uint8_t)(ctl2 & ~LPW_EN)) != 0) {
++		return -1;
++	}
++	delay(200);
++	if (sweet_spmi_pon_read(LPW_S2_CTL2, &ctl2) != 0 || (ctl2 & LPW_EN) != 0) {
++		return -1;
++	}
++	return 0;
++}
++
++/*
++ * One pet, at most one per LPW_PET_MS: the thread, the panic hold loop and the timed reset call this as often as they like. The PON lane is the
++ * emergency lane of sweet_spmi.c: in a panic a lock holder that cannot run does not block it. 0 = petted or not due, -1 = off or the write failed.
++ */
++int laurel_pmic_wdog_pet(void);
++int
++laurel_pmic_wdog_pet(void)
++{
++	if (lpw_on == 0) {
++		return -1;
++	}
++	uint64_t now = mach_absolute_time();
++	if (!lpw_pet_due(now / lpw_ms, lpw_last_pet / lpw_ms)) {
++		return 0;
++	}
++	if (sweet_spmi_pon_write(LPW_PET, LPW_PET_BIT) != 0) {
++		lpw_pet_failed++;
++		return -1;
++	}
++	lpw_last_pet = now;
++	lpw_pets++;
++	return 0;
++}
++
++/* Before every reset or power off of ours (also from the panic hold: kdb_printf only). The count must not run into ABL, the boot menu or Android. */
++void laurel_pmic_wdog_stop(const char *why);
++void
++laurel_pmic_wdog_stop(const char *why)
++{
++	int was = lpw_on;
++
++	lpw_on = 0;
++	if (!lpw_checked) {
++		return;                 /* no PON lane: nothing of ours is armed; the boot loader's own count ends at the reset */
++	}
++	int rc = lpw_disarm();
++	if (was || rc != 0) {
++		kdb_printf("LAUREL PMIC WDOG: off: %s: %s (%u pets, %u failed)\n", why,
++		    rc == 0 ? "disarmed" : "NOT disarmed: the PMIC refused the write", lpw_pets, lpw_pet_failed);
++	}
++}
++
++/*
++ * Thread context, from laurel_wdog_start once it knows whether a pet thread runs. pets: 1 = the APSS watchdog thread pets; 0 = no thread
++ * (laurelwdog=0, or none started): then nothing may stay armed, and no_pets_why names the reason on the off line.
++ */
++void laurel_pmic_wdog_start(int pets, const char *no_pets_why);
++void
++laurel_pmic_wdog_start(int pets, const char *no_pets_why)
++{
++	uint32_t on = 1;
++	uint8_t s1 = 0, s2 = 0, ctl = 0, ctl2 = 0;
++
++	nanoseconds_to_absolutetime(NSEC_PER_MSEC, &lpw_ms);
++	PE_parse_boot_argn("laurelpmicwdog", &on, sizeof(on));
++	if (lpw_read4(&s1, &s2, &ctl, &ctl2) != 0) {
++		printf("LAUREL PMIC WDOG: off: no PON lane (SPMI); if the boot loader armed it, the phone resets about %u s after its start\n", LPW_S1_BOOT_S);
++		return;
++	}
++	lpw_checked = 1;
++	int found = lpw_found_state(ctl2, ctl);
++	const char *found_text = found == 0 ? "off" : found == 1 ? "armed, hard reset (the boot loader)" : "armed, another reset type";
++	if (on == 0 || pets == 0) {
++		int rc = lpw_disarm();
++		printf("LAUREL PMIC WDOG: off: %s; found %s (S1 %u s S2 %u s type %u enable 0x%02x): %s\n",
++		    on == 0 ? "laurelpmicwdog=0" : no_pets_why, found_text, s1 & LPW_TIMER_MASK, s2 & LPW_TIMER_MASK, ctl & LPW_TYPE_MASK, ctl2,
++		    rc == 0 ? "disarmed" : "NOT disarmed: the PMIC refused the write");
++		return;
++	}
++	/*
++	 * Timers and type first, the enable last, a pet, then read back. An armed count goes on while the timers change: the pet right after
++	 * starts it again from 0 [I]. The order of qpnp_pon_reset_config: the enable goes off before the type changes.
++	 */
++	int w = 0;
++	if (found != 0) {
++		w |= sweet_spmi_pon_write(LPW_S2_CTL2, (uint8_t)(ctl2 & ~LPW_EN));
++		delay(200);
++	}
++	w |= sweet_spmi_pon_write(LPW_S1_TIMER, (uint8_t)((s1 & ~LPW_TIMER_MASK) | lpw_timer(LPW_S1_KERNEL_S)));
++	w |= sweet_spmi_pon_write(LPW_S2_TIMER, (uint8_t)((s2 & ~LPW_TIMER_MASK) | lpw_timer(LPW_S2_S)));
++	w |= sweet_spmi_pon_write(LPW_S2_CTL, (uint8_t)((ctl & ~LPW_TYPE_MASK) | LPW_TYPE_HARD));
++	delay(200);
++	w |= sweet_spmi_pon_write(LPW_S2_CTL2, (uint8_t)(ctl2 | LPW_EN));
++	delay(200);
++	w |= sweet_spmi_pon_write(LPW_PET, LPW_PET_BIT);
++	uint8_t b1 = 0, b2 = 0, bctl = 0, bctl2 = 0;
++	if (w != 0 || lpw_read4(&b1, &b2, &bctl, &bctl2) != 0 || !lpw_armed_as(b1, b2, bctl, bctl2, LPW_S1_KERNEL_S, LPW_S2_S)) {
++		int rc = lpw_disarm();
++		printf("LAUREL PMIC WDOG: off: the PMIC does not hold our setting (writes %d; read back S1 %u S2 %u type %u enable 0x%02x); found %s: %s\n",
++		    w, b1 & LPW_TIMER_MASK, b2 & LPW_TIMER_MASK, bctl & LPW_TYPE_MASK, bctl2, found_text,
++		    rc == 0 ? "disarmed" : "NOT disarmed: the PMIC refused the write");
++		return;
++	}
++	lpw_last_pet = mach_absolute_time();
++	lpw_pets = 1;
++	lpw_on = 1;
++	printf("LAUREL PMIC WDOG: on: PM6125 PON watchdog, no pet for %u s + %u s: hard reset by the PMIC (no CPU, no TrustZone), pet every %u ms by the APSS "
++	    "watchdog thread, the panic hold and the timed reset; found %s (S1 %u s S2 %u s type %u enable 0x%02x); laurelpmicwdog=0\n",
++	    LPW_S1_KERNEL_S, LPW_S2_S, LPW_PET_MS, found_text, s1 & LPW_TIMER_MASK, s2 & LPW_TIMER_MASK, ctl & LPW_TYPE_MASK, ctl2);
++}
++
++/* the counts, for a state line */
++void laurel_pmic_wdog_counts(uint32_t *pets, uint32_t *failed, int *on);
++void
++laurel_pmic_wdog_counts(uint32_t *pets, uint32_t *failed, int *on)
++{
++	*pets = lpw_pets;
++	*failed = lpw_pet_failed;
++	*on = lpw_on;
++}
+--- a/bsd/dev/laurel_pmic_wdog_core.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_pmic_wdog_core.h	2026-11-07 04:26:50.087583412 +0530
+@@ -0,0 +1,67 @@
++/*
++ * laurel 3030: the PM6125 PON watchdog ("PMIC WD"): the rules and registers, with no kernel types, so that a host test runs exactly this code
++ * (scripts/laurel/pmic-wdog-test.sh) and the Mu side (tools/laurel-slot/uefi/LaurelPmicWdog.c) carries the same numbers.
++ *
++ * Why a second watchdog: the APSS watchdog (2986) barks (an IRQ: it needs one CPU with interrupts on) and its bite gave no reset on this firmware
++ * [V 2026-11-03 18:48: 90 s in the hold after the bite time]. The PMIC counts on its own 32 kHz clock and resets the SoC through the PON, the same
++ * path as a long press of the Power key (2955), with no CPU and no TrustZone. Registers [V mainline drivers/watchdog/pm8916_wdt.c, downstream
++ * qpnp-power-on.c]: PON base 0x800; S1 timer 0x54 and S2 timer 0x55 in seconds (7 bits, at most 127); S2 control 0x56 reset type (1 warm, 4 shutdown,
++ * 7 hard); S2 control 2 0x57 bit 7 enable; pet 0x58 bit 0. S1 over with no pet: a bark (an SPMI interrupt we do not use); S2 more: the reset.
++ * Hard reset: the PMIC power-cycles the SoC, the PON reason says PMIC_WD, and the configuration of the PMIC starts clean [I]: a phone that fell back
++ * to Android by ABL's retries does not carry an armed watchdog into Android, which never pets it [V qpnp-power-on.c: no pet anywhere].
++ */
++#ifndef LAUREL_PMIC_WDOG_CORE_H
++#define LAUREL_PMIC_WDOG_CORE_H
++
++#define LPW_S1_TIMER    0x854u          /* seconds [6:0] */
++#define LPW_S2_TIMER    0x855u          /* seconds [6:0] */
++#define LPW_S2_CTL      0x856u          /* reset type [3:0] */
++#define LPW_S2_CTL2     0x857u          /* bit 7: enable */
++#define LPW_PET         0x858u          /* write 1: the count starts again */
++#define LPW_TIMER_MASK  0x7fu
++#define LPW_TYPE_MASK   0x0fu
++#define LPW_TYPE_WARM   0x01u
++#define LPW_TYPE_SHUTDOWN 0x04u
++#define LPW_TYPE_HARD   0x07u
++#define LPW_EN          0x80u
++#define LPW_PET_BIT     0x01u
++#define LPW_TIMER_MAX   127u
++
++#define LPW_S1_KERNEL_S 60u             /* the kernel: no pet for 60 s, then 2 s more: the longest hang this port allows */
++#define LPW_S2_S        2u
++#define LPW_S1_BOOT_S   100u            /* the boot loader (mu 0202): DarwinBoot, the kernel start and the CPU bring-up must reach the pet thread in this time */
++#define LPW_PET_MS      1000u           /* one SPMI write a second at most, from the APSS watchdog thread, the panic hold and the timed reset */
++
++/* a pet is due: the first one at once, then at most one per LPW_PET_MS */
++static inline int
++lpw_pet_due(unsigned long long now_ms, unsigned long long last_ms)
++{
++	return last_ms == 0 || now_ms - last_ms >= LPW_PET_MS;
++}
++
++/* the state a boot finds: 0 off, 1 armed with our hard reset, 2 armed with another type (the owner or Android left it) */
++static inline int
++lpw_found_state(unsigned ctl2, unsigned ctl)
++{
++	if ((ctl2 & LPW_EN) == 0) {
++		return 0;
++	}
++	return (ctl & LPW_TYPE_MASK) == LPW_TYPE_HARD ? 1 : 2;
++}
++
++/* the registers hold what we wrote */
++static inline int
++lpw_armed_as(unsigned s1, unsigned s2, unsigned ctl, unsigned ctl2, unsigned want_s1, unsigned want_s2)
++{
++	return (s1 & LPW_TIMER_MASK) == want_s1 && (s2 & LPW_TIMER_MASK) == want_s2 &&
++	       (ctl & LPW_TYPE_MASK) == LPW_TYPE_HARD && (ctl2 & LPW_EN) != 0;
++}
++
++/* a timer value in seconds, inside the 7 bits */
++static inline unsigned
++lpw_timer(unsigned s)
++{
++	return s > LPW_TIMER_MAX ? LPW_TIMER_MAX : s;
++}
++
++#endif /* LAUREL_PMIC_WDOG_CORE_H */
+--- a/bsd/dev/laurel_reboot.c	2026-11-07 04:24:04.657745621 +0530
++++ b/bsd/dev/laurel_reboot.c	2026-11-07 04:25:20.710994701 +0530
+@@ -30,6 +30,8 @@
+ extern void laurel_wdog_panic_begin(void);      /* laurel 2986: osfmk/arm64/laurel_wdog.c */
+ extern void laurel_wdog_stop(void);
+ extern void laurel_wdog_hold(void);        /* laurel 2987 */
++extern void laurel_pmic_wdog_stop(const char *why);   /* laurel 3030: bsd/dev/laurel_pmic_wdog.c */
++extern int laurel_pmic_wdog_pet(void);
+ 
+ #define LAUREL_IMEM_PA            0x0c125000ull
+ #define LAUREL_IMEM_RESTART_OFF   0x65c
+@@ -278,6 +280,7 @@
+ 	}
+ 	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_OFF\n");
+ 	laurel_wdog_stop();                     /* laurel 2986 */
++	laurel_pmic_wdog_stop("power off");     /* laurel 3030: an armed PMIC count would turn the phone on again */
+ 	int64_t rc = lr_psci(PSCI_SYSTEM_OFF);
+ 	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_OFF returned %lld\n", (long long)rc);
+ 	if (old >= 0) {
+@@ -301,6 +304,7 @@
+ 	/* kdb_printf: also safe in the panic hold (console only, no os_log, no locks) */
+ 	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_RESET (%s)\n", lr_modes[lr_mode].name);
+ 	laurel_wdog_stop();                     /* laurel 2986: ABL and Mu must not inherit a running count */
++	laurel_pmic_wdog_stop("reset");         /* laurel 3030: the same for the PMIC count: fastboot and the menu wait for the owner */
+ 	int64_t rc = lr_psci(PSCI_SYSTEM_RESET);
+ 	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_RESET returned %lld\n", (long long)rc);
+ }
+@@ -350,6 +354,7 @@
+ 	uint64_t freq = __builtin_arm_rsr64("CNTFRQ_EL0");
+ 	uint64_t start = __builtin_arm_rsr64("CNTVCT_EL0");
+ 	while (__builtin_arm_rsr64("CNTVCT_EL0") - start < (uint64_t)secs * freq) {
++		(void)laurel_pmic_wdog_pet();   /* laurel 3030: this wait is alive; at most one write a second */
+ 	}
+ 	if (lr_on) {
+ 		laurel_restart();
+--- a/bsd/dev/sweet_usb.c	2026-11-07 04:24:04.666745721 +0530
++++ b/bsd/dev/sweet_usb.c	2026-11-07 04:25:20.714823962 +0530
+@@ -108,6 +108,7 @@
+ extern void laurel_wdog_stop(void);     /* laurel 2986 */
+ extern void laurel_wdog_hold(void);     /* laurel 2987 */
+ extern int laurel_wdog_barked(void);    /* laurel 2990 */
++extern int laurel_pmic_wdog_pet(void);  /* laurel 3030 */
+ extern void laurel_wdog_poll(void);
+ extern void laurel_restart(void);
+ extern void laurel_power_off(void);
+@@ -1763,6 +1764,7 @@
+ 	    secs > 0 ? " (timed reset set by laurelpanic)" : "");
+ 	for (;;) {
+ 		now = mach_absolute_time();
++		(void)laurel_pmic_wdog_pet();   /* laurel 3030: the loop is alive; if it dies, the PMIC resets the phone in 62 s */
+ 		int a = ud_panic_service(pending >= 0);
+ 		if (a >= 0 && pending < 0) {
+ 			pending = a;
+--- a/osfmk/arm64/laurel_wdog.c	2026-11-07 04:24:04.676745833 +0530
++++ b/osfmk/arm64/laurel_wdog.c	2026-11-07 04:25:20.712915618 +0530
+@@ -37,6 +37,9 @@
+ #include <vm/vm_kern.h>
+ #include <arm64/laurel_wdog_core.h>
+ 
++extern void laurel_pmic_wdog_start(int pets, const char *no_pets_why);  /* laurel 3030: bsd/dev/laurel_pmic_wdog.c */
++extern int laurel_pmic_wdog_pet(void);
++
+ extern char *proc_name_address(void *p);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+@@ -682,9 +685,13 @@
+ 			worst_gap = gap;
+ 			kprintf("LAUREL WDOG: on: this thread ran %llu ms after its last run (limit: bark %u s, bite %u s)\n", gap / lwd_ms, LWD_BARK_S, LWD_BITE_S);
+ 		}
+-		if (lwd_check(now) && lwd_on != 0 && lwd_hold == 0) {
++		bool all_answered = lwd_check(now);
++		if (all_answered && lwd_on != 0 && lwd_hold == 0) {
+ 			lwd_wr(LWD_RST, 1u);
+ 		}
++		if (all_answered && lwd_hold == 0) {
++			(void)laurel_pmic_wdog_pet();   /* laurel 3030: the PMIC count, on the same rule, also when the APSS hardware is off */
++		}
+ 		lwd_round(now);
+ 		if (now >= next_minute) {
+ 			next_minute = now + 60000ull * lwd_ms;
+@@ -745,6 +752,7 @@
+ 	PE_parse_boot_argn("laurelwdog", &on, sizeof(on));
+ 	if (on == 0) {
+ 		printf("LAUREL WDOG: off: laurelwdog=0\n");
++		laurel_pmic_wdog_start(0, "laurelwdog=0: no pet thread");   /* laurel 3030: nothing may stay armed */
+ 		return;
+ 	}
+ 	nanoseconds_to_absolutetime(NSEC_PER_MSEC, &lwd_ms);
+@@ -799,9 +807,11 @@
+ 			lwd_on = 0;
+ 		}
+ 		printf("LAUREL WDOG: off: no thread (found EN 0x%x)\n", en0);
++		laurel_pmic_wdog_start(0, "no pet thread");
+ 		return;
+ 	}
+ 	thread_deallocate(th);
++	laurel_pmic_wdog_start(1, NULL);        /* laurel 3030: the thread above pets it on the same rule as the hardware pet */
+ 	if (lwd_on) {
+ 		printf("LAUREL WDOG: on: APSS WDT 0x%llx, bark %u s (%s%s), bite %u s, pet %u ms, a CPU silent %u ms stops the pet; found EN 0x%x bark 0x%x bite 0x%x; laurelwdog=0\n",
+ 		    LWD_PA, LWD_BARK_S, bark_why ? "no interrupt: " : (lwd_bark_any ? "any CPU" : "one CPU"), bark_why ? bark_why : "", LWD_BITE_S, LWD_PET_MS, LWD_SILENT_MS, en0, bark0, bite0);

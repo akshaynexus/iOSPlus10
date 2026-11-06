@@ -13,6 +13,8 @@
 #   BOOT_MENU=1 (default): UniXNU menu with iOS + Android, 5 s to iOS, panic reset after 30 s, boot_b marked for the Android app; BOOT_MENU=0: as before (docs/laurel_sprout/boot-menu.md).
 #   LAUREL_READONLY=1 (dual-boot.sh image): no ufsrw, no rootrw, and BOOT_MENU=0. IOSROOT_HEAD_SHA=sha256 of the first MiB of the installed root: the app's mark (dual-boot.sh image rw)
 #   ENTRY_TITLE=text: title of the iOS entry. STOCK_DTBO=path: the dtbo_b that the mark names (default ~/laurel-backup/stock/images/dtbo.img)
+#   LAST_GOOD_KERNEL=path (default out/laurel/uefi/last-good/kernel when scripts/laurel/mark-kernel-good.sh made it; LAST_GOOD_KERNEL=none: without): a second
+#     entry "ios-lastgood" in the menu with that kernel; after 2 iOS boots in a row that did not end well the menu boots it by default (boot-menu.md section 10)
 # Output: out/laurel/uefi/laurel-uefi-boot.img (+ laurel.adt, payload.img, kernel.gz, cmdline.txt); MU_ONLY=1: laurel-mu-only-boot.img
 # Flash: scripts/bg.sh laurel-flash sh -c 'BOOT=reboot scripts/laurel/flash-boot.sh out/laurel/uefi/laurel-uefi-boot.img'
 #
@@ -113,8 +115,16 @@ else
     [ "${LAUREL_READONLY:-0}" != 1 ] || [ "$IMG_MODE" = ro ] || { echo "uefi-image: FAILED: LAUREL_READONLY=1, and the command line can write: $CMDLINE" >&2; exit 1; }
   fi
   python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot gold --dram "$DRAM" --mu-fd "$FD" --darwinboot --build-stamp "$STAMP_LINE" ${MKADT_EXTRA:-}   # laurel 2016: Gold 0x100 is the boot CPU after the PSCI hand-off
+  # mu 0202: the last good kernel, a copy the owner made (mark-kernel-good.sh), only with the menu; the same kernel as the main entry adds nothing
+  LAST_GOOD_KERNEL=${LAST_GOOD_KERNEL:-$W/last-good/kernel}
+  LAST_GOOD_ARGS=
+  if [ "$BOOT_MENU" = 1 ] && [ "$LAST_GOOD_KERNEL" != none ] && [ -f "$LAST_GOOD_KERNEL" ]; then
+    if cmp -s "$LAST_GOOD_KERNEL" "$KERNEL"; then echo "uefi-image: last good kernel = this kernel: no second entry"
+    else python3 -I "$BS" kernel-check "$LAST_GOOD_KERNEL" --no-repo || { echo "uefi-image: FAILED: the last good kernel $LAST_GOOD_KERNEL has no good stamp: mark one with scripts/laurel/mark-kernel-good.sh, or LAST_GOOD_KERNEL=none" >&2; exit 1; }
+      LAST_GOOD_ARGS="--last-good $LAST_GOOD_KERNEL"; echo "uefi-image: last good kernel entry: $LAST_GOOD_KERNEL"; fi
+  fi
   "$OUT/venv/bin/python3" "$REPO/scripts/laurel/mkdarwinboot.py" "$KERNEL" "$W/laurel.adt" "$W/payload.img" \
-    --cmdline "$CMDLINE" --size-mib "$SIZE_MIB" --timeout "$([ "$BOOT_MENU" = 1 ] && echo 5 || echo 3)" --entry-title "$ENTRY_TITLE" $([ "$BOOT_MENU" = 1 ] && echo --android-entry)
+    --cmdline "$CMDLINE" --size-mib "$SIZE_MIB" --timeout "$([ "$BOOT_MENU" = 1 ] && echo 5 || echo 3)" --entry-title "$ENTRY_TITLE" $([ "$BOOT_MENU" = 1 ] && echo --android-entry) $LAST_GOOD_ARGS
   printf '%s\n' "$CMDLINE" > "$W/cmdline.txt"
   rd=$W/payload.img
   IMG=$W/laurel-uefi-boot.img

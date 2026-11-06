@@ -56,6 +56,10 @@ for pt in "$REPO"/patches/laurel/mu/*.patch "$REPO"/patches/laurel/mu/late/*.pat
   t=$(target "$pt")
   [ -e "$t/.git" ] || continue
   grep -E '^\+\+\+ b/' "$pt" | sed 's|^+++ b/||' | while read -r f; do git -C "$t" checkout -q -- "$f" 2>/dev/null || true; done
+  # a file the patch creates (--- /dev/null) is left by an earlier run: git apply refuses "already exists"; it goes, the patch makes it again
+  awk '/^--- \/dev\/null/ { getline; if ($0 ~ /^\+\+\+ b\//) { sub(/^\+\+\+ b\//, ""); sub(/\t.*/, ""); print } }' "$pt" | while read -r f; do
+    git -C "$t" ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || rm -f "$t/$f"
+  done
 done
 [ "${SETUP:-1}" != 1 ] || git -C "$UNIXNU" submodule update -q --init --depth 1 drivers/DarwinBoot   # SETUP=0: tree already prepared (scripts/laurel/mu-private-tree.sh)
 say "DarwinBoot $(git -C "$UNIXNU/drivers/DarwinBoot" rev-parse --short HEAD), UniXNU $(git -C "$UNIXNU" rev-parse --short HEAD), Mu fork $(git -C "$MU" rev-parse --short HEAD), RAM layout $LAYOUT"
@@ -70,7 +74,7 @@ for pt in $PATCHES; do
   say "applied $(basename "$pt") to $(case "$t" in "$DB") echo DarwinBoot ;; "$UNIXNU") echo UniXNU ;; *) echo Mu ;; esac)"
 done
 # the boot menu's slot core: one source, also built by the host test (scripts/laurel/boot-menu-test.sh). mu 0201 lists these in UniXNULib.inf.
-cp "$REPO/tools/laurel-slot/laurel_slot.c" "$REPO/tools/laurel-slot/laurel_slot.h" "$REPO/tools/laurel-slot/uefi/LaurelSlot.c" "$UNIXNU/package/UniXNUPkg/Library/UniXNULib/"
+cp "$REPO/tools/laurel-slot/laurel_slot.c" "$REPO/tools/laurel-slot/laurel_slot.h" "$REPO/tools/laurel-slot/uefi/LaurelSlot.c" "$REPO/tools/laurel-slot/uefi/LaurelPmicWdog.c" "$UNIXNU/package/UniXNUPkg/Library/UniXNULib/"
 miss=0
 for f in $(grep -rhoE 'Binaries/laurel_sprout/[^ |}]+' "$MU/Platforms/Xiaomi/laurel_sproutPkg" | sort -u); do
   [ -e "$MU/$f" ] || { echo "MISSING $f"; miss=1; }
