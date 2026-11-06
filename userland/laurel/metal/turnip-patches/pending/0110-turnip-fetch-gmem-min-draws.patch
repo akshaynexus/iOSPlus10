@@ -1,0 +1,30 @@
+Turnip (Mi A3, iOS 26), from ios-apollo userland/metal2/turnip/patches/0100: a framebuffer-fetch pass takes GMEM only from TU_FETCH_GMEM_MIN_DRAWS draws. PENDING: not in the series (default 0 = Mesa's rule) until an A/B on the phone picks the default.
+--- a/src/freedreno/vulkan/tu_autotune.cc
++++ b/src/freedreno/vulkan/tu_autotune.cc
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "tu_autotune.h"
++#include "util/u_debug.h" /* laurel: debug_get_num_option */
+ 
+ #include "tu_cmd_buffer.h"
+ #include "tu_cs.h"
+@@ -550,8 +551,16 @@
+     * SINGLE_PRIM_MODE(FLUSH), then that should cause significantly increased
+     * sysmem bandwidth (though we haven't quantified it).
+     */
+-   if (cmd_buffer->state.rp.sysmem_single_prim_mode)
+-      return false;
++   /* laurel (from ios-apollo Turnip 0100): a pass with framebuffer fetch takes GMEM only from
++    * TU_FETCH_GMEM_MIN_DRAWS draws on; below that the autotune picks as for any pass. Each CA key
++    * reads its framebuffer, so every CA pass took GMEM (36 to 108 tiles) whatever its size.
++    * 0: Mesa's rule. */
++   if (cmd_buffer->state.rp.sysmem_single_prim_mode) {
++      static const unsigned fetch_gmem_min_draws =
++         debug_get_num_option("TU_FETCH_GMEM_MIN_DRAWS", 0);
++      if (cmd_buffer->state.rp.drawcall_count >= fetch_gmem_min_draws)
++         return false;
++   }
+ 
+    /* If the user is using a fragment density map, then this will cause less
+     * FS invocations with GMEM, which has a hard-to-measure impact on
