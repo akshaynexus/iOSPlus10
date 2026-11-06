@@ -28,6 +28,23 @@ fi
 mkdir -p "$R/usr/libexec"
 install -m 755 "$B" "$R/usr/libexec/negroni-bluetool"
 [ "$(id -u)" != 0 ] || chown 0:0 "$R/usr/libexec/negroni-bluetool"
-python3 -I "$REPO/scripts/bt/bt-launchd.py" "$R/System/Library/xpc/launchd.plist" on \
+#  3. /usr/local/libexec/laurel-bluetoothd + /usr/local/lib/liblaurel-btpty.dylib (scripts/laurel/btpty-build.sh): the job's start program
+#     execs /usr/sbin/bluetoothd with openpty's central end non-blocking (an accessory's iAP PTY cannot stop the stack; Scion 2e0c90a).
+#     Not built = bluetoothd as Apple's (the job keeps /usr/sbin/bluetoothd), one line. Boot-arg laurel_btpty=0 is the kill switch.
+PT=$REPO/out/laurel/bt/root
+if [ ! -s "$PT/usr/local/libexec/laurel-bluetoothd" ] || [ ! -s "$PT/usr/local/lib/liblaurel-btpty.dylib" ]; then
+  if [ -n "${SUDO_USER:-}" ]; then pb() { sudo -u "$SUDO_USER" "$REPO/scripts/laurel/btpty-build.sh"; }; else pb() { "$REPO/scripts/laurel/btpty-build.sh"; }; fi
+  pb >/dev/null 2>&1 || echo "$(ts) root-bt: WARNING: laurel-bluetoothd not built (scripts/laurel/btpty-build.sh): bluetoothd runs as Apple's, iAP PTY can block it" >&2
+fi
+if [ -s "$PT/usr/local/libexec/laurel-bluetoothd" ] && [ -s "$PT/usr/local/lib/liblaurel-btpty.dylib" ]; then
+  mkdir -p "$R/usr/local/libexec" "$R/usr/local/lib"
+  install -m 755 "$PT/usr/local/libexec/laurel-bluetoothd" "$R/usr/local/libexec/laurel-bluetoothd"
+  install -m 644 "$PT/usr/local/lib/liblaurel-btpty.dylib" "$R/usr/local/lib/liblaurel-btpty.dylib"
+  [ "$(id -u)" != 0 ] || chown 0:0 "$R/usr/local/libexec/laurel-bluetoothd" "$R/usr/local/lib/liblaurel-btpty.dylib"
+  WRAP=/usr/local/libexec/laurel-bluetoothd
+else
+  WRAP=
+fi
+BTD_WRAP=$WRAP python3 -I "$REPO/scripts/bt/bt-launchd.py" "$R/System/Library/xpc/launchd.plist" on \
   "$R/System/Library/LaunchDaemons/com.apple.bluetoothd.plist"
-echo "$(ts) root-bt: done (bluetoothd job + BlueTool stand-in; kernel 2600 + ADT /arm-io/bluetooth from mkadt.py)"
+echo "$(ts) root-bt: done (bluetoothd job${WRAP:+ through $WRAP + liblaurel-btpty.dylib} + BlueTool stand-in; kernel 2600 + ADT /arm-io/bluetooth from mkadt.py)"

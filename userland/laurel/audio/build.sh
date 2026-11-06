@@ -29,6 +29,8 @@ mkdir -p "$B" "$W/src"
 # our change to the external source goes in as a patch on a copy (CLAUDE.md: nothing is committed inside external/)
 cp "$SRC/audio_plugin.c" "$SRC/redwood_audio.h" "$W/src/"
 (cd "$W/src" && patch -s -p1 < "$HERE/mic-input.patch") || { echo "audio: mic-input.patch does not apply" >&2; exit 1; }
+# the Actuator's open of /dev/redwood-haptic is tried again after a failure (both builds; docs/laurel_sprout/haptics.md "iOS 26")
+(cd "$W/src" && patch -s -p1 < "$HERE/actuator-retry.patch") || { echo "audio: actuator-retry.patch does not apply" >&2; exit 1; }
 if [ "${IOS26:-0}" = 1 ]; then
   (cd "$W/src" && patch -s -p1 < "$HERE/ios26-devices.patch") || { echo "audio: ios26-devices.patch does not apply" >&2; exit 1; }
 fi

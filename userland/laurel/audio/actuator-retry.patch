@@ -1,0 +1,41 @@
+--- a/audio_plugin.c
++++ b/audio_plugin.c
+@@ -1074,6 +1074,9 @@
+  */
+ static int haptic = -1;          /* the motor driver; -2: not there (the kernel runs without haptic=5) */
+ static unsigned haptic_said;
++static unsigned haptic_tries;    /* failed opens: every write tries again (laurel: the node may come up after the first haptic) */
++#define HAPTIC_TRIES_EVERY 256   /* after HAPTIC_TRIES_FAST failures, one try in this many writes (a kernel without the node) */
++#define HAPTIC_TRIES_FAST  512
+ 
+ static void
+ actuator_write(const int16_t *samples, UInt32 frames)
+@@ -1085,9 +1088,25 @@
+ 
+ 		peak = v > peak ? v : peak;
+ 	}
+-	if (haptic == -1) {
+-		haptic = open("/dev/redwood-haptic", O_WRONLY | O_NONBLOCK);
+-		haptic = haptic >= 0 ? haptic : -2;
++	/*
++	 * laurel (actuator-retry.patch): a failed open is tried again, at every write for the first HAPTIC_TRIES_FAST, then
++	 * once in HAPTIC_TRIES_EVERY. The one-shot open (haptic = -2 for good) lost the haptics for the whole boot when the
++	 * kernel made the node after the first haptic (Scion 027dd2b saw the same on the S9). Said once when it opens late.
++	 */
++	if (haptic < 0 && (haptic_tries < HAPTIC_TRIES_FAST || haptic_tries % HAPTIC_TRIES_EVERY == 0)) {
++		int fd = open("/dev/redwood-haptic", O_WRONLY | O_NONBLOCK);
++
++		if (fd >= 0) {
++			haptic = fd;
++			if (haptic_tries > 0) {
++				say("redwood: audio: /dev/redwood-haptic opened after %u failed tries\n", haptic_tries);
++			}
++		} else {
++			haptic = -2;
++		}
++	}
++	if (haptic < 0) {
++		haptic_tries++;
+ 	}
+ 	if (haptic >= 0) {
+ 		(void)write(haptic, samples, (size_t)frames * 2);

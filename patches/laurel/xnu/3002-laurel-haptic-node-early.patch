@@ -1,0 +1,89 @@
+laurel 3002: LAUREL HAPTIC: /dev/redwood-haptic is made with /dev/topaz-audio on the audio thread (after vfsinit and sweet_ufs, before the root mount and launchd), not after the root mount; both kernels. docs/laurel_sprout/haptics.md "iOS 26".
+
+Lead: Scion 027dd2b (max77705, Galaxy S9): the audio server's plug-in opens the haptic node once, at its first haptic, and never again when
+the open failed; made in a later thread, iOS never felt a thing; made at driver start, it works. Ours is the same plug-in code (ios-topaz
+audio_plugin.c actuator_write: open once, then haptic = -2 for good). [V 2026-11-03 boot] the node was made at 19:31:51 and audiomxd started at
+19:32:05, so that boot was not this case; but any boot where the root mount is late, or audiomxd's first haptic comes before the root thread's
+20 ms poll, is. devfs_make_node() before vfsinit() panics (audio_dev_init's rule), so the earliest safe point is the audio thread's, after
+topaz_soc_map() (sweet_ufs up). The root thread still makes it when audio is off (adsp=0) or the audio thread is late; whoever comes first.
+The ready line says "made before|after the root mount". The closed-loop self-check (UI line) stays after the root mount: it reads files.
+
+diff --git a/bsd/dev/laurel_haptic.c b/bsd/dev/laurel_haptic.c
+--- a/bsd/dev/laurel_haptic.c
++++ b/bsd/dev/laurel_haptic.c
+@@ -69,6 +69,7 @@
+ extern kern_return_t thread_terminate(thread_t);
+ 
+ int laurel_haptic_start(void);
++void laurel_haptic_make_node(void);              /* TopazAudio.cpp, with /dev/topaz-audio (laurel 3002) */
+ int laurel_haptic_vib(uint32_t ms);
+ int laurel_haptic_publish_closed_loop(void);     /* LaurelVibrator.cpp */
+ 
+@@ -588,7 +589,33 @@
+ #define LH_PLUGIN   "/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver"
+ #define LH_VIRTUAL  "/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin"
+ 
+-/* after the root mount (devfs is up then): the node, then the closed-loop self-check */
++/*
++ * The node (laurel 3002): made as early as devfs allows, with /dev/topaz-audio (TopazAudio's audio thread calls this right
++ * after its own node, once sweet_ufs is up: after vfsinit, before the root mount and before launchd), else here after the
++ * root mount. Why early: the audio server's plug-in opens the node once, at its first haptic, and keeps "not there" for
++ * good when the open failed (ios-topaz audio_plugin.c actuator_write: haptic = -2; Scion 027dd2b saw the same on the
++ * S9: the node made in a later thread was never felt). Whoever comes first makes it; the other sees it made.
++ */
++static void *lh_node;
++static bool lh_node_tried;
++
++void
++laurel_haptic_make_node(void)
++{
++	lck_mtx_lock(&lh_wlock);
++	if (!lh_node_tried) {
++		int major = cdevsw_add(-1, &lh_cdevsw);
++		lh_node_tried = true;
++		lh_node = major < 0 ? NULL :
++		    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic");
++		printf("LAUREL HAPTIC: /dev/redwood-haptic %s (S16LE mono %u Hz, 2 ms blocks, >%u of 32768 = on; made %s)\n",
++		    lh_node ? "ready" : "not made (devfs)", LH_RATE, LH_SILENT,
++		    rootvnode == NULLVP ? "before the root mount" : "after the root mount");
++	}
++	lck_mtx_unlock(&lh_wlock);
++}
++
++/* after the root mount: the node (if the audio thread did not make it yet), then the closed-loop self-check */
+ static void
+ lh_root_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -597,11 +624,8 @@
+ 		delay_for_interval(20, NSEC_PER_MSEC);
+ 		waited += 20;
+ 	}
+-	int major = cdevsw_add(-1, &lh_cdevsw);
+-	void *node = major < 0 ? NULL :
+-	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic");
+-	printf("LAUREL HAPTIC: /dev/redwood-haptic %s (S16LE mono %u Hz, 2 ms blocks, >%u of 32768 = on)\n",
+-	    node ? "ready" : "not made (devfs)", LH_RATE, LH_SILENT);
++	laurel_haptic_make_node();
++	void *node = lh_node;
+ 	if (rootvnode == NULLVP) {
+ 		printf("LAUREL HAPTIC UI: off: no root file system after %u s\n", waited / 1000u);
+ 	} else if (lh_ui == 0) {
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -27,6 +27,7 @@
+ #define LOG(fmt, ...)       IOLog("TopazAudio: " fmt "\n", ##__VA_ARGS__)
+ 
+ extern "C" bool     topaz_soc_map(void);
++extern "C" void     laurel_haptic_make_node(void);  /* bsd/dev/laurel_haptic.c (laurel 3002): /dev/redwood-haptic with our node */
+ extern "C" void    *topaz_smem_partition(uint16_t a, uint16_t b);
+ extern "C" void    *topaz_smem_get(void *part, uint16_t item, uint32_t *size);
+ extern "C" void    *topaz_smem_alloc(void *part, uint16_t item, uint32_t size);
+@@ -2108,6 +2109,7 @@
+ 	}
+ 	audio_dev_init();                                   /* the node exists even if audio stays off */
+ 	mic_dev_init();                                     /* so does this one: an open says ENXIO while the mic is off */
++	laurel_haptic_make_node();                          /* and the haptic node, before user space (laurel 3002) */
+ 	if (killed) {
+ 		say_off("kill switch (boot-arg adsp=0 / laurelaudio=0)");
+ 		goto out;

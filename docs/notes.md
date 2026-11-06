@@ -5529,3 +5529,9 @@ Full text: `docs/laurel_sprout/gpu.md` "RPM scaling", `docs/laurel_sprout/cpu-pa
 - [V] The iOS 16 kernel on laurel-sprout does not build since 2991: `laurel_wdog.c:406: no member named 'el0_synchronous_trap' in 'struct machine_thread'` (xnu-8796 has no such field). Not mine: the last iOS 16 builds in the main checkout's logs are 314-316 patches, before 2991. 3020-3022 apply on it (`apply-xnu: ok`).
 - Worktree: `git submodule update --init` of Mu-Silicium-negroni in a worktree gave an empty directory the first time; `--force --recursive` in tmux fetches it (many nested clones, long). The iOS 16 build in a worktree needs `external/ios-topaz`, `external/ios-sweet-linux` and `out/laurel-kernel/{theos,cache,dl,deps}` as links to the main checkout's.
 - Writing a Python heredoc from zsh: a line `PY` inside the Python text ends a `<<'PY'` heredoc early: use another delimiter.
+- 2026-11-07, patches 3002 + userland (branch t3/laurel-haptics-audio-lag on t3/integ-1107): Scion leads. (1) Haptic node timing: the plug-in opens
+  `/dev/redwood-haptic` once and keeps "not there" (Scion 027dd2b); 3002 makes the node with `/dev/topaz-audio` on the audio thread (before launchd),
+  `actuator-retry.patch` makes the plug-in's open retry; [V] the 11-03 boot had the node 14 s before audiomxd, so timing was not that boot's cause.
+  (2) BTAudioHALPlugin stays in HAL when the bluetoothd job is in the root (Scion 84b0b1a: A2DP plays through it); `bt_audio()` in the 26 spec,
+  `BTAUDIO` default follows `BT` in root-audio.sh. (3) bluetoothd's iAP PTY non-blocking through `laurel-bluetoothd` + `liblaurel-btpty.dylib`
+  (Scion 2e0c90a: a full PTY written under the stack mutex got bluetoothd aborted 20 s after pairing). docs/laurel_sprout/bluetooth.md "iAP PTY".

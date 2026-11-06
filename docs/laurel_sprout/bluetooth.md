@@ -244,3 +244,23 @@ and the boot are not touched.
   build 0x0102 patch 0x0002, mode 3`, `fw: NVM tag 17 byte 2 is 0x22 (no speed index), byte 1 is 0x11: the speed goes
   there`, `fw: cmnv12.bin 2564 bytes from bluetooth_b, speed index 14 in tag 17 byte 1`, then
   `on: WCN39xx product 0x000f rom 0x0102, cmbtfw12.tlv + cmnv12.bin, 3000000 baud, BD_ADDR ..`.
+
+## iAP PTY and the audio plug-in (2026-11-07, Scion 2e0c90a and 84b0b1a; host only, not booted)
+
+- **BTAudioHALPlugin.driver stays in HAL when the bluetoothd job is in the root.** It is how bluetoothd's A2DP/HFP devices reach CoreAudio: Scion
+  84b0b1a saw, on the S9 with bluetoothd and this plug-in, "[BTAudio] Starting BTAudioPlugin", VirtualAudio's headset ports and A2DP streaming to a
+  WH-1000XM3; without it bluetoothd logs "unable to sendMsg due to no available xpc client connections" and no headphones appear. We moved it to
+  HAL.disabled since the negroni days (its factory's XPC trapped the host without bluetoothd). Now: `scripts/laurel/root-audio.sh` keeps it unless
+  `BT=0` (`BTAUDIO=1|0` overrides); `ios26-root-spec.py bt_audio()` keeps it when the bluetooth hook applied, else moves it, one audit line. The trap
+  case is the one without bluetoothd, which is the case where it is moved. [U] on this phone until a headset is paired.
+- **bluetoothd's iAP PTY made non-blocking** (`userland/laurel/bt/laurel_btpty.c`, inserted by `/usr/local/libexec/laurel-bluetoothd`,
+  `btd_wrap.c`; built by `scripts/laurel/btpty-build.sh`, installed by `root-bt.sh`, the job's `ProgramArguments[0]` set by `scripts/bt/bt-launchd.py`
+  with `BTD_WRAP`). Scion 2e0c90a [V on the S9]: an accessory that offers iAP (the WH-1000XM3 does) makes bluetoothd open the "Wireless IAP"
+  profile at pairing: `openpty`, the peripheral end to an accessory server that is not there, then every iAP byte written into the central end from
+  the stack thread with the stack mutex held; nobody reads it, the PTY fills, the write sleeps in `ptcout`, 20 s later bluetoothd's watchdog aborts
+  the process and the headset is dropped. bluetoothd makes that end non-blocking in another configuration; the interposer does it in every one:
+  a full PTY gives EAGAIN and the byte is dropped (iAP goes nowhere here anyway). Lines in bluetoothd's stderr and `/var/tmp/laurel-bt.log`:
+  `LAUREL BT PTY: on: in bluetoothd (pid N)`, `LAUREL BT PTY: /dev/ttysNNN: central end FD non-blocking`. Kill switch `laurel_btpty=0`
+  (the wrapper then execs Apple's bluetoothd as is). Not built: the job keeps `/usr/sbin/bluetoothd`, one WARNING line from root-bt.sh.
+- Test: pair a headset that offers iAP; expect pairing to stay up past 20 s, `LAUREL BT PTY` lines, and with the plug-in in HAL a "Headphones"
+  route in Control Center and sound in the headset.

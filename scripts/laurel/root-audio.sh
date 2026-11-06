@@ -85,12 +85,15 @@ else
   echo "root-audio: WARNING: no VirtualAudio.plugin in the root (no speaker route without it)" >&2
 fi
 
-# 3. BTAudioHALPlugin off
+# 3. BTAudioHALPlugin: in HAL when the bluetoothd job is in this root (root-bt.sh, BT=1, the default), else off. The plug-in is the
+#    way A2DP/HFP devices reach CoreAudio (Scion 84b0b1a: with it and bluetoothd, headphones play); without bluetoothd it waits for a mach
+#    service that never comes and its XPC trapped the host on negroni. BTAUDIO=1|0 overrides.
 BT=$HAL/BTAudioHALPlugin.driver
 BTOFF=$R/System/Library/Audio/Plug-Ins/HAL.disabled/BTAudioHALPlugin.driver
-if [ "${BTAUDIO:-0}" = 1 ]; then
-  if [ -d "$BTOFF" ] && [ ! -e "$BT" ]; then mv "$BTOFF" "$BT"; fi
-  echo "root-audio: BTAudioHALPlugin.driver stays in HAL (BTAUDIO=1)"
+BTAUDIO=${BTAUDIO:-$([ "${BT_JOB:-${BT:-1}}" = 0 ] && echo 0 || echo 1)}
+if [ "$BTAUDIO" = 1 ]; then
+  if [ -d "$BTOFF" ] && [ ! -e "$BT" ]; then mkdir -p "$(dirname "$BT")"; mv "$BTOFF" "$BT"; rmdir "$(dirname "$BTOFF")" 2>/dev/null || true; fi
+  echo "root-audio: BTAudioHALPlugin.driver in HAL (bluetoothd job on; A2DP/HFP devices reach CoreAudio through it)"
 elif [ -d "$BT" ]; then
   mkdir -p "$(dirname "$BTOFF")"
   rm -rf "$BTOFF"

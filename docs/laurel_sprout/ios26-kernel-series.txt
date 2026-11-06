@@ -357,6 +357,7 @@
 2995-laurel-wdog-frame-scan.patch                              applied
 3000-laurel-audio-lead.patch                                   applied
 3001-laurel-haptic-first-contact.patch                         applied
+3002-laurel-haptic-node-early.patch                            applied
 3020-laurel-cpu-motion.patch                                   applied
 3021-laurel-gpu-motion.patch                                   applied
 3022-laurel-ram-top-line.patch                                 applied
@@ -380,4 +381,4 @@
 9017-laurel-wdog-trap-stamp-sleh.patch                         post
 9018-laurel-wdog-irq-frame-sleh.patch                          post
 9019-laurel-wdog-el0-trap-flag.patch                           post
-== series: 244 applied, 87 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
+== series: 245 applied, 87 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
