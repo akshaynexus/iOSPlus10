@@ -114,4 +114,10 @@ over on Android.
   3. **A dark phone that stays dark**: a hang with nothing armed (the count was disarmed and the kernel never re-armed it), or a crash-dump mode (Qualcomm dump: nothing on the panel, or a `fastboot`/`dload` text) [U]: then only the keys (Power + Vol Down).
   The host cannot tell 1 from 3 until ABL's fallback brings Android (case 1), so the owner's look at the panel decides.
 
+### 6.4 The dark phone is a powered-off phone: fastboot's idle exit [I, strong]
+
+- [V] 19:25:50 fastboot, no command for 13 s (the lock was another job's), 19:26:03 gone, dark until 19:54:53, when fastboot appeared again (the owner's keys [I]). Then 19:58:46 fastboot with the guardian paused, no command, gone by 19:59:05, dark again (20:01). Every fastboot visit the guardian or a hand answered within seconds ended in a normal boot; every visit left idle for about 13-18 s ended dark. A boot after an idle exit never showed on USB, and the PMIC count never reset it: nothing runs. Read: this ABL's fastboot powers the phone off after about 15 s with no command [I]. A powered-off phone is case 3 of 6.3: only the Power key starts it.
+- Fix: the guardian keeps every fastboot session alive (one `getvar product` per 5 s tick) while it waits for the lock or stands back for a host job (commit after 80b3c89). Every other script that asks for fastboot must send its first command within 10 s, or keep the session alive the same way.
+- cpu-flash3 (another agent): `ctl bootloader` under the lock, then the lock freed, then a slow poll for fastboot: it lost the race to the guardian 3 times (19:56-19:58) and, with the guardian paused, to the idle exit (19:59). A job that wants fastboot should keep the lock from the `ctl bootloader` until its flash, and poll fastboot every 2 s.
+
 - 07:44: the phone is dark on USB (no fastboot, no iOS, no adb) since 07:29:51: a hang before USB on ae838bd, with the PMIC watchdog off in that image: case C with no way in from the host. The next key press lands in fastboot, where the guardian flashes the queued image (3052 + 3090 + 3091, PMIC watchdog on) within seconds.

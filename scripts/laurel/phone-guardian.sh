@@ -254,9 +254,13 @@ while :; do
   if [ -f "$G/pause" ]; then sleep "$TICK"; continue; fi
   case "$s" in
   fastboot)
+    # [V 19:26, 19:59] a fastboot visit that gets no command for about 13-18 s ends by itself, and the phone is then dark (no boot, no USB, no
+    # PMIC reset: a power-off [I]), until the keys. So while this loop waits (another job holds the phone, or a host job asked for fastboot) it
+    # keeps the session alive with one getvar per tick.
+    if [ "$standback_until" -gt "$(now)" ] || ! lock_free; then timeout 4 fastboot getvar product >/dev/null 2>&1 || true; fi
     if [ "$standback_until" -gt "$(now)" ]; then :
     elif [ "$standback_until" = 0 ] && host_asked; then
-      standback_until=$(( $(now) + ${HOST_WAIT_S:-90} )); log "fastboot: a host job asked for it (ctl bootloader in the USB log): standing back ${HOST_WAIT_S:-90} s"
+      standback_until=$(( $(now) + ${HOST_WAIT_S:-90} )); log "fastboot: a host job asked for it (ctl bootloader in the USB log): standing back ${HOST_WAIT_S:-90} s, keeping the session alive"
     elif lock_free; then
       [ -n "$free_since" ] || free_since=$(now)
       if [ $(( $(now) - free_since )) -ge "$FREE_S" ]; then
