@@ -1,0 +1,180 @@
+laurel 3050: LAUREL WDOG: the stuck-CPU report says whether the silent core's clock runs, and tries a SEV; the bark's "pet thread last ran" is read after the reports. Both kernels. docs/laurel_sprout/watchdog.md section 16.
+
+[V 2026-11-03..07, 26 catches] One core per cluster stops dead under full load, always the same core (silver cpu 5 in 8-CPU boots,
+gold cpu 1 in 4-CPU boots), in EL0 (modelmanagerd, iconservicesagent, audiomxd, runningboardd: objc_msgSend, swift_allocBox) and
+inside system calls (madvise, mmap, kevent_id, getdirentries64), its timer PPI and the SGI pending at the redistributor, nothing active,
+no handler running, its trap count frozen. Nothing in the code masks interrupts at EL0 (the emulator writes NZCV only, every EL0 return
+takes the saved SPSR), the only SPI this port enables is the bark, GICR_ISACTIVER0 is 0: the GIC CPU interface is not wedged. What is
+left: the core executes nothing (a stall on the bus, a trap into a world above EL1: the EL2 vectors of start.s are `b .`, or TrustZone),
+or its clock is stopped. The report could not tell these apart. Now, in the same lines, with reads only:
+- "core state: OSM cycles in 10 ms: N (M MHz)": the OSM's per-core cycle counter (clk-cpu-osm.c OSM_CYCLE_COUNTER_STATUS_REG 0x9c0 +
+  4 * core), read twice 10 ms apart from the reporting CPU, next to the same count of a core of the same cluster that answers (the
+  reference proves the register counts at all). 0: the clock is stopped (WFI/WFE with no wake, or off). Near the cluster's MHz: it runs.
+- GICR_WAKER of the silent core: ProcessorSleep set would mean the redistributor forwards nothing.
+- At the first line of a silence (2 s) one SEV: a core parked in WFE with its interrupt masked wakes on it; nothing else notices a SEV.
+- The bark's "pet thread last ran 960767920505705 ms ago" [V 05:19:53, 05:21:55, 05:24:16]: `now` was read before the eight reports
+  (seconds of kprintf) and the pet thread stamped a later time on another CPU: the difference wrapped. Read again after the reports;
+  a stamp after now prints 0.
+New export in bsd/dev/laurel_thermal.c: laurel_osm_core_cycles(mpidr, &cycles), false before the tables are mapped.
+
+diff --git a/osfmk/arm64/laurel_wdog.c b/osfmk/arm64/laurel_wdog.c
+--- a/osfmk/arm64/laurel_wdog.c
++++ b/osfmk/arm64/laurel_wdog.c
+@@ -204,7 +204,7 @@
+ 
+ /* read only: the pending and active words of a CPU's redistributor: its SGIs and PPIs (bit = INTID). laurel 2988: whole words */
+ static bool
+-lwd_gicr_words(uint32_t mpidr, uint32_t *pending, uint32_t *active)
++lwd_gicr_words(uint32_t mpidr, uint32_t *pending, uint32_t *active, uint32_t *waker)
+ {
+ 	if (lwd_gicr == 0) {
+ 		return false;
+@@ -216,6 +216,9 @@
+ 		if (typer != 0 && aff == (mpidr & 0xffffu)) {
+ 			*pending = *(volatile uint32_t *)(lwd_gicr + off + LWD_SGI_OFF + 0x200u);
+ 			*active = *(volatile uint32_t *)(lwd_gicr + off + LWD_SGI_OFF + 0x300u);
++			if (waker != NULL) {
++				*waker = *(volatile uint32_t *)(lwd_gicr + off + 0x14u);    /* laurel 3050: GICR_WAKER */
++			}
+ 			return true;
+ 		}
+ 		if (typer & (1ull << 4)) {      /* GICR_TYPER.Last */
+@@ -231,7 +234,7 @@
+ {
+ 	uint32_t p = 0, a = 0;
+ 
+-	if (!lwd_gicr_words(mpidr, &p, &a)) {
++	if (!lwd_gicr_words(mpidr, &p, &a, NULL)) {
+ 		return false;
+ 	}
+ 	*pending = (p & LWD_SGI_BIT) != 0;
+@@ -399,6 +402,55 @@
+ 	}
+ }
+ 
++/*
++ * laurel 3050: does the silent core's clock run? The OSM keeps a cycle counter per core (bsd/dev/laurel_thermal.c, laurel_osm_core_cycles):
++ * two reads 10 ms apart, for the silent core and for a core of the same cluster that answers (the reference says the counter works at all).
++ * A count near the cluster's MHz x 10000: the core executes, or spins in a world above EL1 (EL2 vectors, TrustZone), or waits on the bus with
++ * its clock on. A count of 0: the clock is stopped: WFI/WFE with no wake, or the core is off. GICR_WAKER: ProcessorSleep (bit 1) set means the
++ * redistributor forwards nothing to it. Reads only; a 10 ms wait on this CPU, also with interrupts off (the bark). Nothing is written.
++ */
++extern bool laurel_osm_core_cycles(uint32_t mpidr, uint32_t *cycles);
++static void
++lwd_core_state_line(const char *prefix, int cpu, uint32_t mpidr, bool have_waker, uint32_t waker)
++{
++	uint32_t c0 = 0, c1 = 0, r0 = 0, r1 = 0, rm = 0;
++	int ref = -1;
++	bool have = laurel_osm_core_cycles(mpidr, &c0), have_ref = false;
++
++	for (unsigned i = 0; i < LWD_CPUS && have; i++) {
++		cpu_data_t *rd = (cpu_data_t *)CpuDataEntries[i].cpu_data_vaddr;
++
++		if ((int)i == cpu || rd == NULL || lwd_cpu[i].online == 0 || lwd_cpu[i].silent_ms >= 1000u) {
++			continue;
++		}
++		rm = (uint32_t)rd->cpu_phys_id;
++		if (((rm ^ mpidr) & 0xff00u) == 0 && laurel_osm_core_cycles(rm, &r0)) {
++			ref = (int)i;
++			have_ref = true;
++			break;
++		}
++	}
++	if (have) {
++		uint64_t until = mach_absolute_time() + 10ull * (lwd_ms ? lwd_ms : 19200);
++
++		while (mach_absolute_time() < until) {
++			;
++		}
++		(void)laurel_osm_core_cycles(mpidr, &c1);
++		if (have_ref) {
++			(void)laurel_osm_core_cycles(rm, &r1);
++		}
++	}
++	if (!have) {
++		kprintf("%s cpu %d core state: OSM cycle counter not readable; GICR WAKER %s0x%x\n", prefix, cpu, have_waker ? "" : "unread ", waker);
++		return;
++	}
++	kprintf("%s cpu %d core state: OSM cycles in 10 ms: %u (%u MHz: %s); reference cpu %d of the same cluster: %u (%u MHz); GICR WAKER %s0x%x%s\n",
++	    prefix, cpu, c1 - c0, (c1 - c0) / 10000u, (c1 - c0) == 0 ? "its clock is stopped: WFI/WFE with no wake, or off" : "it runs, or spins above EL1, or waits on the bus",
++	    ref, have_ref ? r1 - r0 : 0, have_ref ? (r1 - r0) / 10000u : 0, have_waker ? "" : "unread ", waker,
++	    (have_waker && (waker & 2u)) ? " (ProcessorSleep: the redistributor forwards nothing)" : "");
++}
++
+ /* Three lines through kprintf, also from a path with interrupts off (a stackshot, a bark). Only reads; a CPU that runs on sees no change. */
+ void laurel_wdog_report_cpu(int cpu, const char *prefix);
+ void
+@@ -442,8 +494,8 @@
+ 	}
+ #endif
+ 	bool open = in_trap || here;
+-	uint32_t pend = 0, act = 0;
+-	bool have_words = lwd_gicr_words((uint32_t)cd->cpu_phys_id, &pend, &act);
++	uint32_t pend = 0, act = 0, waker = 0;
++	bool have_words = lwd_gicr_words((uint32_t)cd->cpu_phys_id, &pend, &act, &waker);
+ 	uint32_t dyld_slide = 0;
+ 	thread_t th = (thread_t)cd->cpu_active_thread;
+ 	struct thread_ro *ro = NULL;
+@@ -469,6 +521,7 @@
+ 		    prefix, cpu, c->trap_count, trap_t != 0 && now > trap_t ? (now - trap_t) / ticks : 0, c->trap_pc, esr >> 26, pend, act,
+ 		    have_words ? "" : " (unread)", dyld_slide);
+ 	}
++	lwd_core_state_line(prefix, cpu, (uint32_t)cd->cpu_phys_id, have_words, waker);
+ }
+ 
+ /* post/9015: a stackshot gave this CPU up */
+@@ -564,7 +617,11 @@
+ 		}
+ 		laurel_wdog_report_cpu((int)i, "LAUREL WDOG: bark:");
+ 	}
+-	panic("LAUREL WDOG: bark: no pet for %u s; pet thread last ran %llu ms ago; silent CPUs 0x%x", LWD_BARK_S, (now - lwd_thread_ran) / ticks, silent);
++	/* laurel 3050: the reports above take seconds and the pet thread goes on running on another CPU: read both again, and a stamp after now is 0 */
++	now = mach_absolute_time();
++	uint64_t ran = lwd_thread_ran;
++
++	panic("LAUREL WDOG: bark: no pet for %u s; pet thread last ran %llu ms ago; silent CPUs 0x%x", LWD_BARK_S, now > ran ? (now - ran) / ticks : 0, silent);
+ }
+ 
+ /* one signal to each CPU in use: the stamp in sleh_irq is the answer. SIGPast waits for nothing: no slot, no spin (cpu_signal_internal): a stuck CPU cannot stop the sender. */
+@@ -612,6 +669,11 @@
+ 			char prefix[48];
+ 
+ 			snprintf(prefix, sizeof(prefix), "LAUREL WDOG: on: silent %u ms:", silent[i]);
++			if (c->level == 1) {
++				/* laurel 3050: a core parked in WFE with its interrupt masked wakes on an event; nothing else sees a SEV */
++				__builtin_arm_sev();
++				kprintf("%s cpu %u: SEV sent (wakes a core parked in WFE)\n", prefix, i);
++			}
+ 			laurel_wdog_report_cpu((int)i, prefix);
+ 		} else if (say < 0) {
+ 			kprintf("LAUREL WDOG: on: cpu %u answers again after over %u ms; it came in at pc 0x%llx\n", i, before, c->pc);
+diff --git a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
+--- a/bsd/dev/laurel_thermal.c
++++ b/bsd/dev/laurel_thermal.c
+@@ -154,6 +154,26 @@
+ 	return 0;
+ }
+ 
++/*
++ * laurel 3050: the OSM's cycle counter of one core (clk-cpu-osm.c OSM_CYCLE_COUNTER_STATUS_REG: 0x9c0 + 4 * core of the cluster's
++ * frame). It counts while the core's clock runs, from any CPU, with no side effect: the watchdog report reads it twice for a silent
++ * core, so a core that executes (or spins in another world) and a core whose clock is stopped (WFI, WFE, power collapse) tell apart.
++ * False: no table mapped yet, or not a core of the two clusters.
++ */
++#define OSM_CYCLES      0x9c0u
++bool laurel_osm_core_cycles(uint32_t mpidr, uint32_t *cycles);
++bool
++laurel_osm_core_cycles(uint32_t mpidr, uint32_t *cycles)
++{
++	unsigned c = (mpidr >> 8) & 0xffu, core = mpidr & 0xffu;
++
++	if (c >= CL_N || core >= 4u || cl_base[c] == 0) {
++		return false;
++	}
++	*cycles = *(volatile uint32_t *)(cl_base[c] + OSM_CYCLES + 4u * core);
++	return true;
++}
++
+ #include "laurel_thermal_tsens.h"       /* tsens_dC, read_temps */
+ 
+ #include "laurel_gov_loop.h"            /* sample_busy, gov_step, rows_line */

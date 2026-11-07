@@ -288,3 +288,51 @@ So a kernel that hangs at `PE_init` now ends in a hard reset 102 s after the jum
 3. The reset itself, once, on purpose: `EXTRA_ARGS=laurelwdog=0` makes 3030 disarm (no pet thread)... so instead: a boot with `laurelpmicwdog=1` and a hang. The first real hang of the phone shows it: the log stops, the phone is in the menu about 62 s later (kernel count) or 102 s after the jump (menu count). **Then, before anything else, read the PMIC WD state in Android after a WD reset**: `adb shell su -c 'cat /sys/kernel/debug/regmap/spmi0-00/registers | grep ^857'` must say `857: 00` (the hard reset cleared the enable). If it says `80`, the count survives a hard reset: then Android would reset 102 s into every boot that follows a WD reset, and the menu's arming must go (`laurelpmicwdog=0` in `uefi-image.sh` until a disarm path for ABL's fallback exists). [I] it clears; [U] on this PMIC.
 4. ABL after a PMIC hard reset: the menu again, retries one less (the notice line counts), no fastboot, no EDL.
 5. iOS 16: the same patches apply (both kernels build); not booted.
+
+## 16. 2026-11-07: 26 catches read together; what the core is not doing; patches 3050, 3051 (built, NOT BOOTED)
+
+Owner: "Another panic when I opened the lockscreen and unlocked pls fix these panics". Kernel da6a24b (386 patches; 2994 and 3041 on, both SMMUs PTM on, `laurelucache=0`).
+
+### The population [V logs 11-03..11-07]
+
+| Boot type | Core | Catches | Where |
+|---|---|---|---|
+| 8 CPUs | cpu 5 (mpidr 0x1, silver) | 9 on 11-06, 4 on 11-07, 3 on 11-03 | EL0: modelmanagerd `swift_allocBox+0x1b0`, iconservicesagent `objc_retain_x20+0xc`, audiomxd; system calls: madvise, mmap, kevent_id, getdirentries64 (healthd, fitnessintelligenced) |
+| 4 CPUs | cpu 1 (mpidr 0x101, gold) | 7 on 11-06 | runningboardd `objc_msgSend+0xc4`, kevent_id |
+| any | another core | 0 | |
+
+Every catch: the timer PPI (INTID 19 on this GIC: Qualcomm wires the architected timers to PPIs 16-19, `trinket.dtsi` `<1 3 0xf08>`) and SGI 1 pending at the redistributor, `active 0`, `in a handler now: pc 0x0`, the core's trap count frozen (363877 at 05:19:36 and at 05:19:53), the other 7 cores fine. The user pcs are the hottest functions of any process (the last interrupt's place, not the stall's). Temperatures at the 11-07 catches 76.7-79.3 C, both clusters at 100 % and at the top rows (1804, 2016 MHz); the 11-06 catches 40 s to 4 min after boot (the boot storm, both clusters at 100 %); the 34 quiet minutes of the 11-07 boot ran at low load. 05:08:34, 81.9 C at 100 %: no catch.
+
+### Excluded in the code [V]
+
+| Candidate | Why not |
+|---|---|
+| Interrupts masked at EL0 by a bad SPSR | the EL0 emulator writes NZCV and SS only (`laurel_a64emu.c` 1386, 1399, 2450, 2480); UCACHE moves the pc only; `sleh_synchronous` inherits the mask from the saved SPSR, `exception_return` restores it: a kernel-side leak heals at the ERET |
+| The GIC CPU interface wedged by a lost EOI (an active priority) | the only SPI this port enables is the bark (grep: no other GICD write exists; USB, UFS, GPU, display, touch poll); `GICR_ISACTIVER0` 0 in every catch: no SGI or PPI active |
+| PMR, group enable, WAKER | written once at boot (`pe_init_fiq`), never again (grep) |
+| A trap into EL2 | secondaries arrive at EL2 and `sweet_secondary_entry` sets HCR_EL2 = RW only, CPTR/MDCR/VTTBR 0, CNTHCTL 3, CNTVOFF 0; VBAR_EL2 = `LowExceptionVectorBase` (`b .`): only an HVC reaches it; the kernel has 0 `hvc` instructions (objdump) |
+| Linux errata of these cores | 845719 (Kryo 2xx silver, AArch32 ASID), 858921 (Kryo 2xx gold, CNTVCT), Falkor 1003 (not these parts): none is a stall |
+| A per-thread cause | 26 processes, 26 pcs, the same core each time |
+| The SMMUs | 2992, 2993 on; catches went on |
+| A lock spin | 2994 on: a 250 ms spin panics; no such panic came |
+
+### Left [I]
+
+The core executes nothing: a stall on the bus (one instruction that never completes), a world above EL1 (TrustZone on a secure interrupt whose handler never returns), or a stopped clock. The one constant is the physical core: the second core of each cluster (the inner cores of the row [I]), which is what a core with the smallest timing margin at an operating point looks like. The port's operating point is new: since 2972 (11-03, the day the hangs began) both clusters sit at their top rows whenever a core is full, for minutes, at 75-82 C; stock Android throttles at the skin sensors long before (its CPU zones trip at 95 C, but `quiet-therm`/`xo-therm` steps hold the clusters at 1.4-1.6 GHz when the phone is warm). [U] the mechanism.
+
+### Also seen 11-07 [V]
+
+- 05:30:59 the log stops after `LAUREL BT: ios: client gone` and `SWEET INTF1: 300 frames`, USB enumerated, no pong, no bark in 4 min (3030 off by `laurelpmicwdog=0`). A total hang, or the boot core (cpu 0, gold at 2016 MHz, busy 75 %, 55 C) stuck: the USB thread lives there, and the bark on another core would hold on the `ud` state it owns [I]. The BT client comes and goes every 10 s in that log (289 times), so the BT line is not the trigger.
+- `pet thread last ran 960767920505705 ms ago` in every bark: `now` read before the eight reports, the pet thread stamps later on another CPU: a wrapped difference (3050 fixes the read).
+
+### 3050 `LAUREL WDOG` core state line (both kernels)
+
+At every silent line and at the bark, after the three lines of 2988/2991: `cpu N core state: OSM cycles in 10 ms: C (M MHz: it runs, or spins above EL1, or waits on the bus | its clock is stopped: WFI/WFE with no wake, or off); reference cpu R of the same cluster: C2 (M2 MHz); GICR WAKER 0x..`. The OSM keeps a cycle counter per core (`clk-cpu-osm.c` `OSM_CYCLE_COUNTER_STATUS_REG` 0x9c0 + 4 * core; `laurel_osm_core_cycles()` in `laurel_thermal.c`), readable from any CPU; two reads 10 ms apart, next to a core of the same cluster that answers (the reference shows the register counts; Linux reads core 0's copy when per-core DCVS is off, so the per-core registers may not count: then the reference says so too). At 2 s one SEV (a core parked in WFE with its interrupt masked wakes on it; nothing else notices). Reads only.
+
+Reading: `0` for the silent core and a count for the reference: the core's clock is stopped (a WFI/WFE with no wake: then the SEV line matters, or a power state). A count near the cluster's MHz: the core runs or waits with its clock on: TrustZone, EL2, or the bus.
+
+### 3051 `LAUREL CPU MARGIN` (both kernels)
+
+`LAUREL CPU MARGIN: on: the top OSM row of each cluster is held back: silver up to 1612 MHz (top 1804), gold up to 1804 MHz (top 2016); ...; laurelcpumargin=0 brings them back`. The governor, the touch and motion holds and the thermal caps rise to the row in use (`cl_top`), one below the table's last; `lgov_top_row()` in `laurel_gov_core.h`, `gov-test.sh` PASS. Self-check: 3 rows in both tables, else `off`. Cost: about 10 % of peak CPU. This is the test of the margin reading: the catch rate per hour of the same use (unlock, Home, widgets, Settings) with and without it decides; with `laurelcpumargin=0` the top rows come back for the A/B.
+
+Expected at the next catch with 3050: the core state line. With 3051: no catch in an hour of the use that gave 4 in 7 minutes. If the catches go on at the lower rows, the margin reading is wrong and 3051 goes (`laurelcpumargin=0`, then the patch), and the core state line is the next lead.

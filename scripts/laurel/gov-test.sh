@@ -1,5 +1,5 @@
 #!/bin/sh
-# Host test of the Mi A3 CPU governor decision (patches 2890, 2972 and 3020: bsd/dev/laurel_gov_core.h). macOS and Linux. Under 1 s, foreground.
+# Host test of the Mi A3 CPU governor decision (patches 2890, 2972, 3020 and 3051: bsd/dev/laurel_gov_core.h). macOS and Linux. Under 1 s, foreground.
 #   scripts/laurel/gov-test.sh [PATCH]
 # The header comes from the patches (2890 makes the file, 2972 and 3020 change it), so the test checks the code that goes into the kernel.
 set -eu
@@ -7,6 +7,7 @@ set -eu
 PATCH=${1:-$REPO/patches/laurel/xnu/2890-laurel-cpu-response.patch}
 NEXT=${2:-$REPO/patches/laurel/xnu/2972-laurel-cpu-full-response.patch}
 MOTION=${3:-$REPO/patches/laurel/xnu/3020-laurel-cpu-motion.patch}
+MARGIN=${4:-$REPO/patches/laurel/xnu/3051-laurel-cpu-margin.patch}   # laurel 3051: lgov_top_row
 D=$OUT/gov-test
 rm -rf "$D"
 mkdir -p "$D"
@@ -17,5 +18,6 @@ awk '/^\+\+\+ b\/bsd\/dev\/laurel_gov_core\.h/ {p=1; next}
 [ -s "$D/laurel_gov_core.h" ] || { echo "gov-test: no laurel_gov_core.h in $PATCH" >&2; exit 1; }
 (cd "$D" && awk '/^diff --git a\/bsd\/dev\/laurel_gov_core\.h/ {p=1} p && /^diff / && !/laurel_gov_core/ {exit} p {print}' "$NEXT" | sed -e 's#^--- a/bsd/dev/#--- #' -e 's#^+++ b/bsd/dev/#+++ #' | patch -s laurel_gov_core.h)
 (cd "$D" && awk '/^diff --git a\/bsd\/dev\/laurel_gov_core\.h/ {p=1} p && /^diff / && !/laurel_gov_core/ {exit} p {print}' "$MOTION" | sed -e 's#^--- a/bsd/dev/#--- #' -e 's#^+++ b/bsd/dev/#+++ #' | patch -s laurel_gov_core.h)
+(cd "$D" && awk '/^diff --git a\/bsd\/dev\/laurel_gov_core\.h/ {p=1} p && /^diff / && !/laurel_gov_core/ {exit} p {print}' "$MARGIN" | sed -e 's#^--- a/bsd/dev/#--- #' -e 's#^+++ b/bsd/dev/#+++ #' | patch -s laurel_gov_core.h)
 ${CC:-cc} -O2 -Wall -Wextra -Werror -I"$D" -o "$D/gov_test" "$REPO/tools/gov-test/gov_test.c"
 "$D/gov_test"

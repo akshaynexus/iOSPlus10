@@ -1,0 +1,115 @@
+laurel 3051: LAUREL CPU MARGIN: the top OSM row of each cluster is held back (silver 1612 MHz, gold 1804 MHz on the Mi A3); laurelcpumargin=0. Both kernels. docs/laurel_sprout/watchdog.md section 16.
+
+[V] 26 stuck-core catches since 2026-11-03, the day 2972 pinned both clusters at their top rows (1804 and 2016 MHz) whenever a core is
+full; 11-06: 16 in 65 min, each in the boot storm (both clusters at 100 %); 11-07: 4 in 7 minutes at 76.7-79.3 C with both clusters at
+100 %, then a total hang; the quiet 34 minutes of that boot ran mostly at low load. Always the same physical core of a cluster: the mark
+of a core with the smallest margin at an operating point, not of a thread (26 processes, 26 user and kernel pcs). The OSM sets the
+voltage of a row by its own table, so the top rows are legal, but stock Android never holds both clusters there for minutes (its thermal
+zones throttle at the skin sensors first); one row down is where stock spends its hot time. [I] cause; the catch rate with and without
+this patch on the same use decides it. Self-check: 3 rows in both tables. The thermal caps (2303) now rise to the row in use, not to the
+table's last row; the on-line of LAUREL CPUFREQ names the rows in use. Rule lgov_top_row() in laurel_gov_core.h (gov-test.sh).
+
+diff --git a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
+--- a/bsd/dev/laurel_thermal.c
++++ b/bsd/dev/laurel_thermal.c
+@@ -70,6 +70,7 @@
+ static vm_offset_t cl_base[CL_N];
+ static uint32_t cl_khz[CL_N][OSM_ROWS];
+ static uint32_t cl_rows[CL_N], cl_floor[CL_N], cl_row[CL_N], cl_cap[CL_N];
++static uint32_t cl_top[CL_N];                   /* laurel 3051: the highest row in use: the table's last row, or one below it (LAUREL CPU MARGIN) */
+ static uint32_t cl_busy[CL_N], cl_tick[CL_N], cl_low[CL_N];
+ static vm_offset_t ts_base;
+ static bool th_on;
+@@ -151,6 +152,7 @@
+ 	cl_row[c] = abl < n ? abl : 0;
+ 	cl_floor[c] = 0;
+ 	cl_cap[c] = n - 1;
++	cl_top[c] = n - 1;
+ 	return 0;
+ }
+ 
+@@ -303,6 +305,39 @@
+ 		printf("LAUREL CPU MOTION: off: no CPU governor\n");
+ 		return -1;
+ 	}
++	/*
++	 * laurel 3051 (LAUREL CPU MARGIN): the top OSM row of each cluster is held back. [V 2026-11-03..07, docs/laurel_sprout/watchdog.md 16] with
++	 * both clusters pinned at their top rows (1804 and 2016 MHz, 2972) one core per cluster stopped dead under full load, 26 times, always
++	 * the same core (silver cpu 5, or gold cpu 1 in a 4-CPU boot), in EL0 and in system calls, with its timer and SGI pending and no handler
++	 * running; nothing in the code masks it, the GIC is clean, stock Android never holds both clusters at the top rows for minutes (its
++	 * thermal zones throttle first). The top rows are the untested operating point of this port: one row down (1612 and 1804 MHz) is where
++	 * stock spends its hot time. Self-check: at least 3 rows in both tables. Kill switch laurelcpumargin=0: the top rows come back.
++	 */
++	int margin = 1;
++	(void)PE_parse_boot_argn("laurelcpumargin", &margin, sizeof(margin));
++	if (!margin) {
++		printf("LAUREL CPU MARGIN: off: laurelcpumargin=0: the top rows %u and %u MHz are in use\n",
++		    cl_khz[CL_SILVER][cl_rows[CL_SILVER] - 1] / 1000, cl_khz[CL_GOLD][cl_rows[CL_GOLD] - 1] / 1000);
++	} else if (cl_rows[CL_SILVER] < 3 || cl_rows[CL_GOLD] < 3) {
++		printf("LAUREL CPU MARGIN: off: a table of %u and %u rows is too short to hold one back\n", cl_rows[CL_SILVER], cl_rows[CL_GOLD]);
++	} else {
++		cl_top[CL_SILVER] = lgov_top_row(cl_rows[CL_SILVER], 1);
++		cl_top[CL_GOLD] = lgov_top_row(cl_rows[CL_GOLD], 1);
++		cl_cap[CL_SILVER] = cl_top[CL_SILVER];
++		cl_cap[CL_GOLD] = cl_top[CL_GOLD];
++		if (cl_row[CL_SILVER] > cl_cap[CL_SILVER] || cl_row[CL_GOLD] > cl_cap[CL_GOLD]) {
++			uint32_t r = cl_row[CL_SILVER];       /* ABL's row, if above the new cap: write the cap now */
++			cl_row[CL_SILVER] = cl_cap[CL_SILVER] + 1;
++			wr_row(CL_SILVER, r);
++			r = cl_row[CL_GOLD];
++			cl_row[CL_GOLD] = cl_cap[CL_GOLD] + 1;
++			wr_row(CL_GOLD, r);
++		}
++		printf("LAUREL CPU MARGIN: on: the top OSM row of each cluster is held back: silver up to %u MHz (top %u), gold up to %u MHz (top %u); "
++		    "one core per cluster stalled at the top rows under full load (watchdog.md 16); laurelcpumargin=0 brings them back\n",
++		    cl_khz[CL_SILVER][cl_top[CL_SILVER]] / 1000, cl_khz[CL_SILVER][cl_rows[CL_SILVER] - 1] / 1000,
++		    cl_khz[CL_GOLD][cl_top[CL_GOLD]] / 1000, cl_khz[CL_GOLD][cl_rows[CL_GOLD] - 1] / 1000);
++	}
+ 	const ml_topology_info_t *topo = ml_get_topology_info();
+ 	if (!topo || topo->num_cpus == 0) {
+ 		printf("LAUREL CPUFREQ: off: no CPU topology\n");
+@@ -347,9 +382,9 @@
+ 	}
+ 	printf("LAUREL CPUFREQ: on: OSM governor %u ms tick, a core full for one tick goes to the cap, touch holds both caps, GPU work holds gold's; silver rows %u..%u (%u..%u MHz), gold rows %u..%u (%u..%u MHz), %u cpus\n",
+ 	    GOV_TICK_MS,
+-	    cl_floor[CL_SILVER], cl_rows[CL_SILVER] - 1, cl_khz[CL_SILVER][cl_floor[CL_SILVER]] / 1000,
+-	    cl_khz[CL_SILVER][cl_rows[CL_SILVER] - 1] / 1000, cl_floor[CL_GOLD], cl_rows[CL_GOLD] - 1,
+-	    cl_khz[CL_GOLD][cl_floor[CL_GOLD]] / 1000, cl_khz[CL_GOLD][cl_rows[CL_GOLD] - 1] / 1000, topo->num_cpus);
++	    cl_floor[CL_SILVER], cl_top[CL_SILVER], cl_khz[CL_SILVER][cl_floor[CL_SILVER]] / 1000,
++	    cl_khz[CL_SILVER][cl_top[CL_SILVER]] / 1000, cl_floor[CL_GOLD], cl_top[CL_GOLD],
++	    cl_khz[CL_GOLD][cl_floor[CL_GOLD]] / 1000, cl_khz[CL_GOLD][cl_top[CL_GOLD]] / 1000, topo->num_cpus);
+ 	return 0;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/laurel_thermal_caps.h b/bsd/dev/laurel_thermal_caps.h
+--- a/bsd/dev/laurel_thermal_caps.h
++++ b/bsd/dev/laurel_thermal_caps.h
+@@ -16,9 +16,9 @@
+ 			cl_cap[CL_SILVER]--;
+ 		}
+ 	} else if (th_cpu > -1000 && th_cpu < TH_COOL_DC && (sec & 1u) == 0) {
+-		if (cl_cap[CL_SILVER] + 1 < cl_rows[CL_SILVER]) {
++		if (cl_cap[CL_SILVER] < cl_top[CL_SILVER]) {        /* laurel 3051: up to the top row in use, not the table's last */
+ 			cl_cap[CL_SILVER]++;
+-		} else if (cl_cap[CL_GOLD] + 1 < cl_rows[CL_GOLD]) {
++		} else if (cl_cap[CL_GOLD] < cl_top[CL_GOLD]) {
+ 			cl_cap[CL_GOLD]++;
+ 		}
+ 	}
+diff --git a/bsd/dev/laurel_gov_core.h b/bsd/dev/laurel_gov_core.h
+--- a/bsd/dev/laurel_gov_core.h
++++ b/bsd/dev/laurel_gov_core.h
+@@ -74,4 +74,13 @@
+ 	}
+ 	return want > cap ? cap : want;
+ }
++/* laurel 3051 (LAUREL CPU MARGIN): the highest row in use: the last row of a table of `rows`, less `margin` rows, never below row 1 */
++static inline unsigned
++lgov_top_row(unsigned rows, unsigned margin)
++{
++	unsigned top = rows ? rows - 1 : 0;
++
++	return top > margin ? top - margin : (top ? 1 : 0);
++}
++
+ #endif

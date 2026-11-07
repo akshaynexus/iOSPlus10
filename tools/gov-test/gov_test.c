@@ -53,6 +53,11 @@ main(void)
 	/* the thermal cap wins over the jump */
 	assert(lgov_next(10, 100, 1, 0, 4, 0, &low) == 4);
 
+	/* laurel 3051: the top row in use is one below the table's last row; a short table keeps row 1 at least */
+	assert(lgov_top_row(8, 1) == 6 && lgov_top_row(8, 0) == 7 && lgov_top_row(2, 1) == 1 && lgov_top_row(1, 1) == 0 && lgov_top_row(0, 1) == 0);
+	assert(lgov_next(10, 100, 1, 0, lgov_top_row(8, 1), 0, &low) == 6);   /* a full core goes to the row in use, not to the table's last */
+	printf("gov-test (host only): margin: a table of 8 rows runs up to row %u\n", lgov_top_row(8, 1));
+
 	/* a touch: the hold row at the next tick, before any load shows */
 	low = 0;
 	row = lgov_next(0, 0, 0, 0, cap, cap, &low);
