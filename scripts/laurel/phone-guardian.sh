@@ -193,6 +193,16 @@ echo "debug: $(ls /sys/kernel/debug/ 2>&1 | tr "\n" " " | cut -c1-160)"' 2>/dev/
   *) log "android: PON 0x857 not readable ($(printf '%s' "$v" | tr '\n' ' ' | cut -c1-240)); bootreason $(timeout 8 adb -s "$ser" shell getprop ro.boot.bootreason 2>/dev/null | tr -d '\r')" ;;
   esac
   slot=$(timeout 8 adb -s "$ser" shell getprop ro.boot.slot_suffix 2>/dev/null | tr -d '\r')
+  # a phone that comes back to Android within 20 min of a switch did not reach USB on slot b (an early hang the PMIC watchdog resets, 7 times,
+  # then ABL's fallback): after SWITCH_LIMIT such rounds Android stays, the log says why, and `rm out/laurel/guardian/switch-rounds` starts again
+  last=$(rec switch_at 0); rounds=$(rec switch-rounds 0)
+  if [ $(( $(now) - last )) -lt 1200 ]; then rounds=$((rounds + 1)); else rounds=0; fi
+  set_rec switch-rounds "$rounds"
+  if [ "$rounds" -ge "${SWITCH_LIMIT:-3}" ]; then
+    log "android (slot ${slot:-?}): back on Android $rounds times within 20 min of a switch: iOS does not reach USB on slot b (an early hang; the menu's count resets it, ABL falls back after 7). Android stays. Owner: read the panel; rm out/laurel/guardian/switch-rounds to try again"
+    return 1
+  fi
+  set_rec switch_at "$(now)"
   if timeout 20 adb -s "$ser" shell bootctl set-active-boot-slot 1 >/dev/null 2>&1 && [ "$(timeout 8 adb -s "$ser" shell bootctl get-active-boot-slot 2>/dev/null | tr -d '\r')" = 1 ]; then
     timeout 15 adb -s "$ser" reboot >/dev/null 2>&1 || true
     log "android (slot ${slot:-?}): HAL switch: bootctl set-active-boot-slot 1 ok, adb reboot: iOS boots (boot_b untouched)"

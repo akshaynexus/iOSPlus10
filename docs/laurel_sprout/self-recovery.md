@@ -104,4 +104,14 @@ over on Android.
 - The first Android pass (19:15:11) failed on a shell bug of mine (`${k:+KERNEL=..}` run as a command): fixed (`env`). adb can flicker (device, none, device within 5 s): a failed boot is counted once (boot_start cleared).
 - Whole Android round trip with the fixed guardian: Android up 19:21:44 (guardian start) -> 120 s wait -> 19:23:46 switch -> 19:24:27 SSH: under 3 min, no key.
 
+### 6.3 19:25: a third bark, fastboot left by itself, then nothing on USB [V guardian log]
+
+- `19:25:21 LAUREL PANIC: holding 20 s ...` (bark, cpu 5 again) -> `19:25:50 state: fastboot` while `cpu-uicheck` held the phone-lock (the guardian waits) -> `19:26:03` the phone left fastboot **with no command from anyone** (13 s) -> nothing on USB since (fastboot, iOS, adb all absent at 19:34).
+- Fastboot leaves by itself about 13-18 s after the last command, every time nobody talks to it (07:23, 07:29, 19:26); sessions the guardian or a hand kept busy lasted minutes [I: an idle exit of this ABL's fastboot]. The guardian acts within 3 s, so it only matters when another job holds the lock: then the phone boots normally, as a reboot would.
+- After that exit the boot chain is ABL -> menu (5 s countdown, no key needed; a key stops it) -> DarwinBoot -> kernel, and the menu arms the PMIC count (102 s) before the jump. Nothing on USB for 8 min means one of:
+  1. **The kernel hangs before USB on every boot and the PMIC count resets it each time**: the panel shows the Mu menu with its countdown, then the dark DarwinBoot/kernel screen, again about every 2 min; the menu's notice counts up (`iOS failed N boots in a row`); after 7 ABL boots Android (the Android boot animation): the guardian then switches back at most 3 times within 20 min, then keeps Android and logs `Android stays`.
+  2. **The menu waits**: the menu stays on the panel with a question (`confirm`, or the Android entry's refusal) and its countdown stopped: a key stops the chain, and only a key (Power on the iOS entry) continues it.
+  3. **A dark phone that stays dark**: a hang with nothing armed (the count was disarmed and the kernel never re-armed it), or a crash-dump mode (Qualcomm dump: nothing on the panel, or a `fastboot`/`dload` text) [U]: then only the keys (Power + Vol Down).
+  The host cannot tell 1 from 3 until ABL's fallback brings Android (case 1), so the owner's look at the panel decides.
+
 - 07:44: the phone is dark on USB (no fastboot, no iOS, no adb) since 07:29:51: a hang before USB on ae838bd, with the PMIC watchdog off in that image: case C with no way in from the host. The next key press lands in fastboot, where the guardian flashes the queued image (3052 + 3090 + 3091, PMIC watchdog on) within seconds.
