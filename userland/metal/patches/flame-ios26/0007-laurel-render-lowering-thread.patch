@@ -1,6 +1,6 @@
 --- a/phone/metal2/bridge/NativeMetalObjects.rs
 +++ b/phone/metal2/bridge/NativeMetalObjects.rs
-@@ -163,12 +163,46 @@
+@@ -163,12 +163,47 @@
      let mut policy = DevicePolicy::default();
      let name = std::env::var("NEGRONIMETAL_POLICY").unwrap_or_default();
      if name == "exact" {
@@ -24,7 +24,8 @@
 +/// the lowering finds fails the command buffer (`CommandBufferError::CallRefused`), which
 +/// CoreAnimation reads in the status. Self-check: the runtime starts the thread at the first encoder
 +/// that logs; where it cannot start, every call is lowered on the program's thread as before, so
-+/// nothing is lost. One line: `LAUREL RENDER LOWERING: on|off`. Kill switch `NEGRONIMETAL_LOWERING=0`.
++/// nothing is lost. One line: `LAUREL RENDER LOWERING: on|off`. Kill switch `NEGRONIMETAL_LOWERING=0`;
++/// `=1`: the thread with upstream's rule for fetching pipelines (m2v-ios26/0007 relaxes it).
 +fn laurel_render_lowering(mut policy: metal2vulkan::device::DevicePolicy) -> metal2vulkan::device::DevicePolicy {
 +    use metal2vulkan::device::RenderLoweringPolicy;
 +    static SAID: std::sync::Once = std::sync::Once::new();
@@ -34,7 +35,7 @@
 +        let name = std::env::args().next().unwrap_or_default();
 +        let name = name.rsplit('/').next().unwrap_or("").to_owned();
 +        let text = match on {
-+            true => "on: render encoder calls lowered on the runtime's lowering thread (kill switch NEGRONIMETAL_LOWERING=0)",
++            true => "on: render encoder calls lowered on the runtime's lowering thread, fetching pipelines too (NEGRONIMETAL_LOWERING=1: upstream's rule, fetching pipelines at the call; =0: off)",
 +            false => "off: NEGRONIMETAL_LOWERING=0: calls lowered inside each call",
 +        };
 +        let line = format!("NMTL[{} {}]: LAUREL RENDER LOWERING: {}\n", std::process::id(), name, text);

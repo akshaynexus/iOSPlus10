@@ -175,4 +175,19 @@ Owner's goal: 60 fps with live Liquid Glass. The CPU side of the default stack, 
 - `m2v-ios26/0006`: the lowering thread is spawned with `spawn_render_class` (0005): on iOS it takes the render thread's fixed policy and priority, as the scheduler and the handler pool do, since the render thread's `endEncoding` and `commit` wait for it. Kill switch `NEGRONIMETAL_QOS=0` (with 0005).
 - Why it should pay [I]: the phone has 8 cores and the Home animation is serial on the render thread (SpringBoard's main thread idles while it runs, section 7). The lowering (metal2vulkan + Turnip + malloc: 63 % of the thread's busy time) goes to a second core; the render thread keeps CoreAnimation's own work, the checks and the log. The gain is bounded by CoreAnimation's own share and by `waitUntilScheduled`, which waits for the lowering of the end: the pipelining is inside a frame.
 
+**The sticky rule for fetching pipelines [V host].** With 0007 alone the host bench did not move (draw 8.15 us on against 7.61 off): a debug count showed every at-call fall was the pipeline state, sticky. `call_checks.rs` `pipeline_state` makes the encoder lower every call at the call from a state that fetches the pass's colors on (`decides`: input attachments), and every CoreAnimation key fetches (the scene bench's `luma_boost_lph` too). `check_pipeline` is the lowering's own check and runs at the call (routing, the moved and fetching refusals), and `viewing` makes no reformat view for a fetching state, so the relaxation `m2v-ios26/0007` logs a fetching state like any other. `NEGRONIMETAL_LOWERING=1`: upstream's rule.
+
+**Host A/B [V, `logs/encode-bench-plugin14-*.txt`, 200 draws a frame, binds before each draw, this x86 host].** The bench times the main thread only; the worker's work is not in these numbers.
+
+| Run | draw us (main thread) | of it the binds | end us | commit us | frame us |
+|---|---:|---:|---:|---:|---:|
+| spin 0, `NEGRONIMETAL_LOWERING=0` (at the call, as before) | 8.20 | 1.72 | 32.3 | 8.3 | 1640 |
+| spin 0, on | 9.40 | 8.88 | 2.1 | 0.4 | 1881 |
+| spin 4 us a draw, off | 12.22 | 1.70 | 34.7 | 8.7 | 2444 |
+| spin 4 us a draw, on | 8.96 | 4.47 | 1.8 | 0.4 | 1793 |
+
+- With no work of its own the main thread waits for the worker (`wait_for_room`, 16 % in `syscall`): the frame reads the worker's rate plus the hand-off, 15 % more than at the call. The worker is one thread: the lowering is not faster, it is elsewhere.
+- With 4 us of own work a draw (CoreAnimation's share on the phone is about 24 % of the render thread's busy time, so 2-3 us against the 8 us lowering) the frame is 27 % shorter on the main thread, and the end and commit cost nothing there.
+- [I] On the phone the render thread then does CoreAnimation's work, the checks and the log; the worker, on another core, the lowering, Turnip and the kernel calls of the recording. The frame's CPU wall time goes from the sum to about the worker's part (63 % of today's busy time) plus the waits. `waitUntilScheduled` still waits for the end's lowering and the submission.
+
 **Build and measure.** `scripts/laurel/ios26-plugin-build.sh NAME [all|fetch|bridge|plugin|snap]` builds the default stack's plug-in (tree `out/ios26/metal-impl`) and keeps it as `out/ios26/snap/NAME` for `PLUGIN=`. `scripts/laurel/ios26-lowering-build.sh NAME` = fetch, host encode bench on and off (`logs/encode-bench-NAME-on.txt`, `-off.txt`), bridge, plugin, snap. Phone A/B: `out/ios26/snap/run.sh l1-on t6.dylib plugin13` against `run.sh l1-off t6.dylib plugin13 NEGRONIMETAL_LOWERING=0` (same file, same test).

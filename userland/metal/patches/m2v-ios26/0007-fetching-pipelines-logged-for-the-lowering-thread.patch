@@ -1,0 +1,33 @@
+metal2vulkan (Mi A3, iOS 26): a render pipeline state that fetches the pass's colors (input attachments: every CoreAnimation key) no longer makes the encoder lower every call at the call from then on (call_checks.rs, the sticky rule): it is logged for the lowering thread like any other state. The checks at the call run the lowering's own check_pipeline (routing, moved and fetching refusals), and the lowering makes no reformat view for a fetching state, so the pass's colors stay as the checks hold them. Measured on the host: with upstream's rule the whole scene bench (CA's luma_boost key, which fetches) lowered at the call (LAUREL DEBUG: 40 of 40 at-call falls were the pipeline state, sticky). Kill switch NEGRONIMETAL_LOWERING=1: upstream's rule; =0: no lowering thread at all (flame-ios26/0007).
+--- a/crates/metal2vulkan-runtime/src/render/call_checks.rs
++++ b/crates/metal2vulkan-runtime/src/render/call_checks.rs
+@@ -442,7 +442,13 @@
+             return FROM_NOW;
+         };
+         let base = &graphics.base().graphics;
+-        let decides = !base.input_attachments.is_empty()
++        // laurel (m2v-ios26/0007): a state that fetches the pass's colors through input attachments
++        // is logged as any other where the fetch rule is on (`laurel_fetch_logged`): `check_pipeline`
++        // above is the lowering's own check (the routing, the moved and fetching refusals), so the
++        // call returns every refusal the lowering would; `viewing` makes no reformat view for a
++        // fetching state, so the pass's colors stay as the checks hold them. Every CoreAnimation key
++        // fetches: with upstream's rule the whole compositor lowered at the call.
++        let decides = (!base.input_attachments.is_empty() && !Self::laurel_fetch_logged())
+             || !base.storage_attachments.is_empty()
+             || base.fragment_imageblock.is_some()
+             || graphics.reads_tile_memory()
+@@ -458,6 +464,14 @@
+         Ok(Checked::Logged)
+     }
+ 
++    /// laurel (m2v-ios26/0007): whether a state that fetches the pass's colors is logged for the
++    /// lowering thread (on; flame-ios26/0007 selects the thread), or lowers every call from it on
++    /// at the call (`NEGRONIMETAL_LOWERING=1`, upstream's rule). Read once.
++    fn laurel_fetch_logged() -> bool {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        *ON.get_or_init(|| std::env::var_os("NEGRONIMETAL_LOWERING").is_none_or(|v| v != "1"))
++    }
++
+     /// Whether a draw of `pipeline` renders a pass color in another format than its attachment's
+     /// (`ShapeInputs::viewing`, which reads the attachment as the lowering keeps it).
+     fn reformats(&self, device: &Device, pipeline: &DrawingState) -> bool {
