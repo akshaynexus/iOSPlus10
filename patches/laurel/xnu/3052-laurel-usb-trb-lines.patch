@@ -1,0 +1,59 @@
+laurel 3052: LAUREL USB: every DMA TRB, the setup packet and the notification on a cache line of its own: a TX arm no longer writes the line back over the controller's RX completion (the frozen `ue0 rx`, then the "total hang" with no bark). Both kernels. docs/laurel_sprout/watchdog.md section 16.
+
+[V 2026-11-07 05:29:18 and 06:37:39] `LAUREL USB: ue0 rx N` froze after a burst of received frames while tx went on; about 90 s later
+the log stopped mid-line, USB stayed enumerated, no pong, no bark for minutes: read as a total hang of the phone. The RX freeze is the
+first event each time. [V code] The five TRBs of the gadget sat in one 64-byte line of cached DMA memory (0x1000-0x103f, UD_TRB_OUT
+.. UD_TRB_TX). ud_start_trb writes a TRB and cleans its line (flush_dcache64: clean + invalidate); the CPU's copy of the other TRBs
+in that line still says HWO = 1 from their arm, so a TX arm (one per console frame) in the window between an RX completion's
+write-back and its event writes HWO = 1 back over the controller's RX TRB. ud_rx_done then reads HWO set: before 3031 it re-armed
+and dropped the frame (a lost ping now and then); with 3031 (a completion of a TRB the controller still owns is not a frame, for the
+panic hold's re-arm) it returns and the RX endpoint is never armed again. The TX side can lose its completion the same way by an RX
+re-arm. One line each; two static asserts refuse a layout with two records on one line. The DMA area stays 16 KiB; nothing outside
+sweet_usb.c knows these offsets. Kill switch: none: a layout; 3031's rule stays as it is.
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -243,17 +243,34 @@
+ #define TRBCTL_STATUS3  (4u << 4)
+ #define TRBCTL_DATA     (5u << 4)
+ 
+-/* DMA area layout */
++/*
++ * DMA area layout. laurel 3052: every TRB, the setup packet and the notification on a 64-byte cache line of its own. The area is
++ * cached memory (kmem_alloc_contig) kept right by ud_sync (clean + invalidate of the lines touched). The five TRBs sat in one line
++ * (0x1000-0x103f): a CPU write to one TRB (a TX arm for every console frame) made the line dirty with the CPU's old copy of the
++ * other TRBs (HWO set from their arm), and the clean wrote the whole line back over the controller's completion write-back of
++ * another TRB (HWO cleared, the length) when that completion came in between. The completion event then read HWO still set:
++ * before 3031 the RX handler re-armed and dropped one frame (a lost `ping` now and then [V]); with 3031's rule for the panic hold
++ * (a completion of a TRB the controller still owns is not a frame: no re-arm) the RX endpoint was never armed again
++ * [V 2026-11-07 05:29:18, 06:37:39: `ue0 rx` frozen after a burst, the log stopped about 90 s later, no bark: the phone looked
++ * hung with its USB dead]. The TX TRB's write-back can be clobbered the same way by an RX re-arm. One line each: no write of one
++ * TRB can clean over another's. The static asserts below are the self-check: a layout that puts two of them on one line does not build.
++ */
+ #define UD_EVT          0x0000          /* event buffer, 4 KiB */
+ #define UD_EVT_SIZE     0x1000
+ #define UD_TRB_OUT      0x1000          /* ep0 OUT TRB */
+-#define UD_TRB_IN       0x1010          /* ep0 IN TRB */
+-#define UD_TRB_RX       0x1020          /* ep1 OUT (bulk, host -> phone) */
+-#define UD_TRB_TX       0x1030          /* ep1 IN (bulk, phone -> host) */
+-#define UD_TRB_INT      0x1050          /* ep2 IN (interrupt, notifications) */
+-#define UD_SETUP        0x1040          /* 8-byte setup packet */
+-#define UD_DATA         0x1100          /* ep0 data stage, 512 bytes */
+-#define UD_NOTIFY       0x1300          /* 16-byte notification */
++#define UD_TRB_IN       0x1040          /* ep0 IN TRB */
++#define UD_TRB_RX       0x1080          /* ep1 OUT (bulk, host -> phone) */
++#define UD_TRB_TX       0x10c0          /* ep1 IN (bulk, phone -> host) */
++#define UD_TRB_INT      0x1100          /* ep2 IN (interrupt, notifications) */
++#define UD_SETUP        0x1140          /* 8-byte setup packet (the controller writes it) */
++#define UD_NOTIFY       0x1180          /* 16-byte notification (the CPU writes it, the controller reads it) */
++#define UD_DATA         0x1200          /* ep0 data stage, 512 bytes (lines 0x1200-0x13ff) */
++#define UD_LINE         64u
++_Static_assert((UD_TRB_OUT / UD_LINE) != (UD_TRB_IN / UD_LINE) && (UD_TRB_IN / UD_LINE) != (UD_TRB_RX / UD_LINE) &&
++    (UD_TRB_RX / UD_LINE) != (UD_TRB_TX / UD_LINE) && (UD_TRB_TX / UD_LINE) != (UD_TRB_INT / UD_LINE) &&
++    (UD_TRB_INT / UD_LINE) != (UD_SETUP / UD_LINE) && (UD_SETUP / UD_LINE) != (UD_NOTIFY / UD_LINE) &&
++    (UD_NOTIFY / UD_LINE) != (UD_DATA / UD_LINE), "laurel 3052: two DMA records on one cache line");
++_Static_assert(UD_DATA + 512 <= 0x2000, "laurel 3052: the ep0 data stage runs into the RX frame");
+ #define UD_RX           0x2000          /* one received frame */
+ #define UD_TX           0x2800          /* one frame to send */
+ #define UD_FRAME_MAX    0x800
