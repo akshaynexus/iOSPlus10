@@ -1,0 +1,23 @@
+metal2vulkan (Mi A3, iOS 26): the lowering thread (render/lowering_worker.rs, RenderLoweringPolicy::Worker, which flame-ios26/0007 selects) takes the render thread's scheduling policy and priority as the scheduler and the handler pool do (0005): the render thread's end_encoding and commit wait for what it lowers. Kill switch NEGRONIMETAL_QOS=0 (with 0005).
+--- a/crates/metal2vulkan-runtime/src/render/lowering_worker.rs
++++ b/crates/metal2vulkan-runtime/src/render/lowering_worker.rs
+@@ -24,7 +24,9 @@
+ //! - **Commits.** The device's commits that wait for its render encoders' ends lie here too
+ //!   (`render/queued_commits.rs`): the thread that lowers such an end runs them.
+ //! - **Started** with the device's first encoder that logs its calls, at the user-interactive
+-//!   class (`exit_guard::spawn_user_interactive`), as the threads command buffers' work waits for;
++//!   class (`exit_guard::spawn_user_interactive`), as the threads command buffers' work waits for,
++//!   and on iOS at the render thread's policy and priority (laurel m2v-ios26/0006: it lowers what
++//!   the render thread's end and commit wait for; `exit_guard::spawn_render_class`, as 0005);
+ //!   stopped and joined with the device (`DeviceShared`'s drop). No slot handed to it holds the
+ //!   device by then: an encoder holds its device until it ends or goes, and its slot lets go of
+ //!   its lowering then.
+@@ -90,7 +92,7 @@
+         });
+         let running = Arc::clone(&shared);
+         let builder = std::thread::Builder::new().name("metal2vulkan-lowering".to_owned());
+-        let thread = exit_guard::spawn_user_interactive(builder, move || running.run()).ok()?;
++        let thread = exit_guard::spawn_render_class(builder, move || running.run()).ok()?;
+         Some(LoweringWorker {
+             shared,
+             thread: Mutex::new(Some(thread)),

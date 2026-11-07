@@ -3,6 +3,7 @@
 #   scripts/bg.sh encode-bench scripts/laurel/ios26-encode-bench.sh [build|run|all] [DRAWS,FRAMES]      default all 200,300
 # Result: logs/encode-bench.txt: us per draw, per pass end, per commit; self time by function, by the inlined function too. A host number is for compare before/after only; the phone's cost is larger.
 # METAL_OUT default out/ios26/metal-impl: the tree of the phone's build, with its patches. Env passes to the run (NEGRONIMETAL_QOS=0 and others).
+# NMN_SCENE_BENCH_SPIN=US (env): a spin of US us after each draw stands in for the program's own work between draws (CoreAnimation's). The A/B of the lowering thread (flame-ios26/0007, NEGRONIMETAL_LOWERING=0) needs it: the thread overlaps with that work only; with no spin the main thread waits for the thread (512 calls ahead at most) and the draw cost reads the thread's rate.
 set -euo pipefail
 . "$(cd "$(dirname "$0")" && pwd)/metal-env.sh"
 export METAL_OUT=${METAL_OUT:-$OUT/ios26/metal-impl}

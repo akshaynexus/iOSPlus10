@@ -240,6 +240,8 @@ static int scene_bench(const char *spec, NmbQueue *queue, const struct NmbRender
 	double draw_us = 0, end_us = 0, commit_us = 0, wait_us = 0, begin_us = 0, bind_us = 0;
 	/* NMN_SCENE_BENCH_BIND=0: bind once a pass, not before each draw: the cost of the draw call alone */
 	const bool bind_each = getenv("NMN_SCENE_BENCH_BIND") == NULL || strcmp(getenv("NMN_SCENE_BENCH_BIND"), "0") != 0;
+	/* NMN_SCENE_BENCH_SPIN=US: the program's own work between two draws (CoreAnimation's: 24 % of the render thread's busy time on the phone), as a spin of US microseconds after each draw: what a lowering thread (RenderLoweringPolicy::Worker) overlaps with */
+	const double spin_us = getenv("NMN_SCENE_BENCH_SPIN") != NULL ? atof(getenv("NMN_SCENE_BENCH_SPIN")) : 0;
 	const double viewport[6] = {0, 0, 720, 1560, 0, 1};
 	const uint64_t scissor[4] = {0, 0, 720, 1560};
 	bench_tid = (pid_t)syscall(SYS_gettid);
@@ -276,6 +278,11 @@ static int scene_bench(const char *spec, NmbQueue *queue, const struct NmbRender
 			binding += bench_now() - b0;
 			if (!nmb_render_draw_indexed(en, 3, 6, 0, ib, 0, 1, 0, 0))
 				FAIL("bench draw");
+			if (spin_us > 0) {
+				const double until = bench_now() + spin_us;
+				while (bench_now() < until)
+					;
+			}
 		}
 		const double t2 = bench_now();
 		if (!nmb_encoder_end(en))
@@ -300,7 +307,7 @@ static int scene_bench(const char *spec, NmbQueue *queue, const struct NmbRender
 	const struct itimerval off = {{0, 0}, {0, 0}};
 	setitimer(ITIMER_PROF, &off, NULL);
 	const int n = frames - warm;
-	printf("bench: %d draws, %d frames, bind %s: begin %.1f us, draw %.2f us each (%.0f us a frame; of it the binds %.2f us each), end %.1f us, commit %.1f us, wait %.1f us\n", draws, n, bind_each ? "each draw" : "once a pass", begin_us / n, draw_us / n / draws, draw_us / n, bind_us / n / draws, end_us / n, commit_us / n, wait_us / n);
+	printf("bench: %d draws, %d frames, bind %s, spin %.0f us: begin %.1f us, draw %.2f us each (%.0f us a frame; of it the binds %.2f us each), end %.1f us, commit %.1f us, wait %.1f us\n", draws, n, bind_each ? "each draw" : "once a pass", spin_us, begin_us / n, draw_us / n / draws, draw_us / n, bind_us / n / draws, end_us / n, commit_us / n, wait_us / n);
 	if (pcs != NULL) {
 		FILE *o = fopen(pcs, "w");
 		if (o == NULL)
