@@ -64,7 +64,8 @@ echo "ssh" >> "$D/calls.txt"; [ "\$(cat "$F.state")" = ios-ssh ] && echo Darwin;
 SH
 cat > "$D/bin/op10tool" <<SH
 #!/bin/sh
-echo "op10tool \$*" >> "$D/calls.txt"; exit 1
+echo "op10tool \$*" >> "$D/calls.txt"
+case "\$2" in ping) [ -f "$F.pong" ] && { echo pong; exit 0; }; exit 1 ;; bootloader) echo fastboot > "$F.state"; echo 0 > "$F.turn"; exit 0 ;; esac; exit 1
 SH
 cat > "$D/bin/timeout" <<SH
 #!/bin/sh
@@ -92,6 +93,7 @@ printf 'image A' > "$D/imgA"; printf 'line=aaaa\nkernel_sha256=none\n' > "$D/img
 printf 'image B' > "$D/imgB"; printf 'line=bbbb\nkernel_sha256=none\n' > "$D/imgB.stamp"
 echo b > "$F.slot"
 PATH="$D/bin:$PATH"; export PATH
+PHONE_LOCK=$D/phone.lock; export PHONE_LOCK
 fails=0; checks=0
 ok() { checks=$((checks + 1)); }
 bad() { fails=$((fails + 1)); echo "FAIL: $*"; }
@@ -104,13 +106,13 @@ run_until() {   # run the loop until the log has the text or 60 s pass
   { echo "== until '$1'"; cat "$LOG"; } >> "$D/all.log"
   grep -q -- "$1" "$LOG" || bad "no '$1' in the log within 60 s; log: $(tail -n 3 "$LOG")"
 }
-PL=/tmp/iosplus10-phone.lock
+PL=$PHONE_LOCK
 
 # 1. fastboot, nothing queued, no fails: no flash; set_active b as the first command of a fresh session; reboot; the phone leaves
 : > "$D/calls.txt"; echo fastboot > "$F.state"
 run_until "reboot: the phone left fastboot"
 grep -q "flash boot_b: none (fails 0 of 3" "$LOG" && ok || bad "case 1: expected no flash: $(grep fastboot "$LOG" | tail -1)"
-[ "$(first_after_fresh)" = "fastboot set_active b" ] && ok || bad "case 1: set_active b must be the first command of a fresh session: $(first_after_fresh)"
+grep -q "^fastboot reboot bootloader" "$D/calls.txt" && bad "case 1: a reboot-bootloader round trip (a visit can be 18 s)" || ok
 grep -q "set_active b: ok" "$LOG" && ok || bad "case 1: set_active not ok"
 grep -q "^fastboot flash" "$D/calls.txt" && bad "case 1: a flash happened" || ok
 [ "$(cat "$F.state")" = ios ] && ok || bad "case 1: the phone did not leave fastboot"
@@ -128,7 +130,7 @@ grep -q "^fastboot set_active\|^fastboot flash\|^fastboot reboot" "$D/calls.txt"
 (cd "$D/repo" && sh scripts/laurel/phone-guardian.sh queue "$D/imgA" >/dev/null)
 [ -f "$G/queue.img" ] && ok || bad "case 3: queue not recorded"
 run_until "reboot: the phone left fastboot"
-[ "$(first_after_fresh)" = "fastboot flash boot_b $G/queue.img" ] && ok || bad "case 3: the flash must be the first command after reboot bootloader: $(first_after_fresh)"
+[ "$(grep -c '^fastboot flash boot_b' "$D/calls.txt")" -le 2 ] && ok || bad "case 3: more than two flash tries"
 grep -q "^android-guard boot-image" "$D/calls.txt" && ok || bad "case 3: the Android guard was not asked"
 cmp -s "$F.boot_b" "$D/imgA" && ok || bad "case 3: boot_b is not image A"
 [ ! -f "$G/queue.img" ] && [ "$(sed -n 's/^sha256 //p' "$G/flashed.txt")" = "$(sha256sum "$D/imgA" | cut -d' ' -f1)" ] && ok || bad "case 3: flashed record wrong"
@@ -149,7 +151,7 @@ run_until "reboot: the phone left fastboot"
 grep -q "boot failed: fastboot" "$LOG" && ok || bad "case 5: the failed boot was not counted"
 grep -q "flash boot_b: ok ([0-9]* boots in a row failed: the last good image" "$LOG" && ok || bad "case 5: last good not flashed: $(grep 'fastboot (slot' "$LOG")"
 cmp -s "$F.boot_b" "$D/imgA" && ok || bad "case 5: boot_b is not the last good image"
-[ "$(first_after_fresh)" = "fastboot flash boot_b $G/last-good.img" ] && ok || bad "case 5: flash first: $(first_after_fresh)"
+grep -q "^fastboot flash boot_b $G/last-good.img" "$D/calls.txt" && ok || bad "case 5: last good not flashed"
 
 # 6. Android on slot a (and another phone on adb): PON 0x857 read, ios26-retry.sh FAST_SWITCH=1, the other phone never touched
 : > "$D/calls.txt"; : > "$LOG"; echo android > "$F.state"; echo a > "$F.slot"
@@ -162,6 +164,14 @@ grep -q "^ios26-retry FAST_SWITCH=1 EXTRA_ARGS=ufsqueue=0 laurelucache=0 rw" "$D
 sleep 4; kill "$gp" 2>/dev/null; wait "$gp" 2>/dev/null || true
 grep -q "OTHER PHONE TOUCHED" "$D/calls.txt" && bad "case 6: the other phone got a command" || ok
 grep -q "state: android" "$LOG" && bad "case 6: the other phone was taken for the Mi A3" || ok
+
+# 8. iOS, ctl answers, an image queued: the guardian asks for fastboot itself and flashes it
+: > "$D/calls.txt"; : > "$LOG"; echo ios > "$F.state"; touch "$F.pong"; rm -f "${G:?}"/queue.*
+(cd "$D/repo" && sh scripts/laurel/phone-guardian.sh queue "$D/imgB" >/dev/null)
+run_until "reboot: the phone left fastboot"
+grep -q "^op10tool ctl bootloader" "$D/calls.txt" && ok || bad "case 8: no ctl bootloader"
+cmp -s "$F.boot_b" "$D/imgB" && ok || bad "case 8: boot_b is not the queued image"
+rm -f "$F.pong"
 
 # 7. never: forbidden fastboot commands, and no serial in the log
 grep -Eq "^fastboot (flashing|erase|oem|format|set_active a|flash (boot_a|dtbo_a|userdata|partition|modemst|fsg|persist|devinfo|vbmeta|gpt))" "$D/calls.txt" && bad "forbidden command" || ok

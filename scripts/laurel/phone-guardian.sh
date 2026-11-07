@@ -8,10 +8,12 @@
 #   scripts/laurel/phone-guardian.sh mark-good                             by hand: the image on boot_b is good now
 #   scripts/laurel/phone-guardian.sh status                                the records and the last log lines
 # What it does, one line per action in logs/phone-guardian.log:
-#   fastboot, and no job holds phone-lock for FREE_S (20 s): takes the lock; the queued image, or the last good image after FAIL_LIMIT (3)
-#     boots in a row that did not reach SSH, goes to boot_b as the FIRST command of a fresh session (fastboot reboot bootloader first:
-#     this ABL fails every second command); then set_active b in a fresh session (slot b active, ABL's retries back to 7 [I ABL
-#     SetActiveSlot]), then fastboot reboot. No image to flash: set_active b + reboot only.
+#   fastboot, and no job holds phone-lock for FREE_S (3 s; a fastboot visit lasted 18 s twice on 2026-11-07 07:23 and 07:29 [U why]):
+#     takes the lock; `getvar product` once (laurel_sprout, or no answer); the queued image, or the last good image after FAIL_LIMIT (3)
+#     boots in a row that did not reach SSH, goes to boot_b at once (this ABL fails every second command of a session: each command is
+#     sent twice when the first try fails, no `reboot bootloader` round trip); then set_active b (slot b active, ABL's retries back to
+#     7 [I ABL SetActiveSlot]), then fastboot reboot. No image to flash: set_active b + reboot only. About 10 s in all.
+#   iOS with an image queued and ctl answering (pong): `op10tool ctl bootloader` at once, and the fastboot step flashes it.
 #   iOS on USB (1209:0001): SSH for GOOD_S (10 min) with no panic = the image on boot_b is good: a copy in out/laurel/guardian/last-good.img,
 #     and mark-kernel-good.sh for the menu's own fallback entry. No SSH and no pong for NOSSH_S: one `op10tool ctl bootloader` per 5 min.
 #   Android on adb (slot a: ABL's retries ran out, or the menu's Android entry): after ANDROID_WAIT_S with the lock free: PON 0x857 read
@@ -27,11 +29,11 @@ cd "$REPO"
 G=$REPO/out/laurel/guardian
 LOG=$REPO/logs/phone-guardian.log
 mkdir -p "$G" "$REPO/logs"
-FREE_S=${FREE_S:-20}; GOOD_S=${GOOD_S:-600}; NOSSH_S=${NOSSH_S:-300}; FAIL_LIMIT=${FAIL_LIMIT:-3}; ANDROID_WAIT_S=${ANDROID_WAIT_S:-120}
+FREE_S=${FREE_S:-3}; GOOD_S=${GOOD_S:-600}; NOSSH_S=${NOSSH_S:-300}; FAIL_LIMIT=${FAIL_LIMIT:-3}; ANDROID_WAIT_S=${ANDROID_WAIT_S:-120}
 TICK=${TICK:-5}; LEAVE_S=${LEAVE_S:-12}
 TOOL=${OP10TOOL:-$REPO/out/bin/op10tool}
 EXTRA=${GUARDIAN_EXTRA_ARGS:-"ufsqueue=0 laurelucache=0"}
-PL=/tmp/iosplus10-phone.lock
+PL=${PHONE_LOCK:-/tmp/iosplus10-phone.lock}      # the test gives its own
 STOCK_DTBO=${STOCK_DTBO:-$HOME/laurel-backup/stock/images/dtbo.img}
 
 now() { date +%s; }
@@ -112,10 +114,12 @@ wait_fb() { _c=0; until fb_present; do [ "$_c" -lt "$1" ] || return 1; sleep 2; 
 fresh_session() { timeout 15 fastboot reboot bootloader >/dev/null 2>&1 || true; sleep 6; wait_fb 20; }
 
 # ---- fastboot: flash or reboot, under the lock ----
+# [V 2026-11-07 03:47-04:16] a write as the first command of a session worked, the second command of a session fails; [V 07:23, 07:29] a visit
+# can be 18 s long: no getvar rounds, no reboot-bootloader round trip; every command is tried twice (the failing turn passes at once).
+fb2() { timeout "$1" fastboot "$2" "$3" ${4:+"$4"} >/dev/null 2>&1 || { fb_present || return 2; timeout "$1" fastboot "$2" "$3" ${4:+"$4"} >/dev/null 2>&1; }; }
 fb_recover() {
-  p=$(fb_get product) || p=
-  [ "$p" = laurel_sprout ] || { log "fastboot: the phone does not say laurel_sprout (product '${p:-no answer}'): nothing done"; return 1; }
-  slot=$(fb_get current-slot) || slot=?
+  p=$(timeout 4 fastboot getvar product 2>&1 | sed -n 's/^product: *//p' | tr -d '\r') || p=
+  case "$p" in laurel_sprout|"") ;; *) log "fastboot: the phone says product '$p', not laurel_sprout: nothing done"; return 1 ;; esac
   fails=$(rec fails 0)
   img=; why=
   if [ -f "$G/queue.img" ]; then img=$G/queue.img; why="queued image"
@@ -129,36 +133,28 @@ fb_recover() {
   if [ -n "$img" ]; then
     _w=1
     while :; do
-      fresh_session || { log "fastboot: no fastboot after reboot bootloader (try $_w)"; return 1; }
-      if timeout 120 fastboot flash boot_b "$img" >/dev/null 2>&1; then flashed=ok; break; fi
-      [ "$_w" -lt 4 ] || { log "fastboot: flash boot_b failed 4 times ($why)"; flashed=failed; break; }
-      _w=$((_w + 1))
+      if fb2 120 flash boot_b "$img"; then flashed=ok; break; fi
+      fb_present || { log "fastboot: the phone left during the flash (try $_w)"; flashed=failed; break; }
+      [ "$_w" -lt 3 ] || { log "fastboot: flash boot_b failed 3 times ($why)"; flashed=failed; break; }
+      _w=$((_w + 1)); timeout 15 fastboot reboot bootloader >/dev/null 2>&1 || true; sleep 6; wait_fb 10 || { flashed=failed; break; }
     done
     if [ "$flashed" = ok ]; then
       note_flash "$img" "guardian ($why)" >/dev/null
       [ "$img" != "$G/queue.img" ] || { mv -f "$G/queue.img" "$G/queue.done.img"; rm -f "$G/queue.txt"; }
     fi
   fi
-  # slot b active, retries back to 7: a fresh session, up to 3
-  sa=failed; _t=0
-  while [ "$_t" -lt 3 ]; do
-    fresh_session || break
-    timeout 15 fastboot set_active b >/dev/null 2>&1 || true
-    cs=$(fb_get current-slot) || cs=?
-    [ "$cs" = b ] && { sa=ok; break; }
-    _t=$((_t + 1))
-  done
-  # reboot; a second command of a session can fail: ask again from a fresh one until the phone leaves fastboot
+  # slot b active, retries back to 7
+  if fb2 15 set_active b; then sa=ok; else sa=failed; fi
+  # reboot; repeat until the phone leaves fastboot
   left=no; _r=0
   while [ "$_r" -lt 5 ]; do
     timeout 15 fastboot reboot >/dev/null 2>&1 || true
     sleep "$LEAVE_S"; fb_present || { left=yes; break; }
-    timeout 15 fastboot reboot bootloader >/dev/null 2>&1 || true; sleep 6; wait_fb 20 || { left=yes; break; }
     _r=$((_r + 1))
   done
   set_rec boot_start "$(now)"; set_rec boot_good 0; set_rec ssh_seen 0
   if [ -n "$img" ]; then fl="$flashed ($why: $(basename "$img") $(sha "$img" | cut -c1-12))"; elif [ -n "$why" ]; then fl="none ($why)"; else fl="none (fails $fails of $FAIL_LIMIT: the image on boot_b boots again)"; fi
-  log "fastboot (slot $slot): flash boot_b: $fl; set_active b: $sa; reboot: $( [ "$left" = yes ] && echo "the phone left fastboot" || echo "STILL IN FASTBOOT after 5 tries: only the keys help")"
+  log "fastboot (product '${p:-no answer}'): flash boot_b: $fl; set_active b: $sa; reboot: $( [ "$left" = yes ] && echo "the phone left fastboot" || echo "STILL IN FASTBOOT after 5 tries: only the keys help")"
   [ "$left" = yes ]
 }
 
@@ -183,6 +179,7 @@ android_recover() {
 }
 
 # ---- the loop ----
+echo $$ > "$G/pid"       # `kill $(cat out/laurel/guardian/pid)` stops the loop (pkill -f matches the caller's own command line)
 state=start; since=$(now); free_since=; nossh_last=0; good_at=0; none_said=0; android_since=
 log "start: FREE_S=$FREE_S GOOD_S=$GOOD_S FAIL_LIMIT=$FAIL_LIMIT (fails now $(rec fails 0), last good: $( [ -f "$G/last-good.img" ] && sha "$G/last-good.img" | cut -c1-12 || echo none), on boot_b: $(sed -n 's/^sha256 //p' "$G/flashed.txt" 2>/dev/null | cut -c1-12))"
 while :; do
@@ -213,6 +210,13 @@ while :; do
       fi
     else free_since=; fi ;;
   ios)
+    if [ -f "$G/queue.img" ] && lock_free && [ $(( $(now) - nossh_last )) -ge 60 ] && pong; then
+      nossh_last=$(now)
+      log "ios: an image is queued and ctl answers: op10tool ctl bootloader (sync over SSH first when it answers)"
+      timeout 15 sshpass -p "${IOS_PASSWORD:-alpine}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=6 root@192.168.7.2 sync >/dev/null 2>&1 || true
+      timeout 10 "$TOOL" ctl bootloader >/dev/null 2>&1 || true
+      sleep "$TICK"; continue
+    fi
     if ssh_up; then
       [ "$(rec ssh_seen 0)" = 1 ] || { set_rec ssh_seen 1; log "ios: SSH up $(( $(now) - since )) s after USB"; good_at=$(now); }
       if [ "$(rec boot_good 0)" = 0 ] && [ $(( $(now) - good_at )) -ge "$GOOD_S" ]; then
