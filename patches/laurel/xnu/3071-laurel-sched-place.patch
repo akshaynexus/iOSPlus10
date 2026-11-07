@@ -1,0 +1,22 @@
+laurel 3071: LAUREL SCHED PLACE: without CLPC every thread group prefers the boot pset (gold) for every QoS bucket and the E -> P edge forbids migration, so silver runs only gold's spill and the UI's threads queue behind the daemons on gold (boot storm: 367 s busy of 480, usblog 2026-11-07 05:21). Now, as CLPC on an iPhone: the utility and background buckets prefer the efficiency pset (silver); fixed-priority, foreground, user-initiated and default keep gold; both edges carry the weighted spill (64 us), so an idle cluster takes the other's excess and no job or QoS is limited to a cluster. Set once when every CPU has registered (before launchd), applied to the thread groups that exist and to every later one. Pure rule in osfmk/kern/laurel_sched_place.h (host test scripts/laurel/test-sched-place.sh); the sched_clutch.c hunks are post/9027 (the base owns sched_clutch.c on xnu-12377). Kill switch laurelschedplace=0. docs/laurel_sprout/cpu-efficiency.md.
+
+diff --git a/osfmk/kern/laurel_sched_place.h b/osfmk/kern/laurel_sched_place.h
+new file mode 100644
+index 0000000..dd47076
+--- /dev/null
++++ b/osfmk/kern/laurel_sched_place.h
+@@ -0,0 +1,14 @@
++/*
++ * laurel 3071: LAUREL SCHED PLACE: the pset a QoS bucket prefers, without kernel types, so that the host test
++ * (scripts/laurel/test-sched-place.sh) runs exactly this rule. As CLPC on an iPhone: utility and background work prefers the
++ * efficiency cluster; fixed-priority, foreground, user-initiated and default work prefers the performance cluster (the boot pset).
++ * The edges stay open both ways (sched_clutch.c), so this is a preference, not a limit.
++ */
++#ifndef LAUREL_SCHED_PLACE_H
++#define LAUREL_SCHED_PLACE_H
++static inline unsigned
++lsp_pset_for_bucket(unsigned bucket, unsigned bucket_ut, unsigned bucket_bg, unsigned p_pset, unsigned e_pset)
++{
++	return (bucket == bucket_ut || bucket == bucket_bg) ? e_pset : p_pset;
++}
++#endif /* LAUREL_SCHED_PLACE_H */
