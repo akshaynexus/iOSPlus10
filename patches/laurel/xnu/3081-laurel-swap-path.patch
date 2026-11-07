@@ -1,0 +1,78 @@
+laurel 3081: LAUREL SWAP, part 2: the iPhone swap path and sizes on this kernel. [V phone 06:34:54, 3080 kernel] "LAUREL SWAP: off: already with swap: mode 0x4 stays": the Mi A3 kernel is built for the macOS platform (XNU_SDK MacOSX, XNU_TARGET_OS_OSX), so vm_compressor_mode was VM_PAGER_COMPRESSOR_WITH_SWAP from the start, with macOS values: swap files in /System/Volumes/VM (no such directory on the root: no file was ever made, compressor only), 256 MiB to 1 GiB each, up to 100 (VM_MAX_SWAP_FILE_NUM). On ARM64_BOARD_CONFIG_SWEET the three blocks take the !XNU_TARGET_OS_OSX values: /private/var/vm/swapfileN, 64 to 128 MiB each, at most 5 (640 MiB). The on line now prints when the mode has swap (changed or not), with the path and the limit: "LAUREL SWAP: on: already with swap: mode 0x4: compressed pages go to /private/var/vm/swapfileN, at most 5 x 128 MiB, 4078 MiB RAM". Both kernels (xnu-12377: the header is vm_compressor_backing_store_internal.h with other context: series rule drop_file + post/9025 for the header; the .c hunk applies). docs/laurel_sprout/memory.md.
+
+diff -ruN a/osfmk/vm/laurel_swap.c b/osfmk/vm/laurel_swap.c
+--- a/osfmk/vm/laurel_swap.c	2026-11-07 06:38:52.381104078 +0530
++++ b/osfmk/vm/laurel_swap.c	2026-11-07 06:38:52.381216556 +0530
+@@ -16,6 +16,7 @@
+ #include <stdbool.h>
+ #include <kern/clock.h>
+ #include <kern/misc_protos.h>
++#include <string.h>
+ #include <kern/thread.h>
+ #include <mach/vm_param.h>
+ #include <pexpert/pexpert.h>
+@@ -38,6 +39,7 @@
+ extern uint64_t vm_swap_get_max_configured_space(void);
+ extern unsigned int vm_page_free_count, vm_page_active_count, vm_page_inactive_count, vm_page_speculative_count, vm_page_wire_count;
+ extern unsigned int memorystatus_level;
++extern char swapfilename[];
+ 
+ #define LSW_PERIOD_MS   60000u
+ 
+@@ -124,12 +126,18 @@
+ 		printf("LAUREL SWAP: off: no choice was made before vm_config_init (hook missing): mode as the kernel chose\n");
+ 		return;
+ 	}
+-	if (lsw.after != lsw.before) {
+-		printf("LAUREL SWAP: on: %s: mode 0x%x -> 0x%x: compressed pages go to /private/var/vm/swapfileN, at most %d x %u MiB, %u MiB RAM; off with laurelswap=0\n",
+-		    lsw.why, lsw.before, lsw.after, vm_num_swap_files_config, mib(vm_swap_get_max_configured_space() / (vm_num_swap_files_config ? vm_num_swap_files_config : 1)),
+-		    mib(max_mem));
++	if (lsw.after == LSW_COMPRESSOR_WITH_SWAP || lsw.after == LSW_FREEZER_WITH_SWAP) {
++		char was[24] = "";
++		if (lsw.after != lsw.before) {
++			snprintf(was, sizeof(was), " (was 0x%x)", lsw.before);
++		}
++		/* laurel 3081: this kernel is built for the macOS platform (XNU_TARGET_OS_OSX), so its mode was 0x4 from the start, with
++		 * macOS's swap path /System/Volumes/VM and 100 x 1 GiB files; 3081 gives it the iPhone's path and sizes */
++		printf("LAUREL SWAP: on: %s: mode 0x%x%s: compressed pages go to %sN, at most %d x %u MiB, %u MiB RAM; off with laurelswap=0\n",
++		    lsw.why, lsw.after, was, swapfilename, vm_num_swap_files_config,
++		    mib(vm_swap_get_max_configured_space() / (vm_num_swap_files_config ? vm_num_swap_files_config : 1)), mib(max_mem));
+ 	} else {
+-		printf("LAUREL SWAP: off: %s: mode 0x%x stays\n", lsw.why, lsw.before);
++		printf("LAUREL SWAP: off: %s: mode 0x%x stays, no swap file\n", lsw.why, lsw.before);
+ 	}
+ 	if (kernel_thread_start(laurel_swap_thread, NULL, &t) == KERN_SUCCESS) {
+ 		thread_set_thread_name(t, "laurel_swap");
+diff -ruN a/osfmk/vm/vm_compressor_backing_store.c b/osfmk/vm/vm_compressor_backing_store.c
+--- a/osfmk/vm/vm_compressor_backing_store.c	2026-11-07 06:38:52.349352659 +0530
++++ b/osfmk/vm/vm_compressor_backing_store.c	2026-11-07 06:38:52.382666469 +0530
+@@ -132,7 +132,7 @@
+ 
+ boolean_t vm_swap_force_defrag = FALSE, vm_swap_force_reclaim = FALSE;
+ 
+-#if !XNU_TARGET_OS_OSX
++#if !XNU_TARGET_OS_OSX || defined(ARM64_BOARD_CONFIG_SWEET)  /* laurel 3081: 5 swap files as an iPhone, not macOS's 100 */
+ 
+ /*
+  * For CONFIG_FREEZE, we scale the c_segments_limit based on the
+diff -ruN a/osfmk/vm/vm_compressor_backing_store.h b/osfmk/vm/vm_compressor_backing_store.h
+--- a/osfmk/vm/vm_compressor_backing_store.h	2026-11-07 06:38:52.345352613 +0530
++++ b/osfmk/vm/vm_compressor_backing_store.h	2026-11-07 06:38:52.381706413 +0530
+@@ -39,7 +39,7 @@
+ #include <libkern/crypto/aes.h>
+ #include <kern/host_statistics.h>
+ 
+-#if !XNU_TARGET_OS_OSX
++#if !XNU_TARGET_OS_OSX || defined(ARM64_BOARD_CONFIG_SWEET)  /* laurel 3081: the Mi A3 kernel is a macOS-platform build; swap as an iPhone */
+ 
+ #define MIN_SWAP_FILE_SIZE              (64 * 1024 * 1024ULL)
+ 
+@@ -53,7 +53,7 @@
+ 
+ #endif /* !XNU_TARGET_OS_OSX */
+ 
+-#if defined(XNU_TARGET_OS_OSX)
++#if defined(XNU_TARGET_OS_OSX) && !defined(ARM64_BOARD_CONFIG_SWEET)  /* laurel 3081 */
+ #define SWAP_VOLUME_NAME        "/System/Volumes"
+ #define SWAP_FILE_NAME          SWAP_VOLUME_NAME "/VM/swapfile"
+ #else

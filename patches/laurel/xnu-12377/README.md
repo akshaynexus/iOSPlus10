@@ -62,4 +62,6 @@ header or kernelcache is in git: they stay in `out/` and `~/op10-apple/`.
 
 `post/9024`: the vm_config_init hook of laurel 3080 (`LAUREL SWAP`: the compressor runs with a swap file in /private/var/vm): xnu-12377 reads `vm_compressor_mode` as a TUNABLE_DT in `osfmk/vm/vm_pageout.c`, not in `vm_fault_init`; the series rule drops the vm_fault.c section of 3080 here. Host test `scripts/laurel/test-swap.sh`; `docs/laurel_sprout/memory.md`.
 
+`post/9025`: the header hunks of laurel 3081 (`LAUREL SWAP` path and sizes: `/private/var/vm`, 64-128 MiB files, 5 files on the SWEET build, which is a macOS-platform build) for `vm_compressor_backing_store_internal.h`; the series rule drops the 3081 `.h` section here.
+
 Host tests of what lives in `post/9000`: `scripts/laurel/test-a64emu.sh` (emulator), `scripts/laurel/test-slide.sh` (slide on 4 KiB pages), `scripts/laurel/test-apple80211.sh` (23F84 Apple80211).

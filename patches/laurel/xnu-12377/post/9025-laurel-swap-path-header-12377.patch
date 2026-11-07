@@ -1,0 +1,23 @@
+laurel 9025 (iOS 26): the header hunks of laurel 3081 (LAUREL SWAP path and sizes on the SWEET build) for xnu-12377, whose swap store header is osfmk/vm/vm_compressor_backing_store_internal.h with other include lines before the MIN/MAX_SWAP_FILE_SIZE block (the 8796 hunk does not apply as text). The series rule drops the .h section of 3081 here; the .c hunk (VM_MAX_SWAP_FILE_NUM) applies from the series.
+
+diff -ruN a/osfmk/vm/vm_compressor_backing_store_internal.h b/osfmk/vm/vm_compressor_backing_store_internal.h
+--- a/osfmk/vm/vm_compressor_backing_store_internal.h	2026-11-07 06:41:16.397030296 +0530
++++ b/osfmk/vm/vm_compressor_backing_store_internal.h	2026-11-07 06:41:16.420398605 +0530
+@@ -43,7 +43,7 @@
+ #include <vm/vm_pageout_xnu.h>
+ #include <vm/vm_compressor_backing_store_xnu.h>
+ 
+-#if !XNU_TARGET_OS_OSX
++#if !XNU_TARGET_OS_OSX || defined(ARM64_BOARD_CONFIG_SWEET)  /* laurel 3081: the Mi A3 kernel is a macOS-platform build; swap as an iPhone */
+ 
+ #define MIN_SWAP_FILE_SIZE              (64 * 1024 * 1024ULL)
+ 
+@@ -57,7 +57,7 @@
+ 
+ #endif /* !XNU_TARGET_OS_OSX */
+ 
+-#if defined(XNU_TARGET_OS_OSX)
++#if defined(XNU_TARGET_OS_OSX) && !defined(ARM64_BOARD_CONFIG_SWEET)  /* laurel 3081 */
+ #define SWAP_VOLUME_NAME        "/System/Volumes"
+ #define SWAP_FILE_NAME          SWAP_VOLUME_NAME "/VM/swapfile"
+ #else

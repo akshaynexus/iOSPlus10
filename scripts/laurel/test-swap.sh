@@ -50,3 +50,9 @@ int main(void) {
 C
 cc -std=c11 -Wall -Wextra -Werror -I"$T" -o "$T/t" "$T/t.c"
 "$T/t"
+# laurel 3081: the three swap blocks take the iPhone values on the SWEET build (the kernel is a macOS-platform build)
+P=$REPO/patches/laurel/xnu/3081-laurel-swap-path.patch
+n=$(grep -c -E '^\+#if (!XNU_TARGET_OS_OSX \|\| defined\(ARM64_BOARD_CONFIG_SWEET\)|defined\(XNU_TARGET_OS_OSX\) && !defined\(ARM64_BOARD_CONFIG_SWEET\))' "$P")
+[ "$n" = 3 ] || { echo "test-swap: FAIL: 3081 has $n of 3 SWEET swap blocks (file sizes, path, file count)"; exit 1; }
+grep -q 'swapfilename' "$P" || { echo "test-swap: FAIL: 3081 does not print the swap path"; exit 1; }
+echo "test-swap: 3081 PASS (3 SWEET blocks, path in the on line)"
