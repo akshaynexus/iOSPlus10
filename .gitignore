@@ -62,3 +62,17 @@ external/hakios-dada/
 external/AdrenoMetal/
 external/metal2vulkan-inferno/
 external/Bergamota/
+external/UniXNU-tb128fu/
+external/ArmCpu-tb128fu/
+external/Adreno610-tb128fu/
+external/AdrenoMetal-tb128fu/
+external/uefi-tb128fu/
+external/UniXNU-clover/
+external/uefi-clover/
+external/ios-doha/
+external/ios-ginkgo/
+external/UniXNU-gta4l/
+external/topaz-woa/
+external/ginkgo-mainline/
+external/arctos-willow/
+external/Portsmith-iOS/
