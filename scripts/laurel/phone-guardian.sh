@@ -114,6 +114,13 @@ fb_get() { for _t in 1 2 3 4; do _v=$(timeout 10 fastboot getvar "$1" 2>&1 | sed
 wait_fb() { _c=0; until fb_present; do [ "$_c" -lt "$1" ] || return 1; sleep 2; _c=$((_c + 1)); done; }
 fresh_session() { timeout 15 fastboot reboot bootloader >/dev/null 2>&1 || true; sleep 6; wait_fb 20; }
 
+# [V 19:56-19:58] a host job (cpu-flash3) sent `ctl bootloader` under the lock, freed it, and waited for fastboot: the guardian won the race each
+# time and rebooted the phone (3 rounds). A fastboot visit that a host `ctl bootloader` asked for (the USB log shows it, with no panic after it)
+# is that job's: the guardian stands back HOST_WAIT_S (90 s) unless it sent the command itself, and does not count the boot as failed.
+host_asked() {
+  [ $(( $(now) - $(rec ctl_sent 0) )) -gt 60 ] || return 1
+  tail -n 120 "$REPO/logs/usblog.log" 2>/dev/null | awk '/LAUREL CTL: "bootloader"/ { a = 1; p = 0 } /LAUREL PANIC: holding/ { p = 1 } END { exit !(a && !p) }'
+}
 # ---- fastboot: flash or reboot, under the lock ----
 # [V 2026-11-07 03:47-04:16] a write as the first command of a session worked, the second command of a session fails; [V 07:23, 07:29] a visit
 # can be 18 s long: no getvar rounds, no reboot-bootloader round trip; every command is tried twice (the failing turn passes at once).
@@ -223,7 +230,7 @@ echo "debug: $(ls /sys/kernel/debug/ 2>&1 | tr "\n" " " | cut -c1-160)"' 2>/dev/
 
 # ---- the loop ----
 echo $$ > "$G/pid"       # `kill $(cat out/laurel/guardian/pid)` stops the loop (pkill -f matches the caller's own command line)
-state=start; since=$(now); free_since=; nossh_last=0; good_at=0; none_said=0; android_since=
+state=start; since=$(now); free_since=; nossh_last=0; good_at=0; none_said=0; android_since=; standback_until=0
 log "start: FREE_S=$FREE_S GOOD_S=$GOOD_S FAIL_LIMIT=$FAIL_LIMIT (fails now $(rec fails 0), last good: $( [ -f "$G/last-good.img" ] && sha "$G/last-good.img" | cut -c1-12 || echo none), on boot_b: $(sed -n 's/^sha256 //p' "$G/flashed.txt" 2>/dev/null | cut -c1-12))"
 while :; do
   if fb_present; then s=fastboot
@@ -235,18 +242,22 @@ while :; do
     # a boot that ends in fastboot or Android before it was good: one more fail
     if [ "$s" = fastboot ] || [ "$s" = android ]; then
       if ! lock_free; then log "boot ended by a job that holds the phone ($(cat "$PL.who" 2>/dev/null)): not a failed boot"; set_rec boot_start ""
+      elif [ "$s" = fastboot ] && host_asked; then log "boot ended by a host ctl bootloader (USB log): not a failed boot"; set_rec boot_start ""
       elif [ -n "$(rec boot_start)" ] && [ "$(rec boot_good 0)" = 0 ]; then
         f=$(( $(rec fails 0) + 1 )); set_rec fails "$f"; set_rec boot_start ""      # counted once: adb can flicker (android, none, android in 5 s)
         log "boot failed: $s after $t s in state $state (SSH seen: $( [ "$(rec ssh_seen 0)" = 1 ] && echo yes || echo no)); fails in a row: $f"
       fi
     fi
     log "state: $s (was $state for $t s)"
-    state=$s; since=$(now); free_since=; none_said=0; android_since=
+    state=$s; since=$(now); free_since=; none_said=0; android_since=; standback_until=0
   fi
   if [ -f "$G/pause" ]; then sleep "$TICK"; continue; fi
   case "$s" in
   fastboot)
-    if lock_free; then
+    if [ "$standback_until" -gt "$(now)" ]; then :
+    elif [ "$standback_until" = 0 ] && host_asked; then
+      standback_until=$(( $(now) + ${HOST_WAIT_S:-90} )); log "fastboot: a host job asked for it (ctl bootloader in the USB log): standing back ${HOST_WAIT_S:-90} s"
+    elif lock_free; then
       [ -n "$free_since" ] || free_since=$(now)
       if [ $(( $(now) - free_since )) -ge "$FREE_S" ]; then
         if take_lock; then fb_recover || true; drop_lock; else log "fastboot: phone-lock taken meanwhile by $(cat "$PL.who" 2>/dev/null)"; fi
@@ -258,6 +269,7 @@ while :; do
       nossh_last=$(now)
       log "ios: an image is queued and ctl answers: op10tool ctl bootloader (sync over SSH first when it answers)"
       timeout 15 sshpass -p "${IOS_PASSWORD:-alpine}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=6 root@192.168.7.2 sync >/dev/null 2>&1 || true
+      set_rec ctl_sent "$(now)"
       timeout 10 "$TOOL" ctl bootloader >/dev/null 2>&1 || true
       sleep "$TICK"; continue
     fi
