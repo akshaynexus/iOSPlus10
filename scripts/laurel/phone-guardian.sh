@@ -35,7 +35,7 @@ PL=/tmp/iosplus10-phone.lock
 STOCK_DTBO=${STOCK_DTBO:-$HOME/laurel-backup/stock/images/dtbo.img}
 
 now() { date +%s; }
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') guardian: $*" | tee -a "$LOG"; }
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') guardian: $*" >> "$LOG"; }
 sha() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
 rec() { cat "$G/$1" 2>/dev/null || echo "${2:-}"; }
 set_rec() { printf '%s\n' "$2" > "$G/$1"; }
