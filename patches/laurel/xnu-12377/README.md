@@ -60,4 +60,6 @@ header or kernelcache is in git: they stay in `out/` and `~/op10-apple/`.
 
 `post/9012`: `LAUREL BT SCAN: on`: extended LE scan commands go to the chip as legacy ones; bluetoothd no longer restarts on status 701. Kill switch `laurelbtscan=0`; host test `scripts/laurel/test-bt-scan.sh`.
 
+`post/9024`: the vm_config_init hook of laurel 3080 (`LAUREL SWAP`: the compressor runs with a swap file in /private/var/vm): xnu-12377 reads `vm_compressor_mode` as a TUNABLE_DT in `osfmk/vm/vm_pageout.c`, not in `vm_fault_init`; the series rule drops the vm_fault.c section of 3080 here. Host test `scripts/laurel/test-swap.sh`; `docs/laurel_sprout/memory.md`.
+
 Host tests of what lives in `post/9000`: `scripts/laurel/test-a64emu.sh` (emulator), `scripts/laurel/test-slide.sh` (slide on 4 KiB pages), `scripts/laurel/test-apple80211.sh` (23F84 Apple80211).

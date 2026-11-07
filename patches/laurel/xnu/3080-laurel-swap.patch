@@ -1,0 +1,240 @@
+laurel 3080: LAUREL SWAP: the VM compressor runs with a swap file, as on a real iPhone. [V code] Both Mi A3 kernels (SWEET: CONFIG_JETSAM, no CONFIG_FREEZE) start the compressor without swap, so a full compressor kills the largest compressed process (mediaserverd at 2.6 GB in the 11-04 logs). New osfmk/vm/laurel_swap.c + laurel_swap_core.h (pure decision, host test scripts/laurel/test-swap.sh): before vm_config_init reads vm_compressor_mode, NO_SWAP/NOT_CONFIGURED -> COMPRESSOR_WITH_SWAP (a freezer kernel: FREEZER_WITH_SWAP) unless a vm_compressor= boot-arg was given; the kernel then writes full compressed segments to /private/var/vm/swapfileN (encrypted, 128 MiB each, at most 5 = 640 MiB, made on demand). Self-check: the first swap file made, or the first failure to make one (read-only root, no directory, no space: the kernel then runs compressor-only as before), is reported once; one line a minute with free/active/inactive/speculative/wired, compressor pages and bytes, segments, swap used, memorystatus level. Kill switch laurelswap=0. The xnu-8796 hook is in vm_fault.c (vm_fault_init parses vm_compressor=); on xnu-12377 the mode is a TUNABLE_DT read in vm_pageout.c vm_config_init: rule drop_file + post/9024. docs/laurel_sprout/memory.md.
+
+diff -ruN a/osfmk/conf/files b/osfmk/conf/files
+--- a/osfmk/conf/files	2026-11-07 05:38:38.828793968 +0530
++++ b/osfmk/conf/files	2026-11-07 05:40:11.077756293 +0530
+@@ -269,6 +269,7 @@
+ osfmk/vm/vm_compressor.c		standard
+ osfmk/vm/vm_compressor_pager.c		standard
+ osfmk/vm/vm_compressor_backing_store.c	standard
++osfmk/vm/laurel_swap.c	standard
+ osfmk/vm/vm_compressor_algorithms.c	standard
+ osfmk/vm/lz4.c				standard
+ osfmk/vm/vm_phantom_cache.c		optional config_phantom_cache
+diff -ruN a/osfmk/vm/laurel_swap.c b/osfmk/vm/laurel_swap.c
+--- a/osfmk/vm/laurel_swap.c	1970-01-01 05:30:00.000000000 +0530
++++ b/osfmk/vm/laurel_swap.c	2026-11-07 05:40:11.041836518 +0530
+@@ -0,0 +1,141 @@
++/*
++ * laurel 3080: LAUREL SWAP: the VM compressor runs with a swap file, as on a real iPhone.
++ * [V code] This kernel has CONFIG_JETSAM and no CONFIG_FREEZE, so vm_compressor_mode defaults to VM_PAGER_COMPRESSOR_NO_SWAP: compressed
++ * pages stay in RAM, and when the compressor is full the kernel kills the largest compressed process ("low swap: killing largest
++ * compressed process", mediaserverd at 2.6 GB). With VM_PAGER_COMPRESSOR_WITH_SWAP the swapout thread writes full compressed segments
++ * to /private/var/vm/swapfileN (encrypted, 128 MiB each, at most VM_MAX_SWAP_FILE_NUM = 5 on a non-macOS kernel: 640 MiB), made on
++ * demand by the swapfile create thread; nothing is written while the compressor has room.
++ * Self-check: the choice is made only when no vm_compressor= boot-arg exists (laurel_swap_choose, before vm_config_init reads the mode);
++ * the first swap file made, or the first failure to make one (read-only root, no /private/var/vm, disk full), is reported once; the
++ * kernel itself goes on as "compressor only" after a failure (vm_swap_out_of_space -> the same kills as before). A line a minute with
++ * the memory state is the running self-check (LAUREL SWAP: free/active/inactive/wired, compressor pages and bytes, swap used, level).
++ * Kill switch: laurelswap=0 (the mode stays as the kernel chose). Both kernels. docs/laurel_sprout/memory.md.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <stdint.h>
++#include <stdbool.h>
++#include <kern/clock.h>
++#include <kern/misc_protos.h>
++#include <kern/thread.h>
++#include <mach/vm_param.h>
++#include <pexpert/pexpert.h>
++#include "laurel_swap_core.h"
++
++void laurel_swap_choose(uint32_t *mode, boolean_t by_hand);
++void laurel_swap_start(void);
++
++/* osfmk/vm/vm_compressor.c, vm_compressor_backing_store.c, vm_resident.c, bsd/kern/kern_memorystatus.c: read only */
++extern uint32_t c_segment_pages_compressed;
++extern uint32_t c_segment_count;
++extern uint32_t c_segments_limit;
++extern uint64_t compressor_bytes_used;
++extern int vm_num_swap_files;
++extern int vm_num_swap_files_config;
++extern uint64_t vm_swapfile_last_failed_to_create_ts;
++extern uint64_t vm_swap_put_failures_no_swap_file;
++extern uint64_t vm_swap_get_used_space(void);
++extern uint64_t vm_swap_get_total_space(void);
++extern uint64_t vm_swap_get_max_configured_space(void);
++extern unsigned int vm_page_free_count, vm_page_active_count, vm_page_inactive_count, vm_page_speculative_count, vm_page_wire_count;
++extern unsigned int memorystatus_level;
++
++#define LSW_PERIOD_MS   60000u
++
++static struct {
++	bool        chosen;
++	bool        enabled;
++	bool        by_hand;
++	uint32_t    before;
++	uint32_t    after;
++	const char *why;
++	int         files_seen;
++	bool        fail_said;
++} lsw;
++
++static inline uint32_t
++mib(uint64_t bytes)
++{
++	return (uint32_t)(bytes >> 20);
++}
++
++static inline uint32_t
++pages_mib(unsigned int pages)
++{
++	return mib((uint64_t)pages * PAGE_SIZE);
++}
++
++/* Before vm_config_init reads the mode. by_hand: a valid vm_compressor= boot-arg was given (then nothing changes). */
++void
++laurel_swap_choose(uint32_t *mode, boolean_t by_hand)
++{
++	uint32_t on = 1;
++
++	if (lsw.chosen) {
++		return;
++	}
++	PE_parse_boot_argn("laurelswap", &on, sizeof(on));
++	lsw.enabled = (on != 0);
++	lsw.by_hand = (by_hand != 0);
++	lsw.before = *mode;
++	lsw.after = laurel_swap_decide(*mode, lsw.enabled, lsw.by_hand, &lsw.why);
++	*mode = lsw.after;
++	lsw.chosen = true;
++}
++
++static void
++laurel_swap_line(void)
++{
++	uint64_t used = vm_swap_get_used_space();
++	uint64_t total = vm_swap_get_total_space();
++
++	if (vm_num_swap_files > lsw.files_seen) {
++		printf("LAUREL SWAP: swapfile %d made: %u MiB of swap in %d file(s), at most %u MiB\n",
++		    vm_num_swap_files - 1, mib(total), vm_num_swap_files, mib(vm_swap_get_max_configured_space()));
++		lsw.files_seen = vm_num_swap_files;
++	}
++	if (!lsw.fail_said && vm_num_swap_files == 0 && vm_swapfile_last_failed_to_create_ts != 0) {
++		printf("LAUREL SWAP: off: /private/var/vm/swapfile0 could not be made (root read-only, no /private/var/vm, or no space): compressor only, %llu puts failed\n",
++		    (unsigned long long)vm_swap_put_failures_no_swap_file);
++		lsw.fail_said = true;
++	}
++	printf("LAUREL SWAP: free %u MiB, active %u, inactive %u, speculative %u, wired %u; compressor %u MiB of pages in %u MiB, %u of %u segments; swap %u of %u MiB in %d files; level %u %%\n",
++	    pages_mib(vm_page_free_count), pages_mib(vm_page_active_count), pages_mib(vm_page_inactive_count),
++	    pages_mib(vm_page_speculative_count), pages_mib(vm_page_wire_count),
++	    pages_mib(c_segment_pages_compressed), mib(compressor_bytes_used), c_segment_count, c_segments_limit,
++	    mib(used), mib(total), vm_num_swap_files, memorystatus_level);
++}
++
++static void
++laurel_swap_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		delay_for_interval(LSW_PERIOD_MS, NSEC_PER_MSEC);
++		laurel_swap_line();
++	}
++}
++
++/* At the end of vm_compressor_init: the swap threads exist, the limits are set. */
++void
++laurel_swap_start(void)
++{
++	thread_t t;
++
++	if (!lsw.chosen) {
++		printf("LAUREL SWAP: off: no choice was made before vm_config_init (hook missing): mode as the kernel chose\n");
++		return;
++	}
++	if (lsw.after != lsw.before) {
++		printf("LAUREL SWAP: on: %s: mode 0x%x -> 0x%x: compressed pages go to /private/var/vm/swapfileN, at most %d x %u MiB, %u MiB RAM; off with laurelswap=0\n",
++		    lsw.why, lsw.before, lsw.after, vm_num_swap_files_config, mib(vm_swap_get_max_configured_space() / (vm_num_swap_files_config ? vm_num_swap_files_config : 1)),
++		    mib(max_mem));
++	} else {
++		printf("LAUREL SWAP: off: %s: mode 0x%x stays\n", lsw.why, lsw.before);
++	}
++	if (kernel_thread_start(laurel_swap_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_set_thread_name(t, "laurel_swap");
++		thread_deallocate(t);
++	} else {
++		printf("LAUREL SWAP: no minute line: the thread was not made\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/osfmk/vm/laurel_swap_core.h b/osfmk/vm/laurel_swap_core.h
+--- a/osfmk/vm/laurel_swap_core.h	1970-01-01 05:30:00.000000000 +0530
++++ b/osfmk/vm/laurel_swap_core.h	2026-11-07 05:40:11.040836506 +0530
+@@ -0,0 +1,49 @@
++/*
++ * laurel 3080: LAUREL SWAP, the decision (pure: no kernel headers, so the host test scripts/laurel/test-swap.sh runs the same code).
++ * The Mi A3 kernels (SWEET, no CONFIG_FREEZE) start the VM compressor without swap (VM_PAGER_COMPRESSOR_NO_SWAP, or
++ * VM_PAGER_NOT_CONFIGURED on xnu-8796): a full compressor kills the largest compressed process. A real iPhone runs the compressor
++ * with a swap file in /private/var/vm. This picks "with swap" unless the owner set vm_compressor= by hand, or laurelswap=0.
++ */
++#ifndef LAUREL_SWAP_CORE_H
++#define LAUREL_SWAP_CORE_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#define LSW_NOT_CONFIGURED        0x00u
++#define LSW_DEFAULT               0x01u
++#define LSW_COMPRESSOR_NO_SWAP    0x02u
++#define LSW_COMPRESSOR_WITH_SWAP  0x04u
++#define LSW_FREEZER_DEFAULT       0x08u
++#define LSW_FREEZER_NO_SWAP       0x10u
++#define LSW_FREEZER_WITH_SWAP     0x20u
++
++/* The mode to run, and in *why one short reason. mode: the kernel's choice so far; enabled: laurelswap != 0; by_hand: a valid vm_compressor= boot-arg. */
++static inline uint32_t
++laurel_swap_decide(uint32_t mode, bool enabled, bool by_hand, const char **why)
++{
++	if (!enabled) {
++		*why = "laurelswap=0";
++		return mode;
++	}
++	if (by_hand) {
++		*why = "vm_compressor= set by hand";
++		return mode;
++	}
++	switch (mode) {
++	case LSW_NOT_CONFIGURED:
++	case LSW_DEFAULT:
++	case LSW_COMPRESSOR_NO_SWAP:
++		*why = "compressor without swap";
++		return LSW_COMPRESSOR_WITH_SWAP;
++	case LSW_FREEZER_DEFAULT:
++	case LSW_FREEZER_NO_SWAP:
++		*why = "freezer without swap";
++		return LSW_FREEZER_WITH_SWAP;
++	default:
++		*why = "already with swap";
++		return mode;
++	}
++}
++
++#endif /* LAUREL_SWAP_CORE_H */
+diff -ruN a/osfmk/vm/vm_compressor.c b/osfmk/vm/vm_compressor.c
+--- a/osfmk/vm/vm_compressor.c	2026-11-07 05:38:38.825793934 +0530
++++ b/osfmk/vm/vm_compressor.c	2026-11-07 05:40:11.075970203 +0530
+@@ -1221,6 +1221,11 @@
+ 
+ 	vm_compressor_available = 1;
+ 
++	{
++		extern void laurel_swap_start(void);  /* laurel 3080: LAUREL SWAP line + minute line */
++		laurel_swap_start();
++	}
++
+ 	vm_page_reactivate_all_throttled();
+ 
+ 	bzero(&vmcs_stats, sizeof(struct vm_compressor_swapper_stats));
+diff -ruN a/osfmk/vm/vm_fault.c b/osfmk/vm/vm_fault.c
+--- a/osfmk/vm/vm_fault.c	2026-11-07 05:38:38.822793900 +0530
++++ b/osfmk/vm/vm_fault.c	2026-11-07 05:40:11.071836857 +0530
+@@ -305,6 +305,10 @@
+ 		/* If no boot arg or incorrect boot arg, try device tree. */
+ 		PE_get_default("kern.vm_compressor", &vm_compressor_mode, sizeof(vm_compressor_mode));
+ 	}
++	{
++		extern void laurel_swap_choose(uint32_t *mode, boolean_t by_hand);  /* laurel 3080: swap on, unless vm_compressor= was given */
++		laurel_swap_choose((uint32_t *)&vm_compressor_mode, !need_default_val);
++	}
+ 	printf("\"vm_compressor_mode\" is %d\n", vm_compressor_mode);
+ 	vm_config_init();
+ 

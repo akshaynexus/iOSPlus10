@@ -74,6 +74,8 @@ RULES = [
          why="12377 moved pid_hibernate from vm_unix.c to kern_proc.c"),
     dict(patches=["0070"], kind="sub", multiline=True, file="bsd/kern/kern_proc.c", old=" #if SOCKETS\n int\n",
          new=" #if SOCKETS\n \n", why="context: in kern_proc.c a blank line follows #if SOCKETS"),
+    dict(patches=["3080"], kind="drop_file", file="osfmk/vm/vm_fault.c",
+         why="12377 reads vm_compressor_mode as a TUNABLE_DT and sets vm_config in osfmk/vm/vm_pageout.c vm_config_init, not in vm_fault_init: post/9024 holds the laurel_swap_choose hook"),
 ]
 
 # Files that the base patches own. file -> (base patch, "series patches whose hunks for this file the base holds"[, "kept"]).

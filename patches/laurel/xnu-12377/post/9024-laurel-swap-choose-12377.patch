@@ -1,0 +1,17 @@
+laurel 9024 (iOS 26): the vm_config_init hook of 3080 (LAUREL SWAP): xnu-12377 reads vm_compressor_mode as a TUNABLE_DT and sets vm_config from it in osfmk/vm/vm_pageout.c vm_config_init (STARTUP KMEM), not in vm_fault_init as xnu-8796 does; laurel_swap_choose runs there, with "by hand" = a vm_compressor= boot-arg exists. The series rule drops the vm_fault.c section of 3080 on this kernel.
+
+diff -ruN a2/osfmk/vm/vm_pageout.c b2/osfmk/vm/vm_pageout.c
+--- a2/osfmk/vm/vm_pageout.c	2026-11-07 05:40:11.037836472 +0530
++++ b2/osfmk/vm/vm_pageout.c	2026-11-07 05:40:11.079772880 +0530
+@@ -5666,6 +5666,11 @@
+ {
+ 	bzero(&vm_config, sizeof(vm_config));
+ 
++	{
++		extern void laurel_swap_choose(uint32_t *mode, boolean_t by_hand);  /* laurel 3080: swap on, unless vm_compressor= was given */
++		laurel_swap_choose((uint32_t *)&vm_compressor_mode, PE_parse_boot_argn("vm_compressor", NULL, 0));
++	}
++
+ 	vm_log("\"vm_compressor_mode\" is %d\n", vm_compressor_mode);
+ 
+ 	if (osenvironment_is_diagnostics() || osenvironment_is_device_recovery()) {

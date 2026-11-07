@@ -56,8 +56,7 @@ KEEP_FOR_PARITY = {'com.apple.wifid', 'com.apple.wifianalyticsd', 'com.apple.aud
 # Owner 2026-11-03: no job is removed, so what stays must live. Boot 11, one log of 52 min: gamepolicyd 271 kills, deviceaccessd 278, liveactivitiesd 204, linkd 34, intents_helper 29, and ended tasks took 28-55 s
 # of CPU a minute at rest, half of all CPU then [V LAUREL CPU TOP]. Each kill also asks for a corpse and can ask for a stackshot, and a stackshot caused the panic of post/9007 [I]. Memory is there: 715 MiB free at the kills [V].
 # Floors: 24 MB for a daemon that maps the store, 16 MB for the others that crossed their limit once or twice.
-JETSAM_FLOORS = {'Daemon': {'com.apple.iconservices.iconservicesagent': {'InactiveHardMemoryLimit': 200}, 'com.apple.liveactivitiesd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
-                            'com.apple.linkd': {'ActiveSoftMemoryLimit': 32, 'InactiveHardMemoryLimit': 32}, 'com.apple.watchlistd': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
+JETSAM_FLOORS = {'Daemon': {'com.apple.iconservices.iconservicesagent': {'InactiveHardMemoryLimit': 200},                             'com.apple.linkd': {'ActiveSoftMemoryLimit': 32, 'InactiveHardMemoryLimit': 32}, 'com.apple.watchlistd': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
                             'com.apple.managedappdistributiond': {'InactiveHardMemoryLimit': 16}, 'com.apple.nehelper': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
                             'com.apple.gamepolicyd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24}, 'com.apple.deviceaccessd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
                             'com.apple.contextstored': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24}, 'com.apple.appplaceholdersyncd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
@@ -67,8 +66,17 @@ JETSAM_FLOORS = {'Daemon': {'com.apple.iconservices.iconservicesagent': {'Inacti
                             'com.apple.donotdisturbd': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
                             'com.apple.dasd': {'ActiveSoftMemoryLimit': 48, 'InactiveHardMemoryLimit': 48},
                             'com.apple.driverkitd': {'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16},
-                            'com.apple.usernotificationsd': {'ActiveSoftMemoryLimit': 32, 'InactiveHardMemoryLimit': 32}},
+                            'com.apple.usernotificationsd': {'ActiveSoftMemoryLimit': 32, 'InactiveHardMemoryLimit': 32},
+                            # 2026-11-07 (RAM agent), logs/usblog.log 05:00-05:30 and the 11-03..11-06 logs: what still crossed its watermark with the floors above in place
+                            'com.apple.pluginkit.pkd': {'ActiveSoftMemoryLimit': 32, 'InactiveHardMemoryLimit': 32},            # 15 MB: 71 crossings, killed (code 7)
+                            'com.apple.siriactionsd': {'ActiveSoftMemoryLimit': 48, 'InactiveHardMemoryLimit': 48},              # 25/18 MB: crossed 25
+                            'com.apple.geod': {'ActiveSoftMemoryLimit': 48, 'InactiveHardMemoryLimit': 48},                      # 19 MB: 8 crossings
+                            'com.apple.biomed': {'ActiveSoftMemoryLimit': 32, 'InactiveHardMemoryLimit': 32},                    # 12 MB: 22 crossings
+                            'com.apple.UserEventAgent-System': {'ActiveSoftMemoryLimit': 32, 'InactiveHardMemoryLimit': 32},     # 15 MB: 8 crossings
+                            'com.apple.liveactivitiesd': {'ActiveSoftMemoryLimit': 48, 'InactiveHardMemoryLimit': 48}},          # crossed the 24 MB floor 8 times
                  'XPCService': {'com.apple.intents.intents-helper': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},
+                                'com.apple.proactive.AppPredictionIntentsHelperService': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},  # no key: 6 MB, crossed, killed
+                                'com.apple.ctcategories.service': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24},  # CategoriesService.xpc (CoreTelephony) [I id: the only service id next to its bundle in the root image]: no key: 6 MB, 28 crossings, 3 kills
                                 'com.apple.WorkflowKit.BackgroundShortcutRunner': {'InactiveHardMemoryLimit': 64},
                                 'com.apple.extensionkitservice': {'ActiveSoftMemoryLimit': 24, 'InactiveHardMemoryLimit': 24}}}
 
