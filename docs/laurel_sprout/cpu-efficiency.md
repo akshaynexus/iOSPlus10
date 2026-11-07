@@ -71,6 +71,47 @@ the compositor. 3070 now keeps 512 slots, 8 probes, and counts the words with no
 Other readings of those minutes: gold `1804:60`, silver `1612:60` (a cap one row under the top: thermal, or the 3051 margin of the wdog agent; [U]);
 `LAUREL CPU TOP: busy 407 s of 480` (85 %) in the storm minute, 251 s the minute after.
 
+## 4c. Boot 06:45 with 3070 (512 slots) and 3071, kernel of `scripts/laurel/snap-build.sh cpu` (series HEAD 06:44, image 430bc5ec) [V]
+
+Both features are on: `kern.laurel_stats` state lines `LAUREL SCHED PLACE on ...` and `LAUREL EMU SITES on ... 512 slots, 8 tried per pc`
+(the boot lines print before the console ring is kept; the stats sysctl keeps them). `LAUREL CPU MOTION on` is there too: 3020 runs [V].
+
+The FP16 hot path, named (`LAUREL EMU: site` lines of the first two UI minutes):
+
+| minute | class | count | process | unslid pc | word | where |
+|---|---|---:|---|---|---|---|
+| 1 | fp16 | 503,357 | iconservicesagent | 0x184368938 | `fcmp h2, h0` | CoreGraphics+0xa6938 |
+| 1 | fp16 | 122,403 | iconservicesagent | 0x184368940 | `fcmp h2, #0.0` | CoreGraphics+0xa6940 |
+| 1 | pac | 21,561 | audiomxd | 0x2a34dea80 | `retab` | libsystem_m+0xa80 |
+| 1 | lse | 13,709 | locationd | root binary | `ldaddal x9, x8, [x8]` | locationd (root, not lowered) |
+| 2 | lse | 27,797 | locationd | root binary | `ldaddal` | same |
+| 2 | fp16 | 20,446 + 20,446 | backboardd | 0x183f1eaa4, 0x183f1eaa8 | `fmov h1, #1.0`, `fcmp h0, h1` | QuartzCore+0x4daa4 |
+| 2 | lse | 5,781 | laurel-springboard | 0x1bd968354 | `cas x8, x9, [x30]` | libdispatch+0x29354 |
+
+`fp16` counts: 687,012 in minute 1, +65,472 in minute 2. The 17 M-word minute of boot 06:36 did not come back on this boot (iconservicesagent 65 s
+there, under 10 s here: the icon cache was warm [I]). No slot this minute: `pac=236 lse=4005 fp16=755`, 495 of 512 slots used (locationd and logd
+have hundreds of LSE sites each: the root binaries are not lowered).
+
+**The CoreGraphics site** (`dsc-image.py ... fn CoreGraphics 0x184368938`): a half-float (RGBA16F) pixel blend loop: `ldr h`, `fcvt s, h`, `fcvtl`,
+`fmla`, `fcvtn`, `str d`, and two FP16 words per pixel: `fcmp h2, h0` (alpha against a limit) and `fcmp h2, #0.0`. Everything else in the loop is
+ARMv8.0. So the icon storm's cost is 2 traps per pixel, about 4 us a pixel at 2 us a trap.
+
+**Decision on a lowering [I, numbers V]:** `fcmp hN, hM` and `fcmp hN, #0.0` are the simplest FP16 forms: `fcvt s16, hN; fcvt s17, hM; fcmp s16, s17`
+(exact: half to single loses nothing, NZCV is the same) with two S registers spilled below the red zone, in the trampoline frame the LSE lowering
+already has (`tools/op10tool/src/a64.rs`: `lse_trampoline`, `TRAMP_FRAME` 176 bytes, the x30 stub when x30 is live). Gain: 625,000 traps in the
+first UI minute of a warm boot (1.2 s of CPU, 2 % of a core), up to 17 M (34 s, 0.6 of a core) in the minute an icon cache is rebuilt. It is a
+boot-storm cost, not a frame cost: the compositor's own FP16 is 41,000 words a minute (0.1 s). Not done in this round; it needs a lowering run over
+the cache and a new root (hours, the shared phone). The recipe is above; the sites lines of every boot say whether it is still worth it.
+
+**Frames in the storm (home-swipe of the autotest, 06:47, 30-60 s after SpringBoard):** `motion ended: 37 frames in 670 ms` (55/s), `90 in 1499`
+(60/s), `151 in 2515` (60/s) [V]. Earlier Home loops were 13-17 frames/s (`ios26-default-speed.md`), but other agents' GPU and metal2vulkan changes
+landed in between: not a measure of 3071 alone [I].
+
+**3071 before/after in the only window that exists (minute 1 of the UI, storm):** CPU TOP busy 367 s before, 366 s after; silver rows `300:7-10` then
+all at its cap both times (the cap is 1612 now: `LAUREL CPU MARGIN`, patch 3051 of the watchdog agent, holds the top row back). No settled window:
+the phone still reboots every 2-4 minutes (3050 work). The `cores` line (runnable ms of SpringBoard and backboardd) came empty: `toybox ps` on this
+root prints no pid column the script can read (awk is not on the root; a sed form is in, not yet proven) [U].
+
 ## 5. Tools
 
 | Tool | What |
@@ -90,8 +131,9 @@ Other readings of those minutes: gold `1804:60`, silver `1612:60` (a cap one row
 | `cores`: runnable ms of SpringBoard, backboardd over 10 s | [U] | lower than before on the same scenario |
 | `ksysctl kern.laurel_stats` `cpu.hold` in a server animation | [U] | `motion` (proves 3020) |
 
-## 7. Open
+## 7. Open (updated 06:50)
 
-- The 2-minute panic cycle (3050) hides every settled number; the before/after of section 6 needs one boot that stays up through `ios26-autotest.sh run`.
+- The 2-4 minute panic cycle (3050) hides every settled number; the before/after of section 6 needs one boot that stays up through `ios26-autotest.sh run`. Until then the sites lines, the state lines and the storm minutes are the evidence.
+- FP16 `fcmp h` lowering in `a64-lower` (section 4c): the next CPU step when a boot shows the icon storm again.
 - The P -> E spill weight for the UI buckets (FG, fixed) could rise above 64 us so the render thread waits on gold rather than runs on an A53: after the first numbers.
 - `cores` 0 ms on P cores: the tool's struct or the cpu kinds [U].
