@@ -131,6 +131,15 @@ and the red zone must match).
 | Self-check of the lowering | `a64-selftest` reads `lse-words.txt` (now with the FP16 words) and runs every real word; `a64-verify` replays dyld's and the kernel's checks and accepts an FP16 site only as a branch to a stub or trampoline head on cortex-a73-decodable code | [V] |
 | Not lowered | `fccmp h` (211 sites), `fmov h, #imm` (one word, 3,600 sites: `movi` would set the other lanes differently), the arithmetic forms: they stay with the emulator. The next sites lines say whether one of them is hot | [V census] |
 
+**Lowering run and root (17:41-17:54) [V]:** `lowered-fp16` next to the shared lowered tree (`LOWERED=DIR`): cache 7,821 FP16 sites (4,646 stubs,
+3,175 `bl`), root Mach-O 100, LSE unchanged (0 left in the cache), `a64-verify` `Problems: none`, both runs the same bytes. Root `root-fp16`
+(`ROOT_OUT`, snapshot tree `build-cpu` with the main checkout's userland products linked into its `out/`): manifest `58e4095cb7 ... features 21
+installed 18 off 3` (camera-plugin, root-update, xnutils off as in the shared root), all checks OK, 18 GB. The root audit line:
+`applied fp16-cmp-lowered: 7821 fcmp/fcmpe h sites through a trampoline (cache + root Mach-O), 0 left for the kernel`. Flash: queued for the
+phone's return (`dual-boot.sh install`, iosroot only). Gotchas: a snapshot tree has none of the userland products of the main checkout's `out/`
+(metal stage, notch, cell, ssh, ...): the first root there came with no compositor; `apfs-fuse` gave one `Input/output error` reading a donor
+file mid-build, the retry passed.
+
 **LSE in the root binaries (logd 27 sites, locationd 92, 5,460 in 16 files): not done.** They are left because the file's `__TEXT` has no free
 run of 64 zero bytes left after the first 2,230 + 303 sites of locationd took 8,204 of its 8,208 free bytes (`macho-lowered.tsv`). The frame fits;
 the space does not. More space means growing `__TEXT` and moving every later segment and the code signature: a Mach-O re-layout, not this
