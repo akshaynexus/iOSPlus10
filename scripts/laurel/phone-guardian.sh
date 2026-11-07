@@ -54,6 +54,13 @@ note_flash() {
   set_rec boot_good 0
   log "noted: boot_b = $img ($(sha "$img" | cut -c1-12), by $who); the fail count starts at 0"
 }
+# the built kernel (with its stamp) whose sha the image stamp names, when still on disk
+kernel_of() {
+  want=$(sed -n 's/^kernel_sha256=//p' "$1" 2>/dev/null); [ -n "$want" ] || return 0
+  for k in "$REPO"/out/laurel-kernel-ios26/out/kernel.ios26.development.sweet.4k "$HOME"/.t3/worktrees/iOSPlus10/*/out/laurel-kernel-ios26/out/kernel.ios26.development.sweet.4k; do
+    [ -f "$k" ] && [ -f "$k.stamp" ] && [ "$(sha "$k")" = "$want" ] && { echo "$k"; return 0; }
+  done
+}
 mark_good() {
   [ -f "$G/flashed.img" ] || { log "mark-good: no record of the image on boot_b (nobody called note-flash): nothing marked"; return 1; }
   if [ "$(sha "$G/flashed.img")" = "$(sha "$G/last-good.img")" ]; then set_rec fails 0; return 0; fi
@@ -64,15 +71,9 @@ mark_good() {
   set_rec fails 0
   log "last good image: $(sha "$G/last-good.img" | cut -c1-12) ($(sed -n 's/^line=//p' "$G/last-good.img.stamp" 2>/dev/null | cut -c1-40))"
   # the menu's own fallback entry (mu 0202): the kernel of this image, when a built copy with its stamp still exists
-  want=$(sed -n 's/^kernel_sha256=//p' "$G/last-good.img.stamp" 2>/dev/null)
-  if [ -n "$want" ]; then
-    for k in "$REPO"/out/laurel-kernel-ios26/out/kernel.ios26.development.sweet.4k "$HOME"/.t3/worktrees/iOSPlus10/*/out/laurel-kernel-ios26/out/kernel.ios26.development.sweet.4k; do
-      [ -f "$k" ] && [ -f "$k.stamp" ] || continue
-      if [ "$(sha "$k")" = "$want" ]; then
-        if out=$(sh "$REPO/scripts/laurel/mark-kernel-good.sh" "$k" 2>&1); then log "menu fallback: $out"; else log "menu fallback: mark-kernel-good failed: $(echo "$out" | tail -n 1)"; fi
-        break
-      fi
-    done
+  k=$(kernel_of "$G/last-good.img.stamp")
+  if [ -n "$k" ]; then
+    if out=$(sh "$REPO/scripts/laurel/mark-kernel-good.sh" "$k" 2>&1); then log "menu fallback: $out"; else log "menu fallback: mark-kernel-good failed: $(echo "$out" | tail -n 1)"; fi
   fi
 }
 status() {
@@ -167,8 +168,9 @@ android_recover() {
   857:*) log "android: PON 0x857 = ${v#857: } ($( [ "${v#857: }" = 00 ] && echo "the PMIC watchdog count did not survive into Android" || echo "ARMED: the count survived a reset: read docs/laurel_sprout/self-recovery.md, case D"))"; echo "$(date -u +%Y%m%dT%H%M%SZ) $v" >> "$G/pon-857.txt" ;;
   *) log "android: PON 0x857 not readable (adb root: '${r:-no answer}'; debugfs regmap: '${v:-nothing}')" ;;
   esac
-  log "android: slot a: the way back: ios26-retry.sh FAST_SWITCH=1 (Android opens its data, boot_b + dtbo_b, slot b from fastboot)"
-  if FAST_SWITCH=1 EXTRA_ARGS="$EXTRA" sh "$REPO/scripts/laurel/ios26-retry.sh" rw > "$REPO/logs/phone-guardian-retry.log" 2>&1; then
+  k=$(kernel_of "$G/flashed.img.stamp"); [ -n "$k" ] || k=$(kernel_of "$G/last-good.img.stamp")
+  log "android: slot a: the way back: ios26-retry.sh FAST_SWITCH=1 (Android opens its data, boot_b + dtbo_b, slot b from fastboot); kernel ${k:-of the main checkout}"
+  if FAST_SWITCH=1 EXTRA_ARGS="$EXTRA" ${k:+KERNEL="$k"} sh "$REPO/scripts/laurel/ios26-retry.sh" rw > "$REPO/logs/phone-guardian-retry.log" 2>&1; then
     log "android: ios26-retry.sh done: $(tail -n 1 "$REPO/logs/phone-guardian-retry.log")"
     set_rec boot_start "$(now)"; set_rec boot_good 0; set_rec ssh_seen 0
     return 0
@@ -191,7 +193,8 @@ while :; do
     t=$(( $(now) - since ))
     # a boot that ends in fastboot or Android before it was good: one more fail
     if [ "$s" = fastboot ] || [ "$s" = android ]; then
-      if [ -n "$(rec boot_start)" ] && [ "$(rec boot_good 0)" = 0 ]; then
+      if ! lock_free; then log "boot ended by a job that holds the phone ($(cat "$PL.who" 2>/dev/null)): not a failed boot"; set_rec boot_start ""
+      elif [ -n "$(rec boot_start)" ] && [ "$(rec boot_good 0)" = 0 ]; then
         f=$(( $(rec fails 0) + 1 )); set_rec fails "$f"
         log "boot failed: $s after $t s in state $state (SSH seen: $( [ "$(rec ssh_seen 0)" = 1 ] && echo yes || echo no)); fails in a row: $f"
       fi
