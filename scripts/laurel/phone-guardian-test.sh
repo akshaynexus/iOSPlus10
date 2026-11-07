@@ -49,7 +49,13 @@ OP611FL1XX:"shell getprop ro.product.device") echo OP611FL1 ;;
 OP611FL1XX:*) echo "OTHER PHONE TOUCHED: \$*" >> "$D/calls.txt"; exit 1 ;;
 MIA3SERIAL:"shell getprop sys.boot_completed") echo 1 ;;
 MIA3SERIAL:"root  ") echo "restarting adbd as root" ;;
-MIA3SERIAL:"shell cat /sys/kernel/debug/regmap/spmi0-00/registers"*) echo "857: 00" ;;
+MIA3SERIAL:"shell grep -q debugfs"*) echo "/sys/kernel/debug/regmap/spmi0-00/registers:857: 00"; echo "debug: regmap" ;;
+MIA3SERIAL:"shell getprop ro.boot.slot_suffix") echo _a ;;
+MIA3SERIAL:"shell bootctl set-active-boot-slot") [ -f "$F.nohal" ] && exit 1; echo b > "$F.slot" ;;
+MIA3SERIAL:"shell bootctl get-active-boot-slot") [ "\$(cat "$F.slot")" = b ] && echo 1 || echo 0 ;;
+MIA3SERIAL:"reboot  ") echo ios > "$F.state" ;;
+MIA3SERIAL:"wait-for-device  ") ;;
+MIA3SERIAL:"shell id -u") echo 0 ;;
 MIA3SERIAL:"reboot bootloader ") echo fastboot > "$F.state"; echo 0 > "$F.turn" ;;
 esac
 exit 0
@@ -155,10 +161,17 @@ grep -q "^fastboot flash boot_b $G/last-good.img" "$D/calls.txt" && ok || bad "c
 
 # 6. Android on slot a (and another phone on adb): PON 0x857 read, ios26-retry.sh FAST_SWITCH=1, the other phone never touched
 : > "$D/calls.txt"; : > "$LOG"; echo android > "$F.state"; echo a > "$F.slot"
-run_until "ios26-retry.sh done"
+run_until "HAL switch: bootctl set-active-boot-slot 1 ok"
 grep -q "PON 0x857 = 00" "$LOG" && ok || bad "case 6: no PON read: $(grep android "$LOG" | head -2)"
-grep -q "^ios26-retry FAST_SWITCH=1 EXTRA_ARGS=ufsqueue=0 laurelucache=0 rw" "$D/calls.txt" && ok || bad "case 6: retry not called right: $(grep retry "$D/calls.txt")"
-[ "$(cat "$F.state")" = ios ] && ok || bad "case 6: not back in iOS"
+grep -q "^adb -s MIA3SERIAL shell bootctl set-active-boot-slot 1" "$D/calls.txt" && ok || bad "case 6: no HAL switch"
+grep -q "^ios26-retry" "$D/calls.txt" && bad "case 6: ios26-retry called although the HAL switch worked" || ok
+[ "$(cat "$F.state")" = ios ] && [ "$(cat "$F.slot")" = b ] && ok || bad "case 6: not back in iOS on slot b"
+# 6b. the HAL switch fails: ios26-retry.sh FAST_SWITCH=1 is the next way
+: > "$D/calls.txt"; : > "$LOG"; echo android > "$F.state"; echo a > "$F.slot"; touch "$F.nohal"
+run_until "ios26-retry.sh done"
+grep -q "^ios26-retry FAST_SWITCH=1 EXTRA_ARGS=ufsqueue=0 laurelucache=0 rw" "$D/calls.txt" && ok || bad "case 6b: retry not called right: $(grep retry "$D/calls.txt")"
+[ "$(cat "$F.state")" = ios ] && ok || bad "case 6b: not back in iOS"
+rm -f "$F.nohal"
 : > "$D/calls.txt"; : > "$LOG"; echo android-other > "$F.state"
 (cd "$D/repo" && exec env TICK=1 sh scripts/laurel/phone-guardian.sh) > "$D/run.out" 2>&1 & gp=$!
 sleep 4; kill "$gp" 2>/dev/null; wait "$gp" 2>/dev/null || true

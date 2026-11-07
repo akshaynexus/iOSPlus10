@@ -148,7 +148,8 @@ fb_recover() {
   # before set_active, so the failing turn of this ABL is not where fb2 expects it: up to 4 tries.
   sa=failed; _t=0
   while [ "$_t" -lt 4 ]; do
-    if timeout 15 fastboot set_active b >/dev/null 2>&1; then sa="ok (try $((_t + 1)))"; break; fi
+    if sa_out=$(timeout 15 fastboot set_active b 2>&1); then sa="ok (try $((_t + 1)))"; break; fi
+    sa="failed ($(printf '%s' "$sa_out" | tr '\n' ' ' | cut -c1-120))"
     fb_present || break; _t=$((_t + 1))
   done
   # reboot; repeat until the phone leaves fastboot
@@ -165,22 +166,47 @@ fb_recover() {
 }
 
 # ---- Android: the way back to slot b, under the lock ----
+# [V 19:18:56] `fastboot set_active b` answers `FAILED (remote: 'Invalid Slot')` on this ABL while slot a is active (set_active a from b works, 19:12:12),
+# so the way back from Android is the HAL's: `bootctl set-active-boot-slot 1` over root adb (dual-boot.sh switch uses the same call: it swaps the
+# partition type GUIDs, moves the boot LUN and sets the retries), then a normal reboot. Then ios26-retry.sh FAST_SWITCH=1 (the documented path
+# with every check; it needs the dual-boot records complete), then adb reboot bootloader for the fastboot step.
+adb_root() {
+  _c=0
+  while [ "$_c" -lt 12 ]; do
+    [ "$(timeout 8 adb -s "$1" shell id -u 2>/dev/null | tr -d '\r')" = 0 ] && return 0
+    timeout 15 adb -s "$1" root >/dev/null 2>&1 || true; sleep 3; timeout 20 adb -s "$1" wait-for-device >/dev/null 2>&1 || true
+    _c=$((_c + 1))
+  done
+  return 1
+}
 android_recover() {
   ser=$1
-  r=$(timeout 15 adb -s "$ser" root 2>/dev/null | tr -d '\r' | head -c 80); sleep 3
-  v=$(timeout 10 adb -s "$ser" shell 'cat /sys/kernel/debug/regmap/spmi0-00/registers 2>/dev/null | grep "^857:"' 2>/dev/null | tr -d '\r')
-  case "$v" in
-  857:*) log "android: PON 0x857 = ${v#857: } ($( [ "${v#857: }" = 00 ] && echo "the PMIC watchdog count did not survive into Android" || echo "ARMED: the count survived a reset: read docs/laurel_sprout/self-recovery.md, case D"))"; echo "$(date -u +%Y%m%dT%H%M%SZ) $v" >> "$G/pon-857.txt" ;;
-  *) log "android: PON 0x857 not readable (adb root: '${r:-no answer}'; debugfs regmap: '${v:-nothing}')" ;;
+  adb_root "$ser" || log "android: no root adb (Settings -> System -> Developer options -> Rooted debugging)"
+  # PON 0x857: the regmap of the PMIC under debugfs, or the downstream spmi-dbgfs (address, data)
+  v=$(timeout 25 adb -s "$ser" shell 'grep -q debugfs /proc/mounts || mount -t debugfs none /sys/kernel/debug 2>/dev/null
+for d in /sys/kernel/debug/regmap/spmi*; do grep -H "^857:" "$d/registers" 2>/dev/null && break; done
+for d in /sys/kernel/debug/spmi/spmi-0/0-00 /sys/kernel/debug/spmi/spmi-0/*-00; do [ -f "$d/address" ] || continue; echo 0x857 > "$d/address"; echo 1 > "$d/count"; echo "spmi-dbgfs:857: $(cat "$d/data" 2>/dev/null | head -c 16)"; break; done
+echo "debug: $(ls /sys/kernel/debug/ 2>&1 | tr "\n" " " | cut -c1-160)"' 2>/dev/null | tr -d '\r')
+  val=$(printf '%s\n' "$v" | sed -n 's/^.*857: *\(0x\)\{0,1\}\([0-9a-fA-F][0-9a-fA-F]\).*/\2/p' | head -n 1)
+  case "$val" in
+  [0-9a-fA-F][0-9a-fA-F]) log "android: PON 0x857 = $val ($( [ "$val" = 00 ] && echo "the PMIC watchdog count did not survive into Android" || echo "ARMED: the count survived a reset: read docs/laurel_sprout/self-recovery.md, case D"))"; echo "$(date -u +%Y%m%dT%H%M%SZ) 857: $val" >> "$G/pon-857.txt" ;;
+  *) log "android: PON 0x857 not readable ($(printf '%s' "$v" | tr '\n' ' ' | cut -c1-240)); bootreason $(timeout 8 adb -s "$ser" shell getprop ro.boot.bootreason 2>/dev/null | tr -d '\r')" ;;
   esac
+  slot=$(timeout 8 adb -s "$ser" shell getprop ro.boot.slot_suffix 2>/dev/null | tr -d '\r')
+  if timeout 20 adb -s "$ser" shell bootctl set-active-boot-slot 1 >/dev/null 2>&1 && [ "$(timeout 8 adb -s "$ser" shell bootctl get-active-boot-slot 2>/dev/null | tr -d '\r')" = 1 ]; then
+    timeout 15 adb -s "$ser" reboot >/dev/null 2>&1 || true
+    log "android (slot ${slot:-?}): HAL switch: bootctl set-active-boot-slot 1 ok, adb reboot: iOS boots (boot_b untouched)"
+    set_rec boot_start "$(now)"; set_rec boot_good 0; set_rec ssh_seen 0
+    return 0
+  fi
   k=$(kernel_of "$G/flashed.img.stamp"); [ -n "$k" ] || k=$(kernel_of "$G/last-good.img.stamp")
-  log "android: slot a: the way back: ios26-retry.sh FAST_SWITCH=1 (Android opens its data, boot_b + dtbo_b, slot b from fastboot); kernel ${k:-of the main checkout}"
-  if FAST_SWITCH=1 EXTRA_ARGS="$EXTRA" ${k:+KERNEL="$k"} sh "$REPO/scripts/laurel/ios26-retry.sh" rw > "$REPO/logs/phone-guardian-retry.log" 2>&1; then
+  log "android (slot ${slot:-?}): the HAL switch failed; ios26-retry.sh FAST_SWITCH=1 (Android opens its data, boot_b + dtbo_b, slot b from fastboot); kernel ${k:-of the main checkout}"
+  if env FAST_SWITCH=1 EXTRA_ARGS="$EXTRA" ${k:+KERNEL="$k"} sh "$REPO/scripts/laurel/ios26-retry.sh" rw > "$REPO/logs/phone-guardian-retry.log" 2>&1; then
     log "android: ios26-retry.sh done: $(tail -n 1 "$REPO/logs/phone-guardian-retry.log")"
     set_rec boot_start "$(now)"; set_rec boot_good 0; set_rec ssh_seen 0
     return 0
   fi
-  log "android: ios26-retry.sh failed: $(grep -m1 'STOP:' "$REPO/logs/phone-guardian-retry.log" || tail -n 1 "$REPO/logs/phone-guardian-retry.log"); now adb reboot bootloader, then the fastboot step (the last good image after $FAIL_LIMIT fails)"
+  log "android: ios26-retry.sh failed: $(grep -m1 'STOP:' "$REPO/logs/phone-guardian-retry.log" || tail -n 1 "$REPO/logs/phone-guardian-retry.log"); now adb reboot bootloader, then the fastboot step"
   if ser=$(mi_a3); then timeout 20 adb -s "$ser" reboot bootloader >/dev/null 2>&1 || true; fi
   return 1
 }
@@ -200,7 +226,7 @@ while :; do
     if [ "$s" = fastboot ] || [ "$s" = android ]; then
       if ! lock_free; then log "boot ended by a job that holds the phone ($(cat "$PL.who" 2>/dev/null)): not a failed boot"; set_rec boot_start ""
       elif [ -n "$(rec boot_start)" ] && [ "$(rec boot_good 0)" = 0 ]; then
-        f=$(( $(rec fails 0) + 1 )); set_rec fails "$f"
+        f=$(( $(rec fails 0) + 1 )); set_rec fails "$f"; set_rec boot_start ""      # counted once: adb can flicker (android, none, android in 5 s)
         log "boot failed: $s after $t s in state $state (SSH seen: $( [ "$(rec ssh_seen 0)" = 1 ] && echo yes || echo no)); fails in a row: $f"
       fi
     fi
