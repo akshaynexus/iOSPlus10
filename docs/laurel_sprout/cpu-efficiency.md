@@ -140,6 +140,15 @@ phone's return (`dual-boot.sh install`, iosroot only). Gotchas: a snapshot tree 
 (metal stage, notch, cell, ssh, ...): the first root there came with no compositor; `apfs-fuse` gave one `Input/output error` reading a donor
 file mid-build, the retry passed.
 
+**On the phone (root flashed 18:48-19:02, 36 sparse pieces, 893 s; first boot 19:03) [V]:** `LAUREL BUILD: root 58e4095cb7 20261107T175213 ... features 21
+installed 18 off 3`. `LAUREL EMU: counts`: `fp16=16` after minute 1, `fp16=1780` after minute 2 and flat after (minutes 3-4: +0), with
+`lsd` 41-45 s and `containermanager` 17-19 s a minute (the first boot of a new root seeds LaunchServices). On the old root the same minutes
+had `fp16=76,300` then `+14,800` (warm icon cache, 18:45) and `687,012` (06:46). The FP16 sites lines name no site any more; the residual
+1,780 words are forms the rule does not cover (the next sites lines say which). The first lowered root flash failed with `no phone in fastboot`:
+the install made the sparse image and its read-back list (30 s + 18 GB read) while the phone waited in fastboot, and the idle ABL USB device
+died (as `dual-boot.sh` notes); the second run, with those files ready, went straight to the write. SpringBoard started once, no `CRASH` line in
+the 5 minutes; the UI picture and a Home swipe on this root: queued (`logs/cpu-uicheck.log`).
+
 **LSE in the root binaries (logd 27 sites, locationd 92, 5,460 in 16 files): not done.** They are left because the file's `__TEXT` has no free
 run of 64 zero bytes left after the first 2,230 + 303 sites of locationd took 8,204 of its 8,208 free bytes (`macho-lowered.tsv`). The frame fits;
 the space does not. More space means growing `__TEXT` and moving every later segment and the code signature: a Mach-O re-layout, not this
