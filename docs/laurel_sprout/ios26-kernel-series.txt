@@ -369,6 +369,11 @@
 3031-laurel-usb-hold-rearm.patch                               applied
 3040-laurel-ucache-line-after-boot-thread.patch                applied
 3041-laurel-lock-timeout-line-at-early-boot.patch              applied
+3050-laurel-wdog-core-state.patch                              applied
+3051-laurel-cpu-margin.patch                                   applied
+3070-laurel-emu-sites.patch                                    applied
+3071-laurel-sched-place.patch                                  applied
+3080-laurel-swap.patch                                         applied+rules(2): drop_file, glue
 9000-series-12377-api.patch                                    post
 9001-laurel-release-only-initialized-pages.patch               post
 9002-laurel-no-panic-region.patch                              post
@@ -393,4 +398,7 @@
 9021-laurel-pmap-free-backtrace.patch                          post
 9022-laurel-ucache-sleh-init.patch                             post
 9023-laurel-ucache-ec0-sleh.patch                              post
-== series: 250 applied, 90 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
+9024-laurel-swap-choose-12377.patch                            post
+9026-laurel-emu-sites-abi.patch                                post
+9027-laurel-sched-place-clutch.patch                           post
+== series: 254 applied, 91 applied+rules, 0 replaced, 8 skipped, 11 base, 0 errors
