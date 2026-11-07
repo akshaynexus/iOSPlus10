@@ -14,7 +14,7 @@ for i in $(seq 1 "$N"); do
   touch "$O.start"
   # A hang leaves the GPU off until a reboot: only then (each boot of slot b counts), with the lock only for the command.
   OP=/home/akshay/Documents/GitHub/iOSPlus10/out/bin/op10tool
-  U=$(ls -t /home/akshay/Documents/GitHub/iOSPlus10/logs/usblog-*.txt | head -1); boot=$(grep -an 'exec hangtelemetryd' "$U" | tail -1 | cut -d: -f1); hang=$(grep -an 'watchdog: GPU hang' "$U" | tail -1 | cut -d: -f1)
+  U=$(ls -t /home/akshay/Documents/GitHub/iOSPlus10/logs/usblog-*.txt | head -1); boot=$(grep -an 'LAUREL BUILD: image' "$U" | tail -1 | cut -d: -f1); hang=$(grep -an 'watchdog: GPU hang' "$U" | tail -1 | cut -d: -f1)
   if [ "${hang:-0}" -gt "${boot:-0}" ]; then /home/akshay/Documents/GitHub/iOSPlus10/scripts/laurel/phone-lock.sh native "$OP" ctl reboot 2>&1 | tail -1; sleep 30; fi
   # No lock in this wait: at most 15 min for SSH, then 120 s of uptime (a stuck CPU comes at 70-80 s after a boot). No attempt to bring iOS back: another job may be flashing.
   for _ in $(seq 1 90); do
