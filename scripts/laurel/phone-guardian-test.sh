@@ -113,7 +113,7 @@ PL=$PHONE_LOCK
 run_until "reboot: the phone left fastboot"
 grep -q "flash boot_b: none (fails 0 of 3" "$LOG" && ok || bad "case 1: expected no flash: $(grep fastboot "$LOG" | tail -1)"
 grep -q "^fastboot reboot bootloader" "$D/calls.txt" && bad "case 1: a reboot-bootloader round trip (a visit can be 18 s)" || ok
-grep -q "set_active b: ok" "$LOG" && ok || bad "case 1: set_active not ok"
+grep -q "set_active b: ok (try" "$LOG" && ok || bad "case 1: set_active not ok"
 grep -q "^fastboot flash" "$D/calls.txt" && bad "case 1: a flash happened" || ok
 [ "$(cat "$F.state")" = ios ] && ok || bad "case 1: the phone did not leave fastboot"
 

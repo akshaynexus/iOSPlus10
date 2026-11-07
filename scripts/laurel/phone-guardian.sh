@@ -144,8 +144,13 @@ fb_recover() {
       [ "$img" != "$G/queue.img" ] || { mv -f "$G/queue.img" "$G/queue.done.img"; rm -f "$G/queue.txt"; }
     fi
   fi
-  # slot b active, retries back to 7
-  if fb2 15 set_active b; then sa=ok; else sa=failed; fi
+  # slot b active, retries back to 7. [V 19:09:02] two tries failed after a flash-less pass: the fastboot client sends getvars of its own
+  # before set_active, so the failing turn of this ABL is not where fb2 expects it: up to 4 tries.
+  sa=failed; _t=0
+  while [ "$_t" -lt 4 ]; do
+    if timeout 15 fastboot set_active b >/dev/null 2>&1; then sa="ok (try $((_t + 1)))"; break; fi
+    fb_present || break; _t=$((_t + 1))
+  done
   # reboot; repeat until the phone leaves fastboot
   left=no; _r=0
   while [ "$_r" -lt 5 ]; do
