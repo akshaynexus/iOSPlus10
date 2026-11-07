@@ -358,6 +358,14 @@ pub mod enc {
     pub fn tbz_w(t: u32, bit: u32, words: i32) -> u32 {
         0x3600_0000 | bit << 19 | ((words as u32) & 0x3fff) << 5 | t
     }
+    /// movz Wd, #imm16
+    pub fn movz_w(d: u32, imm16: u32) -> u32 {
+        0x5280_0000 | imm16 << 5 | d
+    }
+    /// fmov Sd, Wn
+    pub fn fmov_s_w(d: u32, n: u32) -> u32 {
+        0x1e27_0000 | n << 5 | d
+    }
     /// and x16, x17, #0xfffffffffbffffff: FPCR without AHP
     pub const AND_X16_X17_NO_AHP: u32 = 0x9265_fa30;
     /// fcvt Sd, Hn (half to single)
@@ -568,12 +576,45 @@ pub fn fp16cmp_trampoline(c: &Fp16Cmp) -> Vec<u32> {
     v
 }
 
-/// The trampoline of one word the lowering serves through a trampoline: an LSE word or an FP16 compare.
+/// `fmov Hd, #imm8` (C7.2.141, type 11): the second FP16 site of the Mi A3 after the compares (QuartzCore+0x4daa4, `fmov h1, #1.0`,
+/// 25,000-66,000 a minute in backboardd's frame path, 2026-11-07 19:08). The half value is VFPExpandImm(imm8, 16).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fp16Mov {
+    pub rd: u32,
+    pub half: u16,
+}
+
+pub fn fp16mov_decode(w: u32) -> Option<Fp16Mov> {
+    if w & 0xffe0_1fe0 != 0x1ee0_1000 {
+        return None;
+    }
+    let imm8 = (w >> 13) & 0xff;
+    let (sign, b6, b54, frac) = (imm8 >> 7, (imm8 >> 6) & 1, (imm8 >> 4) & 3, imm8 & 15);
+    let exp = (b6 ^ 1) << 4 | b6 << 3 | b6 << 2 | b54;
+    Some(Fp16Mov { rd: w & 31, half: (sign << 15 | exp << 10 | frac << 6) as u16 })
+}
+
+/// `movz w16, #half; fmov Sd, w16`: FMOV (scalar, immediate) clears the other bits of the vector register, FMOV Sd, Wn does the same
+/// (the half sits in bits 15:0, bits 31:16 are zero). No flag changes. x16 is spilled in the trampoline frame.
+pub fn fp16mov_trampoline(m: &Fp16Mov) -> Vec<u32> {
+    use enc::*;
+    vec![sub_sp(TRAMP_FRAME), str_sp(16, 0), movz_w(16, m.half as u32), fmov_s_w(m.rd, 16), ldr_sp(16, 0), add_sp(TRAMP_FRAME), RET]
+}
+
+/// An FP16 word the lowering serves: a compare or an immediate move.
+pub fn fp16_lowerable(w: u32) -> bool {
+    fp16cmp_decode(w).is_some() || fp16mov_decode(w).is_some()
+}
+
+/// The trampoline of one word the lowering serves through a trampoline: an LSE word, an FP16 compare or an FP16 immediate move.
 pub fn trampoline_for(w: u32) -> Option<Vec<u32>> {
     if let Some(l) = lse_decode(w) {
         return Some(lse_trampoline(&l));
     }
-    fp16cmp_decode(w).map(|c| fp16cmp_trampoline(&c))
+    if let Some(c) = fp16cmp_decode(w) {
+        return Some(fp16cmp_trampoline(&c));
+    }
+    fp16mov_decode(w).map(|m| fp16mov_trampoline(&m))
 }
 
 /// Per-site stub when x30 is live: save x30 below the red zone, call the shared trampoline, restore, go back.
@@ -742,6 +783,19 @@ mod tests {
         assert_eq!(enc::fcmp_s(16, 17, false, false), 0x1e31_2200);
         assert_eq!(enc::fcmp_s(16, 0, true, true), 0x1e20_2218);
         assert!(trampoline_for(0x1ee0_2040).is_some() && trampoline_for(0x88e0_fc41).is_some() && trampoline_for(NOP).is_none());
+    }
+
+    #[test]
+    fn fp16mov_forms() {
+        // llvm-mc: fmov h1, #1.0 = 0x1eee1001; fmov h0, #0.5 = 0x1eec1000; fmov h31, #-2.0 = 0x1ef0101f
+        assert_eq!(fp16mov_decode(0x1eee_1001), Some(Fp16Mov { rd: 1, half: 0x3c00 }));
+        assert_eq!(fp16mov_decode(0x1eec_1000), Some(Fp16Mov { rd: 0, half: 0x3800 }));
+        assert_eq!(fp16mov_decode(0x1ef0_101f), Some(Fp16Mov { rd: 31, half: 0xc000 }));
+        assert!(fp16mov_decode(0x1e2e_1001).is_none()); // fmov s1, #1.0 is ARMv8.0
+        assert!(fp16mov_decode(0x1eee_1021).is_none()); // bits 9:5 must be zero
+        // llvm-mc: movz w16, #0x3c00 = 0x52878010; fmov s1, w16 = 0x1e270201; str x16, [sp] = 0xf90003f0
+        assert_eq!(fp16mov_trampoline(&Fp16Mov { rd: 1, half: 0x3c00 }), vec![enc::sub_sp(TRAMP_FRAME), 0xf900_03f0, 0x5287_8010, 0x1e27_0201, 0xf940_03f0, enc::add_sp(TRAMP_FRAME), RET]);
+        assert!(fp16_lowerable(0x1eee_1001) && fp16_lowerable(0x1ee0_2040) && !fp16_lowerable(NOP));
     }
 
     #[test]

@@ -255,7 +255,8 @@ fn valid_regs(l: &Lse) -> bool {
 #[derive(Clone, Copy)]
 struct FpCase {
     word: u32,
-    cmp: Fp16Cmp,
+    /// the compare, or None for an immediate move
+    cmp: Option<Fp16Cmp>,
     v: [[u64; 2]; 32],
     nzcv: u64,
     fpcr: u64,
@@ -286,7 +287,14 @@ fn fp16_words() -> Vec<u32> {
             out.push(0x1ee0_2000 | rn << 5 | 8 | signal << 4);
         }
     }
-    out.retain(|w| a64::fp16cmp_decode(*w).is_some());
+    // fmov Hd, #imm8: every imm8 on a few registers, a few on every register
+    for imm8 in 0..256u32 {
+        out.push(0x1ee0_1000 | imm8 << 13 | [0u32, 1, 16, 31][imm8 as usize % 4]);
+    }
+    for rd in 0..32u32 {
+        out.push(0x1ee0_1000 | 0x70 << 13 | rd);
+    }
+    out.retain(|w| a64::fp16_lowerable(*w));
     out.sort();
     out.dedup();
     out
@@ -371,7 +379,7 @@ fn program_fp16(cases: &[FpCase], lowered: bool) -> Vec<u8> {
         let start = code.len();
         let mut tramps: Vec<u32> = Vec::new();
         for (at, i) in sites {
-            let t = a64::fp16cmp_trampoline(&cases[i].cmp);
+            let t = a64::trampoline_for(cases[i].word).unwrap();
             let here = start + tramps.len();
             if i % 2 == 1 {
                 let stub = a64::lse_stub((here + 4) as i32 - (here as i32 + 1), (at + 1) as i32 - (here as i32 + 3));
@@ -393,7 +401,7 @@ fn run_fp16(words: &[u32], outdir: &Path, run_one: &dyn Fn(&Path, &str) -> Resul
     let mut seed = 0x1234_5678_9abc_def1u64;
     let mut cases = Vec::new();
     for &w in words {
-        let cmp = a64::fp16cmp_decode(w).unwrap();
+        let cmp = a64::fp16cmp_decode(w);
         // 8 cases a word: bl and stub mode (parity), FPCR 0 and AHP (FZ16 is RES0 on a CPU without FEAT_FP16: never set here), equal operands twice
         for variant in 0..8 {
             let mut v = [[0u64; 2]; 32];
@@ -401,8 +409,8 @@ fn run_fp16(words: &[u32], outdir: &Path, run_one: &dyn Fn(&Path, &str) -> Resul
                 r[0] = rng(&mut seed) & !0xffff | half(&mut seed) as u64;
                 r[1] = rng(&mut seed);
             }
-            if variant >= 6 {
-                v[cmp.rm as usize][0] = v[cmp.rn as usize][0];
+            if let (Some(c), true) = (cmp, variant >= 6) {
+                v[c.rm as usize][0] = v[c.rn as usize][0];
             }
             let fpcr = if variant & 2 != 0 { 1 << 26 } else { 0 };
             let nzcv = ((rng(&mut seed) >> 60) & 0xf) << 28;
@@ -429,7 +437,7 @@ fn run_fp16(words: &[u32], outdir: &Path, run_one: &dyn Fn(&Path, &str) -> Resul
                 let first = x.iter().zip(y).position(|(p, q)| p != q).unwrap();
                 let rx = u64::from_le_bytes(x[first & !7..(first & !7) + 8].try_into().unwrap());
                 let ry = u64::from_le_bytes(y[first & !7..(first & !7) + 8].try_into().unwrap());
-                println!("fp16 case {i} word {:#010x} {:?} fpcr {:#x} hn {:#06x} hm {:#06x}: first diff at dump offset {first}: native {rx:#x}, lowered {ry:#x}", c.word, c.cmp, c.fpcr, c.v[c.cmp.rn as usize][0] & 0xffff, c.v[c.cmp.rm as usize][0] & 0xffff);
+                println!("fp16 case {i} word {:#010x} {:?} fpcr {:#x} hn {:#06x} hm {:#06x}: first diff at dump offset {first}: native {rx:#x}, lowered {ry:#x}", c.word, c.cmp, c.fpcr, c.cmp.map_or(0, |m| c.v[m.rn as usize][0] & 0xffff), c.cmp.map_or(0, |m| c.v[m.rm as usize][0] & 0xffff));
             }
         }
     }
@@ -454,7 +462,7 @@ pub fn run(words: Option<&Path>, outdir: &Path) -> Result<()> {
             if a64::lse_decode(w).is_some_and(|l| a64::lse_refuses(&l).is_none() && valid_regs(&l)) {
                 list.push(w);
             }
-            if a64::fp16cmp_decode(w).is_some() {
+            if a64::fp16_lowerable(w) {
                 fp16.push(w);
             }
         }
@@ -516,7 +524,7 @@ pub fn run(words: Option<&Path>, outdir: &Path) -> Result<()> {
     fp16.sort();
     fp16.dedup();
     let (fp16_cases, fp16_bad) = run_fp16(&fp16, outdir, &run_one)?;
-    println!("a64-selftest fp16: {} fcmp/fcmpe words ({fp16_synth} synthetic), {fp16_cases} cases, {fp16_bad} mismatches", fp16.len());
+    println!("a64-selftest fp16: {} fcmp/fcmpe/fmov-imm words ({fp16_synth} synthetic), {fp16_cases} cases, {fp16_bad} mismatches", fp16.len());
     let a = run_one(&np, "max")?;
     let b = run_one(&lp, "cortex-a53")?;
     if a.len() != cases.len() * OUT_SIZE || b.len() != a.len() {

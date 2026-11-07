@@ -107,9 +107,9 @@ fn scan_range(r: &Range, code: &[bool], rules: &Rules, p: &mut UnitPlan) {
             }
         }
         if rules.fp16 {
-            if let Some(_c) = a64::fp16cmp_decode(w) {
+            if a64::fp16_lowerable(w) {
                 if !code[i] {
-                    *p.counts.entry("left, not proven code: fp16 fcmp".into()).or_default() += 1;
+                    *p.counts.entry("left, not proven code: fp16 fcmp/fmov".into()).or_default() += 1;
                     continue;
                 }
                 p.sites.push(LseSite { addr, word: w, lr_dead: census::lr_dead_after(r, code, i) });
@@ -214,7 +214,7 @@ fn plan_lse(mut sites: Vec<LseSite>, slots: Vec<(u64, u64)>) -> LsePlan {
     seen_words.sort();
     seen_words.dedup();
     lp.words = seen_words;
-    lp.fp16_sites = sites.iter().filter(|s| a64::fp16cmp_decode(s.word).is_some()).count() as u64;
+    lp.fp16_sites = sites.iter().filter(|s| a64::fp16_lowerable(s.word)).count() as u64;
     let mut i = 0;
     while i < sites.len() {
         let zone_start = sites[i].addr & !(ZONE - 1);
@@ -286,7 +286,7 @@ fn plan_lse(mut sites: Vec<LseSite>, slots: Vec<(u64, u64)>) -> LsePlan {
         }
         i = j;
     }
-    lp.fp16_left = lp.left_sites.iter().filter(|&&a| sites.binary_search_by_key(&a, |s| s.addr).ok().is_some_and(|k| a64::fp16cmp_decode(sites[k].word).is_some())).count() as u64;
+    lp.fp16_left = lp.left_sites.iter().filter(|&&a| sites.binary_search_by_key(&a, |s| s.addr).ok().is_some_and(|k| a64::fp16_lowerable(sites[k].word))).count() as u64;
     lp
 }
 
@@ -532,7 +532,7 @@ fn lse_summary(s: &mut String, lp: &LsePlan, slot_total: u64) {
     let _ = writeln!(s, "| trampolines placed / unique LSE words | {} / {} |", lp.trampolines, lp.words.len());
     let _ = writeln!(s, "| bytes used: trampolines + stubs | {} + {} |", lp.tramp_bytes, lp.stub_bytes);
     let _ = writeln!(s, "| free r-x bytes offered (zero runs of 64 bytes or more outside sections, plus dead images) | {slot_total} |");
-    let _ = writeln!(s, "| FP16 fcmp/fcmpe sites through a trampoline (counted in the LSE rows above) / left for the kernel | {} / {} |", lp.fp16_sites - lp.fp16_left, lp.fp16_left);
+    let _ = writeln!(s, "| FP16 fcmp/fcmpe/fmov-imm sites through a trampoline (counted in the LSE rows above) / left for the kernel | {} / {} |", lp.fp16_sites - lp.fp16_left, lp.fp16_left);
 }
 
 pub fn run(cache_path: Option<&Path>, machos: &[PathBuf], outdir: &Path, rules: &str, page_shift: u32, dead: &[String], plan_only: bool) -> Result<()> {
@@ -1096,8 +1096,8 @@ pub fn verify(orig: &Path, lowered: &Path, dead: &[String], macho_orig: Option<&
                 continue;
             }
             let lse = a64::lse_decode(old);
-            if lse.is_some() || a64::fp16cmp_decode(old).is_some() {
-                let kind = if lse.is_some() { "lse" } else { "fp16 fcmp" };
+            if lse.is_some() || a64::fp16_lowerable(old) {
+                let kind = if lse.is_some() { "lse" } else if a64::fp16cmp_decode(old).is_some() { "fp16 fcmp" } else { "fp16 fmov" };
                 let is_b = new & 0xfc00_0000 == 0x1400_0000;
                 let is_bl = new & 0xfc00_0000 == 0x9400_0000;
                 let imm = (((new & 0x3ff_ffff) as i64) << 38) >> 38;
@@ -1387,8 +1387,8 @@ fn verify_machos(orig: &Path, new_root: &Path, counts: &mut BTreeMap<String, u64
                                 } else {
                                     let _ = writeln!(r.p, "{}+{at:#x}: {a:#x} -> {b:#x}, expected {w:#x}", rel.display());
                                 }
-                            } else if (a64::lse_decode(a).is_some() || a64::fp16cmp_decode(a).is_some()) && (b & 0xfc00_0000 == 0x1400_0000 || b & 0xfc00_0000 == 0x9400_0000) {
-                                *r.c.entry(if a64::lse_decode(a).is_some() { "mach-o lse -> branch" } else { "mach-o fp16 fcmp -> branch" }.into()).or_default() += 1;
+                            } else if (a64::lse_decode(a).is_some() || a64::fp16_lowerable(a)) && (b & 0xfc00_0000 == 0x1400_0000 || b & 0xfc00_0000 == 0x9400_0000) {
+                                *r.c.entry(if a64::lse_decode(a).is_some() { "mach-o lse -> branch" } else { "mach-o fp16 -> branch" }.into()).or_default() += 1;
                             } else {
                                 let _ = writeln!(r.p, "{}+{at:#x}: {a:#x} -> {b:#x}: no rule", rel.display());
                             }
