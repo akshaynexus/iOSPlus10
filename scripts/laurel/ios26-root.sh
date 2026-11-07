@@ -18,7 +18,7 @@ DEV=n104ap
 B=$APPLE/ios26/$BUILD-$DEV
 D=$B/os
 T=$B/tree
-L=$B/lowered
+L=${LOWERED:-$B/lowered}   # LOWERED=DIR: a scratch output of scripts/ios26/lower-userland.sh (a test next to the shared folder)
 # ROOT_OUT: another output folder (a test next to a root that another job uses). Default the path of the docs
 R=${ROOT_OUT:-$B/root}
 W=$R/work

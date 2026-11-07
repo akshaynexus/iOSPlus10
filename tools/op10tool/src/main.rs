@@ -196,7 +196,7 @@ enum Cmd {
         #[arg(long)]
         all_slices: bool,
     },
-    /// Run each LSE form natively (qemu -cpu max) and through its trampoline (qemu -cpu cortex-a53); compare every register, NZCV, red zone and memory
+    /// Run each LSE form and FP16 compare natively (qemu -cpu max) and through its trampoline (qemu -cpu cortex-a53); compare every register, NZCV, FPSR, red zone and memory
     A64Selftest {
         /// Extra words, one hex per line (lse-words.txt of a64-lower)
         #[arg(long)]
@@ -216,7 +216,7 @@ enum Cmd {
         /// New output folder
         #[arg(long)]
         out: PathBuf,
-        /// Comma list: all, pac, rcpc, lse, sysreg, slide
+        /// Comma list: all, pac, rcpc, lse, sysreg, slide, fp16 (fcmp/fcmpe on half registers)
         #[arg(long, default_value = "all")]
         rules: String,
         /// Code-signature page shift of the output (12 for a 4 KiB kernel; 0 keeps the file's own and rehashes in place)

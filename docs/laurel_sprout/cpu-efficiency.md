@@ -112,6 +112,31 @@ all at its cap both times (the cap is 1612 now: `LAUREL CPU MARGIN`, patch 3051 
 the phone still reboots every 2-4 minutes (3050 work). The `cores` line (runnable ms of SpringBoard and backboardd) came empty: `toybox ps` on this
 root prints no pid column the script can read (awk is not on the root; a sed form is in, not yet proven) [U].
 
+## 4d. The FP16 `fcmp` lowering, a real feature of the root build (`a64-lower` rule `fp16`, 2026-11-07 afternoon)
+
+Owner's order: implement it while the phone is off. Done in `tools/op10tool/src/a64.rs` (`fp16cmp_decode`, `fp16cmp_trampoline`, `trampoline_for`),
+`lower.rs` (the sites join the LSE plan: same zones, same slots, same `bl` or x30 stub, the verify pass accepts `fp16 fcmp -> bl/b`), `a64test.rs`
+(the qemu self-test runs every form natively on `-cpu max` and through the trampoline on `-cpu cortex-a53`: every V register, NZCV, FPSR, x30
+and the red zone must match).
+
+| Item | What | Mark |
+|---|---|---|
+| Forms | `fcmp Hn, Hm`, `fcmp Hn, #0.0`, `fcmpe Hn, Hm`, `fcmpe Hn, #0.0` (C7.2.70, opcode2 00000 / 01000 / 10000 / 11000). The cache has 7,821 sites in 279 unique words, the root Mach-O files 100 | [V census] |
+| Trampoline | `sub sp, #176; stp q, q, [sp]; stp x16, x17, [sp, #32]; mrs x17, fpcr; tbz w17, #26, conv; and x16, x17, #~AHP; msr fpcr, x16; conv: fcvt s, h (x1 or x2); fcmp(e) s, s or s, #0.0; tbz w17, #26, out; msr fpcr, x17; out: ldp x16, x17; ldp q, q; add sp; ret`. Two Q scratch registers from v16-v19 that are not the operands. 13 or 15 words, 2 or 3 for the LSE frame's spill slots (48 bytes: 32 for the Q pair, 16 for x16/x17) | [V code, unit test] |
+| Why exact | every half value is a single value, so `fcvt s, h` + `fcmp s` gives the same NZCV and the same cumulative FPSR flags (a signaling NaN raises Invalid in the conversion as it would in the half compare; a quiet NaN raises it only under `fcmpe`, in the single compare) | [V self-test: 304 cases, 0 mismatches] |
+| FPCR.AHP | bit 26 makes a conversion read the half in the alternative format (no infinity, no NaN) while the half compare stays IEEE: the trampoline clears AHP around the conversions when it is set, and puts it back. Tested with AHP on and off | [V self-test] |
+| FPCR.FZ16 | bit 19 flushes a denormal half input of `fcmp h` but not of a conversion (FPUnpackCV). On a CPU without FEAT_FP16 (the Kryo 260, cortex-a53) the bit is RES0: no program here can set it, so the trampoline needs no flush path. The first draft had one; the self-test showed `-cpu cortex-a53` dropping the bit, which proves the point | [V self-test, I ARM ARM] |
+| Kill switch | `A64_FP16=0 scripts/ios26/lower-userland.sh`: the rule set becomes `pac,rcpc,lse,sysreg,slide`, the words stay for the kernel emulator (LAUREL EMU) | [V script] |
+| Root audit | feature `fp16-cmp-lowered` in `ios26-root-spec.py`: reads `lower-report.md` of the lowered tree; `applied` with the site counts, `off` when the rule was off or the report is older | [V self-test of the spec, 43 of 43] |
+| Self-check of the lowering | `a64-selftest` reads `lse-words.txt` (now with the FP16 words) and runs every real word; `a64-verify` replays dyld's and the kernel's checks and accepts an FP16 site only as a branch to a stub or trampoline head on cortex-a73-decodable code | [V] |
+| Not lowered | `fccmp h` (211 sites), `fmov h, #imm` (one word, 3,600 sites: `movi` would set the other lanes differently), the arithmetic forms: they stay with the emulator. The next sites lines say whether one of them is hot | [V census] |
+
+**LSE in the root binaries (logd 27 sites, locationd 92, 5,460 in 16 files): not done.** They are left because the file's `__TEXT` has no free
+run of 64 zero bytes left after the first 2,230 + 303 sites of locationd took 8,204 of its 8,208 free bytes (`macho-lowered.tsv`). The frame fits;
+the space does not. More space means growing `__TEXT` and moving every later segment and the code signature: a Mach-O re-layout, not this
+round. Cost on the phone: locationd 14,000-28,000 traps a minute, logd 15,000 (0.03-0.06 s of CPU a minute). The libdispatch `cas x8, x9, [x30]`
+(5,800 a minute in SpringBoard) is one of the 10 x30 words the stub scheme cannot serve: same answer.
+
 ## 5. Tools
 
 | Tool | What |
@@ -134,6 +159,6 @@ root prints no pid column the script can read (awk is not on the root; a sed for
 ## 7. Open (updated 06:50)
 
 - The 2-4 minute panic cycle (3050) hides every settled number; the before/after of section 6 needs one boot that stays up through `ios26-autotest.sh run`. Until then the sites lines, the state lines and the storm minutes are the evidence.
-- FP16 `fcmp h` lowering in `a64-lower` (section 4c): the next CPU step when a boot shows the icon storm again.
+- The FP16 `fcmp h` lowering is in (section 4d); its first root is built when the phone is back for the flash.
 - The P -> E spill weight for the UI buckets (FG, fixed) could rise above 64 us so the render thread waits on gold rather than runs on an A53: after the first numbers.
 - `cores` 0 ms on P cores: the tool's struct or the cpu kinds [U].

@@ -2,6 +2,7 @@
 # Lower the iOS 26 donor userland for the Mi A3 CPU (ARMv8.0, no PAC, no LSE), check it on the host, and count what is left.
 #   scripts/bg.sh ios26-lower env DEV=n104ap scripts/ios26/lower-userland.sh
 # Needs: scripts/ios26/fetch-os.sh + sysos-tree.sh output, out/bin/op10tool, llvm-mc, qemu-aarch64.
+# A64_FP16=0: kill switch of the FP16 fcmp/fcmpe lowering (rule fp16; the words then stay for the kernel's emulator, LAUREL EMU).
 # Output (never in git): $APPLE/ios26/$BUILD-$DEV/lowered/ (link out/ios26/lowered-$DEV), logs in the job log.
 # Steps: a64-lower (cache + root Mach-O, 4 KiB signatures), a64-selftest on the real LSE words, a64-verify, a64-census of
 # the result, then a second a64-lower of the cache to prove the output is the same bytes. Host results only.
@@ -20,13 +21,14 @@ DEAD=${DEAD:-VisualGeneration.framework/VisualGeneration}
 dead_args=; for d in $DEAD; do dead_args="$dead_args --dead-image $d"; done
 TOOL=$OUT/bin/op10tool
 rm -rf "$L" "$L.again" "$OUT/ios26/census-$DEV-lowered"
-"$TOOL" a64-lower --cache "$C" --macho "$T/root" --out "$L" --page-shift 12 $dead_args
+RULES=all; [ "${A64_FP16:-1}" != 0 ] || RULES=pac,rcpc,lse,sysreg,slide
+"$TOOL" a64-lower --cache "$C" --macho "$T/root" --out "$L" --page-shift 12 --rules "$RULES" $dead_args
 mkdir -p "$OUT/ios26"
 [ -n "${LOWERED:-}" ] || ln -sfn "$L" "$OUT/ios26/lowered-$DEV"
 "$TOOL" a64-selftest --words "$L/lse-words.txt" --out "$OUT/ios26/selftest"
 "$TOOL" a64-verify --orig "$C" --lowered "$L" $dead_args --macho-orig "$T/root"
 "$TOOL" a64-census --cache "$L/dyld_shared_cache_arm64e" --root "$L/macho" --all-slices --out "$OUT/ios26/census-$DEV-lowered"
-"$TOOL" a64-lower --cache "$C" --out "$L.again" --page-shift 12 $dead_args > /dev/null
+"$TOOL" a64-lower --cache "$C" --out "$L.again" --page-shift 12 --rules "$RULES" $dead_args > /dev/null
 ( cd "$L" && sha256_list dyld_shared_cache_arm64e* ) > "$OUT/ios26/lowered-$DEV.sha256"
 ( cd "$L.again" && sha256_list dyld_shared_cache_arm64e* ) > "$OUT/ios26/lowered-$DEV.again.sha256"
 if cmp "$OUT/ios26/lowered-$DEV.sha256" "$OUT/ios26/lowered-$DEV.again.sha256"; then echo "deterministic: same SHA-256 for every cache file in both runs"; else echo "NOT deterministic"; exit 1; fi

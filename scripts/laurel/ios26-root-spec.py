@@ -97,6 +97,7 @@ class Tree:
         self.skipped = 0
         self.links_extra = 0
         self.undo = None    # while a hook runs: overlay path -> bytes it had (None: no file). A hook that fails leaves no trace
+        self.lowered = None  # the lowered tree (a64-lower output) this root takes its cache and Mach-O files from; main() sets it
 
     def scan(self, base, prefix):
         """All entries under BASE (bytes path) into the tree at PREFIX."""
@@ -1369,9 +1370,30 @@ def wallpaper(t, work):
     return f'Autobahn flags off in SpringBoard\'s domain (system + /var/preferences); Lock and Home {w}x{h} cpbitmap, {len(full)} bytes: {what}'
 
 
+def fp16_cmp_lowered(t):
+    """The FP16 fcmp/fcmpe words of the cache and the root binaries go through a trampoline (a64-lower rule fp16, docs/laurel_sprout/cpu-efficiency.md):
+    the lowered tree is an input of this root, so this hook only reads a64-lower's report and says what the root carries. Off when the lowering ran
+    without the rule (A64_FP16=0 in scripts/ios26/lower-userland.sh) or the report has no FP16 row."""
+    import re
+    if not t.lowered:
+        raise HookOff('no lowered tree given')
+    rep = os.path.join(t.lowered, 'lower-report.md')
+    with open(rep) as f:
+        text = f.read()
+    if not re.search(r'Rules: Rules \{[^}]*fp16: true', text):
+        raise HookOff('a64-lower ran without the fp16 rule (A64_FP16=0): the words stay for the kernel emulator')
+    rows = re.findall(r'FP16 fcmp/fcmpe sites through a trampoline[^|]*\| (\d+) / (\d+) \|', text)
+    if not rows:
+        raise HookOff('no FP16 row in lower-report.md: an older a64-lower')
+    done = sum(int(a) for a, _ in rows)
+    left = sum(int(b) for _, b in rows)
+    return f'{done} fcmp/fcmpe h sites through a trampoline (cache + root Mach-O), {left} left for the kernel; kill switch A64_FP16=0 at the lowering'
+
+
 def parity(t, work):
     """Every hook of docs/laurel_sprout/ios26-parity.md. None needs another to work, unless its line says so. After debug(), air(), metal(): each one adds to their launchd.plist."""
     feature(t, 'gpu-firmware', 'GPU', gpu_firmware)
+    feature(t, 'fp16-cmp-lowered', 'FP16CMP', fp16_cmp_lowered)
     bar = feature(t, 'statusbar', 'STATUSBAR', statusbar, work)
     drop = feature(t, 'notch', 'NOTCH', notch, work) if bar else False
     if not bar:
@@ -1406,7 +1428,7 @@ def parity(t, work):
     t.audit('root-update', 'off', 'not ported before a boot: the update path needs SSH on a booted iOS 26 root and has never written on a phone on iOS 16. Evidence needed: docs/laurel_sprout/ios26-parity.md "No-wipe update"')
 
 
-FEATURES = ('debug-ios26', 'air-ios26', 'metal26', 'gpu-firmware', 'statusbar', 'notch', 'cell', 'ringer', 'audio', 'bluetooth', 'camera-tables', 'camera-plugin', 'flashlight', 'hevc', 'xnutils', 'brightness', 'bold-text', 'staged-apps', 'wallpaper', 'root-update')
+FEATURES = ('debug-ios26', 'air-ios26', 'metal26', 'gpu-firmware', 'fp16-cmp-lowered', 'statusbar', 'notch', 'cell', 'ringer', 'audio', 'bluetooth', 'camera-tables', 'camera-plugin', 'flashlight', 'hevc', 'xnutils', 'brightness', 'bold-text', 'staged-apps', 'wallpaper', 'root-update')
 
 
 def root_manifest(t, stamp=None):
@@ -1849,6 +1871,7 @@ def main():
     shutil.rmtree(os.path.join(work, 'overlay'), ignore_errors=True)
     os.makedirs(os.path.join(work, 'overlay'), exist_ok=True)
     t = Tree(work)
+    t.lowered = a.lowered
     print('scan OS volume')
     t.scan(a.os.encode(), b'')
     print('scan SystemOS volume')

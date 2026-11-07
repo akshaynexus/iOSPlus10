@@ -334,6 +334,40 @@ pub mod enc {
     pub fn csel(x: bool, d: u32, n: u32, m: u32, cond: u32) -> u32 {
         (x as u32) << 31 | 0x1a80_0000 | m << 16 | cond << 12 | n << 5 | d
     }
+    /// stp Qa, Qb, [sp, #off] / ldp (SIMD&FP, 128-bit, signed offset in units of 16)
+    pub fn stp_q_sp(a: u32, b: u32, off: u32) -> u32 {
+        0xad00_03e0 | (off / 16) << 15 | b << 10 | a
+    }
+    pub fn ldp_q_sp(a: u32, b: u32, off: u32) -> u32 {
+        0xad40_03e0 | (off / 16) << 15 | b << 10 | a
+    }
+    /// stp x16, x17, [sp, #32] / ldp: the integer scratch of the FP16 trampoline, in the frame's third 16 bytes
+    pub fn stp_x16_x17() -> u32 {
+        0xa902_47f0
+    }
+    pub fn ldp_x16_x17() -> u32 {
+        0xa942_47f0
+    }
+    pub fn mrs_fpcr(t: u32) -> u32 {
+        0xd53b_4400 | t
+    }
+    pub fn msr_fpcr(t: u32) -> u32 {
+        0xd51b_4400 | t
+    }
+    /// tbz Wt, #bit, +words (bit < 32)
+    pub fn tbz_w(t: u32, bit: u32, words: i32) -> u32 {
+        0x3600_0000 | bit << 19 | ((words as u32) & 0x3fff) << 5 | t
+    }
+    /// and x16, x17, #0xfffffffffbffffff: FPCR without AHP
+    pub const AND_X16_X17_NO_AHP: u32 = 0x9265_fa30;
+    /// fcvt Sd, Hn (half to single)
+    pub fn fcvt_s_h(d: u32, n: u32) -> u32 {
+        0x1ee2_4000 | n << 5 | d
+    }
+    /// fcmp / fcmpe Sn, Sm or Sn, #0.0
+    pub fn fcmp_s(n: u32, m: u32, zero: bool, signal: bool) -> u32 {
+        0x1e20_2000 | m << 16 | n << 5 | (zero as u32) << 3 | (signal as u32) << 4
+    }
     pub fn sxt(x: bool, d: u32, n: u32, bits: u32) -> u32 {
         // sbfm Rd, Rn, #0, #bits-1
         (x as u32) << 31 | (x as u32) << 22 | 0x1300_0000 | (bits - 1) << 10 | n << 5 | d
@@ -483,6 +517,65 @@ pub fn lse_trampoline(l: &Lse) -> Vec<u32> {
     c
 }
 
+/// One FEAT_FP16 scalar compare: `fcmp`/`fcmpe Hn, Hm` or `Hn, #0.0`. The hottest emulated words of the Mi A3 (laurel 3070, 2026-11-07:
+/// 503,357 + 122,403 traps a minute in one CoreGraphics half-float blend loop, 17 M in the minute that rebuilds the icon cache).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fp16Cmp {
+    /// fcmpe: a quiet NaN also signals
+    pub signal: bool,
+    /// compare with +0.0 (Rm field is 0)
+    pub zero: bool,
+    pub rn: u32,
+    pub rm: u32,
+}
+
+/// Encoding (C7.2.70): 0 0 0 11110 ptype=11 1 Rm op=00 1000 Rn opcode2; opcode2: 00000 fcmp, 01000 fcmp #0.0, 10000 fcmpe, 11000 fcmpe #0.0.
+pub fn fp16cmp_decode(w: u32) -> Option<Fp16Cmp> {
+    if w & 0xffe0_fc07 != 0x1ee0_2000 {
+        return None;
+    }
+    let (opc, rm, rn) = (w & 0x1f, (w >> 16) & 31, (w >> 5) & 31);
+    let zero = opc & 8 != 0;
+    if zero && rm != 0 {
+        return None;
+    }
+    Some(Fp16Cmp { signal: opc & 16 != 0, zero, rn, rm })
+}
+
+/// The half compare as a single compare: `fcvt s, h` is exact (every half value is a single value; a signaling NaN gives Invalid and a
+/// quiet NaN, as the half compare itself would), so NZCV and the cumulative FPSR flags come out the same. FPCR bits: FZ16 is RES0 on a
+/// CPU without FEAT_FP16 (the Kryo 260, cortex-a53), so no program here ever runs with it; AHP (bit 26) changes how a conversion reads
+/// a half (no infinity or NaN in the alternative format) but not the compare, so when it is set the trampoline clears it around the
+/// conversions and puts it back (the qemu self-test runs both). Two Q and two X registers are spilled in the trampoline frame; NZCV is
+/// the result. Entered with `bl`, returns with `ret`: same frame, same stub as the LSE trampolines (TRAMP_FRAME, lse_stub).
+pub fn fp16cmp_trampoline(c: &Fp16Cmp) -> Vec<u32> {
+    use enc::*;
+    let mut free = (16..=19u32).filter(|&r| r != c.rn && r != c.rm);
+    let (s0, s1) = (free.next().unwrap(), free.next().unwrap());
+    let mut v = vec![sub_sp(TRAMP_FRAME), stp_q_sp(s0, s1, 0), stp_x16_x17(), mrs_fpcr(17), tbz_w(17, 26, 3), AND_X16_X17_NO_AHP, msr_fpcr(16), fcvt_s_h(s0, c.rn)];
+    if c.zero {
+        v.push(fcmp_s(s0, 0, true, c.signal));
+    } else {
+        v.push(fcvt_s_h(s1, c.rm));
+        v.push(fcmp_s(s0, s1, false, c.signal));
+    }
+    v.push(tbz_w(17, 26, 2));
+    v.push(msr_fpcr(17));
+    v.push(ldp_x16_x17());
+    v.push(ldp_q_sp(s0, s1, 0));
+    v.push(add_sp(TRAMP_FRAME));
+    v.push(RET);
+    v
+}
+
+/// The trampoline of one word the lowering serves through a trampoline: an LSE word or an FP16 compare.
+pub fn trampoline_for(w: u32) -> Option<Vec<u32>> {
+    if let Some(l) = lse_decode(w) {
+        return Some(lse_trampoline(&l));
+    }
+    fp16cmp_decode(w).map(|c| fp16cmp_trampoline(&c))
+}
+
 /// Per-site stub when x30 is live: save x30 below the red zone, call the shared trampoline, restore, go back.
 /// `tramp_words`: distance from this stub's second word to the trampoline; `back_words`: from the stub's last word to the
 /// word after the site.
@@ -573,19 +666,22 @@ pub struct Rules {
     pub lse: bool,
     pub sysreg: bool,
     pub slide: bool,
+    /// FP16 `fcmp`/`fcmpe` through a trampoline (kill switch of the root build: A64_FP16=0 in scripts/ios26/lower-userland.sh)
+    pub fp16: bool,
 }
 impl Rules {
     pub fn parse(s: &str) -> Result<Rules, String> {
-        let mut r = Rules { pac: false, rcpc: false, lse: false, sysreg: false, slide: false };
+        let mut r = Rules { pac: false, rcpc: false, lse: false, sysreg: false, slide: false, fp16: false };
         for t in s.split(',') {
             match t {
-                "all" => r = Rules { pac: true, rcpc: true, lse: true, sysreg: true, slide: true },
+                "all" => r = Rules { pac: true, rcpc: true, lse: true, sysreg: true, slide: true, fp16: true },
                 "pac" => r.pac = true,
                 "rcpc" => r.rcpc = true,
                 "lse" => r.lse = true,
                 "sysreg" => r.sysreg = true,
                 "slide" => r.slide = true,
-                o => return Err(format!("unknown rule {o} (all, pac, rcpc, lse, sysreg, slide)")),
+                "fp16" => r.fp16 = true,
+                o => return Err(format!("unknown rule {o} (all, pac, rcpc, lse, sysreg, slide, fp16)")),
             }
         }
         Ok(r)
@@ -616,6 +712,36 @@ mod tests {
         for w in [0xc85f_7c20u32, 0xc800_7c20, 0x88df_fc20, 0xc8df_fc20] {
             assert!(lse_decode(w).is_none(), "{w:#x}");
         }
+    }
+
+    #[test]
+    fn fp16cmp_forms() {
+        // the Mi A3 sites: fcmp h2, h0 / fcmp h2, #0.0 (CoreGraphics), fcmp h0, h1 (QuartzCore)
+        assert_eq!(fp16cmp_decode(0x1ee0_2040), Some(Fp16Cmp { signal: false, zero: false, rn: 2, rm: 0 }));
+        assert_eq!(fp16cmp_decode(0x1ee0_2048), Some(Fp16Cmp { signal: false, zero: true, rn: 2, rm: 0 }));
+        assert_eq!(fp16cmp_decode(0x1ee1_2000), Some(Fp16Cmp { signal: false, zero: false, rn: 0, rm: 1 }));
+        assert_eq!(fp16cmp_decode(0x1ee1_2010), Some(Fp16Cmp { signal: true, zero: false, rn: 0, rm: 1 })); // fcmpe h0, h1
+        assert_eq!(fp16cmp_decode(0x1ee0_2018), Some(Fp16Cmp { signal: true, zero: true, rn: 0, rm: 0 })); // fcmpe h0, #0.0
+        assert!(fp16cmp_decode(0x1ee1_2008).is_none()); // #0.0 form with Rm != 0: not an encoding
+        assert!(fp16cmp_decode(0x1e20_2040).is_none()); // fcmp s2, s0 is ARMv8.0
+        assert!(fp16cmp_decode(0x1e60_2040).is_none()); // fcmp d2, d0
+        assert!(fp16cmp_decode(0x1ee0_2041).is_none()); // opcode2 bit 0 set: no such form
+        // trampoline: scratch registers avoid the operands
+        let t = fp16cmp_trampoline(&fp16cmp_decode(0x1ef1_2200).unwrap()); // fcmp h16, h17 (llvm-mc: 0x1ef12200)
+        assert_eq!(&t[..4], &[enc::sub_sp(TRAMP_FRAME), enc::stp_q_sp(18, 19, 0), enc::stp_x16_x17(), enc::mrs_fpcr(17)]);
+        assert_eq!(&t[7..10], &[enc::fcvt_s_h(18, 16), enc::fcvt_s_h(19, 17), enc::fcmp_s(18, 19, false, false)]);
+        assert_eq!(&t[12..], &[enc::ldp_x16_x17(), enc::ldp_q_sp(18, 19, 0), enc::add_sp(TRAMP_FRAME), RET]);
+        assert_eq!(fp16cmp_trampoline(&fp16cmp_decode(0x1ee0_2048).unwrap()).len(), 15); // the #0.0 form converts one operand
+        // llvm-mc: tbz w17, #26, #16 = 0x36d00091; and x16, x17, #0xfffffffffbffffff = 0x927ff630; msr fpcr, x16 = 0xd51b4410
+        assert_eq!(enc::tbz_w(17, 26, 4), 0x36d0_0091);
+        assert_eq!(enc::msr_fpcr(16), 0xd51b_4410);
+        // llvm-mc encodings: stp q16, q17, [sp] = 0xad0047f0; fcvt s16, h2 = 0x1ee24050; fcmp s16, s17 = 0x1e312200; fcmpe s16, #0.0 = 0x1e202218
+        assert_eq!(enc::stp_q_sp(16, 17, 0), 0xad00_47f0);
+        assert_eq!(enc::ldp_q_sp(16, 17, 0), 0xad40_47f0);
+        assert_eq!(enc::fcvt_s_h(16, 2), 0x1ee2_4050);
+        assert_eq!(enc::fcmp_s(16, 17, false, false), 0x1e31_2200);
+        assert_eq!(enc::fcmp_s(16, 0, true, true), 0x1e20_2218);
+        assert!(trampoline_for(0x1ee0_2040).is_some() && trampoline_for(0x88e0_fc41).is_some() && trampoline_for(NOP).is_none());
     }
 
     #[test]
