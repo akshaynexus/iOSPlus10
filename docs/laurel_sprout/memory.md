@@ -46,8 +46,25 @@ No limit lowered, no job removed (owner's rule). Spec self-test PASS (43 of 43 h
 
 ## 4. Measurements
 
-Before (from the logs, section 1): free 767-2117 MiB, wired 290-366 MiB, 0 compressor numbers (none were logged), kills in the 05:00-05:30 log (9 boots, each ended by the watchdog at about 80 s): 4 jetsam per-process (code 7), 0 compressor-full, 21 watermark crossings.
-After: pending a boot of the 3080 kernel (see the end of this file for the state).
+Before (kernel 43eed8b7b8, 390 patches, no 3080; boot 06:10:24, `vm_stat` of the root over SSH, 16 KiB pages) [V]:
+
+| Time after boot | free | active | inactive | speculative | wired | file-backed | anonymous | in compressor | compressions | pageins |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 30 s (06:10:56) | 266 MiB | 1651 | 902 | 740 | 518 | 2114 | 1178 | 0 | 0 | 123169 |
+| 80 s (06:11:45) | 56 MiB | 1725 | 1373 | 369 | 551 | 2023 | 1445 | 0 | 0 | 142160 |
+
+So 80 s after boot the free list is at its floor (56 MiB of 4078), half the RAM is file cache (2 GiB file-backed: the shared cache and the
+boot storm's reads), the compressor has not started (0 compressions): the pageout thread reclaims file pages first, so no process
+has been compressed yet, and nothing could have been swapped. Largest RSS: UserEventAgent 79 MiB, locationd 74, chronod 72,
+backboardd 56, audiomxd 56. Kills in these 10 minutes: 0 jetsam, 0 compressor-full, 0 watermark crossings (the floors of 11-03
+are on this root; the new floors are not yet). The root has Apple's `vm_stat`, `footprint`, `taskinfo`, `zprint`, `ltop` in /usr/bin
+and no `sysctl`: `mem-stat.sh` uses `vm_stat`.
+
+After: pending. The 3080 kernel is built (`out/ram-3080/kernel.ios26.development.sweet.4k`, 394 patches, series ebd3cf21f98d5787,
+stamp ok with `--no-repo`; the repo's patch set moved on during the build, so a default image refuses it: `KERNEL=out/ram-3080/...`
+by hand) and not booted: the phone left USB at 06:12 after another agent's flash and did not come back in 20 minutes (no fastboot, no
+iOS, no Android on the bus). Next: `KERNEL=out/ram-3080/kernel.ios26.development.sweet.4k EXTRA_ARGS="ufsqueue=0 laurelpmicwdog=0 laurelucache=0"
+scripts/laurel/ios26-fast-flash.sh rw` under both locks, then `mem-stat.sh watch 10`, then the camera and Safari until `swapfile 0 made`.
 
 ## 5. How to test
 

@@ -9,9 +9,9 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$REPO"
 SSHP=scripts/laurel/phone-ssh.sh
 LOG=logs/usblog.log
-SYSCTLS="hw.memsize vm.page_free_count vm.page_free_target vm.page_active_count vm.page_inactive_count vm.page_speculative_count vm.page_wire_count vm.page_purgeable_count vm.pageout_pages vm.compressor_mode vm.compressor_is_active vm.compressor_pages_compressed vm.compressor_bytes_used vm.compressor_input_bytes vm.compressor_compressed_bytes vm.compressor_swapped_bytes vm.compressor_available vm.swapusage vm.memory_pressure kern.memorystatus_level kern.memorystatus_vm_pressure_level kern.memorystatus_swap_all_apps vm.pagesize"
 snap() {   # one snapshot on stdout; the lock is held only for the SSH call
-  sh scripts/laurel/phone-lock.sh mem-stat sh "$SSHP" "echo '# $(date +%H:%M:%S)'; uptime; sysctl $SYSCTLS 2>&1 | sed 's/^/  /'; echo '# swap files'; ls -la /private/var/vm 2>&1 | sed 's/^/  /'; df -k /private/var 2>&1 | sed 's/^/  /'; echo '# largest processes (RSS KiB)'; ps -A -o pid,rss,vsz,comm 2>/dev/null | sort -k2 -rn | head -12 | sed 's/^/  /'" 2>&1 | sed -n '1,80p'
+  # the root has Apple's vm_stat, footprint, taskinfo, zprint (/usr/bin) and toybox ps; no sysctl, no uptime [V 2026-11-07]
+  sh scripts/laurel/phone-lock.sh mem-stat sh "$SSHP" "echo '# $(date +%H:%M:%S)'; vm_stat 2>&1 | sed 's/^/  /'; echo '# swap files'; ls -la /private/var/vm 2>&1 | sed 's/^/  /'; df -k /private/var 2>&1 | sed 's/^/  /'; echo '# largest processes (RSS KiB)'; ps -A -o pid,rss,vsz,comm 2>/dev/null | sort -k2 -rn | head -12 | sed 's/^/  /'" 2>&1 | sed -n '1,80p'
 }
 kills() {  # kills in the last N minutes of the usblog, by kind
   n=${1:-10}
@@ -32,7 +32,8 @@ watch)
   i=0
   while [ "$i" -lt "$min" ]; do snap >> "$out" 2>&1 || echo "# $(date +%H:%M:%S) no answer" >> "$out"; i=$((i + 1)); [ "$i" -lt "$min" ] && sleep 60; done
   kills "$min" | tee -a "$out"
-  echo "# free MiB per snapshot:"; awk '/vm.page_free_count/{f=$2} /vm.pagesize/{print int(f*$2/1048576)}' "$out" | tr '\n' ' '; echo
+  echo "# per snapshot (MiB, 16 KiB pages): free / wired / in compressor; compressions, swapouts:"
+  awk '/Pages free:/{f=$3} /Pages wired down:/{w=$4} /Pages occupied by compressor:/{c=$5} /^  Compressions:/{k=$2} /^  Swapouts:/{sub(/\./,"",$2); printf "%d/%d/%d c%d s%d  ", f/64, w/64, c/64, k, $2}' "$out"; echo
   ;;
 launch)
   b=${2:?bundle id}; [ -f "$LOG" ] || { echo "launch: no $LOG"; exit 1; }
