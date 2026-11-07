@@ -1,0 +1,314 @@
+laurel 3091: LAUREL USB CHECK: RX liveness of the USB gadget while iOS runs. No frame from a configured host for 30 s: 3 ARP asks of the host 2 s apart (its kernel answers for 192.168.7.1), then the RX endpoint ended and armed again (3031's recipe) and one ask, then a gadget restart (RUN/STOP off and on: the host enumerates again, 20 s) and one ask, then a panic with the reason, which lands in fastboot (3090). Any frame ends the check ("RX back after ..."). Rules in bsd/dev/laurel_usb_check_core.h, host test scripts/laurel/usb-check-test.sh. Kill switch laurelusbcheck=0. Both kernels. docs/laurel_sprout/self-recovery.md.
+
+[V 2026-11-07 05:29, 06:37, 06:48] The gadget's RX side died while iOS ran on (3052 has the cause: TRBs on one cache line); the live log kept coming, no panic, no bark, no pong, and the keys were the only way in. The host sends a frame at least every 10 s while scripts/debug/usblog.sh runs (its keepalive), so silence of 30 s from a configured host is the first sign; the ARP reply is the proof the check accepts (rx_frames moves). Costs: a host that sends nothing but answers ARP: one ARP request every 32 s. A host that is gone (not configured) is silence of the normal kind: no check, no panic.
+
+--- a/bsd/dev/sweet_usb.c	2026-11-07 07:00:08.754322316 +0530
++++ b/bsd/dev/sweet_usb.c	2026-11-07 07:02:58.657517278 +0530
+@@ -80,6 +80,7 @@
+ #include <net/kpi_interface.h>
+ #include <net/kpi_protocol.h>
+ #include <netinet/in.h>
++#include "laurel_usb_check_core.h"   /* laurel 3091: RX liveness rules */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void laurel_usb_net_attach(void);
+@@ -2221,6 +2222,144 @@
+ }
+ STARTUP(LOCKDOWN, STARTUP_RANK_SECOND, laurel_usb_timer_check); /* laurel 2015: after the LAUREL GIC report */
+ 
++
++/*
++ * laurel 3091: USB RX liveness (laurel_usb_check_core.h has the rules and the why). ud_thread runs one step per turn once ue0 is up;
++ * the actions are below. The ARP request goes through the normal TX queue: a reply from the host is a frame like any other
++ * (rx_frames moves), which is the only proof the check accepts.
++ */
++static struct luc ud_check;
++static int ud_check_on = 1;             /* laurelusbcheck=0 */
++
++static void
++ud_check_arp(void)
++{
++	mbuf_t m = NULL;
++
++	if (ud.ifp == NULL) {
++		return;
++	}
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0) {
++		return;
++	}
++	if (mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < 64) {
++		mbuf_freem(m);
++		return;
++	}
++	uint8_t *f = (uint8_t *)mbuf_data(m);
++	bzero(f, 64);
++	memset(f, 0xff, ETHER_ADDR_LEN);
++	memcpy(f + ETHER_ADDR_LEN, ud_phone_mac, ETHER_ADDR_LEN);
++	ud_put16(f + 12, ETHERTYPE_ARP);
++	uint8_t *a = f + ETHER_HDR_LEN;
++	ud_put16(a, 1);
++	ud_put16(a + 2, ETHERTYPE_IP);
++	a[4] = ETHER_ADDR_LEN;
++	a[5] = 4;
++	ud_put16(a + 6, 1);                     /* request: who has 192.168.7.1, tell 192.168.7.2 */
++	memcpy(a + 8, ud_phone_mac, ETHER_ADDR_LEN);
++	ud_put32(a + 14, UD_IP_PHONE);
++	ud_put32(a + 24, UD_IP_HOST);
++	mbuf_setlen(m, ETHER_HDR_LEN + 28);
++	mbuf_pkthdr_setlen(m, ETHER_HDR_LEN + 28);
++	(void)ud_if_output(ud.ifp, m);
++}
++
++/* the hold's recipe (3031): end the transfer the controller may still hold, then a fresh RX TRB. ud_thread owns the RX side: no lock. */
++static void
++ud_check_rearm(void)
++{
++	if (ud.ep_busy[EP_RX]) {
++		(void)ud_epcmd(EP_RX, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | (ud.ep_rsc[EP_RX] << 16), 0, 0, 0);
++		ud.ep_busy[EP_RX] = false;
++		ud_udelay(1000);
++	}
++	ud_rx_arm();
++}
++
++/*
++ * Soft disconnect and connect, as Linux dwc3 (dwc3_gadget_run_stop): every data transfer ended, the data endpoints off, RUN/STOP
++ * cleared until the controller halts, 200 ms for the host to see the detach, ep0 back at a SETUP, RUN/STOP set. The host then
++ * resets the bus and enumerates (ud_event handles both as for a cable plugged in again); SET_CONFIGURATION sets configured.
++ */
++static void
++ud_check_restart(void)
++{
++	static const unsigned data_eps[3] = { EP_RX, EP_TX, EP_INT };
++
++	for (unsigned i = 0; i < 3; i++) {
++		unsigned e = data_eps[i];
++		if (ud.ep_busy[e]) {
++			(void)ud_epcmd(e, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | (ud.ep_rsc[e] << 16), 0, 0, 0);
++			ud.ep_busy[e] = false;
++			ud_udelay(1000);
++		}
++	}
++	lck_mtx_lock(ud.lock);
++	ud.tx_busy = false;
++	ud.configured = false;
++	ud.data_alt = 0;
++	lck_mtx_unlock(ud.lock);
++	dwc_wr(DALEPENA, 0x3);
++	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++	int i;
++	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT) == 0; i++) {
++		ud_udelay(1000);
++	}
++	ud_sleep_ms(200);
++	if (ud.state != EP0_SETUP) {
++		/* a control transfer was in flight: its TRBs go, then a SETUP waits as at the start */
++		for (unsigned e = 0; e < 2; e++) {
++			(void)ud_epcmd(e, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | (((dwc_rd(DEPCMD(e)) >> 16) & 0x7f) << 16), 0, 0, 0);
++			ud_udelay(1000);
++		}
++		ud_start_setup();
++	}
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	printf("LAUREL USB CHECK: gadget restarted (controller halted after %d ms): the host enumerates it again\n", i);
++}
++
++static void
++ud_check_poll(uint64_t now)
++{
++	uint64_t ns;
++
++	if (!ud_check_on || ud_early || ud_tc_mode || ud_in_panic || ud.ifp == NULL) {
++		return;
++	}
++	absolutetime_to_nanoseconds(now, &ns);
++	switch (luc_step(&ud_check, ns, ud.configured, ud.rx_frames)) {
++	case LUC_NONE:
++		break;
++	case LUC_ASK:
++		if (ud_check.stage == 1) {
++			printf("LAUREL USB CHECK: no frame from the host for %u s: asking it by ARP\n", LUC_QUIET_S);
++		}
++		ud_check_arp();
++		break;
++	case LUC_REARM:
++		printf("LAUREL USB CHECK: no ARP reply after %u asks: RX endpoint re-armed (rx %llu tx %llu, stale %u), asking again\n",
++		    LUC_ASKS, ud.rx_frames, ud.tx_frames, ud_rx_stale);
++		ud_check_rearm();
++		ud_check_arp();
++		break;
++	case LUC_RESTART:
++		printf("LAUREL USB CHECK: still no reply: restarting the gadget (%u s for the host)\n", LUC_RESTART_WAIT_S);
++		ud_check_restart();
++		break;
++	case LUC_BACK:
++		printf("LAUREL USB CHECK: RX back after %s (asks %u, re-arms %u, restarts %u, recovered %u)\n",
++		    luc_stage_name(ud_check.last_stage), ud_check.asks, ud_check.rearms, ud_check.restarts, ud_check.recovered);
++		break;
++	case LUC_PANIC:
++		panic("LAUREL USB CHECK: RX dead: no frame from the host for %llu s after %u ARP asks, %u RX re-arm, %u gadget restart "
++		    "(host configured again: %s); rx %llu tx %llu stale %u; laurelusbcheck=0 turns this off",
++		    (ns - ud_check.quiet_at) / NSEC_PER_SEC, ud_check.asks, ud_check.rearms, ud_check.restarts,
++		    ud.configured ? "yes" : "no", ud.rx_frames, ud.tx_frames, ud_rx_stale);
++		break;
++	}
++}
++
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -2237,6 +2376,13 @@
+ 		ud_nohost_ms = 1;
+ 	}
+ 	PE_parse_boot_argn("laurelusb_resetend", &ud_reset_end, sizeof(ud_reset_end));
++	PE_parse_boot_argn("laurelusbcheck", &ud_check_on, sizeof(ud_check_on));
++	if (ud_check_on) {
++		printf("LAUREL USB CHECK: on: no frame from a configured host for %u s: %u ARP asks %u s apart, RX re-arm, gadget restart "
++		    "(%u s), then a panic (fastboot); laurelusbcheck=0\n", LUC_QUIET_S, LUC_ASKS, LUC_ASK_S, LUC_RESTART_WAIT_S);
++	} else {
++		printf("LAUREL USB CHECK: off: laurelusbcheck=0\n");
++	}
+ 	if (poll == 0) {
+ 		printf("LAUREL USB POLL: off: laurelusb_poll=0 (1 ms poll); TX queue %u, ENDTRANSFER at bus reset %s\n",
+ 		    UD_TXQ, ud_reset_end ? "on" : "off");
+@@ -2263,6 +2409,7 @@
+ 		laurel_wdog_poll();             /* laurel 2986: says so if the pet thread stopped */
+ 		++ticks;
+ 		uint64_t now = mach_absolute_time();
++		ud_check_poll(now);             /* laurel 3091: RX liveness */
+ 		if (!ud.configured && now >= next_nohost) {
+ 			/* one line per 10 s until the host configures the gadget: the panel shows where it stops */
+ 			next_nohost = now + 10 * sec;
+--- /dev/null	2026-11-05 03:50:01.083249037 +0530
++++ b/bsd/dev/laurel_usb_check_core.h	2026-11-07 07:04:51.152829477 +0530
+@@ -0,0 +1,130 @@
++/*
++ * laurel 3091: USB RX liveness: the rules, with no kernel types, so the host runs them too
++ * (scripts/laurel/usb-check-test.sh builds this header with tools/usb-check-test/usb-check-test.c).
++ *
++ * Why: 2026-11-07 the gadget's receive side died while iOS ran on (the RX TRB shared a cache line with the TX TRB: 3052),
++ * the live log kept coming, no panic, no bark, and the host had no way in: only the keys. The host sends a frame at least
++ * every 10 s while scripts/debug/usblog.sh runs (its keepalive), SSH and ctl more. So: no frame for LUC_QUIET_S while the
++ * host has the gadget configured is the first sign. The feature then asks the host by ARP (the host's kernel answers for
++ * 192.168.7.1 with no program of ours), LUC_ASKS times, LUC_ASK_S apart. No answer: the RX endpoint is ended and armed
++ * again (the hold's recipe of 3031), one more ask; still nothing: the gadget restarts (RUN/STOP off and on: the host
++ * enumerates it again, LUC_RESTART_WAIT_S for that), one more ask; still nothing: a panic with the reason, which lands in
++ * fastboot (3090) where the guardian takes over. Any frame at any stage ends the check: "RX back after ...".
++ * Kill switch: laurelusbcheck=0. A host that sends nothing but answers ARP costs one ARP every LUC_QUIET_S + 2 s.
++ */
++#ifndef LAUREL_USB_CHECK_CORE_H
++#define LAUREL_USB_CHECK_CORE_H
++
++#define LUC_QUIET_S         30u     /* no frame from a configured host for this long: the check starts */
++#define LUC_ASKS            3u      /* ARP asks before the first repair */
++#define LUC_ASK_S           2u      /* between asks, and after each repair */
++#define LUC_RESTART_WAIT_S  20u     /* after the gadget restart: the host must configure it again */
++
++enum luc_act {
++	LUC_NONE = 0,
++	LUC_ASK,            /* send one ARP request to the host */
++	LUC_REARM,          /* end and arm the RX endpoint again, then ask */
++	LUC_RESTART,        /* restart the gadget (RUN/STOP), then wait for the host */
++	LUC_PANIC,          /* RX is dead: panic (the text says why) */
++	LUC_BACK            /* a frame came in during a check: say so */
++};
++
++enum luc_stage {
++	LUC_S_QUIET = 0,
++	LUC_S_ASKED,        /* 1..LUC_ASKS: that many asks are out */
++	LUC_S_REARMED = 10,
++	LUC_S_RESTARTED,    /* waiting for the host to configure again */
++	LUC_S_RESTART_ASKED,
++	LUC_S_DEAD
++};
++
++struct luc {
++	unsigned long long rx_seen;     /* rx_frames at the last change */
++	unsigned long long quiet_at;    /* when rx_frames last changed (or the host went away) */
++	unsigned long long next;        /* the next step not before this */
++	unsigned stage;
++	unsigned asks, rearms, restarts, recovered;
++	unsigned last_stage;            /* the stage a frame ended (for the line) */
++};
++
++/* one step of the rules; now in ns, from any monotonic clock */
++static inline enum luc_act
++luc_step(struct luc *c, unsigned long long now, int configured, unsigned long long rx_frames)
++{
++	const unsigned long long S = 1000000000ull;
++
++	if (c->stage == LUC_S_DEAD) {
++		return LUC_NONE;        /* the panic is on its way */
++	}
++	if (rx_frames != c->rx_seen) {
++		c->rx_seen = rx_frames;
++		c->quiet_at = now;
++		if (c->stage != LUC_S_QUIET) {
++			c->last_stage = c->stage;
++			c->stage = LUC_S_QUIET;
++			c->recovered++;
++			return LUC_BACK;
++		}
++		return LUC_NONE;
++	}
++	if (c->stage == LUC_S_RESTARTED) {
++		if (configured) {
++			c->stage = LUC_S_RESTART_ASKED;
++			c->asks++;
++			c->next = now + LUC_ASK_S * S;
++			return LUC_ASK;
++		}
++		if (now >= c->next) {
++			c->stage = LUC_S_DEAD;
++			return LUC_PANIC;
++		}
++		return LUC_NONE;
++	}
++	if (!configured) {
++		/* no host: silence is normal; a host that left during a check ends it */
++		c->quiet_at = now;
++		c->stage = LUC_S_QUIET;
++		return LUC_NONE;
++	}
++	if (now - c->quiet_at < LUC_QUIET_S * S || now < c->next) {
++		return LUC_NONE;
++	}
++	if (c->stage < LUC_ASKS) {
++		c->stage++;
++		c->asks++;
++		c->next = now + LUC_ASK_S * S;
++		return LUC_ASK;
++	}
++	if (c->stage == LUC_ASKS) {
++		c->stage = LUC_S_REARMED;
++		c->rearms++;
++		c->asks++;
++		c->next = now + LUC_ASK_S * S;
++		return LUC_REARM;
++	}
++	if (c->stage == LUC_S_REARMED) {
++		c->stage = LUC_S_RESTARTED;
++		c->restarts++;
++		c->next = now + LUC_RESTART_WAIT_S * S;
++		return LUC_RESTART;
++	}
++	if (c->stage == LUC_S_RESTART_ASKED) {
++		c->stage = LUC_S_DEAD;
++		return LUC_PANIC;
++	}
++	return LUC_NONE;
++}
++
++static inline const char *
++luc_stage_name(unsigned stage)
++{
++	switch (stage) {
++	case LUC_S_QUIET: return "quiet";
++	case LUC_S_REARMED: return "the RX re-arm";
++	case LUC_S_RESTARTED: return "the gadget restart";
++	case LUC_S_RESTART_ASKED: return "the ask after the gadget restart";
++	case LUC_S_DEAD: return "dead";
++	default: return stage <= LUC_ASKS ? "an ARP ask" : "?";
++	}
++}
++#endif

@@ -50,6 +50,7 @@ while :; do
   [ "$_w" -lt 4 ] || die "fastboot flash boot_b failed 4 times"
   say "fastboot flash failed"; _w=$((_w + 1)); sleep 2
 done
+sh scripts/laurel/phone-guardian.sh note-flash "$IMG" fast-flash >/dev/null 2>&1 || true   # the guardian's record of boot_b (self-recovery.md)
 say "reboot into iOS"
 timeout 15 fastboot reboot >/dev/null 2>&1 || say "ABL did not take reboot: hold Power"
 say "done: slot b, iOS is booting"

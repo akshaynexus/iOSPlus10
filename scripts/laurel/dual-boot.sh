@@ -636,6 +636,7 @@ flash-slot-b)
   fastboot -s "$FB_S" reboot bootloader; sleep 6
   need_fastboot_mi_a3
   fastboot -s "$FB_S" flash boot_b "$bi"
+  sh "$REPO/scripts/laurel/phone-guardian.sh" note-flash "$bi" flash-slot-b >/dev/null 2>&1 || true   # the guardian's record of boot_b (self-recovery.md)
   fastboot -s "$FB_S" reboot bootloader; sleep 6
   need_fastboot_mi_a3
   fastboot -s "$FB_S" flash dtbo_b "$STOCK_DTBO"

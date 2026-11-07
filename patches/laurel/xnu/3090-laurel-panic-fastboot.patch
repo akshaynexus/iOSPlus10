@@ -1,0 +1,135 @@
+laurel 3090: LAUREL PANIC LANDING: every reset that a panic starts lands in fastboot (ABL), not in a normal boot: the timed reset of the USB hold, the reset of a panic with no USB, the nested panic in the hold. The hold waits laurelpanic=N s (not given: 30 s; 0: for ever) for a host command first, which keeps its own mode (ctl reboot|bootloader|poweroff). Kill switch laurelpanicfb=0 (a normal boot, as before). Both kernels. docs/laurel_sprout/self-recovery.md.
+
+[V 2026-11-07, owner] After a panic the reset of 2990/laurelpanic booted normally; ABL's retries of slot b ran out after 6 such boots and the phone ended on Android or in a loop; the owner's keys were the only way back ("I told you to make a solution where I don't have to keep doing this"). In fastboot the host (scripts/laurel/phone-guardian.sh) flashes or reboots the phone with no key. The mode is the one `op10tool ctl bootloader` uses (laurel 2018: PON SOFT_RB_SPARE + warm reset [V lands in fastboot on this phone]); no PON lane: LAUREL PANIC LANDING: off, a normal boot. The one line at boot: LAUREL PANIC LANDING: on: a panic holds N s for a host command ..., then resets into fastboot.
+
+--- a/bsd/dev/laurel_reboot.c	2026-11-07 06:59:31.593883542 +0530
++++ b/bsd/dev/laurel_reboot.c	2026-11-07 06:59:50.834583982 +0530
+@@ -129,6 +129,33 @@
+ }
+ static int lr_on;
+ 
++/*
++ * laurel 3090: where a panic lands. Before: the timed reset of a panic (laurelpanic=N, or 20 s after a bark) booted normally, and
++ * ABL's retries of slot b ran out after 6 such boots: the phone ended on Android, or looped, and the owner's keys were the way back.
++ * Now every reset that a panic starts (the timed one of the USB hold, the one of a panic with no USB, a nested panic in the hold)
++ * selects the mode "bootloader": ABL's fastboot, where the host (scripts/laurel/phone-guardian.sh) flashes or reboots with no key.
++ * A USB command in the hold (ctl reboot|bootloader|recovery|poweroff) keeps its own mode. laurelpanicfb=0: a normal boot, as before.
++ * laurelpanic=N: the hold waits N s for a host command first; not given: 30 s; 0: for ever (bring-up: the text stays, op10tool ctl ends it).
++ */
++#define LR_PANIC_SECS_DEFAULT  30
++static int lr_panic_fb = 1;
++int laurel_panic_secs(void);
++int
++laurel_panic_secs(void)
++{
++	int secs = 0;
++	if (!PE_parse_boot_argn("laurelpanic", &secs, sizeof(secs))) {
++		return LR_PANIC_SECS_DEFAULT;
++	}
++	return secs > 0 ? secs : 0;
++}
++const char *laurel_panic_mode(void);
++const char *
++laurel_panic_mode(void)
++{
++	return lr_panic_fb ? "bootloader" : "normal";
++}
++
+ /* laurel 2005: the USB command server and the panic hold pick the mode by name. 0 = set, EINVAL, ENXIO = no IMEM reason. */
+ int laurel_reboot_set_mode(const char *name);
+ int
+@@ -206,6 +233,21 @@
+ 	} else {
+ 		printf("LAUREL REBOOT: PON reason off: SPMI arbiter not ready\n");
+ 	}
++	PE_parse_boot_argn("laurelpanicfb", &lr_panic_fb, sizeof(lr_panic_fb));
++	if (lr_panic_fb && lr_pon_shift < 0) {
++		lr_panic_fb = 0;
++		printf("LAUREL PANIC LANDING: off: no PON lane, so no fastboot mode: a panic resets into a normal boot\n");
++	} else if (lr_panic_fb) {
++		int secs = laurel_panic_secs();
++		if (secs > 0) {
++			printf("LAUREL PANIC LANDING: on: a panic holds %d s for a host command (op10tool ctl ...), then resets into fastboot; "
++			    "no USB: fastboot after %d s; laurelpanicfb=0 for a normal boot, laurelpanic=N for the wait\n", secs, secs);
++		} else {
++			printf("LAUREL PANIC LANDING: on: a panic holds for ever (laurelpanic=0); a host command resets it, a nested panic lands in fastboot\n");
++		}
++	} else {
++		printf("LAUREL PANIC LANDING: off: laurelpanicfb=0: a panic resets into a normal boot\n");
++	}
+ 	lr_on = 1;
+ 	return 1;
+ }
+@@ -353,12 +395,13 @@
+ 		return;
+ 	}
+ 	cpu = cpu_number();
+-	PE_parse_boot_argn("laurelpanic", &secs, sizeof(secs));
++	secs = laurel_panic_secs();     /* laurel 3090: not given: 30 s, then fastboot */
+ 	if (secs <= 0) {
+ 		entries = 0;            /* no timed reset: the nested rule above must not reset either */
+ 		return;
+ 	}
+-	kdb_printf("LAUREL PANIC: reset in %d s\n", secs);
++	(void)laurel_reboot_set_mode(laurel_panic_mode());
++	kdb_printf("LAUREL PANIC: no USB hold: reset in %d s, mode %s\n", secs, laurel_panic_mode());
+ 	uint64_t freq = __builtin_arm_rsr64("CNTFRQ_EL0");
+ 	uint64_t start = __builtin_arm_rsr64("CNTVCT_EL0");
+ 	while (__builtin_arm_rsr64("CNTVCT_EL0") - start < (uint64_t)secs * freq) {
+--- a/bsd/dev/sweet_usb.c	2026-11-07 06:59:31.597883590 +0530
++++ b/bsd/dev/sweet_usb.c	2026-11-07 07:00:08.735710650 +0530
+@@ -105,6 +105,8 @@
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+ extern uint64_t sweet_log_position(void);
+ extern int laurel_reboot_set_mode(const char *name);
++extern int laurel_panic_secs(void);             /* laurel 3090: the hold's wait: laurelpanic=N, not given 30, 0 for ever */
++extern const char *laurel_panic_mode(void);     /* laurel 3090: "bootloader" (default) or "normal" (laurelpanicfb=0) */
+ extern void laurel_wdog_stop(void);     /* laurel 2986 */
+ extern void laurel_wdog_hold(void);     /* laurel 2987 */
+ extern int laurel_wdog_barked(void);    /* laurel 2990 */
+@@ -1834,7 +1836,7 @@
+ 		uint64_t freq = __builtin_arm_rsr64("CNTFRQ_EL0"), start = __builtin_arm_rsr64("CNTVCT_EL0");
+ 		while (__builtin_arm_rsr64("CNTVCT_EL0") - start < 5 * freq) {
+ 		}
+-		(void)laurel_reboot_set_mode("normal");
++		(void)laurel_reboot_set_mode(laurel_panic_mode());      /* laurel 3090: fastboot, the guardian takes it */
+ 		laurel_restart();
+ 		laurel_reset_raw();
+ 		return;
+@@ -1842,8 +1844,8 @@
+ 	if (!ud_panic_begin()) {
+ 		return;
+ 	}
+-	PE_parse_boot_argn("laurelpanic", &secs, sizeof(secs));
+-	if (secs <= 0 && laurel_wdog_barked()) {
++	secs = laurel_panic_secs();             /* laurel 3090: not given: 30 s */
++	if ((secs <= 0 || secs > 20) && laurel_wdog_barked()) {
+ 		secs = 20;                      /* laurel 2990: a stuck CPU: the text is out, reset with no key press */
+ 	}
+ 	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sec);
+@@ -1852,8 +1854,12 @@
+ 	if (secs > 0) {
+ 		reset_at = now + (uint64_t)secs * sec;
+ 	}
+-	kdb_printf("LAUREL PANIC: holding; reset with: op10tool ctl bootloader%s\n",
+-	    secs > 0 ? " (timed reset set by laurelpanic)" : "");
++	if (secs > 0) {
++		kdb_printf("LAUREL PANIC: holding %d s for a host command (op10tool ctl bootloader|reboot|poweroff), then a reset into %s\n",
++		    secs, strcmp(laurel_panic_mode(), "bootloader") == 0 ? "fastboot (laurelpanicfb=0: a normal boot)" : "a normal boot");
++	} else {
++		kdb_printf("LAUREL PANIC: holding for ever (laurelpanic=0); reset with: op10tool ctl bootloader\n");
++	}
+ 	for (;;) {
+ 		now = mach_absolute_time();
+ 		(void)laurel_pmic_wdog_pet();   /* laurel 3030: the loop is alive; if it dies, the PMIC resets the phone in 62 s */
+@@ -1878,8 +1884,8 @@
+ 		}
+ 		if (now >= reset_at) {
+ 			reset_at = UINT64_MAX;
+-			kdb_printf("LAUREL PANIC: %d s over: reset\n", secs);
+-			(void)laurel_reboot_set_mode("normal");
++			kdb_printf("LAUREL PANIC: %d s over: reset, mode %s\n", secs, laurel_panic_mode());
++			(void)laurel_reboot_set_mode(laurel_panic_mode());      /* laurel 3090 */
+ 			laurel_restart();
+ 			kdb_printf("LAUREL PANIC: reset failed\n");
+ 		}

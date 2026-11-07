@@ -15,7 +15,7 @@ while timeout 4 out/bin/op10tool ctl ping 2>/dev/null | grep -q pong && [ "$c" -
   sleep 5; up && { echo "ensure-ios: iOS is up"; exit 0; }; c=$((c + 1))
 done
 echo "ensure-ios: no iOS: back through ios26-retry.sh"
-sh scripts/laurel/phone-lock.sh ensure-ios sh -c 'LAUREL_PANIC_SECS=${LAUREL_PANIC_SECS:-0} EXTRA_ARGS=${EXTRA_ARGS:-ufsqueue=0} sh scripts/laurel/ios26-retry.sh rw'
+sh scripts/laurel/phone-lock.sh ensure-ios sh -c 'EXTRA_ARGS=${EXTRA_ARGS:-ufsqueue=0} sh scripts/laurel/ios26-retry.sh rw'
 c=0
 until up; do [ "$c" -lt 40 ] || { echo "ensure-ios: no SSH 200 s after the switch"; exit 1; }; sleep 5; c=$((c + 1)); done
 echo "ensure-ios: iOS is up"

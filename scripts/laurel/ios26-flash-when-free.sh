@@ -20,4 +20,4 @@ until timeout 3 fastboot devices 2>/dev/null | grep -q fastboot; do
 done
 say "fastboot seen"
 sleep 2
-exec sh scripts/laurel/phone-lock.sh flash sh -c "LAUREL_PANIC_SECS=${LAUREL_PANIC_SECS:-0} EXTRA_ARGS='${EXTRA_ARGS:-ufsqueue=0}' sh scripts/laurel/ios26-fast-flash.sh ${1:-rw}"
+exec sh scripts/laurel/phone-lock.sh flash sh -c "EXTRA_ARGS='${EXTRA_ARGS:-ufsqueue=0}' sh scripts/laurel/ios26-fast-flash.sh ${1:-rw}"
