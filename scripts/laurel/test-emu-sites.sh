@@ -4,8 +4,8 @@
 # comm is cut at 16, the unslid pc is pc - slide (0 with no slide), 8 threads on one site lose no count. Exit 0 = PASS.
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-H=$(ls -d "$REPO"/out/laurel-kernel-ios26/src/xnu/osfmk/arm64/laurel_emu_sites.h 2>/dev/null || true)
-[ -n "$H" ] || { H=$(mktemp -d)/laurel_emu_sites.h; sed -n '/^+++ b\/osfmk\/arm64\/laurel_emu_sites.h/,$p' "$REPO/patches/laurel/xnu/3070-laurel-emu-sites.patch" | sed '1,2d; s/^+//' > "$H"; }
+# the header comes from the patch in the repo (the shared build tree may hold an older one)
+H=$(mktemp -d)/laurel_emu_sites.h; sed -n '/^+++ b\/osfmk\/arm64\/laurel_emu_sites.h/,$p' "$REPO/patches/laurel/xnu/3070-laurel-emu-sites.patch" | sed '1,2d; s/^+//' > "$H"
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 cat > "$T/t.c" <<'C'
 #include <stdio.h>
@@ -38,9 +38,9 @@ int main(void)
 	unsigned h = les_hash(0x4000); unsigned found = 0; uint64_t pcs[LES_PROBE + 1];
 	for (uint64_t pc = 0x4000; found < LES_PROBE + 1; pc += 4) if (les_hash(pc) == h) pcs[found++] = pc;
 	for (unsigned i = 0; i < LES_PROBE; i++) les_note(&t, pcs[i], 0, 1, "c", 0);
-	CHECK(t.other == 0, "probe run holds LES_PROBE pcs");
+	CHECK(t.other[1] == 0, "probe run holds LES_PROBE pcs");
 	les_note(&t, pcs[LES_PROBE], 0, 1, "c", 0);
-	CHECK(t.other == 1, "one more in that run is other");
+	CHECK(t.other[1] == 1 && t.other[0] == 0, "one more in that run is other, per class");
 	/* more than LES_TOP sites: the top is the LES_TOP largest, sorted */
 	memset(&t, 0, sizeof(t));
 	for (unsigned s = 0; s < 12; s++) for (unsigned k = 0; k <= s; k++) les_note(&t, 0x8000 + s * 64, 0, 2, "m", 0);
@@ -52,7 +52,7 @@ int main(void)
 	for (int i = 0; i < 8; i++) pthread_create(&th[i], NULL, hammer, NULL);
 	for (int i = 0; i < 8; i++) pthread_join(th[i], NULL);
 	n = les_top(&t, top, d, &used);
-	CHECK(n == 1 && d[0] == 800000 && used == 1 && t.other == 0 && strcmp(t.s[top[0]].comm, "SpringBoard") == 0, "8 threads, one site, no lost count");
+	CHECK(n == 1 && d[0] == 800000 && used == 1 && t.other[4] == 0 && strcmp(t.s[top[0]].comm, "SpringBoard") == 0, "8 threads, one site, no lost count");
 	printf("%s: test-emu-sites\n", fails ? "FAIL" : "PASS");
 	return fails ? 1 : 0;
 }

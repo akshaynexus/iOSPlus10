@@ -14,7 +14,7 @@ out=$REPO/logs/cpu-place-$name-$(date +%Y%m%d-%H%M%S).txt
 {
   echo "cpu-place-read $name: $secs s on $(date +%H:%M:%S)"
   "$REPO/scripts/laurel/phone-lock.sh" cpu-place "$SSHP" "ksysctl kern.laurel_stats 2>&1 | grep -i 'cpu\\.'; \
-    pids=\$(toybox ps -A -o pid,comm 2>/dev/null | awk '\$2==\"SpringBoard\"||\$2==\"backboardd\"{printf \"%s \", \$1}'); echo \"ui pids: \$pids\"; \
+    pids=\$(toybox ps -A -o pid,comm 2>/dev/null | sed -n 's/^ *\\([0-9][0-9]*\\) *\\(SpringBoard\\|backboardd\\)\$/\\1/p' | tr '\\n' ' '); echo \"ui pids: \$pids\"; \
     echo 'cpus: busy % per CPU, one row a second (0-3 gold, 4-7 silver)'; \
     [ -n \"\$pids\" ] && (/usr/local/bin/laurel-autotest cores $secs \$pids > /tmp/cores.txt 2>&1 &); \
     /usr/local/bin/laurel-autotest cpus $secs 2>&1; sleep 1; echo 'cores: SpringBoard, backboardd (ms CPU, ms on P cores, runnable ms)'; cat /tmp/cores.txt 2>/dev/null; rm -f /tmp/cores.txt"

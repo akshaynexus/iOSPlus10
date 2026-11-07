@@ -3,8 +3,8 @@
 # order (FIXPRI 0, FG 1, IN 2, DF 3, UT 4, BG 5) only UT and BG prefer the efficiency pset. Exit 0 = PASS.
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-H=$(ls -d "$REPO"/out/laurel-kernel-ios26/src/xnu/osfmk/kern/laurel_sched_place.h 2>/dev/null || true)
-[ -n "$H" ] || { H=$(mktemp -d)/laurel_sched_place.h; sed -n '/^+++ b\/osfmk\/kern\/laurel_sched_place.h/,$p' "$REPO/patches/laurel/xnu/3071-laurel-sched-place.patch" | sed '1,2d; s/^+//' > "$H"; }
+# the header comes from the patch in the repo (the shared build tree may hold an older one)
+H=$(mktemp -d)/laurel_sched_place.h; sed -n '/^+++ b\/osfmk\/kern\/laurel_sched_place.h/,$p' "$REPO/patches/laurel/xnu/3071-laurel-sched-place.patch" | sed '1,2d; s/^+//' > "$H"
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 cat > "$T/t.c" <<'C'
 #include <stdio.h>

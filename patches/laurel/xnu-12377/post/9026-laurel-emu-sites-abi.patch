@@ -1,7 +1,7 @@
-laurel 9026 (iOS 26): the laurel_abi.c hunks of laurel 3070 (LAUREL EMU SITES): les_note() on every served word, the sites line after the counts line, the on/off line and the kill switch laurelemusites=0; post/9000 makes laurel_abi.c.
+laurel 9026 (iOS 26): the laurel_abi.c hunks of laurel 3070 (LAUREL EMU SITES): les_note() on every served word, one line per hot site and a per-class no-slot line after the counts line, the on/off line and the kill switch laurelemusites=0; post/9000 makes laurel_abi.c.
 
 diff --git a/osfmk/arm64/laurel_abi.c b/osfmk/arm64/laurel_abi.c
-index 178316c..4cc99d1 100644
+index 178316c..5761379 100644
 --- a/osfmk/arm64/laurel_abi.c
 +++ b/osfmk/arm64/laurel_abi.c
 @@ -58,7 +58,11 @@ static const char *const laurel_emu_names[A64E_NCLASS] = {
@@ -25,36 +25,51 @@ index 178316c..4cc99d1 100644
 +	(void) PE_parse_boot_argn("laurelemusites", &sites, sizeof(sites));
 +	laurel_emu_sites_on = sites != 0;
 +	if (laurel_emu_sites_on) {
-+		printf("LAUREL EMU SITES: on: the %u hottest served words of each minute, by process, user pc, pc with the dyld slide off, word and class; "
-+		    "%u slots, %u tried per pc (kill switch laurelemusites=0)\n", LES_TOP, LES_N, LES_PROBE);
++		printf("LAUREL EMU SITES: on: the %u hottest served words of each minute, one line each: class, count, process, user pc, pc with the dyld slide off, word; "
++		    "%u slots, %u tried per pc; words with no slot counted per class (kill switch laurelemusites=0)\n", LES_TOP, LES_N, LES_PROBE);
 +	} else {
 +		printf("LAUREL EMU SITES: off: laurelemusites=0 (the counts line stays)\n");
 +	}
  }
  STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, laurel_abi_init);
  
-@@ -107,6 +121,20 @@ laurel_emu_report(void)
+@@ -107,8 +121,35 @@ laurel_emu_report(void)
  	    laurel_emu_count[A64E_FP16], laurel_emu_count[A64E_FCMA], laurel_emu_count[A64E_DOTPROD], laurel_emu_count[A64E_JSCVT],
  	    laurel_emu_count[A64E_FHM], laurel_emu_count[A64E_SHA3], laurel_emu_count[A64E_RDM], laurel_emu_count[A64E_SYSREG],
  	    laurel_emu_unknown, laurel_emu_faults, laurel_emu_retries);
 +	if (laurel_emu_sites_on) {
-+		/* laurel 3070: the hottest sites of the minute; the pc with the slide off is the cache address the tools read (scripts/laurel/ios26-emu-sites.py) */
++		/*
++		 * laurel 3070: the hottest sites of the minute, one short line each (a 400-byte line is cut by another CPU's line); the pc with the
++		 * slide off is the cache address the tools read (scripts/laurel/ios26-emu-sites.py). The last line: the minute's words per class
++		 * that found no slot, and the slots in use.
++		 */
 +		unsigned top[LES_TOP], used = 0;
 +		uint64_t delta[LES_TOP];
 +		unsigned n = les_top(&laurel_emu_sites, top, delta, &used);
-+		char line[400];
++		static uint64_t other_last[A64E_NCLASS];
++		char line[200];
 +		int at = 0;
-+		for (unsigned i = 0; i < n && at < (int)sizeof(line) - 80; i++) {
++		for (unsigned i = 0; i < n; i++) {
 +			const struct les_site *s = &laurel_emu_sites.s[top[i]];
-+			at += scnprintf(line + at, sizeof(line) - at, "%s%s %llu %s pc 0x%llx unslid 0x%llx word 0x%08x", i ? "; " : "",
++			printf("LAUREL EMU: site %u: %s %llu %s pc 0x%llx unslid 0x%llx word 0x%08x\n", i + 1,
 +			    s->cls < A64E_NCLASS ? laurel_emu_names[s->cls] : "?", delta[i], s->comm[0] ? s->comm : "?", s->pc, s->unslid, s->word);
 +		}
-+		printf("LAUREL EMU: sites: %s; other %llu; %u of %u slots\n", n ? line : "none", laurel_emu_sites.other, used, LES_N);
++		for (unsigned c = 0; c < A64E_NCLASS && at < (int)sizeof(line) - 32; c++) {
++			uint64_t o = __atomic_load_n(&laurel_emu_sites.other[c], __ATOMIC_RELAXED), d = o - other_last[c];
++			other_last[c] = o;
++			if (d != 0) {
++				at += scnprintf(line + at, sizeof(line) - at, " %s=%llu", laurel_emu_names[c], d);
++			}
++		}
++		printf("LAUREL EMU: sites: %u named; no slot this minute:%s; %u of %u slots used\n", n, at ? line : " none", used, LES_N);
 +	}
  }
  
++
  /* Returns only if the word should run again. */
-@@ -163,6 +191,12 @@ laurel_abi_trap(arm_saved_state_t *state, uint32_t word)
+ static void
+ laurel_emu_fault(arm_saved_state_t *state, const struct a64emu_out *o)
+@@ -163,6 +204,12 @@ laurel_abi_trap(arm_saved_state_t *state, uint32_t word)
  		/* the kernel's exclusive pair is over; no monitor state goes back to EL0 (no clrex in locore.s, this path says it itself) */
  		__asm__ volatile ("clrex");
  		os_atomic_inc(&laurel_emu_count[o.cls], relaxed);

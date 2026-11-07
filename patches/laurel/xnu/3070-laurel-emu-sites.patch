@@ -1,17 +1,17 @@
-laurel 3070: LAUREL EMU SITES: the EL0 emulator (LAUREL EMU) keeps the words it serves by site (process, user pc, pc with the dyld cache slide off, word, class, count) and names the 4 hottest sites of each minute in a line after the counts line: the input for a lowering of those words in the root (as the PAC/LSE lowering) or a feature that steers the library to its ARMv8.0 path. Before: 900,000 FP16 words a minute in the boot storm with no site. Pure table in osfmk/arm64/laurel_emu_sites.h (host test scripts/laurel/test-emu-sites.sh); the laurel_abi.c hunks are post/9026 (the file exists only on xnu-12377). Kill switch laurelemusites=0. docs/laurel_sprout/cpu-efficiency.md.
+laurel 3070: LAUREL EMU SITES: the EL0 emulator (LAUREL EMU) keeps the words it serves by site (process, user pc, pc with the dyld cache slide off, word, class, count) and names the 4 hottest sites of each minute, one line each, after the counts line; words that find no slot are counted per class: the input for a lowering of those words in the root (as the PAC/LSE lowering) or a feature that steers the library to its ARMv8.0 path. Boot 2026-11-07 06:36: 17 M FP16 words a minute while iconservicesagent and dasd ran, 128 slots were full: now 512 slots, 8 probes. Pure table in osfmk/arm64/laurel_emu_sites.h (host test scripts/laurel/test-emu-sites.sh); the laurel_abi.c hunks are post/9026 (the file exists only on xnu-12377). Kill switch laurelemusites=0. docs/laurel_sprout/cpu-efficiency.md.
 
 diff --git a/osfmk/arm64/laurel_emu_sites.h b/osfmk/arm64/laurel_emu_sites.h
 new file mode 100644
-index 0000000..06c8209
+index 0000000..e0feaff
 --- /dev/null
 +++ b/osfmk/arm64/laurel_emu_sites.h
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,125 @@
 +/*
 + * laurel 3070: LAUREL EMU SITES. The EL0 emulator (LAUREL EMU, laurel_abi.c) serves words this CPU has not: PAC, LSE, FP16, ...
 + * A served word costs about 2 us; 900,000 FP16 words a minute were seen in the boot storm (usblog 2026-11-07 05:21), and the
 + * counts alone do not say where they come from. This table keeps every site the emulator serves, by user pc: the process, the word,
 + * its class, the pc with the dyld cache slide taken off (so it names the cache address the tools read), and a count. The minute
-+ * line (`LAUREL EMU: sites: ...`) names the LES_TOP hottest sites of that minute. The answer is the input for a lowering of those
++ * lines (`LAUREL EMU: site N: ...`, one per site: a long line gets cut by another CPU's line) name the LES_TOP hottest sites of that minute. The answer is the input for a lowering of those
 + * words in the root (as the PAC and LSE lowering), or a feature that steers the library to its ARMv8.0 path.
 + * Pure: no kernel types. The host test scripts/laurel/test-emu-sites.sh runs exactly this code. Relaxed atomics: a lost count is
 + * one count; a slot is claimed by one compare-and-swap; a reader of a slot that was just claimed may see an empty name once.
@@ -22,8 +22,9 @@ index 0000000..06c8209
 +#include <stdint.h>
 +#include <stdbool.h>
 +
-+#define LES_N      128u     /* slots: the cache has 177 FP16 sites in all, a boot touches far fewer */
-+#define LES_PROBE  4u       /* slots tried for one pc */
++#define LES_N      512u     /* slots: boot 06:36 filled 128 with the storm's sites and lost 17 M FP16 words a minute to "other" */
++#define LES_PROBE  8u       /* slots tried for one pc */
++#define LES_CLASSES 16u     /* >= the emulator's classes: "other" is kept per class */
 +#define LES_COMM   16u      /* MAXCOMLEN */
 +#define LES_TOP    4u       /* sites named a minute */
 +
@@ -39,7 +40,7 @@ index 0000000..06c8209
 +
 +struct les_table {
 +	struct les_site s[LES_N];
-+	uint64_t other;         /* served words that found no slot (LES_PROBE slots full) */
++	uint64_t other[LES_CLASSES];    /* served words that found no slot (LES_PROBE slots full), per class */
 +};
 +
 +static inline unsigned
@@ -90,7 +91,7 @@ index 0000000..06c8209
 +			return;
 +		}
 +	}
-+	__atomic_fetch_add(&t->other, 1, __ATOMIC_RELAXED);
++	__atomic_fetch_add(&t->other[cls < LES_CLASSES ? cls : LES_CLASSES - 1], 1, __ATOMIC_RELAXED);
 +}
 +
 +/* The LES_TOP sites with the most served words since the last call, hottest first: slot indexes in out[], the deltas in delta[]. Returns how many. */

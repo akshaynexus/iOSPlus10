@@ -52,6 +52,25 @@ Expected [I]: in the storm, gold's queues lose the UT/BG part of the daemons' wo
 silver (an A53 at 1804 MHz, about half an A73's speed per clock) less often; silver's 300 MHz seconds fall. Not expected: less total CPU.
 Both patches compile with the tree's own flags (`compile_commands.json`, `-fsyntax-only`, 0 errors). **NOT BOOTED.**
 
+## 4b. First boots with 3070 and 3071 (kernels 43eed8b7b8 390 patches 06:10, 8c7f0143db 394 patches 06:36; the phone still reboots every 2-4 min) [V]
+
+The sites lines came: `scripts/laurel/ios26-emu-sites.py logs/usblog.log`:
+
+| count (7 minute lines) | class | process | unslid pc | word | image |
+|---:|---|---|---|---|---|
+| 31,417 | pac | audiomxd | 0x2a34dea80 | `retab` | libsystem_m.dylib+0xa80 |
+| 20,031 | lse | laurel-springboard | 0x1bd968354 | `cas x8, x9, [x30]` | libdispatch.dylib+0x29354 (one of the 10 LSE words with x30 the lowering leaves) |
+| 11,265 | fp16 | backboardd | 0x183f1eaa8 | `fcmp h0, h1` | QuartzCore+0x4daa8 |
+| 7,447 + 7,439 + 4,627 | lse | logd | root binary | `cash`, `swpl` | logd (root, not lowered) |
+
+**The FP16 storm is not these.** `LAUREL EMU: counts` went `fp16=34,941` (06:36:42), `5,912,620` (06:37:43), `22,908,768` (06:38:43): **17 M FP16 words
+in one minute, 280,000 a second**, about 0.6 of a core at 2 us a word [I]. In that minute `LAUREL CPU TOP` had iconservicesagent 65 s, dasd 33 s,
+StocksWidget 22 s, FitnessWidget 15 s, modelcatalogd 13 s; the first sites table (128 slots, 4 probes) was full and the storm's sites fell to
+`other`. [I] The icon and widget rendering (CoreGraphics / vImage half-float paths, 2,762 + 2,335 FP16 sites in the cache) is the FP16 hot path, not
+the compositor. 3070 now keeps 512 slots, 8 probes, and counts the words with no slot per class; one line per site. The next boot names the sites.
+Other readings of those minutes: gold `1804:60`, silver `1612:60` (a cap one row under the top: thermal, or the 3051 margin of the wdog agent; [U]);
+`LAUREL CPU TOP: busy 407 s of 480` (85 %) in the storm minute, 251 s the minute after.
+
 ## 5. Tools
 
 | Tool | What |
