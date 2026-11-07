@@ -78,7 +78,21 @@ its floor (54-69 MiB) while the file cache (inactive + speculative, about 1.7 Gi
 52198 = the 4078 MiB pool. Kills in the 3 minutes: 0 (`mem-stat.sh watch` got one snapshot before the hang: UserEventAgent 79 MiB,
 locationd 74, chronod 72 RSS).
 
-Still pending: a boot of the 3081 kernel (snapshot build `ram`), `swapfile 0 made` under load, the 10 minute series and the launch times.
+Boot of the 3081 kernel (6da502a72c, 396 patches, the owner's flash, 06:46:10) [V USB log]:
+
+| Line | What it says |
+|---|---|
+| 06:46:40 | free 63 MiB, active 1732, inactive 1026, speculative 706, wired 535; compressor 0; 0 swap files; level 86 % |
+| 06:47:40 | free 56, active 1713, inactive 1712, speculative 3, wired 573; compressor 0; 0 swap files; level 85 % |
+| 06:47:09 on | `LAUREL USB: ue0 rx 11227` frozen while tx grows: UDP control and SSH dead (the kernel runs); `mem-stat.sh watch` got one snapshot (06:46:34) |
+| 06:48:29 | the log stops (after `xpcproxy` lines, a 48-line backboardd `SMP` dump at 06:47:09 before): a hang, the second of this kind. No swap file existed, so not the swap path |
+
+The `on` line of 3081 (`compressed pages go to /private/var/vm/swapfileN, at most 5 x 128 MiB`) is not in the live log of this boot: the
+console lines of that moment (vm_compressor_init, just before launchd) were not captured [U: a ring replay needs USB control, which was
+dead]. The minute lines prove the thread and the counters; the path and the limit are [V code] and in the host test only.
+
+Not measured (the phone hangs 2-4 minutes into every boot of today's kernels and USB RX froze; the stuck-CPU and USB work own that):
+the 10 minute series, kills per 10 minutes on the new floors, `swapfile 0 made` under `mem-load.sh`, app launch times.
 
 ## 5. How to test
 
