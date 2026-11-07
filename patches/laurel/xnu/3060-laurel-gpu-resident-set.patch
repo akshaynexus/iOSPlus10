@@ -1,0 +1,207 @@
+laurel 3060: the resident set: a submission flagged MSM_SUBMIT_LAUREL_RESIDENT (0x01000000) lists only the buffers its command buffers index; the kernel takes every live buffer of the client as named (Turnip names the device's whole list at every submission anyway: 209,444 names in 84 submissions on the Mi A3 with live glass, about 2,500 a submission, 1176 us of kernel time each; docs/laurel_sprout/ios26-default-speed.md section 10). The push rules run over the client's own table (the same decisions), every live buffer gets the fence, the surfaces their drawn fence. Saved: the copyin of the list, its heap copy and three walks with a handle lookup each. GET_PARAM 0x7c answers 1: the client's self-check (Turnip patch 0110 reads it). A 5th stats line every 5 s: the walk's us a submission and how many submissions named the resident set. Kill switch gpuresident=0: the flag is ignored and the param answers 0. [V] compiles (snapshot build); NOT BOOTED.
+
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -214,6 +214,7 @@
+ #define MSM_PREP_NOSYNC         0x04
+ #define MSM_SUBMIT_CMD_BUF      1
+ #define MSM_SUBMIT_FENCE_FD_OUT 0x20000000
++#define MSM_SUBMIT_LAUREL_RESIDENT 0x01000000  /* laurel 3060: every buffer of this client is named; the list holds the command buffers' only */
+ 
+ #define GPU_BUFFERS             8192            /* a client's, at most */
+ #define GPU_BUFFER_MAX          (256u << 20)
+@@ -248,6 +249,20 @@
+ static uint32_t gWSSelCalls[LGT_SLOTS];
+ static TUNABLE(uint32_t, gGPUSeedRule, "gpuseed", 1);   /* kill switch gpuseed=0: the 4 ms rule above for every surface */
+ /*
++ * laurel 3060: the resident set. Turnip names every buffer of the device at every submission (about 2,500 on the Mi A3 with live glass: 209,444 names
++ * in 84 submissions, docs/laurel_sprout/ios26-default-speed.md section 10), so the list it gives says nothing: a submission with MSM_SUBMIT_LAUREL_RESIDENT
++ * lists only the buffers its command buffers index, and the kernel takes every live buffer of the client as named: the push rules run over its own table
++ * (the same decisions as with the full list, since the full list was the table), and every live buffer gets the fence. Saves the 40 KiB copyin, the heap
++ * list and three walks with a handle lookup each. GET_PARAM 0x7c answers 1 (the self-check of the client). Kill switch gpuresident=0: the flag is
++ * ignored and the client names all, as before (the param answers 0, so a client that reads it names all too).
++ */
++static TUNABLE(uint32_t, gGPUResident, "gpuresident", 1);
++bool
++redwood_gpu_resident(void)
++{
++	return gGPUResident != 0;
++}
++/*
+  * laurel 2977: own scattered buffers: push only when a CPU write is possible (laurel_gpu_push_core.h), and made write-combined when the phone allows it, so that a
+  * persistently mapped block needs no push at all. Kill switch gpudirty=0: every mapped one at every submission, cached, as before.
+  * Log 2026-11-03 02:54:49-02:55:16: 28-127 MB a submission, 18-52 ms, about 530 MB/s, followed the pool: 4 MB at 50 MB free, 72 MB at 0.
+@@ -272,6 +287,8 @@
+ 	uint64_t push_host, push_surface, push_own;     /* laurel 2977: where the push time went */
+ 	uint64_t lock_wait, held;               /* laurel 2913: a submission: before it had the lock, and with it */
+ 	uint64_t flush_out;                     /* laurel 2977: of `held` above: scan and push when the push was outside the lock */
++	uint64_t scanning;                      /* laurel 3060: of `flushing`: the walk over the named buffers, before the pushes */
++	uint32_t resident;                      /* laurel 3060: submissions that named the resident set */
+ } gGPUStat;
+ 
+ /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
+@@ -570,6 +587,7 @@
+ 	IOLock *                fSubmitLock;            /* laurel 2977: one submission of this client at a time: the push is outside gGPULock */
+ 	struct gpu_push *       fPush;                  /* laurel 2977: under fSubmitLock: fPushPlaces places, as many as the largest submission asked for (twice that) */
+ 	uint32_t                fPushPlaces;
++	uint32_t *              fNamed;                 /* laurel 3060: the handles a submission names (GPU_BUFFERS places): the list given, or the whole table */
+ 	uint16_t *              fSurfaceHandles;        /* laurel 2978: under gGPULock: the handles that are surfaces, fSurfaceCount of them */
+ 	uint16_t *              fSurfaceAt;             /* ... and each handle's place there */
+ 	uint32_t                fSurfaceCount;
+@@ -896,6 +914,10 @@
+ 		IODelete(fPush, struct gpu_push, fPushPlaces);  /* laurel 2977 */
+ 		fPush = NULL;
+ 	}
++	if (fNamed != NULL) {
++		IODelete(fNamed, uint32_t, GPU_BUFFERS);        /* laurel 3060 */
++		fNamed = NULL;
++	}
+ 	if (fSurfaceHandles != NULL) {
+ 		IODelete(fSurfaceHandles, uint16_t, GPU_BUFFERS);       /* laurel 2978 */
+ 		fSurfaceHandles = NULL;
+@@ -1701,6 +1723,8 @@
+ 	IOReturn ret = kIOReturnBadArgument;
+ 	uint32_t pushing = 0;                   /* laurel 2977: places in fPush */
+ 	bool submitLocked = false;
++	uint32_t nnamed = 0;                    /* laurel 3060: the buffers this submission names: the list, or every live one */
++	bool resident = (request->flags & MSM_SUBMIT_LAUREL_RESIDENT) != 0 && gGPUResident != 0;
+ 
+ 	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
+ 		IOLog("RedwoodGPU: a submission of %u command buffers in %u buffers: not taken\n", request->nr_cmds, request->nr_bos);
+@@ -1722,8 +1746,15 @@
+ 	lock_began = mach_absolute_time();              /* laurel 2913 */
+ 	IOLockLock(fSubmitLock);                        /* laurel 2977 */
+ 	submitLocked = true;
+-	if (fPushPlaces < request->nr_bos) {
+-		uint32_t places = request->nr_bos > GPU_SUBMIT_BOS / 2 ? GPU_SUBMIT_BOS : request->nr_bos * 2;
++	if (fNamed == NULL) {
++		fNamed = IONew(uint32_t, GPU_BUFFERS);  /* laurel 3060 */
++		if (fNamed == NULL) {
++			ret = kIOReturnNoMemory;
++			goto out;
++		}
++	}
++	if (fPushPlaces < (resident ? GPU_BUFFERS : request->nr_bos)) {
++		uint32_t places = resident || request->nr_bos > GPU_SUBMIT_BOS / 2 ? GPU_SUBMIT_BOS : request->nr_bos * 2;
+ 
+ 		if (fPush != NULL) {
+ 			IODelete(fPush, struct gpu_push, fPushPlaces);
+@@ -1737,6 +1768,19 @@
+ 	}
+ 	IOLockLock(gGPULock);
+ 	gGPUStat.lock_wait += mach_absolute_time() - lock_began;
++	/* laurel 3060: who is named: the list given, or (the resident set) every live buffer of this client */
++	if (resident) {
++		for (uint32_t h = 0; h < GPU_BUFFERS; h++) {
++			if (fBuffers[h].memory != NULL) {
++				fNamed[nnamed++] = h + 1;
++			}
++		}
++		gGPUStat.resident++;
++	} else {
++		for (uint32_t i = 0; i < request->nr_bos; i++) {
++			fNamed[nnamed++] = bos[i].handle;
++		}
++	}
+ 	/*
+ 	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
+ 	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
+@@ -1754,8 +1798,8 @@
+ 
+ 	nanoseconds_to_absolutetime(GPU_PUSH_SAFE_MS * NSEC_PER_MSEC, &safe);
+ 	nanoseconds_to_absolutetime(GPU_PUSH_FRAME_MS * NSEC_PER_MSEC, &frame);
+-	for (uint32_t i = 0; i < request->nr_bos; i++) {
+-		struct gpu_buffer * b = buffer(bos[i].handle);
++	for (uint32_t i = 0; i < nnamed; i++) {
++		struct gpu_buffer * b = buffer(fNamed[i]);
+ 		uint8_t kind;
+ 
+ 		if (b == NULL) {
+@@ -1814,7 +1858,7 @@
+ 		fPush[pushing].surface = b->surface;
+ 		fPush[pushing].kernel = b->kernel;
+ 		fPush[pushing].size = b->size;
+-		fPush[pushing].handle = bos[i].handle;
++		fPush[pushing].handle = fNamed[i];
+ 		fPush[pushing].kind = kind;
+ 		b->memory->retain();
+ 		if (b->surface != NULL) {
+@@ -1824,6 +1868,7 @@
+ 		gGPUStat.flushed += b->size;
+ 		gGPUStat.pushes++;
+ 	}
++	gGPUStat.scanning += mach_absolute_time() - began;       /* laurel 3060 */
+ 	if (pushing != 0) {
+ 		uint64_t spent[3] = { 0, 0, 0 };
+ 
+@@ -1860,7 +1905,7 @@
+ 		}
+ 	}
+ 	gGPUStat.flushing += mach_absolute_time() - began;
+-	gGPUStat.buffers += request->nr_bos;
++	gGPUStat.buffers += nnamed;
+ 	for (uint32_t i = 0; i < request->nr_cmds; i++) {
+ 		struct gpu_buffer * b = cmds[i].submit_idx < request->nr_bos ? buffer(bos[cmds[i].submit_idx].handle) : NULL;
+ 
+@@ -1883,8 +1928,8 @@
+ 		uint32_t big = 0, all_words = 0;
+ 		uint64_t ns;
+ 
+-		for (uint32_t i = 0; i < request->nr_bos; i++) {
+-			struct gpu_buffer * b = buffer(bos[i].handle);
++		for (uint32_t i = 0; i < nnamed; i++) {
++			struct gpu_buffer * b = buffer(fNamed[i]);
+ 
+ 			big += b != NULL && b->size >= (4u << 20);
+ 		}
+@@ -1892,7 +1937,7 @@
+ 			all_words += words[i];
+ 		}
+ 		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+-		redwood_tl("tl: Q %u at %llu: %u buffers, %u big, %u words\n", request->fence, ns / 1000, request->nr_bos, big, all_words);
++		redwood_tl("tl: Q %u at %llu: %u buffers, %u big, %u words\n", request->fence, ns / 1000, nnamed, big, all_words);
+ 	}
+ 	if (request->flags & MSM_SUBMIT_FENCE_FD_OUT) {
+ 		request->fence_fd = -1;
+@@ -1903,8 +1948,8 @@
+ 	 * (freedreno names every buffer for reading and writing alike, so which it is cannot be
+ 	 * told; the last submission of a frame names the surface the frame is drawn into.)
+ 	 */
+-	for (uint32_t i = 0; request->fence != 0 && i < request->nr_bos; i++) {
+-		struct gpu_buffer * b = buffer(bos[i].handle);
++	for (uint32_t i = 0; request->fence != 0 && i < nnamed; i++) {
++		struct gpu_buffer * b = buffer(fNamed[i]);
+ 
+ 		if (b != NULL) {
+ 			b->fence = request->fence;
+@@ -1974,6 +2019,11 @@
+ 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
+ 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
+ 		    fBufferBytes >> 20, gGPUStat.pushes, gGPUStat.clean, push_host / NSEC_PER_USEC, push_surface / NSEC_PER_USEC, push_own / NSEC_PER_USEC);
++		uint64_t scanning;
++
++		absolutetime_to_nanoseconds(gGPUStat.scanning, &scanning);
++		IOLog("RedwoodGPU: the walk over the named buffers %llu us a submission, %u of %u submissions named the resident set (laurel 3060)\n",
++		    scanning / NSEC_PER_USEC / gGPUStat.submissions, gGPUStat.resident, gGPUStat.submissions);
+ 		uint64_t lock_wait, held, ws_time;
+ 		uint32_t ws_calls = gWSCalls;
+ 
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1790,6 +1790,8 @@
+ 	return ready;
+ }
+ 
++bool redwood_gpu_resident(void);        /* laurel 3060: RedwoodGPU.cpp */
++
+ bool
+ redwood_gpu_parameter(uint32_t which, uint64_t *value)
+ {
+@@ -1809,6 +1811,7 @@
+ 	case 0x10: *value = HBB; return true;                   /* HIGHEST_BANK_BIT (laurel: trinket-gpu.dtsi 14) */
+ 	case 0x12: *value = 7; return true;                     /* UBWC_SWIZZLE */
+ 	case 0x13: *value = 0; return true;                     /* MACROTILE_MODE */
++	case 0x7c: *value = redwood_gpu_resident() ? 1 : 0; return true;        /* laurel 3060: LAUREL_RESIDENT: a submission may name the resident set */
+ 	default:
+ 		return false;                                   /* VA_START/VA_SIZE: addresses are ours to give */
+ 	}

@@ -1,0 +1,124 @@
+laurel (Mi A3, iOS 26): the resident set: with a kernel that answers GET_PARAM 0x7c = 1 (RedwoodGPU laurel 3060) a submission is flagged MSM_SUBMIT_LAUREL_RESIDENT and lists its command buffers only (each once); the kernel takes every live buffer of the client as named. Before, the device's whole list went in at every submission (about 2,500 buffers with live glass: a 40 KiB copyin and three kernel walks each). One line LAUREL TURNIP RESIDENT: on|off (the kernel's answer is the self-check). Kill switch NEGRONIMETAL_RESIDENT=0. Host: ios26-encode-bench.sh with IOCTL_COUNT_RESIDENT=1 (ioctl-count.so answers the param) runs the on path on Mesa's drm-shim.
+
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -361,6 +361,8 @@
+    struct drm_msm_gem_submit_bo *submit_bo_list;
+    /* map bo handles to bo list index: */
+    uint32_t submit_bo_count, submit_bo_list_size;
++   /* laurel 0110: the kernel takes every buffer of the client as named (RedwoodGPU laurel 3060, GET_PARAM 0x7c): a submission lists its command buffers only */
++   bool laurel_resident;
+    /* bo list for dumping: */
+    struct util_dynarray dump_bo_list;
+    mtx_t bo_mutex;
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+@@ -188,6 +188,37 @@
+    return true;
+ }
+ 
++/* laurel 0110: the resident set. On the Mi A3 the kernel (RedwoodGPU laurel 3060) takes every live buffer of the client as named by a submission
++ * flagged MSM_SUBMIT_LAUREL_RESIDENT, whose list holds the command buffers only; the device's whole list (about 2,500 buffers with live
++ * glass) is not copied in and walked at every submission. The self-check: GET_PARAM 0x7c answers 1. Kill switch NEGRONIMETAL_RESIDENT=0.
++ * One line: LAUREL TURNIP RESIDENT: on|off. */
++#define MSM_SUBMIT_LAUREL_RESIDENT 0x01000000
++#define MSM_PARAM_LAUREL_RESIDENT 0x7c
++#ifdef __APPLE__
++extern "C" void ngl_log(const char *fmt, ...);
++#define laurel_say(...) ngl_log(__VA_ARGS__)
++#else
++#define laurel_say(...) mesa_logi(__VA_ARGS__)
++#endif
++
++static bool
++laurel_resident_init(int fd)
++{
++   const char *off = getenv("NEGRONIMETAL_RESIDENT");
++   uint64_t value = 0;
++
++   if (off != NULL && off[0] == '0') {
++      laurel_say("LAUREL TURNIP RESIDENT: off: NEGRONIMETAL_RESIDENT=0: every buffer named at every submission");
++      return false;
++   }
++   if (tu_drm_get_param(fd, MSM_PARAM_LAUREL_RESIDENT, &value) != 0 || value != 1) {
++      laurel_say("LAUREL TURNIP RESIDENT: off: the kernel has no resident set (GET_PARAM 0x7c): every buffer named at every submission");
++      return false;
++   }
++   laurel_say("LAUREL TURNIP RESIDENT: on: a submission names its command buffers only, the kernel takes every buffer of the device as named (kill switch NEGRONIMETAL_RESIDENT=0)");
++   return true;
++}
++
+ static VkResult
+ msm_device_init(struct tu_device *dev)
+ {
+@@ -213,6 +244,7 @@
+    }
+ 
+    dev->fd = fd;
++   dev->laurel_resident = laurel_resident_init(fd);
+ 
+    return VK_SUCCESS;
+ }
+@@ -881,6 +913,8 @@
+ #endif
+ 
+    uint32_t flags = MSM_PIPE_3D0;
++   struct drm_msm_gem_submit_bo *resident_bos = NULL;  /* laurel 0110 */
++   uint32_t resident_count = 0;
+ 
+    /* Allocate without wait timeline semaphores */
+    in_syncobjs = (struct drm_msm_gem_submit_syncobj *) vk_zalloc(
+@@ -939,6 +973,17 @@
+     * time when bo_mutex is not locked. So we update the index here under the
+     * lock.
+     */
++   /* laurel 0110: with the resident set the list holds the command buffers only (each once), the kernel names the rest */
++   if (queue->device->laurel_resident && entry_count) {
++      resident_bos = (struct drm_msm_gem_submit_bo *) vk_alloc(&queue->device->vk.alloc, entry_count * sizeof(*resident_bos), 8,
++                                                                VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
++      if (resident_bos == NULL) {
++         mtx_unlock(&queue->device->bo_mutex);
++         result = vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
++         goto fail_submit;
++      }
++      flags |= MSM_SUBMIT_LAUREL_RESIDENT;
++   }
+    util_dynarray_foreach (&submit->commands, struct drm_msm_gem_submit_cmd,
+                           cmd) {
+       unsigned i = cmd -
+@@ -946,14 +991,24 @@
+                                struct drm_msm_gem_submit_cmd, 0);
+       struct tu_bo **bo = util_dynarray_element(&submit->command_bos,
+                                                 struct tu_bo *, i);
++      if (resident_bos != NULL) {
++         uint32_t j = 0;
++
++         while (j < resident_count && resident_bos[j].handle != (*bo)->gem_handle)
++            j++;
++         if (j == resident_count)
++            resident_bos[resident_count++] = queue->device->submit_bo_list[(*bo)->submit_bo_list_idx];
++         cmd->submit_idx = j;
++         continue;
++      }
+       cmd->submit_idx = (*bo)->submit_bo_list_idx;
+    }
+ 
+    req = (struct drm_msm_gem_submit) {
+       .flags = flags,
+-      .nr_bos = entry_count ? queue->device->submit_bo_count : 0,
++      .nr_bos = resident_bos != NULL ? resident_count : entry_count ? queue->device->submit_bo_count : 0,
+       .nr_cmds = entry_count,
+-      .bos = (uint64_t)(uintptr_t) queue->device->submit_bo_list,
++      .bos = (uint64_t)(uintptr_t) (resident_bos != NULL ? resident_bos : queue->device->submit_bo_list),
+       .cmds = (uint64_t)(uintptr_t)submit->commands.data,
+       .queueid = queue->msm_queue_id,
+       .in_syncobjs = (uint64_t)(uintptr_t)in_syncobjs,
+@@ -968,6 +1023,8 @@
+                              &req, sizeof(req));
+ 
+    mtx_unlock(&queue->device->bo_mutex);
++   if (resident_bos != NULL)
++      vk_free(&queue->device->vk.alloc, resident_bos);
+ 
+    if (ret) {
+       result = vk_device_set_lost(&queue->device->vk, "submit failed: %m");

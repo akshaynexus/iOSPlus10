@@ -213,6 +213,7 @@ Each way to a CPU write, and what covers it [V code]: user map: `clientMemoryFor
 | 2977 rule + WC | [V log] 28-127 MB, 18-52 ms a submission are the cost; [I] most of it own scattered; 0 for WC buffers. With WC off: little (persistent maps) | a missed push: corruption. Pageable + WC on this kernel [U]: a panic at the first scattered buffer | Corruption that `gpudirty=0` cures. Crash file. `LAUREL GPU WC: off` |
 | 2977 outside lock | other requests stop waiting 18-52 ms [V as held time] | an error in the rule: a fault in the push. Slower `us before the lock` in a client | Crash file with `redwood_gpu_to_memory`. `gpuflushout=0` cures |
 | 2978 | [I] part of `us each` in made; number after a boot | a table entry not cleaned: SMMU fault | `TopazGPU: SMMU` lines; `gpuptebatch=0` cures |
+| 3060 resident set | [V s11] 2,500 buffers named a submission, 1176 us of kernel time each; [I] the walks' share gone, the pushes stay | a buffer the client did not name is pushed or fenced: none (the full list was the table) | 5th stats line `the walk over the named buffers`; `LAUREL TURNIP RESIDENT: on`; `gpuresident=0` cures |
 
 Kill switches: `gpudirty=0`, `gpuflushout=0`, `gpuptebatch=0`. Start line: `LAUREL GPU PUSH: on: own buffers only after a CPU map or write; outside the lock`.
 

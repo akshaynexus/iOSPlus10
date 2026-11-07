@@ -10,7 +10,7 @@ export METAL_OUT=${METAL_OUT:-$OUT/ios26/metal-impl}
 . "$REPO/scripts/metal/env.sh"
 what=${1:-all}; spec=${2:-200,300}
 W=$OUT/ios26/encode-bench
-T=$OUT/ios26/turnip-host
+T=${TURNIP_HOST:-$OUT/ios26/turnip-host}        # TURNIP_HOST=DIR: another host Turnip (a snapshot tree's out/ios26/turnip-host)
 B=$MOUT/bridge/linux/libnative_metal_bridge.a
 FLAME=$MOUT/src/flame/phone/metal2/bridge
 LIB=$OUT/ios26/metallib/Frameworks_QuartzCore.framework_default.metallib/default.metallib
@@ -27,5 +27,12 @@ cat > "$W/icd.json" <<JSON
 JSON
 cd "$W"
 export VK_ICD_FILENAMES=$W/icd.json VK_DRIVER_FILES=$W/icd.json TU_DEBUG=noconform,nocache FD_GPU_ID=610 NMN_SCENE_BENCH=$spec NMN_SCENE_BENCH_PCS=$W/pcs.txt
-LD_PRELOAD=$T/libfreedreno_noop_drm_shim.so ./scene-default libvulkan.so.1 "$W/cache" "$LIB" > "$W/run.log" 2>&1 || { echo "encode-bench: scene exit $?"; tail -5 "$W/run.log"; exit 1; }
-{ grep -E '^(bench|FAIL)' "$W/run.log"; python3 -I "$REPO/scripts/laurel/ios26-encode-bench.py" "$W/pcs.txt" "$W/scene-default"; } | tee "$REPO/logs/encode-bench${BENCH_NAME:+-$BENCH_NAME}.txt"
+# IOCTL_COUNT=1: userland/laurel/metal-native/tests/ioctl-count.c before the shim: the DRM ioctls counted (GEM_NEW with callers, named buffers a submit) at the end of run.log;
+# IOCTL_COUNT_RESIDENT=1 with it: the host stands in for RedwoodGPU laurel 3060 (GET_PARAM 0x7c = 1): Turnip patch 0110's on path runs here.
+PRELOAD=$T/libfreedreno_noop_drm_shim.so
+if [ "${IOCTL_COUNT:-0}" = 1 ]; then
+  clang -O1 -g -shared -fPIC -o "$W/ioctl-count.so" "$REPO/userland/laurel/metal-native/tests/ioctl-count.c" -ldl
+  PRELOAD=$W/ioctl-count.so:$PRELOAD
+fi
+LD_PRELOAD=$PRELOAD ./scene-default libvulkan.so.1 "$W/cache" "$LIB" > "$W/run.log" 2>&1 || { echo "encode-bench: scene exit $?"; tail -5 "$W/run.log"; exit 1; }
+{ grep -E '^(bench|FAIL)|ioctl-count: GEM_NEW [0-9]+ \(|LAUREL TURNIP' "$W/run.log"; python3 -I "$REPO/scripts/laurel/ios26-encode-bench.py" "$W/pcs.txt" "$W/scene-default"; } | tee "$REPO/logs/encode-bench${BENCH_NAME:+-$BENCH_NAME}.txt"
